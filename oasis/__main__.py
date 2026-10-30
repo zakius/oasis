@@ -19,7 +19,7 @@ def main():
     if args.command == "scan":
         scan.scan(connect(config.database), config.library)
     else:
-        uvicorn.run(create_app(config), host=config.host, port=config.port)
+        uvicorn.run(create_app(config), host=config.host, port=config.port, access_log=False)  # Subsonic puts credentials in query strings
 
 
 if __name__ == "__main__":

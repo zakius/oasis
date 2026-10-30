@@ -1,0 +1,10 @@
+services:
+  oasis:
+    build: .
+    image: oasis
+    restart: unless-stopped
+    ports:
+      - "4533:4533"
+    volumes:
+      - ./config:/config            # oasis.toml and the database
+      - ~/Music:/music:ro           # set library paths in oasis.toml to /music

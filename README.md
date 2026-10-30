@@ -23,6 +23,14 @@ cp oasis.example.toml oasis.toml   # set library paths and a password
 .venv/bin/oasis -c oasis.toml       # scans in the background, serves on port 4533
 ```
 
+Or in a container. Put `oasis.toml` in `./config`, set its library path to `/music`, and run:
+
+```sh
+docker compose up -d --build
+```
+
+`compose.yaml` mounts `~/Music` read-only at `/music`. The container runs as UID 1000, so `./config` must be writable by that user; set `user:` in `compose.yaml` otherwise.
+
 Point a Subsonic client at `http://<host>:4533`. `oasis scan` runs a scan without serving. The server rescans when a client calls `startScan`.
 
 ## Supported API
