@@ -17,7 +17,7 @@ def item(video_id, title, artist="Mixer", album="Mix Album"):
 class FakeYtm:
     def __init__(self, cache):
         self.cache, self.fetched = cache, []
-        self.current = {"RDTMAK_super": ["m1", "m2"], "RDTMAK_mix1": ["m2", "m3"]}
+        self.current = {"RDTMAK_super": ["m1", "m2"], "RDTMAK_mix1": ["m2", "m3"], "PLmine": ["m5"]}
 
     def client(self, auth):
         return "client:" + auth
@@ -25,11 +25,11 @@ class FakeYtm:
     def account_name(self, client):
         return "Test Account"
 
-    def mixes(self, client):
-        return [{"id": id, "title": {"RDTMAK_super": "My Supermix", "RDTMAK_mix1": "My Mix 1"}[id], "description": "For you",
+    def playlists(self, client):
+        return [{"id": id, "title": {"RDTMAK_super": "My Supermix", "RDTMAK_mix1": "My Mix 1", "PLmine": "Road trip"}[id], "description": "For you",
                  "cover": "https://img/cover"} for id in self.current]
 
-    def mix_tracks(self, client, playlist_id):
+    def playlist_tracks(self, client, playlist_id):
         return [track_row(item(v, f"Song {v}")) for v in self.current[playlist_id]]
 
     def cached(self, video_id):
@@ -75,7 +75,8 @@ def test_mixes_are_read_only_playlists_in_the_library(client, ytm):
     link(client)
     client.app.state.api._refresh_mixes("admin")
     mixes = playlists(client)
-    assert set(mixes) == {"My Supermix", "My Mix 1"} and {m["owner"] for m in mixes.values()} == {"YouTube Music"}
+    assert set(mixes) == {"My Supermix", "My Mix 1", "Road trip"} and {m["owner"] for m in mixes.values()} == {"YouTube Music"}
+    assert mixes["My Supermix"]["oasisMix"] is True and "oasisMix" not in mixes["Road trip"]
     entries = call(client, "getPlaylist", id=mixes["My Supermix"]["id"])["playlist"]["entry"]
     assert [e["title"] for e in entries] == ["Song m1", "Song m2"]
     assert {"Song m1", "Song m2", "Song m3"} <= library_titles(client)

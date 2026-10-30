@@ -119,18 +119,24 @@ class YouTubeMusic:
         with self.api_lock:
             return client.get_account_info()["accountName"]
 
-    def mixes(self, client) -> list[dict]:
-        """The account's personal mixes (My Supermix, My Mix 1-7, Discover, Replay, New Release...) from its home feed."""
+    def playlists(self, client) -> list[dict]:
+        """The account's personal mixes (My Supermix, Discover, Replay, the themed My Mixes...) from its home feed, then
+        its library playlists: Liked Music and the playlists it made or saved."""
         with self.api_lock:
-            home = client.get_home(limit=12)
-        cards = [c for section in home for c in section.get("contents", []) if (c.get("playlistId") or "").startswith("RDTMAK")]
-        return list({c["playlistId"]: {"id": c["playlistId"], "title": c.get("title") or c["playlistId"],
-                                        "description": c.get("description"), "cover": big_cover(c.get("thumbnails"))}
-                     for c in cards}.values())
+            home = client.get_home(limit=50)
+            library = client.get_library_playlists(limit=None)
+        mixes = [c for section in home for c in section.get("contents", []) if (c.get("playlistId") or "").startswith("RDTMAK")]
+        saved = [p for p in library if p.get("playlistId") and p["playlistId"] != "SE"]  # SE: podcast episodes
+        return list({p["playlistId"]: {"id": p["playlistId"], "title": p.get("title") or p["playlistId"],
+                                       "description": p.get("description"), "cover": big_cover(p.get("thumbnails"))}
+                     for p in mixes + saved}.values())
 
-    def mix_tracks(self, client, playlist_id: str) -> list[dict]:
+    def playlist_tracks(self, client, playlist_id: str) -> list[dict]:
         with self.api_lock:
-            tracks = client.get_watch_playlist(playlistId=playlist_id, limit=100)["tracks"]
+            if playlist_id.startswith("RDTMAK"):  # mixes only open as a watch playlist
+                tracks = client.get_watch_playlist(playlistId=playlist_id, limit=100)["tracks"]
+            else:
+                tracks = client.get_playlist(playlist_id, limit=None)["tracks"]
         return [row for t in tracks if (row := track_row(t))]
 
     def lyrics(self, video_id: str):

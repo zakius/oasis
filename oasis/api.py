@@ -641,6 +641,7 @@ class Api:
         result = clean({
             "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": MIX_OWNER if r["mix"] else r["owner"], "public": False,
             "coverArt": f"pl-{r['id']}" if r["cover"] else None,
+            "oasisMix": True if (r["mix"] or "").startswith("RDTMAK") else None,
             "songCount": len(songs), "duration": sum(s.get("duration", 0) for s in songs),
             "created": iso(r["created"]), "changed": iso(r["changed"]),
         })
@@ -658,16 +659,17 @@ class Api:
         return {"playlist": self._playlist(db, r, True)}
 
     def _refresh_mixes(self, user: str):
-        """Mirrors the user's YouTube Music personal mixes as read-only playlists shown as owned by "YouTube Music"."""
+        """Mirrors the user's YouTube Music mixes and library playlists as read-only playlists shown as owned by
+        "YouTube Music"."""
         db = self._db()
         try:
             row = accounts.get(db, user)
             if not (self.ytm and row and row["ytm_auth"]):
                 return
             client = self.ytm.client(row["ytm_auth"])
-            mixes = self.ytm.mixes(client)
+            mixes = self.ytm.playlists(client)
             for mix in mixes:
-                tracks = list(dict.fromkeys(remember(db, row) for row in self.ytm.mix_tracks(client, mix["id"])))
+                tracks = list(dict.fromkeys(remember(db, row) for row in self.ytm.playlist_tracks(client, mix["id"])))
                 found = db.execute("select id from playlist where owner = ? and mix = ?", (user, mix["id"])).fetchone()
                 if found:
                     playlist_id = found["id"]

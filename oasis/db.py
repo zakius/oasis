@@ -29,7 +29,7 @@ create table if not exists playlist(
     created real not null, changed real not null,
     radio int not null default 0,   -- 1: grows from its own tracks, 2: grows from everything played
     played_pos int not null default -1,
-    mix text,                       -- YouTube Music playlist id of a personal mix; such playlists are read-only
+    mix text,                       -- YouTube Music playlist id (mix or library playlist); such playlists are read-only
     cover text                      -- image URL
 );
 create table if not exists outbox(
