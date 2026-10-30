@@ -56,13 +56,33 @@ def make_id(prefix: str, *parts: str) -> str:
     return prefix + hashlib.sha1("\0".join(p.casefold() for p in parts).encode()).hexdigest()[:16]
 
 
+migrated: set[Path] = set()
+
+
 def connect(path: Path) -> sqlite3.Connection:
     db = sqlite3.connect(path, timeout=30, isolation_level=None)
     db.row_factory = sqlite3.Row
     db.execute("pragma journal_mode=wal")
     db.execute("pragma foreign_keys=on")
-    db.executescript(SCHEMA)
+    if path not in migrated:
+        db.executescript(SCHEMA)
+        migrate(db)
+        migrated.add(path)
     return db
+
+
+def migrate(db: sqlite3.Connection):
+    """Adds the columns a database from an older oasis lacks, as SCHEMA defines them."""
+    current = sqlite3.connect(":memory:")
+    current.executescript(SCHEMA)
+    for (table,) in current.execute("select name from sqlite_master where type = 'table'"):
+        have = {row[1] for row in db.execute(f"pragma table_info({table})")}
+        for _, name, kind, not_null, default, _ in current.execute(f"pragma table_info({table})"):
+            if name not in have:
+                # SQLite adds a NOT NULL column only with a default.
+                constraint = (f" not null default {default}" if not_null else f" default {default}") if default is not None else ""
+                db.execute(f"alter table {table} add column {name} {kind}{constraint}")
+    current.close()
 
 
 def remember(db, row: dict) -> str:
