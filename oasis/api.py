@@ -19,7 +19,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import cover, forward, lyrics, scan, ytm
+from . import accounts, cover, forward, lyrics, scan, web, ytm
 from .config import Config
 from .db import connect, remember
 from .forward import Forwarder, LastFm
@@ -29,7 +29,7 @@ from .ytm import YouTubeMusic
 log = logging.getLogger(__name__)
 
 VERSION = "1.16.1"
-NOT_FOUND, MISSING, AUTH = 70, 10, 40
+NOT_FOUND, MISSING, AUTH, DENIED = 70, 10, 40, 50
 MIX_OWNER = "YouTube Music"
 MIX_REFRESH = 6 * 3600
 
@@ -134,6 +134,10 @@ def artist(r) -> dict:
     })
 
 
+def decode_password(value: str) -> str:
+    return bytes.fromhex(value[4:]).decode() if value.startswith("enc:") else value
+
+
 def is_radio(playlist_name: str) -> int:
     """Playlists named "Radio ..." grow by themselves from the tracks played in them."""
     return int(playlist_name.casefold().startswith("radio"))
@@ -148,14 +152,15 @@ def index_letter(name: str) -> str:
 
 
 class Api:
-    def __init__(self, config: Config, ytm=None, services=None):
-        self.config = config
-        self.ytm = ytm or (YouTubeMusic(config.ytm_cache, config.ytm_auth) if config.ytm_cache else None)
-        if services is None:
-            db = self._db()
-            services = forward.services(config, db, self.ytm)
-            db.close()
-        self.forwarder = Forwarder(self._db, services, self.ytm.match if self.ytm else None)
+    def __init__(self, config: Config, ytm=None, services=None, background=True):
+        self.config, self.background = config, background
+        self.ytm = ytm or (YouTubeMusic(config.ytm_cache) if config.ytm_cache else None)
+        db = self._db()
+        accounts.sync_config_users(db, config.users)
+        db.close()
+        services_for = (lambda db, user: services) if services is not None else \
+            (lambda db, user: forward.user_services(config, self.ytm, accounts.get(db, user)))
+        self.forwarder = Forwarder(self._db, services_for, self.ytm.match if self.ytm else None)
         lastfm = LastFm(config.lastfm_key, config.lastfm_secret or "", None) if config.lastfm_key else None
         self.recommender = Recommender(self._db, self.ytm, lastfm)
         self.completed: set[str] = set()
@@ -180,16 +185,16 @@ class Api:
                 self.scan_lock.release()
         threading.Thread(target=run, daemon=True).start()
 
-    def _authenticate(self, p: Params) -> str:
+    def _authenticate(self, db, p: Params) -> str:
         user = p.need("u")
-        password = self.config.users.get(user)
-        if password is None:
+        row = accounts.get(db, user)
+        if row is None:
             raise Fail(AUTH, "Wrong username or password")
+        password = row["password"]
         if (token := p.get("t")) is not None:
             ok = hashlib.md5((password + p.need("s")).encode()).hexdigest() == token.lower()
         else:
-            given = p.need("p")
-            ok = (bytes.fromhex(given[4:]).decode() if given.startswith("enc:") else given) == password
+            ok = decode_password(p.need("p")) == password
         if not ok:
             raise Fail(AUTH, "Wrong username or password")
         return user
@@ -211,10 +216,89 @@ class Api:
     def getOpenSubsonicExtensions(self, db, p, user):
         return {"openSubsonicExtensions": [{"name": name, "versions": [1]} for name in ("formPost", "songLyrics", "transcodeOffset")]}
 
+    def _user(self, row) -> dict:
+        roles = ("scrobbling", "settings", "download", "playlist", "coverArt", "comment", "stream", "share")
+        return {"username": row["name"], "adminRole": bool(row["admin"]), **{f"{r}Role": True for r in roles},
+                **{f"{r}Role": False for r in ("upload", "podcast", "jukebox")}, "folder": [1]}
+
+    def _admin(self, db, user):
+        if not accounts.get(db, user)["admin"]:
+            raise Fail(DENIED, "Only admins can do that")
+
     def getUser(self, db, p, user):
-        roles = ("scrobbling", "admin", "settings", "download", "upload", "playlist", "coverArt", "comment",
-                 "podcast", "stream", "jukebox", "share")
-        return {"user": {"username": user, **{f"{r}Role": True for r in roles}, "folder": [1]}}
+        name = p.get("username", user)
+        if name != user:
+            self._admin(db, user)
+        return {"user": self._user(self._one(db, "select * from user where name = ?", name))}
+
+    def getUsers(self, db, p, user):
+        self._admin(db, user)
+        return {"users": {"user": [self._user(r) for r in db.execute("select * from user order by name")]}}
+
+    def createUser(self, db, p, user):
+        self._admin(db, user)
+        try:
+            accounts.create(db, p.need("username"), decode_password(p.need("password")), p.get("adminRole") == "true")
+        except ValueError as e:
+            raise Fail(0, str(e))
+        return {}
+
+    def updateUser(self, db, p, user):
+        self._admin(db, user)
+        name = self._one(db, "select name from user where name = ?", p.need("username"))["name"]
+        if (password := p.get("password")) is not None:
+            accounts.set_field(db, name, password=decode_password(password))
+        if (admin := p.get("adminRole")) is not None and name not in self.config.users:
+            accounts.set_field(db, name, admin=int(admin == "true"))
+        return {}
+
+    def deleteUser(self, db, p, user):
+        self._admin(db, user)
+        name = p.need("username")
+        if name in self.config.users:
+            raise Fail(DENIED, "Users from oasis.toml can only be removed there")
+        accounts.delete(db, name)
+        return {}
+
+    def changePassword(self, db, p, user):
+        name = p.need("username")
+        if name != user:
+            self._admin(db, user)
+        if name in self.config.users:
+            raise Fail(DENIED, "This password is set in oasis.toml")
+        self._one(db, "select 1 from user where name = ?", name)
+        accounts.set_field(db, name, password=decode_password(p.need("password")))
+        return {}
+
+    def oasisLinkYouTubeMusic(self, db, p, user):
+        """For clients that already have a YouTube Music sign-in (roma): cookie is the music.youtube.com Cookie header
+        or the request headers; authUser the X-Goog-AuthUser index, 0 by default."""
+        try:
+            headers = accounts.youtube_headers(p.need("cookie"))
+        except ValueError as e:
+            raise Fail(0, str(e))
+        headers["x-goog-authuser"] = p.get("authUser", headers["x-goog-authuser"])
+        return {"youtubeMusic": {"account": self._link_youtube(db, user, headers)}}
+
+    def oasisUnlinkYouTubeMusic(self, db, p, user):
+        accounts.set_field(db, user, ytm_auth=None, ytm_name=None)
+        self._drop_mixes(db, user)
+        return {}
+
+    def _link_youtube(self, db, user, headers: dict) -> str:
+        """Checks the sign-in by reading the account name, saves it, and loads the user's mixes."""
+        if not self.ytm:
+            raise Fail(0, "YouTube Music is not enabled on this server")
+        auth = json.dumps(headers)
+        try:
+            name = self.ytm.account_name(self.ytm.client(auth))
+        except Exception as e:
+            self.ytm.clients.pop(auth, None)
+            raise Fail(0, f"YouTube Music didn't accept that sign-in: {e}")
+        accounts.set_field(db, user, ytm_auth=auth, ytm_name=name)
+        if self.background:
+            threading.Thread(target=self._refresh_mixes, args=(user,), daemon=True).start()
+        return name
 
     def getMusicFolders(self, db, p, user):
         return {"musicFolders": {"musicFolder": [{"id": 1, "name": "Music"}]}}
@@ -427,7 +511,7 @@ class Api:
     def scrobble(self, db, p, user):
         if p.get("submission", "true") == "false":
             for id in p.all("id")[:1]:
-                self.forwarder.now_playing(forward.listen_for(self._one(db, "select * from track where id = ?", id), time.time()))
+                self.forwarder.now_playing(db, user, forward.listen_for(self._one(db, "select * from track where id = ?", id), time.time()))
             return {}
         times = p.all("time")
         for i, id in enumerate(p.all("id")):
@@ -435,7 +519,7 @@ class Api:
             played = int(times[i]) / 1000 if i < len(times) else time.time()
             db.execute("insert into stat(id, play_count, played) values (?, 1, ?) on conflict(id) do update "
                        "set play_count = play_count + 1, played = excluded.played", (id, played))
-            self.forwarder.enqueue(db, id, played)
+            self.forwarder.enqueue(db, user, id, played)
         self.recommender.played(db, user, p.all("id"))
         return {}
 
@@ -554,7 +638,7 @@ class Api:
         songs = [song(s) for s in db.execute(
             SONGS + " join playlist_entry e on e.track_id = t.id where e.playlist_id = ? order by e.pos", (r["id"],))]
         result = clean({
-            "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": r["owner"], "public": False,
+            "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": MIX_OWNER if r["mix"] else r["owner"], "public": False,
             "coverArt": f"pl-{r['id']}" if r["cover"] else None,
             "songCount": len(songs), "duration": sum(s.get("duration", 0) for s in songs),
             "created": iso(r["created"]), "changed": iso(r["changed"]),
@@ -562,24 +646,28 @@ class Api:
         return {**result, "entry": songs} if entries else result
 
     def getPlaylists(self, db, p, user):
-        rows = db.execute("select * from playlist where owner = ? or mix is not null order by mix is not null, name collate nocase", (user,))
+        rows = db.execute("select * from playlist where owner = ? order by mix is not null, name collate nocase", (user,))
         return {"playlists": {"playlist": [self._playlist(db, r, False) for r in rows]}}
 
     def _own_playlist(self, db, id, user):
-        return self._one(db, "select * from playlist where id = ? and owner = ?", id, user)
+        return self._one(db, "select * from playlist where id = ? and owner = ? and mix is null", id, user)
 
     def getPlaylist(self, db, p, user):
-        r = self._one(db, "select * from playlist where id = ? and (owner = ? or mix is not null)", p.need("id"), user)
+        r = self._one(db, "select * from playlist where id = ? and owner = ?", p.need("id"), user)
         return {"playlist": self._playlist(db, r, True)}
 
-    def _refresh_mixes(self):
-        """Mirrors the account's personal mixes as read-only playlists owned by "YouTube Music"."""
+    def _refresh_mixes(self, user: str):
+        """Mirrors the user's YouTube Music personal mixes as read-only playlists shown as owned by "YouTube Music"."""
         db = self._db()
         try:
-            mixes = self.ytm.mixes()
+            row = accounts.get(db, user)
+            if not (self.ytm and row and row["ytm_auth"]):
+                return
+            client = self.ytm.client(row["ytm_auth"])
+            mixes = self.ytm.mixes(client)
             for mix in mixes:
-                tracks = list(dict.fromkeys(remember(db, row) for row in self.ytm.mix_tracks(mix["id"])))
-                found = db.execute("select id from playlist where mix = ?", (mix["id"],)).fetchone()
+                tracks = list(dict.fromkeys(remember(db, row) for row in self.ytm.mix_tracks(client, mix["id"])))
+                found = db.execute("select id from playlist where owner = ? and mix = ?", (user, mix["id"])).fetchone()
                 if found:
                     playlist_id = found["id"]
                     db.execute("update playlist set name = ?, comment = ?, cover = ? where id = ?",
@@ -587,24 +675,29 @@ class Api:
                 else:
                     now = time.time()
                     playlist_id = db.execute("insert into playlist(name, owner, comment, created, changed, mix, cover) "
-                                             "values (?, ?, ?, ?, ?, ?, ?)", (mix["title"], MIX_OWNER, mix["description"],
+                                             "values (?, ?, ?, ?, ?, ?, ?)", (mix["title"], user, mix["description"],
                                              now, now, mix["id"], mix["cover"])).lastrowid
                 self._set_entries(db, playlist_id, tracks)
-            current = [m["id"] for m in mixes]
-            for gone in db.execute(f"select id from playlist where mix is not null and mix not in ({','.join('?' * len(current))})",
-                                   current).fetchall():
-                self._set_entries(db, gone["id"], [])
-                db.execute("delete from playlist where id = ?", (gone["id"],))
-            log.info("mixes: %d refreshed", len(mixes))
+            self._drop_mixes(db, user, keep=[m["id"] for m in mixes])
+            log.info("mixes for %s: %d refreshed", user, len(mixes))
+        except Exception as e:
+            log.warning("mix refresh for %s failed: %s", user, e)
         finally:
             db.close()
 
+    def _drop_mixes(self, db, user, keep=()):
+        for gone in db.execute(f"select id from playlist where owner = ? and mix is not null and mix not in ({','.join('?' * len(keep))})",
+                               (user, *keep)).fetchall():
+            self._set_entries(db, gone["id"], [])
+            db.execute("delete from playlist where id = ?", (gone["id"],))
+
     def _mix_loop(self):
         while True:
-            try:
-                self._refresh_mixes()
-            except Exception as e:
-                log.warning("mix refresh failed: %s", e)
+            db = self._db()
+            users = [r["name"] for r in db.execute("select name from user where ytm_auth is not null")]
+            db.close()
+            for user in users:
+                self._refresh_mixes(user)
             time.sleep(MIX_REFRESH)
 
     def _set_entries(self, db, playlist_id, track_ids):
@@ -763,7 +856,7 @@ def respond(fmt: str, payload: dict, error: Fail | None = None) -> Response:
 
 def create_app(config: Config, background: bool = True, ytm=None, services=None) -> Starlette:
     """background starts the scan and the forwarding, radio and mix workers; tests drive those themselves."""
-    api = Api(config, ytm, services)
+    api = Api(config, ytm, services, background)
 
     async def endpoint(request: Request):
         p = Params(request, await request.body())
@@ -776,7 +869,7 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
         def run():
             db = api._db()
             try:
-                user = api._authenticate(p)
+                user = api._authenticate(db, p)
                 result = handler(api, db, p, user)
                 return result if isinstance(result, Response) else respond(fmt, result)
             except Fail as e:
@@ -791,14 +884,13 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
             yield
             return
         api._start_scan()
-        if api.forwarder.services:
-            api.forwarder.start()
-        if api.ytm and api.ytm.account:
+        api.forwarder.start()
+        if api.ytm:
             threading.Thread(target=api._mix_loop, daemon=True).start()
         api.recommender.start()
         api.recommender.wake.set()
         yield
 
-    app = Starlette(routes=[Route("/rest/{method}", endpoint, methods=["GET", "POST"])], lifespan=lifespan)
+    app = Starlette(routes=[Route("/rest/{method}", endpoint, methods=["GET", "POST"]), *web.routes(api)], lifespan=lifespan)
     app.state.api = api
     return app

@@ -70,12 +70,12 @@ def read_range(url: str, start: int, end: int):
 
 
 class YouTubeMusic:
-    def __init__(self, cache: Path, auth: Path | None = None):
+    def __init__(self, cache: Path):
         from ytmusicapi import YTMusic
         self.cache = cache
         self.cache.mkdir(parents=True, exist_ok=True)
         self.api = YTMusic()
-        self.account = YTMusic(str(auth)) if auth else None  # for history
+        self.clients: dict[str, YTMusic] = {}
         self.visitor = self.api.headers.get("X-Goog-Visitor-Id")
         self.api_lock = threading.Lock()
         self.locks = defaultdict(threading.Lock)
@@ -108,20 +108,29 @@ class YouTubeMusic:
             tracks = self.api.get_watch_playlist(videoId=video_id, radio=True, limit=limit + 1)["tracks"]
         return [row for t in tracks if t.get("videoId") != video_id and (row := track_row(t))][:limit]
 
-    def mixes(self) -> list[dict]:
-        """The account's personal mixes (My Supermix, My Mix 1-7, Discover, Replay, New Release...) from its home feed."""
-        if not self.account:
-            return []
+    def client(self, auth: str):
+        """A signed-in ytmusicapi client for a user's browser headers (JSON), kept for reuse."""
+        from ytmusicapi import YTMusic
+        if auth not in self.clients:
+            self.clients[auth] = YTMusic(auth)
+        return self.clients[auth]
+
+    def account_name(self, client) -> str:
         with self.api_lock:
-            home = self.account.get_home(limit=12)
+            return client.get_account_info()["accountName"]
+
+    def mixes(self, client) -> list[dict]:
+        """The account's personal mixes (My Supermix, My Mix 1-7, Discover, Replay, New Release...) from its home feed."""
+        with self.api_lock:
+            home = client.get_home(limit=12)
         cards = [c for section in home for c in section.get("contents", []) if (c.get("playlistId") or "").startswith("RDTMAK")]
         return list({c["playlistId"]: {"id": c["playlistId"], "title": c.get("title") or c["playlistId"],
                                         "description": c.get("description"), "cover": big_cover(c.get("thumbnails"))}
                      for c in cards}.values())
 
-    def mix_tracks(self, playlist_id: str) -> list[dict]:
+    def mix_tracks(self, client, playlist_id: str) -> list[dict]:
         with self.api_lock:
-            tracks = self.account.get_watch_playlist(playlistId=playlist_id, limit=100)["tracks"]
+            tracks = client.get_watch_playlist(playlistId=playlist_id, limit=100)["tracks"]
         return [row for t in tracks if (row := track_row(t))]
 
     def lyrics(self, video_id: str):
@@ -149,11 +158,9 @@ class YouTubeMusic:
                 rows.append(row | {"track_no": t.get("trackNumber")})
         return rows
 
-    def add_history(self, video_id: str):
-        if not self.account:
-            raise LookupError("no YouTube Music account configured")
+    def add_history(self, client, video_id: str):
         with self.api_lock:
-            self.account.add_history_item(self.account.get_song(video_id))
+            client.add_history_item(client.get_song(video_id))
 
     def resolve(self, video_id: str) -> Stream:
         """A playable audio URL from one visionOS player request (about 0.3 s), reused until it expires."""

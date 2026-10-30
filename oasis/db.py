@@ -33,10 +33,17 @@ create table if not exists playlist(
     cover text                      -- image URL
 );
 create table if not exists outbox(
-    id integer primary key, service text not null, track_id text not null, played real not null,
+    id integer primary key, user text not null, service text not null, track_id text not null, played real not null,
     attempts int not null default 0, next_try real not null
 );
-create table if not exists setting(key text primary key, value text);
+create table if not exists user(
+    name text primary key, password text not null, admin int not null default 0, created real not null,
+    ytm_auth text,                  -- browser headers (JSON) for ytmusicapi
+    ytm_name text,
+    lastfm_session text, lastfm_name text,
+    listenbrainz_token text
+);
+create table if not exists session(token text primary key, user text not null, expires real not null);
 create table if not exists lyrics(track_id text primary key, found text, fetched real not null);
 create table if not exists playlist_entry(
     playlist_id int not null references playlist(id) on delete cascade,

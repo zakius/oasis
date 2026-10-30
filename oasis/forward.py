@@ -64,6 +64,15 @@ class LastFm:
         check(status, body, "Last.fm")
         return result
 
+    def auth_url(self, callback: str) -> str:
+        """Last.fm's page where the user allows oasis; it comes back to callback with a token."""
+        return f"https://www.last.fm/api/auth/?api_key={self.api_key}&cb={urllib.parse.quote(callback, safe='')}"
+
+    def session(self, token: str) -> tuple[str, str]:
+        """Trades the token from the callback for a session key, which never expires, and the user name."""
+        session = self.call({"method": "auth.getSession", "token": token})["session"]
+        return session["key"], session["name"]
+
     def read(self, params: dict) -> dict:
         """Read-only methods need only the API key."""
         query = urllib.parse.urlencode({**params, "api_key": self.api_key, "format": "json"})
@@ -123,33 +132,36 @@ class ListenBrainz:
 class YouTubeMusicHistory:
     """Adds plays to YouTube Music's history, which feeds its recommendations, also for plays of local copies."""
 
-    def __init__(self, ytm):
-        self.ytm = ytm
+    def __init__(self, ytm, client):
+        self.ytm, self.client = ytm, client
 
     def scrobble(self, listen: Listen):
         if not listen.ytm_id:
             raise Rejected(f"no YouTube Music match for {listen.artist} - {listen.title}")
-        self.ytm.add_history(listen.ytm_id)
+        self.ytm.add_history(self.client, listen.ytm_id)
 
     def now_playing(self, listen: Listen):
         pass
 
 
 class Forwarder:
-    """Keeps plays in the database outbox until every configured service has taken them."""
+    """Keeps plays in the database outbox until every service the user linked has taken them."""
 
-    def __init__(self, connect, services: dict, match=None):
-        self.connect, self.services, self.match = connect, services, match
+    def __init__(self, connect, services_for, match=None):
+        """services_for(db, user) returns the user's services by name."""
+        self.connect, self.services_for, self.match = connect, services_for, match
         self.wake = threading.Event()
 
-    def enqueue(self, db, track_id: str, played: float):
-        db.executemany("insert into outbox(service, track_id, played, next_try) values (?, ?, ?, 0)",
-                       [(name, track_id, played) for name in self.services])
+    def enqueue(self, db, user: str, track_id: str, played: float):
+        db.executemany("insert into outbox(user, service, track_id, played, next_try) values (?, ?, ?, ?, 0)",
+                       [(user, name, track_id, played) for name in self.services_for(db, user)])
         self.wake.set()
 
-    def now_playing(self, listen: Listen):
+    def now_playing(self, db, user: str, listen: Listen):
+        services = self.services_for(db, user)
+
         def send():
-            for name, service in self.services.items():
+            for name, service in services.items():
                 try:
                     service.now_playing(listen)
                 except Exception as e:
@@ -178,11 +190,14 @@ class Forwarder:
             db.close()
 
     def send(self, db, entry):
+        service = self.services_for(db, entry["user"]).get(entry["service"])
         listen = self.listen(db, entry)
         try:
+            if service is None:
+                raise Rejected(f"{entry['user']} unlinked {entry['service']}")
             if listen is None:
                 raise Rejected(f"track {entry['track_id']} is gone")
-            self.services[entry["service"]].scrobble(listen)
+            service.scrobble(listen)
         except Rejected as e:
             log.warning("dropping play: %s", e)
         except Exception as e:
@@ -212,25 +227,15 @@ def listen_for(r, played: float, ytm_id: str | None = None) -> Listen:
     return Listen(r["id"], artist, r["title"], album, r["duration"], played, ytm_id or r["ytm_id"])
 
 
-def services(config, db, ytm) -> dict:
+def user_services(config, ytm, user) -> dict:
+    """The services a user linked, by name."""
     found = {}
-    session = db.execute("select value from setting where key = 'lastfm_session'").fetchone()
-    if config.lastfm_key and config.lastfm_secret and session:
-        found["lastfm"] = LastFm(config.lastfm_key, config.lastfm_secret, session[0])
-    if config.listenbrainz_token:
-        found["listenbrainz"] = ListenBrainz(config.listenbrainz_token)
-    if ytm and ytm.account:
-        found["ytmusic"] = YouTubeMusicHistory(ytm)
+    if user is None:
+        return found
+    if config.lastfm_key and config.lastfm_secret and user["lastfm_session"]:
+        found["lastfm"] = LastFm(config.lastfm_key, config.lastfm_secret, user["lastfm_session"])
+    if user["listenbrainz_token"]:
+        found["listenbrainz"] = ListenBrainz(user["listenbrainz_token"])
+    if ytm and user["ytm_auth"]:
+        found["ytmusic"] = YouTubeMusicHistory(ytm, ytm.client(user["ytm_auth"]))
     return found
-
-
-def lastfm_login(config, db):
-    """Signs oasis in to Last.fm once; the session key never expires."""
-    if not (config.lastfm_key and config.lastfm_secret):
-        raise SystemExit("Set [lastfm] api_key and secret first: https://www.last.fm/api/account/create")
-    lastfm = LastFm(config.lastfm_key, config.lastfm_secret, None)
-    token = lastfm.call({"method": "auth.getToken"})["token"]
-    input(f"Allow oasis at https://www.last.fm/api/auth/?api_key={config.lastfm_key}&token={token}\nthen press Enter: ")
-    session = lastfm.call({"method": "auth.getSession", "token": token})["session"]
-    db.execute("insert or replace into setting values ('lastfm_session', ?)", (session["key"],))
-    print(f"Signed in to Last.fm as {session['name']}.")

@@ -15,17 +15,21 @@ def item(video_id, title, artist="Mixer", album="Mix Album"):
 
 
 class FakeYtm:
-    account = object()
-
     def __init__(self, cache):
         self.cache, self.fetched = cache, []
         self.current = {"RDTMAK_super": ["m1", "m2"], "RDTMAK_mix1": ["m2", "m3"]}
 
-    def mixes(self):
+    def client(self, auth):
+        return "client:" + auth
+
+    def account_name(self, client):
+        return "Test Account"
+
+    def mixes(self, client):
         return [{"id": id, "title": {"RDTMAK_super": "My Supermix", "RDTMAK_mix1": "My Mix 1"}[id], "description": "For you",
                  "cover": "https://img/cover"} for id in self.current]
 
-    def mix_tracks(self, playlist_id):
+    def mix_tracks(self, client, playlist_id):
         return [track_row(item(v, f"Song {v}")) for v in self.current[playlist_id]]
 
     def cached(self, video_id):
@@ -63,8 +67,13 @@ def library_titles(client):
     return {s["title"] for s in call(client, "search3", query="")["searchResult3"]["song"]}
 
 
+def link(client):
+    assert call(client, "oasisLinkYouTubeMusic", cookie="SID=1; SAPISID=abc")["youtubeMusic"] == {"account": "Test Account"}
+
+
 def test_mixes_are_read_only_playlists_in_the_library(client, ytm):
-    client.app.state.api._refresh_mixes()
+    link(client)
+    client.app.state.api._refresh_mixes("admin")
     mixes = playlists(client)
     assert set(mixes) == {"My Supermix", "My Mix 1"} and {m["owner"] for m in mixes.values()} == {"YouTube Music"}
     entries = call(client, "getPlaylist", id=mixes["My Supermix"]["id"])["playlist"]["entry"]
@@ -75,21 +84,25 @@ def test_mixes_are_read_only_playlists_in_the_library(client, ytm):
     cover = mixes["My Supermix"]["coverArt"]
     assert cover.startswith("pl-")
     assert call(client, "updatePlaylist", playlistId=mixes["My Mix 1"]["id"], name="mine")["error"]["code"] == 70
+    call(client, "oasisUnlinkYouTubeMusic")
+    assert playlists(client) == {}
     assert call(client, "deletePlaylist", id=mixes["My Mix 1"]["id"])["error"]["code"] == 70
 
 
 def test_mix_refresh_follows_youtube(client, ytm):
     api = client.app.state.api
-    api._refresh_mixes()
+    link(client)
+    api._refresh_mixes("admin")
     ytm.current = {"RDTMAK_super": ["m1", "m4"]}
-    api._refresh_mixes()
+    api._refresh_mixes("admin")
     assert set(playlists(client)) == {"My Supermix"}
     titles = library_titles(client)
     assert "Song m4" in titles and "Song m2" not in titles and "Song m3" not in titles
 
 
 def test_starred_mix_track_downloads(client, ytm):
-    client.app.state.api._refresh_mixes()
+    link(client)
+    client.app.state.api._refresh_mixes("admin")
     call(client, "star", id="yt-m1")
     assert ytm.fetched == ["m1"]
 

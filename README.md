@@ -10,11 +10,17 @@ Early. oasis serves a local music library over the Subsonic API, so any Subsonic
 
 With `[ytmusic] enabled = true`, searches also return YouTube Music songs after the local matches. A YouTube Music result that matches a local track (same artist and title, length within 5 seconds) shows up as the local track. YouTube Music tracks join the library while they are starred or in a playlist, and download into the cache when they join. Other tracks download when first played. Uncached tracks start in about 0.2 seconds: oasis gets the audio URL with one visionOS player request, plays straight from YouTube, and fills the cache in the background. If that client stops working, oasis falls back to yt-dlp, whose URLs only work after about 5 seconds. No account is needed yet. Running from source needs `node` or `bun` on `PATH`; the container image includes node.
 
-Plays that clients report (`scrobble`) go to Last.fm, ListenBrainz and YouTube Music history, whichever are set up in `oasis.toml`. oasis keeps each play until the service takes it, so plays made offline or during an outage arrive later. Plays of local tracks reach YouTube Music history too: oasis finds the same song there (same title, length within 5 seconds) and remembers the match. Clients should not scrobble to Last.fm themselves, or plays count twice.
+## Accounts
 
-- Last.fm: set `api_key` and `secret`, then run `oasis lastfm` (in the container: `docker compose run --rm oasis lastfm`) and allow access in the browser.
-- ListenBrainz: set `token`.
-- YouTube Music history: run `ytmusicapi browser` and paste request headers from a signed-in music.youtube.com tab, then set `auth` to the file it writes.
+Open `http://<host>:4533/` and sign in with a Subsonic user and password. The account page links each user's own services:
+
+- **YouTube Music**: paste the "Copy as cURL" of a `browse` request (or its request headers, or the `Cookie` value) from a signed-in music.youtube.com tab, as the page explains step by step. oasis checks the sign-in and shows the account name. Clients can also link it themselves: `oasisLinkYouTubeMusic` takes `cookie` (the Cookie header) and optional `authUser`, which is how roma reuses its own Google sign-in. `oasisUnlinkYouTubeMusic` removes it.
+- **Last.fm**: "Sign in with Last.fm" goes through Last.fm's own page. The server needs `[lastfm] api_key` and `secret`.
+- **ListenBrainz**: paste the user token. oasis checks it.
+
+Users in `oasis.toml` are admins, and their passwords are set there. Admins add and remove other users on `/admin` or with Subsonic's `createUser`, `updateUser`, `deleteUser` and `getUsers`; anyone changes their own password on the account page or with `changePassword`. Passwords are stored as given, because Subsonic's token login needs them.
+
+Each play a client reports (`scrobble`) goes to the services its user linked. oasis keeps each play until the service takes it, so plays made offline or during an outage arrive later. Plays of local tracks reach YouTube Music history too: oasis finds the same song there (same title, length within 5 seconds) and remembers the match. Clients should not scrobble to Last.fm themselves, or plays count twice.
 
 Recommendations come from YouTube Music radio, plus Last.fm's similar tracks when `[lastfm] api_key` is set. Local copies stand in for streaming tracks everywhere, and other uploads of a song already known fold into it.
 
@@ -24,7 +30,7 @@ Recommendations come from YouTube Music radio, plus Last.fm's similar tracks whe
 - Opening an album known only from streaming search or radio fetches the whole album.
 - Radio playlists grow while you listen and keep 30 unplayed tracks queued. Each user gets a "Radio" playlist that follows everything they play, mixing YouTube Music radio and Last.fm picks for the last few songs. Any playlist whose name starts with "Radio" grows the same way from the songs played in it, so a playlist named "Radio" with one song is a station for that song. Radio tracks don't join the library.
 
-With a YouTube Music account (`[ytmusic] auth`), the account's personal mixes (My Supermix, My Mix 1–7, Discover Mix, Replay Mix and others) appear as read-only playlists with owner `YouTube Music` and the mix's cover art. oasis refreshes them every 6 hours. Their tracks, albums and artists are in the library lists while the mix holds them, but they only download when played, starred or added to your own playlist.
+With YouTube Music linked, each user's personal mixes (My Supermix, My Mix 1–7, Discover Mix, Replay Mix and others) appear as read-only playlists with owner `YouTube Music` and the mix's cover art. oasis refreshes them every 6 hours. Their tracks, albums and artists are in the library lists while the mix holds them, but they only download when played, starred or added to your own playlist.
 
 Lyrics (`getLyricsBySongId`, OpenSubsonic `songLyrics`, and `getLyrics`) come from a `.lrc` file next to the track or lyrics tags in the file. Otherwise oasis asks the sources roma uses at once: YouTube Music, LRCLIB, NetEase, KuGou and LyricsPlus. It picks by roma's rules, with YouTube Music's text as the reference: word-timed lyrics that match it, then YouTube Music's line-timed lyrics, then other synced lyrics that match, then YouTube Music's plain text. Credit lines are dropped. Results are cached, and a miss is retried after a day. NetEase and KuGou are unofficial APIs and may change.
 

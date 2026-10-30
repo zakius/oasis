@@ -1,0 +1,90 @@
+import pytest
+
+from conftest import call, make_client
+from oasis import accounts
+
+
+class FakeYtm:
+    def __init__(self):
+        self.clients = {}
+
+    def client(self, auth):
+        if "bad" in auth:
+            raise ValueError("expired")
+        return auth
+
+    def account_name(self, client):
+        return "Tester"
+
+    def match(self, track):
+        return None
+
+
+@pytest.fixture
+def client(library, tmp_path):
+    with make_client(library, tmp_path / "oasis.db", FakeYtm()) as c:
+        yield c
+
+
+def sign_in(client, name="admin", password="secret"):
+    response = client.post("/login", data={"name": name, "password": password}, follow_redirects=False)
+    assert response.status_code == 303
+    return response
+
+
+def test_youtube_headers_from_any_copy():
+    curl = "curl 'https://music.youtube.com/youtubei/v1/browse' -H 'x-goog-authuser: 1' -H 'cookie: SID=a; SAPISID=b' --compressed"
+    assert accounts.youtube_headers(curl)["x-goog-authuser"] == "1"
+    raw = "Host: music.youtube.com\nCookie: SID=a; SAPISID=b\nX-Goog-AuthUser: 2"
+    assert accounts.youtube_headers(raw)["x-goog-authuser"] == "2"
+    assert accounts.youtube_headers("SID=a; SAPISID=b")["cookie"] == "SID=a; SAPISID=b"
+    with pytest.raises(ValueError):
+        accounts.youtube_headers("SID=a")
+
+
+def test_web_sign_in_and_link_services(client):
+    assert client.get("/account", follow_redirects=False).headers["location"] == "/login"
+    assert "Wrong user" in client.post("/login", data={"name": "admin", "password": "x"}).text
+    sign_in(client)
+    page = client.get("/account").text
+    assert "Signed in as <b>admin</b>" in page and "Copy as cURL" in page
+    linked = client.post("/account/youtube", data={"headers": "SID=a; SAPISID=b"}).text
+    assert "YouTube Music linked as Tester" in linked
+    assert "Wrong" not in client.post("/account/youtube", data={"headers": "nothing"}).text
+    assert "no YouTube sign-in cookie" in client.post("/account/youtube", data={"headers": "nothing"}).text
+    assert "unlinked" in client.post("/account/youtube/unlink").text
+    assert "Needs <code>[lastfm] api_key</code>" in client.get("/account").text
+
+
+def test_admin_manages_users_who_then_use_subsonic(client):
+    sign_in(client)
+    assert "Created bob" in client.post("/admin/users", data={"name": "bob", "password": "pw"}).text
+    assert "already exists" in client.post("/admin/users", data={"name": "bob", "password": "pw"}).text
+    assert call(client, "ping", u="bob", p="pw")["status"] == "ok"
+    assert call(client, "getUser", u="bob", p="pw")["user"]["adminRole"] is False
+    assert call(client, "getUsers", u="bob", p="pw")["error"]["code"] == 50
+    client.cookies.clear()
+    sign_in(client, "bob", "pw")
+    assert "Only admins" in client.get("/admin").text
+    assert "Password changed" in client.post("/account/password", data={"password": "new"}).text
+    assert call(client, "ping", u="bob", p="new")["status"] == "ok"
+    client.cookies.clear()
+    sign_in(client)
+    assert "Deleted bob" in client.post("/admin/users/bob/delete").text
+    assert call(client, "ping", u="bob", p="new")["error"]["code"] == 40
+    assert "only be removed there" in client.post("/admin/users/admin/delete").text
+
+
+def test_subsonic_user_management(client):
+    assert call(client, "createUser", username="carol", password="enc:" + b"pw".hex(), adminRole="true")["status"] == "ok"
+    assert {u["username"]: u["adminRole"] for u in call(client, "getUsers")["users"]["user"]} == {"admin": True, "carol": True}
+    call(client, "changePassword", username="carol", password="pw2")
+    assert call(client, "ping", u="carol", p="pw2")["status"] == "ok"
+    assert call(client, "changePassword", username="admin", password="x")["error"]["code"] == 50
+    call(client, "deleteUser", username="carol")
+    assert [u["username"] for u in call(client, "getUsers")["users"]["user"]] == ["admin"]
+
+
+def test_client_links_youtube_with_its_cookie(client):
+    assert call(client, "oasisLinkYouTubeMusic", cookie="SID=a; SAPISID=b", authUser="1")["youtubeMusic"] == {"account": "Tester"}
+    assert "error" in call(client, "oasisLinkYouTubeMusic", cookie="bad; SAPISID=b")

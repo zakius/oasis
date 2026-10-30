@@ -74,18 +74,19 @@ def test_unknown_track_scrobble_fails(setup):
 def test_youtube_history_matches_local_tracks_once(setup):
     client, _, db = setup
     id = song_id(client, "One")
-    db.execute("insert into outbox(service, track_id, played, next_try) values ('ytmusic', ?, 1, 0)", (id,))
+    db.execute("insert into outbox(user, service, track_id, played, next_try) values ('admin', 'ytmusic', ?, 1, 0)", (id,))
     history, matched = [], []
 
     class Ytm:
-        def add_history(self, video_id):
+        def add_history(self, client, video_id):
             history.append(video_id)
 
     def match(track):
         matched.append(track["title"])
         return "vidOne"
 
-    forward.Forwarder(lambda: connect(db_path(db)), {"ytmusic": forward.YouTubeMusicHistory(Ytm())}, match).flush()
+    services = {"ytmusic": forward.YouTubeMusicHistory(Ytm(), "client")}
+    forward.Forwarder(lambda: connect(db_path(db)), lambda db, user: services, match).flush()
     assert history == ["vidOne"] and matched == ["One"]
     assert db.execute("select ytm_id from track where id = ?", (id,)).fetchone()[0] == "vidOne"
 
