@@ -77,6 +77,7 @@ def test_mixes_are_read_only_playlists_in_the_library(client, ytm):
     mixes = playlists(client)
     assert set(mixes) == {"My Supermix", "My Mix 1", "Road trip"} and {m["owner"] for m in mixes.values()} == {"YouTube Music"}
     assert mixes["My Supermix"]["oasisMix"] is True and "oasisMix" not in mixes["Road trip"]
+    assert mixes["My Supermix"]["youtubeId"] == "RDTMAK_super" and mixes["Road trip"]["youtubeId"] == "PLmine"
     entries = call(client, "getPlaylist", id=mixes["My Supermix"]["id"])["playlist"]["entry"]
     assert [e["title"] for e in entries] == ["Song m1", "Song m2"]
     assert {"Song m1", "Song m2", "Song m3"} <= library_titles(client)
