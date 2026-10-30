@@ -39,7 +39,7 @@ def test_plays_reach_services_and_retry_until_taken(setup):
     client, services, db = setup
     id = song_id(client, "Two")
     call(client, "scrobble", id=id, time=1_700_000_000_000)
-    api_forwarder = forward.Forwarder(lambda: connect(db_path(db)), services)
+    api_forwarder = client.app.state.api.forwarder
     api_forwarder.flush()
     listen = services["ok"].scrobbled[0]
     assert (listen.artist, listen.title, listen.album, listen.played) == ("Beta", "Two", "First", 1_700_000_000)

@@ -45,7 +45,7 @@ def library(tmp_path_factory) -> Path:
 def make_client(library, database, ytm=None, services=None):
     config = Config(library=[library], users={"admin": "secret"}, database=database)
     scan(connect(config.database), config.library)
-    return TestClient(create_app(config, scan_on_start=False, ytm=ytm, services=services or {}))
+    return TestClient(create_app(config, background=False, ytm=ytm, services=services or {}))
 
 
 @pytest.fixture

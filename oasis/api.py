@@ -1,6 +1,8 @@
 import hashlib
 import logging
 import re
+import shutil
+import subprocess
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -15,7 +17,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import cover, forward, scan, ytm
+from . import cover, forward, lyrics, scan, ytm
 from .config import Config
 from .db import connect, remember
 from .forward import Forwarder, LastFm
@@ -26,6 +28,8 @@ log = logging.getLogger(__name__)
 
 VERSION = "1.16.1"
 NOT_FOUND, MISSING, AUTH = 70, 10, 40
+MIX_OWNER = "YouTube Music"
+MIX_REFRESH = 6 * 3600
 
 
 class Fail(Exception):
@@ -203,7 +207,7 @@ class Api:
         return {"license": {"valid": True}}
 
     def getOpenSubsonicExtensions(self, db, p, user):
-        return {"openSubsonicExtensions": [{"name": "formPost", "versions": [1]}]}
+        return {"openSubsonicExtensions": [{"name": name, "versions": [1]} for name in ("formPost", "songLyrics", "transcodeOffset")]}
 
     def getUser(self, db, p, user):
         roles = ("scrobbling", "admin", "settings", "download", "upload", "playlist", "coverArt", "comment",
@@ -358,16 +362,18 @@ class Api:
         return {"artist": [artist(r) for r in artists], "album": [album(r) for r in albums], "song": songs}
 
     def _touch(self, db, ids):
-        """Streaming tracks join the library while starred or in a playlist; joining starts their download."""
+        """Streaming tracks are in the library while starred or in a playlist (radios aside)."""
         for id in ids:
             r = db.execute("select ref, library from track where id = ? and source = 'ytm'", (id,)).fetchone()
             if r is None:
                 continue
-            kept = db.execute("select exists(select 1 from stat where id = ? and starred is not null) or exists(select 1 "
-                              "from playlist_entry e join playlist p on p.id = e.playlist_id where e.track_id = ? and p.radio = 0)",
-                              (id, id)).fetchone()[0]
-            db.execute("update track set library = ? where id = ?", (kept, id))
-            if kept and not r["library"] and self.ytm:
+            starred = db.execute("select 1 from stat where id = ? and starred is not null", (id,)).fetchone()
+            playlists = db.execute("select p.mix from playlist_entry e join playlist p on p.id = e.playlist_id "
+                                   "where e.track_id = ? and p.radio = 0", (id,)).fetchall()
+            db.execute("update track set library = ? where id = ?", (int(bool(starred or playlists)), id))
+            # Mixes put their tracks in the library but change daily, so only the user's own choices download.
+            wanted = starred or any(row["mix"] is None for row in playlists)
+            if wanted and self.ytm and not self.ytm.cached(r["ref"]):
                 threading.Thread(target=self._prefetch, args=(r["ref"],), daemon=True).start()
 
     def _prefetch(self, video_id):
@@ -430,6 +436,35 @@ class Api:
             self.forwarder.enqueue(db, id, played)
         self.recommender.played(db, user, p.all("id"))
         return {}
+
+    def _lyrics(self, db, r):
+        found = lyrics.local(r["ref"]) if r["source"] == "local" else None
+        if not found and self.ytm:
+            try:
+                if video_id := r["ytm_id"] or self.ytm.match(r):
+                    db.execute("update track set ytm_id = ? where id = ?", (video_id, r["id"]))
+                    found = self.ytm.lyrics(video_id)
+            except Exception as e:
+                log.info("YouTube Music lyrics for %s failed: %s", r["id"], e)
+        return found
+
+    def getLyricsBySongId(self, db, p, user):
+        r = self._one(db, "select * from track where id = ?", p.need("id"))
+        found = self._lyrics(db, r)
+        if not found:
+            return {"lyricsList": {}}
+        lines, synced = found
+        return {"lyricsList": {"structuredLyrics": [{
+            "displayArtist": r["artist"], "displayTitle": r["title"], "lang": "xxx", "offset": 0, "synced": synced,
+            "line": [clean({"start": start, "value": text}) for start, text in lines]}]}}
+
+    def getLyrics(self, db, p, user):
+        artist, title = p.get("artist", ""), p.get("title", "")
+        r = db.execute("select * from track where title = ? collate nocase and (? = '' or artist = ? collate nocase "
+                       "or album_artist = ? collate nocase) order by library desc limit 1", (title, artist, artist, artist)).fetchone()
+        found = self._lyrics(db, r) if r else None
+        text = "\n".join(line for _, line in found[0]) if found else None
+        return {"lyrics": clean({"artist": r["artist"] if r else artist, "title": r["title"] if r else title, "value": text})}
 
     def getNowPlaying(self, db, p, user):
         return {"nowPlaying": {}}
@@ -511,20 +546,57 @@ class Api:
             SONGS + " join playlist_entry e on e.track_id = t.id where e.playlist_id = ? order by e.pos", (r["id"],))]
         result = clean({
             "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": r["owner"], "public": False,
+            "coverArt": f"pl-{r['id']}" if r["cover"] else None,
             "songCount": len(songs), "duration": sum(s.get("duration", 0) for s in songs),
             "created": iso(r["created"]), "changed": iso(r["changed"]),
         })
         return {**result, "entry": songs} if entries else result
 
     def getPlaylists(self, db, p, user):
-        rows = db.execute("select * from playlist where owner = ? order by name collate nocase", (user,))
+        rows = db.execute("select * from playlist where owner = ? or mix is not null order by mix is not null, name collate nocase", (user,))
         return {"playlists": {"playlist": [self._playlist(db, r, False) for r in rows]}}
 
     def _own_playlist(self, db, id, user):
         return self._one(db, "select * from playlist where id = ? and owner = ?", id, user)
 
     def getPlaylist(self, db, p, user):
-        return {"playlist": self._playlist(db, self._own_playlist(db, p.need("id"), user), True)}
+        r = self._one(db, "select * from playlist where id = ? and (owner = ? or mix is not null)", p.need("id"), user)
+        return {"playlist": self._playlist(db, r, True)}
+
+    def _refresh_mixes(self):
+        """Mirrors the account's personal mixes as read-only playlists owned by "YouTube Music"."""
+        db = self._db()
+        try:
+            mixes = self.ytm.mixes()
+            for mix in mixes:
+                tracks = list(dict.fromkeys(remember(db, row) for row in self.ytm.mix_tracks(mix["id"])))
+                found = db.execute("select id from playlist where mix = ?", (mix["id"],)).fetchone()
+                if found:
+                    playlist_id = found["id"]
+                    db.execute("update playlist set name = ?, comment = ?, cover = ? where id = ?",
+                               (mix["title"], mix["description"], mix["cover"], playlist_id))
+                else:
+                    now = time.time()
+                    playlist_id = db.execute("insert into playlist(name, owner, comment, created, changed, mix, cover) "
+                                             "values (?, ?, ?, ?, ?, ?, ?)", (mix["title"], MIX_OWNER, mix["description"],
+                                             now, now, mix["id"], mix["cover"])).lastrowid
+                self._set_entries(db, playlist_id, tracks)
+            current = [m["id"] for m in mixes]
+            for gone in db.execute(f"select id from playlist where mix is not null and mix not in ({','.join('?' * len(current))})",
+                                   current).fetchall():
+                self._set_entries(db, gone["id"], [])
+                db.execute("delete from playlist where id = ?", (gone["id"],))
+            log.info("mixes: %d refreshed", len(mixes))
+        finally:
+            db.close()
+
+    def _mix_loop(self):
+        while True:
+            try:
+                self._refresh_mixes()
+            except Exception as e:
+                log.warning("mix refresh failed: %s", e)
+            time.sleep(MIX_REFRESH)
 
     def _set_entries(self, db, playlist_id, track_ids):
         old = [r[0] for r in db.execute("select track_id from playlist_entry where playlist_id = ?", (playlist_id,))]
@@ -566,9 +638,12 @@ class Api:
 
     def getCoverArt(self, db, p, user):
         id = p.need("id")
-        column = {"ar-": "artist_id", "al-": "album_id"}.get(id[:3], "id")
-        r = self._one(db, f"select ref, cover from track where {column} = ? and cover is not null "
-                         "order by source != 'local', cover = 'embedded', disc_no, track_no limit 1", id)
+        if id.startswith("pl-"):
+            r = self._one(db, "select null as ref, cover from playlist where id = ? and cover is not null", id[3:])
+        else:
+            column = {"ar-": "artist_id", "al-": "album_id"}.get(id[:3], "id")
+            r = self._one(db, f"select ref, cover from track where {column} = ? and cover is not null "
+                             "order by source != 'local', cover = 'embedded', disc_no, track_no limit 1", id)
         try:
             image = cover.load(r["ref"], r["cover"])
         except OSError as e:
@@ -579,12 +654,17 @@ class Api:
         return Response(image[0], media_type=image[1], headers={"Cache-Control": "public, max-age=86400"})
 
     def stream(self, db, p, user):
-        r = self._one(db, "select source, ref, content_type from track where id = ?", p.need("id"))
+        r = self._one(db, "select source, ref, content_type, suffix, bitrate from track where id = ?", p.need("id"))
+        target = transcode_target(p.get("format"), p.int("maxBitRate", 0), r["suffix"], r["bitrate"])
         if r["source"] == "local":
+            if target:
+                return transcode(r["ref"], *target, p.int("timeOffset", 0))
             return FileResponse(r["ref"], media_type=r["content_type"])
         if not self.ytm:
             raise Fail(NOT_FOUND, "YouTube Music is not enabled")
         if path := self.ytm.cached(r["ref"]):
+            if target:
+                return transcode(str(path), *target, p.int("timeOffset", 0))
             return FileResponse(path, media_type=r["content_type"])
         try:
             stream = self.ytm.resolve(r["ref"])
@@ -597,6 +677,8 @@ class Api:
                 raise Fail(NOT_FOUND, "Stream unavailable")
         # Play straight from YouTube while the cache fills, so playback starts in well under a second.
         threading.Thread(target=self._prefetch, args=(r["ref"],), daemon=True).start()
+        if target:
+            return transcode(stream.url, *target, p.int("timeOffset", 0))
         return self._proxy(r["ref"], stream, p.range)
 
     def _proxy(self, video_id, stream, range_header):
@@ -625,6 +707,39 @@ class Api:
         return self.stream(db, p, user)
 
 
+TRANSCODE = {  # format: ffmpeg codec, container, content type
+    "opus": ("libopus", "webm", "audio/webm"), "mp3": ("libmp3lame", "mp3", "audio/mpeg"), "aac": ("aac", "adts", "audio/aac"),
+}
+
+
+def transcode_target(fmt: str | None, max_bitrate: int, suffix: str, bitrate: int | None) -> tuple[str, int] | None:
+    """The (format, kbit/s) to transcode to, or None to send the file as it is. Needs ffmpeg."""
+    if not shutil.which("ffmpeg") or fmt == "raw":
+        return None
+    if fmt in TRANSCODE and fmt != suffix:
+        return fmt, min(max_bitrate or 192, 320)
+    if max_bitrate and bitrate and max_bitrate < bitrate:
+        return "opus", max_bitrate
+    return None
+
+
+def transcode(source: str, fmt: str, kbps: int, offset: int) -> StreamingResponse:
+    codec, container, content_type = TRANSCODE[fmt]
+    web = ["-user_agent", ytm.VISIONOS_UA] if source.startswith("https://") else []
+    command = ["ffmpeg", "-v", "error", "-ss", str(offset), *web, "-i", source,
+               "-map", "0:a:0", "-c:a", codec, "-b:a", f"{kbps}k", "-f", container, "pipe:1"]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+
+    def body():
+        try:
+            while data := process.stdout.read(1 << 16):
+                yield data
+        finally:
+            process.kill()
+            process.wait()
+    return StreamingResponse(body(), media_type=content_type)
+
+
 def respond(fmt: str, payload: dict, error: Fail | None = None) -> Response:
     body = {"status": "failed" if error else "ok", "version": VERSION, "type": "oasis", "serverVersion": "0.1.0",
             "openSubsonic": True, **payload}
@@ -637,7 +752,8 @@ def respond(fmt: str, payload: dict, error: Fail | None = None) -> Response:
     return Response(b'<?xml version="1.0" encoding="UTF-8"?>' + tostring(root), media_type="application/xml")
 
 
-def create_app(config: Config, scan_on_start: bool = True, ytm=None, services=None) -> Starlette:
+def create_app(config: Config, background: bool = True, ytm=None, services=None) -> Starlette:
+    """background starts the scan and the forwarding, radio and mix workers; tests drive those themselves."""
     api = Api(config, ytm, services)
 
     async def endpoint(request: Request):
@@ -662,10 +778,14 @@ def create_app(config: Config, scan_on_start: bool = True, ytm=None, services=No
 
     @asynccontextmanager
     async def lifespan(app):
-        if scan_on_start:
-            api._start_scan()
+        if not background:
+            yield
+            return
+        api._start_scan()
         if api.forwarder.services:
             api.forwarder.start()
+        if api.ytm and api.ytm.account:
+            threading.Thread(target=api._mix_loop, daemon=True).start()
         api.recommender.start()
         api.recommender.wake.set()
         yield

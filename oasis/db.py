@@ -28,7 +28,9 @@ create table if not exists playlist(
     id integer primary key, name text not null, owner text not null, comment text,
     created real not null, changed real not null,
     radio int not null default 0,   -- 1: grows from its own tracks, 2: grows from everything played
-    played_pos int not null default -1
+    played_pos int not null default -1,
+    mix text,                       -- YouTube Music playlist id of a personal mix; such playlists are read-only
+    cover text                      -- image URL
 );
 create table if not exists outbox(
     id integer primary key, service text not null, track_id text not null, played real not null,

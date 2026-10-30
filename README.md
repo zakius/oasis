@@ -24,6 +24,12 @@ Recommendations come from YouTube Music radio, plus Last.fm's similar tracks whe
 - Opening an album known only from streaming search or radio fetches the whole album.
 - Radio playlists grow while you listen and keep 30 unplayed tracks queued. Each user gets a "Radio" playlist that follows everything they play, mixing YouTube Music radio and Last.fm picks for the last few songs. Any playlist whose name starts with "Radio" grows the same way from the songs played in it, so a playlist named "Radio" with one song is a station for that song. Radio tracks don't join the library.
 
+With a YouTube Music account (`[ytmusic] auth`), the account's personal mixes (My Supermix, My Mix 1–7, Discover Mix, Replay Mix and others) appear as read-only playlists with owner `YouTube Music` and the mix's cover art. oasis refreshes them every 6 hours. Their tracks, albums and artists are in the library lists while the mix holds them, but they only download when played, starred or added to your own playlist.
+
+Lyrics (`getLyricsBySongId`, OpenSubsonic `songLyrics`, and `getLyrics`) come from a `.lrc` file next to the track, from lyrics tags in the file, or from YouTube Music, which usually has them time-synced.
+
+`stream` transcodes when a client asks for `format=opus` (in WebM), `mp3` or `aac`, or for a `maxBitRate` below the file's bitrate; `timeOffset` starts partway in. Transcoding needs `ffmpeg` on `PATH`, which the container includes. Without it, oasis sends the original file.
+
 ## Run
 
 ```sh

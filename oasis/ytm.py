@@ -31,6 +31,10 @@ class Stream:
     expires: float
 
 
+def big_cover(thumbnails) -> str | None:
+    return re.sub(r"=w\d+-h\d+", "=w544-h544", thumbnails[-1]["url"]) if thumbnails else None
+
+
 def track_row(item: dict) -> dict | None:
     """Turns a ytmusicapi song (search result or watch-playlist track) into a track row."""
     video_id = item.get("videoId")
@@ -51,7 +55,7 @@ def track_row(item: dict) -> dict | None:
         "artist_id": make_id("ar-", artists[0]), "album_id": make_id("al-", artists[0], album),
         "year": int(year) if str(year or "").isdigit() else None, "duration": duration,
         "bitrate": 128, "suffix": "m4a", "content_type": "audio/mp4",
-        "cover": re.sub(r"=w\d+-h\d+", "=w544-h544", thumbnails[-1]["url"]) if thumbnails else None,
+        "cover": big_cover(thumbnails),
         "created": time.time(),
     }
 
@@ -103,6 +107,33 @@ class YouTubeMusic:
         with self.api_lock:
             tracks = self.api.get_watch_playlist(videoId=video_id, radio=True, limit=limit + 1)["tracks"]
         return [row for t in tracks if t.get("videoId") != video_id and (row := track_row(t))][:limit]
+
+    def mixes(self) -> list[dict]:
+        """The account's personal mixes (My Supermix, My Mix 1-7, Discover, Replay, New Release...) from its home feed."""
+        if not self.account:
+            return []
+        with self.api_lock:
+            home = self.account.get_home(limit=12)
+        cards = [c for section in home for c in section.get("contents", []) if (c.get("playlistId") or "").startswith("RDTMAK")]
+        return list({c["playlistId"]: {"id": c["playlistId"], "title": c.get("title") or c["playlistId"],
+                                        "description": c.get("description"), "cover": big_cover(c.get("thumbnails"))}
+                     for c in cards}.values())
+
+    def mix_tracks(self, playlist_id: str) -> list[dict]:
+        with self.api_lock:
+            tracks = self.account.get_watch_playlist(playlistId=playlist_id, limit=100)["tracks"]
+        return [row for t in tracks if (row := track_row(t))]
+
+    def lyrics(self, video_id: str) -> tuple[list[tuple[int | None, str]], bool] | None:
+        """Lines as (start ms, text) and whether they are synced, or None when YouTube Music has none."""
+        with self.api_lock:
+            browse_id = self.api.get_watch_playlist(videoId=video_id, limit=1).get("lyrics")
+            found = self.api.get_lyrics(browse_id, timestamps=True) if browse_id else None
+        if not found or not found.get("lyrics"):
+            return None
+        if found.get("hasTimestamps"):
+            return [(line.start_time, line.text) for line in found["lyrics"]], True
+        return [(None, line) for line in found["lyrics"].splitlines()], False
 
     def album(self, browse_id: str) -> list[dict]:
         with self.api_lock:
