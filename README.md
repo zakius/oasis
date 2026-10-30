@@ -1,0 +1,45 @@
+# oasis
+
+An OpenSubsonic music server that merges your local library with streaming services into one library. Clients see ordinary tracks and never learn where a track comes from.
+
+It pairs with **mirage**, a fooyin fork that shows the server's library as if it were on your machine, and **roma**, an Android client.
+
+## Status
+
+Early. oasis serves a local music library over the Subsonic API, so any Subsonic client works: Feishin, Symfonium, DSub, Supersonic, and others.
+
+Planned:
+
+- YouTube Music search and streaming. Tracks you star, add to a playlist, or play become part of the library.
+- Play forwarding to Last.fm, ListenBrainz and YouTube Music history, also for local copies.
+- Recommendation radios as playlists that grow while you listen.
+
+## Run
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -e .
+cp oasis.example.toml oasis.toml   # set library paths and a password
+.venv/bin/oasis -c oasis.toml       # scans in the background, serves on port 4533
+```
+
+Point a Subsonic client at `http://<host>:4533`. `oasis scan` runs a scan without serving. The server rescans when a client calls `startScan`.
+
+## Supported API
+
+Browsing (`getArtists`, `getArtist`, `getAlbum`, `getSong`, `getIndexes`, `getMusicDirectory`), album lists, random songs, genres, `search2`/`search3` (an empty query lists everything, for clients that sync the whole library), stars, ratings, scrobbles, playlists, cover art (embedded or `cover`/`folder`/`front` images), and `stream`/`download` with HTTP range requests. Responses are XML or JSON (`f=json`), over GET or form POST.
+
+Methods for artist info, similar songs, top songs, podcasts, shares and bookmarks return empty results for now.
+
+## Tests
+
+```sh
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/pytest
+```
+
+The tests generate audio with `ffmpeg`, so it must be on `PATH`.
+
+## License
+
+GPL-3.0-or-later.
