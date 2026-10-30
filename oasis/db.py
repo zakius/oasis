@@ -37,6 +37,7 @@ create table if not exists outbox(
     attempts int not null default 0, next_try real not null
 );
 create table if not exists setting(key text primary key, value text);
+create table if not exists lyrics(track_id text primary key, found text, fetched real not null);
 create table if not exists playlist_entry(
     playlist_id int not null references playlist(id) on delete cascade,
     pos int not null, track_id text not null

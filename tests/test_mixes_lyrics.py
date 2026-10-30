@@ -5,6 +5,7 @@ from mutagen.id3 import ID3, USLT
 
 from conftest import call, make_client, make_track
 from oasis.api import transcode_target
+from oasis.lyrics import Lyrics
 from oasis.ytm import track_row
 
 
@@ -37,7 +38,7 @@ class FakeYtm:
         return "vid-" + track["title"]
 
     def lyrics(self, video_id):
-        return ([(0, "first"), (1500, "second")], True) if video_id == "vid-Two" else None
+        return Lyrics("YouTube Music", [(0, "first"), (1500, "second")], True) if video_id == "vid-Two" else None
 
     def search(self, query, limit):
         return []

@@ -42,6 +42,13 @@ def library(tmp_path_factory) -> Path:
     return root
 
 
+@pytest.fixture(autouse=True)
+def offline_lyrics(monkeypatch):
+    """Tests never ask the real lyrics providers."""
+    from oasis import lyrics
+    monkeypatch.setattr(lyrics, "PROVIDERS", {})
+
+
 def make_client(library, database, ytm=None, services=None):
     config = Config(library=[library], users={"admin": "secret"}, database=database)
     scan(connect(config.database), config.library)

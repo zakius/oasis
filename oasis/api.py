@@ -1,4 +1,6 @@
+import dataclasses
 import hashlib
+import json
 import logging
 import re
 import shutil
@@ -437,15 +439,23 @@ class Api:
         self.recommender.played(db, user, p.all("id"))
         return {}
 
-    def _lyrics(self, db, r):
-        found = lyrics.local(r["ref"]) if r["source"] == "local" else None
-        if not found and self.ytm:
-            try:
-                if video_id := r["ytm_id"] or self.ytm.match(r):
-                    db.execute("update track set ytm_id = ? where id = ?", (video_id, r["id"]))
-                    found = self.ytm.lyrics(video_id)
-            except Exception as e:
-                log.info("YouTube Music lyrics for %s failed: %s", r["id"], e)
+    def _lyrics(self, db, r) -> lyrics.Lyrics | None:
+        """The track's own lyrics first; otherwise the providers' pick, cached (misses for a day)."""
+        if r["source"] == "local" and (found := lyrics.local(r["ref"])):
+            return found
+        cached = db.execute("select found, fetched from lyrics where track_id = ?", (r["id"],)).fetchone()
+        if cached and (cached["found"] or cached["fetched"] > time.time() - 86400):
+            return lyrics.Lyrics(**json.loads(cached["found"])) if cached["found"] else None
+        youtube = None
+        if self.ytm:
+            def youtube():
+                video_id = r["ytm_id"] or self.ytm.match(r)
+                return self.ytm.lyrics(video_id) if video_id else None
+        artist = r["album_artist"] if r["source"] == "ytm" else r["artist"]
+        album = r["album"] if r["album"] != r["title"] else None
+        found = lyrics.find(lyrics.Query(r["title"], artist, album, r["duration"] or 0), youtube)
+        db.execute("insert or replace into lyrics values (?, ?, ?)",
+                   (r["id"], json.dumps(dataclasses.asdict(found)) if found else None, time.time()))
         return found
 
     def getLyricsBySongId(self, db, p, user):
@@ -453,17 +463,16 @@ class Api:
         found = self._lyrics(db, r)
         if not found:
             return {"lyricsList": {}}
-        lines, synced = found
         return {"lyricsList": {"structuredLyrics": [{
-            "displayArtist": r["artist"], "displayTitle": r["title"], "lang": "xxx", "offset": 0, "synced": synced,
-            "line": [clean({"start": start, "value": text}) for start, text in lines]}]}}
+            "displayArtist": r["artist"], "displayTitle": r["title"], "lang": "xxx", "offset": 0, "synced": found.synced,
+            "line": [clean({"start": start, "value": text}) for start, text in found.lines]}]}}
 
     def getLyrics(self, db, p, user):
         artist, title = p.get("artist", ""), p.get("title", "")
         r = db.execute("select * from track where title = ? collate nocase and (? = '' or artist = ? collate nocase "
                        "or album_artist = ? collate nocase) order by library desc limit 1", (title, artist, artist, artist)).fetchone()
         found = self._lyrics(db, r) if r else None
-        text = "\n".join(line for _, line in found[0]) if found else None
+        text = found.text() if found else None
         return {"lyrics": clean({"artist": r["artist"] if r else artist, "title": r["title"] if r else title, "value": text})}
 
     def getNowPlaying(self, db, p, user):

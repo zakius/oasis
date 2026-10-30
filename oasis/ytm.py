@@ -124,16 +124,18 @@ class YouTubeMusic:
             tracks = self.account.get_watch_playlist(playlistId=playlist_id, limit=100)["tracks"]
         return [row for t in tracks if (row := track_row(t))]
 
-    def lyrics(self, video_id: str) -> tuple[list[tuple[int | None, str]], bool] | None:
-        """Lines as (start ms, text) and whether they are synced, or None when YouTube Music has none."""
+    def lyrics(self, video_id: str):
+        """YouTube Music's own lyrics, line-timed when it has timing; None when it has none."""
+        from .lyrics import Lyrics
         with self.api_lock:
             browse_id = self.api.get_watch_playlist(videoId=video_id, limit=1).get("lyrics")
             found = self.api.get_lyrics(browse_id, timestamps=True) if browse_id else None
         if not found or not found.get("lyrics"):
             return None
+        source = "YouTube Music" + (f" · {found['source'].removeprefix('Source: ')}" if found.get("source") else "")
         if found.get("hasTimestamps"):
-            return [(line.start_time, line.text) for line in found["lyrics"]], True
-        return [(None, line) for line in found["lyrics"].splitlines()], False
+            return Lyrics(source, [(line.start_time, line.text) for line in found["lyrics"]], True)
+        return Lyrics(source, [(None, line) for line in found["lyrics"].splitlines()], False)
 
     def album(self, browse_id: str) -> list[dict]:
         with self.api_lock:
