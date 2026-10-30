@@ -64,6 +64,23 @@ class LastFm:
         check(status, body, "Last.fm")
         return result
 
+    def read(self, params: dict) -> dict:
+        """Read-only methods need only the API key."""
+        query = urllib.parse.urlencode({**params, "api_key": self.api_key, "format": "json"})
+        with urllib.request.urlopen(f"{LASTFM}?{query}", timeout=15) as response:
+            result = json.load(response)
+        if "error" in result:
+            raise LookupError(f"Last.fm: {result.get('message')}")
+        return result
+
+    def similar(self, artist: str, title: str, limit: int) -> list[tuple[str, str]]:
+        tracks = self.read({"method": "track.getSimilar", "artist": artist, "track": title, "limit": limit,
+                            "autocorrect": 1})["similartracks"]["track"]
+        return [(t["artist"]["name"], t["name"]) for t in tracks]
+
+    def artist_info(self, name: str) -> dict:
+        return self.read({"method": "artist.getInfo", "artist": name, "autocorrect": 1})["artist"]
+
     def track_params(self, listen: Listen) -> dict:
         params = {"artist": listen.artist, "track": listen.title}
         if listen.album:

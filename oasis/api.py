@@ -17,8 +17,9 @@ from starlette.routing import Route
 
 from . import cover, forward, scan, ytm
 from .config import Config
-from .db import connect
-from .forward import Forwarder
+from .db import connect, remember
+from .forward import Forwarder, LastFm
+from .recommend import Recommender, set_entries
 from .ytm import YouTubeMusic
 
 log = logging.getLogger(__name__)
@@ -127,6 +128,11 @@ def artist(r) -> dict:
     })
 
 
+def is_radio(playlist_name: str) -> int:
+    """Playlists named "Radio ..." grow by themselves from the tracks played in them."""
+    return int(playlist_name.casefold().startswith("radio"))
+
+
 def index_letter(name: str) -> str:
     for article in ("The ", "A "):
         if name.startswith(article):
@@ -144,6 +150,9 @@ class Api:
             services = forward.services(config, db, self.ytm)
             db.close()
         self.forwarder = Forwarder(self._db, services, self.ytm.match if self.ytm else None)
+        lastfm = LastFm(config.lastfm_key, config.lastfm_secret or "", None) if config.lastfm_key else None
+        self.recommender = Recommender(self._db, self.ytm, lastfm)
+        self.completed: set[str] = set()
         self.scanning = False
         self.scan_lock = threading.Lock()
 
@@ -229,15 +238,33 @@ class Api:
         return [album(r) for r in db.execute(sql, (artist_id, 1))] or [album(r) for r in db.execute(sql, (artist_id, 0))]
 
     def _album_songs(self, db, album_id):
-        return [song(r) for r in db.execute(SONGS + " where t.album_id = ? order by disc_no, track_no, title", (album_id,))]
+        return [song(r) for r in db.execute(SONGS + " where t.album_id = ? order by disc_no, track_no is null, track_no, title", (album_id,))]
 
     def getArtist(self, db, p, user):
         r = self._one(db, ARTISTS + " where t.artist_id = ? group by t.artist_id", p.need("id"))
         return {"artist": {**artist(r), "album": self._artist_albums(db, r["id"])}}
 
     def getAlbum(self, db, p, user):
+        self._complete_album(db, p.need("id"))
         r = self._one(db, ALBUMS + " where t.album_id = ? group by t.album_id", p.need("id"))
         return {"album": {**album(r), "song": self._album_songs(db, r["id"])}}
+
+    def _complete_album(self, db, album_id):
+        """Fetches the rest of an album that is only known from streaming tracks seen in search or radio."""
+        if not self.ytm or album_id in self.completed:
+            return
+        sources = db.execute("select source, ytm_album from track where album_id = ?", (album_id,)).fetchall()
+        browse_id = next((r["ytm_album"] for r in sources if r["ytm_album"]), None)
+        if not browse_id or any(r["source"] == "local" for r in sources):
+            return
+        try:
+            rows = self.ytm.album(browse_id)
+        except Exception as e:
+            log.info("album %s unavailable: %s", browse_id, e)
+            return
+        for row in rows:
+            remember(db, row)
+        self.completed.add(album_id)
 
     def getSong(self, db, p, user):
         return {"song": song(self._one(db, SONGS + " where t.id = ?", p.need("id")))}
@@ -323,24 +350,12 @@ class Api:
         if self.ytm and terms and p.int("songOffset", 0) == 0:
             known = {s["id"] for s in songs}
             try:
-                found = [self._remember(db, row) for row in self.ytm.search(" ".join(terms), p.int("songCount", 20))]
+                found = [remember(db, row) for row in self.ytm.search(" ".join(terms), p.int("songCount", 20))]
             except Exception as e:
                 log.warning("YouTube Music search failed: %s", e)
                 found = []
             songs += [song(self._one(db, SONGS + " where t.id = ?", id)) for id in dict.fromkeys(found) if id not in known]
         return {"artist": [artist(r) for r in artists], "album": [album(r) for r in albums], "song": songs}
-
-    def _remember(self, db, row: dict) -> str:
-        """Caches a streaming track's metadata and returns its id, or the id of the local copy of the same song."""
-        local = db.execute("select id from track where source = 'local' and artist_id = ? and title = ? collate nocase "
-                           "and abs(duration - ?) <= 5", (row["artist_id"], row["title"], row["duration"] or 0)).fetchone()
-        if local:
-            db.execute("update track set ytm_id = ? where id = ?", (row["ytm_id"], local["id"]))
-            return local["id"]
-        updates = ", ".join(f"{k} = excluded.{k}" for k in row if k not in ("id", "library", "created"))
-        db.execute(f"insert into track({', '.join(row)}) values ({', '.join('?' * len(row))}) "
-                   f"on conflict(id) do update set {updates}", list(row.values()))
-        return row["id"]
 
     def _touch(self, db, ids):
         """Streaming tracks join the library while starred or in a playlist; joining starts their download."""
@@ -348,8 +363,9 @@ class Api:
             r = db.execute("select ref, library from track where id = ? and source = 'ytm'", (id,)).fetchone()
             if r is None:
                 continue
-            kept = db.execute("select exists(select 1 from stat where id = ? and starred is not null) "
-                              "or exists(select 1 from playlist_entry where track_id = ?)", (id, id)).fetchone()[0]
+            kept = db.execute("select exists(select 1 from stat where id = ? and starred is not null) or exists(select 1 "
+                              "from playlist_entry e join playlist p on p.id = e.playlist_id where e.track_id = ? and p.radio = 0)",
+                              (id, id)).fetchone()[0]
             db.execute("update track set library = ? where id = ?", (kept, id))
             if kept and not r["library"] and self.ytm:
                 threading.Thread(target=self._prefetch, args=(r["ref"],), daemon=True).start()
@@ -412,16 +428,33 @@ class Api:
             db.execute("insert into stat(id, play_count, played) values (?, 1, ?) on conflict(id) do update "
                        "set play_count = play_count + 1, played = excluded.played", (id, played))
             self.forwarder.enqueue(db, id, played)
+        self.recommender.played(db, user, p.all("id"))
         return {}
 
     def getNowPlaying(self, db, p, user):
         return {"nowPlaying": {}}
 
+    def _artist_info(self, db, p):
+        r = self._one(db, ARTISTS + " where t.artist_id = ? group by t.artist_id", p.need("id"))
+        if not self.recommender.lastfm:
+            return {}
+        try:
+            info = self.recommender.lastfm.artist_info(r["name"])
+        except Exception as e:
+            log.info("Last.fm artist info failed: %s", e)
+            return {}
+        names = [a["name"] for a in info.get("similar", {}).get("artist", [])][:p.int("count", 20)]
+        similar = [artist(a) for name in names for a in db.execute(
+            ARTISTS + " where t.library = 1 and t.album_artist = ? collate nocase group by t.artist_id", (name,))]
+        bio = info.get("bio", {}).get("summary", "")
+        return clean({"biography": bio.split("<a href")[0].strip() or None, "lastFmUrl": info.get("url"),
+                      "musicBrainzId": info.get("mbid") or None, "similarArtist": similar})
+
     def getArtistInfo2(self, db, p, user):
-        return {"artistInfo2": {}}
+        return {"artistInfo2": self._artist_info(db, p)}
 
     def getArtistInfo(self, db, p, user):
-        return {"artistInfo": {}}
+        return {"artistInfo": self._artist_info(db, p)}
 
     def getAlbumInfo2(self, db, p, user):
         return {"albumInfo": {}}
@@ -429,14 +462,34 @@ class Api:
     def getAlbumInfo(self, db, p, user):
         return {"albumInfo": {}}
 
+    def _similar(self, db, p):
+        id = p.need("id")
+        column = {"ar-": "artist_id", "al-": "album_id"}.get(id[:3], "id")
+        seed = self._one(db, SONGS + f" where t.{column} = ? order by s.play_count desc, t.library desc, t.disc_no, t.track_no limit 1", id)
+        try:
+            ids = self.recommender.similar(db, seed, min(p.int("count", 50), 200))
+        except Exception as e:
+            log.warning("recommendations failed: %s", e)
+            ids = []
+        return [song(self._one(db, SONGS + " where t.id = ?", i)) for i in ids]
+
     def getSimilarSongs2(self, db, p, user):
-        return {"similarSongs2": {}}
+        return {"similarSongs2": {"song": self._similar(db, p)}}
 
     def getSimilarSongs(self, db, p, user):
-        return {"similarSongs": {}}
+        return {"similarSongs": {"song": self._similar(db, p)}}
 
     def getTopSongs(self, db, p, user):
-        return {"topSongs": {}}
+        name, count = p.need("artist"), min(p.int("count", 50), 200)
+        ids = [r[0] for r in db.execute("select t.id from track t left join stat s on s.id = t.id where t.library = 1 and "
+                                        "t.album_artist = ? collate nocase order by coalesce(s.play_count, 0) desc limit ?", (name, count))]
+        if self.ytm and len(ids) < count:
+            try:
+                rows = [r for r in self.ytm.search(name, count) if name.casefold() in (r["album_artist"].casefold(), r["artist"].casefold())]
+                ids += [remember(db, r) for r in rows]
+            except Exception as e:
+                log.warning("YouTube Music top songs failed: %s", e)
+        return {"topSongs": {"song": [song(self._one(db, SONGS + " where t.id = ?", i)) for i in dict.fromkeys(ids)][:count]}}
 
     def getInternetRadioStations(self, db, p, user):
         return {"internetRadioStations": {}}
@@ -475,9 +528,7 @@ class Api:
 
     def _set_entries(self, db, playlist_id, track_ids):
         old = [r[0] for r in db.execute("select track_id from playlist_entry where playlist_id = ?", (playlist_id,))]
-        db.execute("delete from playlist_entry where playlist_id = ?", (playlist_id,))
-        db.executemany("insert into playlist_entry values (?, ?, ?)", [(playlist_id, i, t) for i, t in enumerate(track_ids)])
-        db.execute("update playlist set changed = ? where id = ?", (time.time(), playlist_id))
+        set_entries(db, playlist_id, track_ids)
         self._touch(db, set(old) | set(track_ids))
 
     def createPlaylist(self, db, p, user):
@@ -485,9 +536,11 @@ class Api:
             playlist_id = self._own_playlist(db, id, user)["id"]
         else:
             now = time.time()
-            playlist_id = db.execute("insert into playlist(name, owner, created, changed) values (?, ?, ?, ?)",
-                                     (p.need("name"), user, now, now)).lastrowid
+            name = p.need("name")
+            playlist_id = db.execute("insert into playlist(name, owner, created, changed, radio) values (?, ?, ?, ?, ?)",
+                                     (name, user, now, now, is_radio(name))).lastrowid
         self._set_entries(db, playlist_id, p.all("songId"))
+        self.recommender.wake.set()
         return {"playlist": self._playlist(db, self._own_playlist(db, playlist_id, user), True)}
 
     def updatePlaylist(self, db, p, user):
@@ -495,11 +548,14 @@ class Api:
         for column in ("name", "comment"):
             if (value := p.get(column)) is not None:
                 db.execute(f"update playlist set {column} = ?, changed = ? where id = ?", (value, time.time(), r["id"]))
+        if (name := p.get("name")) is not None and r["radio"] != 2:
+            db.execute("update playlist set radio = ? where id = ?", (is_radio(name), r["id"]))
         entries = [e["track_id"] for e in db.execute("select track_id from playlist_entry where playlist_id = ? order by pos", (r["id"],))]
         removed = {int(i) for i in p.all("songIndexToRemove")}
         added = p.all("songIdToAdd")
         if removed or added:
             self._set_entries(db, r["id"], [t for i, t in enumerate(entries) if i not in removed] + added)
+        self.recommender.wake.set()
         return {}
 
     def deletePlaylist(self, db, p, user):
@@ -610,6 +666,10 @@ def create_app(config: Config, scan_on_start: bool = True, ytm=None, services=No
             api._start_scan()
         if api.forwarder.services:
             api.forwarder.start()
+        api.recommender.start()
+        api.recommender.wake.set()
         yield
 
-    return Starlette(routes=[Route("/rest/{method}", endpoint, methods=["GET", "POST"])], lifespan=lifespan)
+    app = Starlette(routes=[Route("/rest/{method}", endpoint, methods=["GET", "POST"])], lifespan=lifespan)
+    app.state.api = api
+    return app

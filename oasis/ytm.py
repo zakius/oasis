@@ -38,14 +38,15 @@ def track_row(item: dict) -> dict | None:
         return None
     artists = [a["name"] for a in item.get("artists") or [] if a.get("name")] or ["Unknown Artist"]
     title = item.get("title") or video_id
-    album = (item.get("album") or {}).get("name") or title
+    album_ref = item.get("album") if isinstance(item.get("album"), dict) else {"name": item.get("album")}
+    album = album_ref.get("name") or title
     thumbnails = item.get("thumbnails") or item.get("thumbnail") or []
     duration = item.get("duration_seconds")
     if duration is None and (length := item.get("length") or item.get("duration")):
         duration = sum(int(part) * 60 ** i for i, part in enumerate(reversed(length.split(":"))))
     year = item.get("year")
     return {
-        "id": "yt-" + video_id, "source": "ytm", "ref": video_id, "ytm_id": video_id, "library": 0,
+        "id": "yt-" + video_id, "source": "ytm", "ref": video_id, "ytm_id": video_id, "ytm_album": album_ref.get("id"), "library": 0,
         "title": title, "artist": ", ".join(artists), "album_artist": artists[0], "album": album,
         "artist_id": make_id("ar-", artists[0]), "album_id": make_id("al-", artists[0], album),
         "year": int(year) if str(year or "").isdigit() else None, "duration": duration,
@@ -81,12 +82,39 @@ class YouTubeMusic:
             results = self.api.search(query, filter="songs", limit=limit)
         return [row for item in results[:limit] if (row := track_row(item))]
 
+    def find(self, artist: str, title: str, duration: int | None = None) -> dict | None:
+        """The same song on YouTube Music: same title, and length within 5 s if known, else the same artist."""
+        def same(r):
+            if r["title"].casefold() != title.casefold():
+                return False
+            if duration:
+                return abs((r["duration"] or 0) - duration) <= 5
+            return artist.casefold() in (r["album_artist"].casefold(), r["artist"].casefold())
+        found = [r for r in self.search(f"{artist} {title}", 10) if same(r)]
+        found.sort(key=lambda r: r["album_artist"].casefold() != artist.casefold())
+        return found[0] if found else None
+
     def match(self, track) -> str | None:
-        """The videoId of the same song on YouTube Music: same title and length within 5 s, preferring the same artist."""
-        found = [r for r in self.search(f"{track['artist']} {track['title']}", 10)
-                 if r["title"].casefold() == track["title"].casefold() and abs((r["duration"] or 0) - (track["duration"] or 0)) <= 5]
-        found.sort(key=lambda r: r["album_artist"].casefold() != track["album_artist"].casefold())
-        return found[0]["ref"] if found else None
+        found = self.find(track["album_artist"], track["title"], track["duration"])
+        return found["ref"] if found else None
+
+    def radio(self, video_id: str, limit: int) -> list[dict]:
+        """YouTube Music's radio for a song, without the song itself."""
+        with self.api_lock:
+            tracks = self.api.get_watch_playlist(videoId=video_id, radio=True, limit=limit + 1)["tracks"]
+        return [row for t in tracks if t.get("videoId") != video_id and (row := track_row(t))][:limit]
+
+    def album(self, browse_id: str) -> list[dict]:
+        with self.api_lock:
+            album = self.api.get_album(browse_id)
+        cover = album.get("thumbnails") or []
+        rows = []
+        for t in album.get("tracks", []):
+            row = track_row({**t, "album": {"name": album["title"], "id": browse_id}, "thumbnails": t.get("thumbnails") or cover,
+                             "artists": t.get("artists") or album.get("artists"), "year": album.get("year")})
+            if row:
+                rows.append(row | {"track_no": t.get("trackNumber")})
+        return rows
 
     def add_history(self, video_id: str):
         if not self.account:

@@ -16,9 +16,13 @@ Plays that clients report (`scrobble`) go to Last.fm, ListenBrainz and YouTube M
 - ListenBrainz: set `token`.
 - YouTube Music history: run `ytmusicapi browser` and paste request headers from a signed-in music.youtube.com tab, then set `auth` to the file it writes.
 
-Planned:
+Recommendations come from YouTube Music radio, plus Last.fm's similar tracks when `[lastfm] api_key` is set. Local copies stand in for streaming tracks everywhere, and other uploads of a song already known fold into it.
 
-- Recommendation radios as playlists that grow while you listen.
+- Clients' "instant mix" or "similar songs" (`getSimilarSongs2`) returns YouTube Music's radio for the song, album or artist.
+- `getTopSongs` lists an artist's most played library tracks, then their YouTube Music songs.
+- `getArtistInfo2` returns the Last.fm biography and the similar artists that are in the library.
+- Opening an album known only from streaming search or radio fetches the whole album.
+- Radio playlists grow while you listen and keep 30 unplayed tracks queued. Each user gets a "Radio" playlist that follows everything they play, mixing YouTube Music radio and Last.fm picks for the last few songs. Any playlist whose name starts with "Radio" grows the same way from the songs played in it, so a playlist named "Radio" with one song is a station for that song. Radio tracks don't join the library.
 
 ## Run
 
@@ -43,7 +47,7 @@ Point a Subsonic client at `http://<host>:4533`. `oasis scan` runs a scan withou
 
 Browsing (`getArtists`, `getArtist`, `getAlbum`, `getSong`, `getIndexes`, `getMusicDirectory`), album lists, random songs, genres, `search2`/`search3` (an empty query lists everything, for clients that sync the whole library), stars, ratings, scrobbles, playlists, cover art (embedded or `cover`/`folder`/`front` images), and `stream`/`download` with HTTP range requests. Responses are XML or JSON (`f=json`), over GET or form POST.
 
-Methods for artist info, similar songs, top songs, podcasts, shares and bookmarks return empty results for now.
+Methods for podcasts, shares, bookmarks and internet radio return empty results.
 
 ## Tests
 

@@ -14,6 +14,7 @@ create table if not exists track(
     duration int, bitrate int, size int, suffix text, content_type text,
     cover text,                     -- 'embedded', an image path or URL, or null
     ytm_id text,                    -- YouTube Music videoId, also for local tracks matched to one
+    ytm_album text,                 -- YouTube Music album browse id
     library int not null default 1, -- 0 for streaming tracks only seen in search or radio
     mtime real, created real
 );
@@ -25,7 +26,9 @@ create table if not exists stat(
 );
 create table if not exists playlist(
     id integer primary key, name text not null, owner text not null, comment text,
-    created real not null, changed real not null
+    created real not null, changed real not null,
+    radio int not null default 0,   -- 1: grows from its own tracks, 2: grows from everything played
+    played_pos int not null default -1
 );
 create table if not exists outbox(
     id integer primary key, service text not null, track_id text not null, played real not null,
@@ -50,3 +53,23 @@ def connect(path: Path) -> sqlite3.Connection:
     db.execute("pragma foreign_keys=on")
     db.executescript(SCHEMA)
     return db
+
+
+def remember(db, row: dict) -> str:
+    """Caches a streaming track's metadata and returns its id. The same song already known (same artist and title,
+    length within 5 s), local or under another YouTube upload, keeps its id; a local copy wins."""
+    known = db.execute("select id, source from track where artist_id = ? and title = ? collate nocase and abs(duration - ?) <= 5 "
+                       "and id != ? order by source != 'local' limit 1",
+                       (row["artist_id"], row["title"], row["duration"] or 0, row["id"])).fetchone()
+    if known and not db.execute("select 1 from track where id = ?", (row["id"],)).fetchone():
+        if known["source"] == "local":
+            db.execute("update track set ytm_id = ? where id = ?", (row["ytm_id"], known["id"]))
+        elif row.get("track_no"):  # an album listing places the song on its album
+            db.execute("update track set album = ?, album_id = ?, ytm_album = ?, track_no = ?, year = coalesce(?, year), "
+                       "cover = coalesce(?, cover) where id = ?", (row["album"], row["album_id"], row["ytm_album"],
+                       row["track_no"], row["year"], row["cover"], known["id"]))
+        return known["id"]
+    updates = ", ".join(f"{k} = excluded.{k}" for k in row if k not in ("id", "library", "created"))
+    db.execute(f"insert into track({', '.join(row)}) values ({', '.join('?' * len(row))}) "
+               f"on conflict(id) do update set {updates}", list(row.values()))
+    return row["id"]
