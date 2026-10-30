@@ -68,7 +68,7 @@ def library_titles(client):
 
 
 def link(client):
-    assert call(client, "oasisLinkYouTubeMusic", cookie="SID=1; SAPISID=abc")["youtubeMusic"] == {"account": "Test Account"}
+    assert call(client, "oasisLinkYouTubeMusic", cookie="SID=1; __Secure-3PAPISID=abc")["youtubeMusic"] == {"account": "Test Account"}
 
 
 def test_mixes_are_read_only_playlists_in_the_library(client, ytm):

@@ -33,11 +33,11 @@ def sign_in(client, name="admin", password="secret"):
 
 
 def test_youtube_headers_from_any_copy():
-    curl = "curl 'https://music.youtube.com/youtubei/v1/browse' -H 'x-goog-authuser: 1' -H 'cookie: SID=a; SAPISID=b' --compressed"
+    curl = "curl 'https://music.youtube.com/youtubei/v1/browse' -H 'x-goog-authuser: 1' -H 'cookie: SID=a; __Secure-3PAPISID=b' --compressed"
     assert accounts.youtube_headers(curl)["x-goog-authuser"] == "1"
-    raw = "Host: music.youtube.com\nCookie: SID=a; SAPISID=b\nX-Goog-AuthUser: 2"
+    raw = "Host: music.youtube.com\nCookie: SID=a; __Secure-3PAPISID=b\nX-Goog-AuthUser: 2"
     assert accounts.youtube_headers(raw)["x-goog-authuser"] == "2"
-    assert accounts.youtube_headers("SID=a; SAPISID=b")["cookie"] == "SID=a; SAPISID=b"
+    assert accounts.youtube_headers("SID=a; __Secure-3PAPISID=b")["cookie"] == "SID=a; __Secure-3PAPISID=b"
     with pytest.raises(ValueError):
         accounts.youtube_headers("SID=a")
 
@@ -48,7 +48,7 @@ def test_web_sign_in_and_link_services(client):
     sign_in(client)
     page = client.get("/account").text
     assert "Signed in as <b>admin</b>" in page and "Copy as cURL" in page
-    linked = client.post("/account/youtube", data={"headers": "SID=a; SAPISID=b"}).text
+    linked = client.post("/account/youtube", data={"headers": "SID=a; __Secure-3PAPISID=b"}).text
     assert "YouTube Music linked as Tester" in linked
     assert "Wrong" not in client.post("/account/youtube", data={"headers": "nothing"}).text
     assert "no YouTube sign-in cookie" in client.post("/account/youtube", data={"headers": "nothing"}).text
@@ -86,5 +86,5 @@ def test_subsonic_user_management(client):
 
 
 def test_client_links_youtube_with_its_cookie(client):
-    assert call(client, "oasisLinkYouTubeMusic", cookie="SID=a; SAPISID=b", authUser="1")["youtubeMusic"] == {"account": "Tester"}
-    assert "error" in call(client, "oasisLinkYouTubeMusic", cookie="bad; SAPISID=b")
+    assert call(client, "oasisLinkYouTubeMusic", cookie="SID=a; __Secure-3PAPISID=b", authUser="1")["youtubeMusic"] == {"account": "Tester"}
+    assert "error" in call(client, "oasisLinkYouTubeMusic", cookie="bad; __Secure-3PAPISID=b")

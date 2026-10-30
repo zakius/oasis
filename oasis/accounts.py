@@ -72,8 +72,11 @@ def youtube_headers(pasted: str) -> dict:
     else:
         headers["cookie"] = text.removeprefix("Cookie:").strip()
     cookie = headers.get("cookie", "")
-    if "SAPISID=" not in cookie:
-        raise ValueError("That has no YouTube sign-in cookie (SAPISID). Copy it from music.youtube.com while signed in.")
-    return {"cookie": cookie, "x-goog-authuser": headers.get("x-goog-authuser", "0"),
-            "user-agent": headers.get("user-agent", "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0"),
-            "origin": "https://music.youtube.com"}
+    if not (sapisid := re.search(r"(?:^|;\s*)__Secure-3PAPISID=([^;\s]+)", cookie)):
+        raise ValueError("That has no YouTube sign-in cookie (__Secure-3PAPISID). Copy it from music.youtube.com while signed in.")
+    from ytmusicapi.helpers import get_authorization
+    origin = "https://music.youtube.com"
+    # ytmusicapi takes headers with a SAPISIDHASH authorization for a browser sign-in and renews it per request.
+    return {"cookie": cookie, "x-goog-authuser": headers.get("x-goog-authuser", "0"), "origin": origin,
+            "authorization": get_authorization(sapisid[1] + " " + origin),
+            "user-agent": headers.get("user-agent", "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0")}
