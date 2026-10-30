@@ -294,7 +294,8 @@ class Api:
             name = self.ytm.account_name(self.ytm.client(auth))
         except Exception as e:
             self.ytm.clients.pop(auth, None)
-            raise Fail(0, f"YouTube Music didn't accept that sign-in: {e}")
+            log.warning("YouTube Music sign-in for %s rejected: %s", user, e)
+            raise Fail(0, "YouTube Music didn't accept that sign-in. Sign in again and retry.")
         accounts.set_field(db, user, ytm_auth=auth, ytm_name=name)
         if self.background:
             threading.Thread(target=self._refresh_mixes, args=(user,), daemon=True).start()
