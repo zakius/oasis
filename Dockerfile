@@ -12,7 +12,7 @@ COPY --from=node:24-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=mwader/static-ffmpeg:7.1 /ffmpeg /usr/local/bin/ffmpeg
 COPY --from=build /opt/venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1
-RUN useradd --system --uid 1000 --home-dir /config oasis && mkdir /config && chown oasis /config
+RUN groupadd --gid 1000 oasis && useradd --uid 1000 --gid 1000 --home-dir /config oasis && mkdir /config && chown oasis:oasis /config
 USER oasis
 VOLUME /config
 EXPOSE 4533
