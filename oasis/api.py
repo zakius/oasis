@@ -1,21 +1,21 @@
 import hashlib
 import logging
+import re
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
 from xml.etree.ElementTree import Element, tostring
 
-from contextlib import asynccontextmanager
-
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import cover, scan
+from . import cover, scan, ytm
 from .config import Config
 from .db import connect
 from .ytm import YouTubeMusic
@@ -59,6 +59,7 @@ def to_xml(tag: str, value: dict) -> Element:
 class Params:
     def __init__(self, request: Request, body: bytes):
         self.multi = [*request.query_params.multi_items(), *parse_qsl(body.decode())]
+        self.range = request.headers.get("range")
 
     def get(self, key: str, default=None):
         return next((v for k, v in self.multi if k == key), default)
@@ -517,12 +518,42 @@ class Api:
             return FileResponse(r["ref"], media_type=r["content_type"])
         if not self.ytm:
             raise Fail(NOT_FOUND, "YouTube Music is not enabled")
+        if path := self.ytm.cached(r["ref"]):
+            return FileResponse(path, media_type=r["content_type"])
         try:
-            path = self.ytm.cached(r["ref"]) or self.ytm.fetch(r["ref"])
+            stream = self.ytm.resolve(r["ref"])
         except Exception as e:
-            log.warning("download of %s failed: %s", r["ref"], e)
-            raise Fail(NOT_FOUND, "Stream unavailable")
-        return FileResponse(path, media_type=r["content_type"])
+            log.info("no direct stream for %s (%s), downloading", r["ref"], e)
+            try:
+                return FileResponse(self.ytm.fetch(r["ref"]), media_type=r["content_type"])
+            except Exception as e:
+                log.warning("download of %s failed: %s", r["ref"], e)
+                raise Fail(NOT_FOUND, "Stream unavailable")
+        # Play straight from YouTube while the cache fills, so playback starts in well under a second.
+        threading.Thread(target=self._prefetch, args=(r["ref"],), daemon=True).start()
+        return self._proxy(r["ref"], stream, p.range)
+
+    def _proxy(self, video_id, stream, range_header):
+        start, end = 0, stream.size - 1
+        if m := re.fullmatch(r"bytes=(\d*)-(\d*)", range_header or ""):
+            if m[1]:
+                start, end = int(m[1]), min(int(m[2]), end) if m[2] else end
+            elif m[2]:
+                start = max(0, stream.size - int(m[2]))
+            if start > end:
+                return Response(status_code=416, headers={"Content-Range": f"bytes */{stream.size}"})
+
+        def body():
+            try:
+                yield from ytm.read_range(stream.url, start, end)
+            except Exception as e:
+                log.warning("stream of %s broke: %s", video_id, e)
+                self.ytm.forget(video_id)
+
+        headers = {"Accept-Ranges": "bytes", "Content-Length": str(end - start + 1)}
+        if range_header:
+            headers["Content-Range"] = f"bytes {start}-{end}/{stream.size}"
+        return StreamingResponse(body(), status_code=206 if range_header else 200, media_type=stream.content_type, headers=headers)
 
     def download(self, db, p, user):
         return self.stream(db, p, user)

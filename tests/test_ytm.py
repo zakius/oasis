@@ -3,7 +3,8 @@ from pathlib import Path
 import pytest
 
 from conftest import call, make_client
-from oasis.ytm import track_row
+from oasis import ytm as ytm_module
+from oasis.ytm import Stream, track_row
 
 SEARCH_ITEM = {
     "videoId": "vid1", "title": "Remote Song", "artists": [{"name": "Gamma"}, {"name": "Delta"}],
@@ -16,10 +17,18 @@ DUPLICATE = {"videoId": "vid2", "title": "one", "artists": [{"name": "Beta"}], "
 
 class FakeYtm:
     def __init__(self, cache: Path):
-        self.cache, self.fetched = cache, []
+        self.cache, self.fetched, self.direct = cache, [], False
 
     def search(self, query, limit):
         return [track_row(SEARCH_ITEM), track_row(DUPLICATE)][:limit]
+
+    def resolve(self, video_id):
+        if not self.direct:
+            raise LookupError("no direct m4a audio")
+        return Stream("https://googlevideo/" + video_id, "audio/mp4", 10, 0)
+
+    def forget(self, video_id):
+        pass
 
     def cached(self, video_id):
         path = self.cache / f"{video_id}.m4a"
@@ -80,9 +89,37 @@ def test_playlist_membership_keeps_streaming_track_in_library(client):
     assert "Remote Song" not in library_titles(client)
 
 
-def test_stream_downloads_once_then_serves_cache(client, ytm):
+def test_stream_without_direct_url_downloads_once_then_serves_cache(client, ytm):
     call(client, "search3", query="remote")
     for _ in range(2):
         response = client.get("/rest/stream", params={"u": "admin", "p": "secret", "id": "yt-vid1"})
         assert response.status_code == 200 and response.content == b"audio:vid1"
     assert ytm.fetched == ["vid1"]
+
+
+AUDIO = b"0123456789"
+
+
+@pytest.mark.parametrize("range_header, status, body, content_range", [
+    (None, 200, AUDIO, None),
+    ("bytes=2-5", 206, b"2345", "bytes 2-5/10"),
+    ("bytes=7-", 206, b"789", "bytes 7-9/10"),
+    ("bytes=-3", 206, b"789", "bytes 7-9/10"),
+    ("bytes=4-99", 206, b"456789", "bytes 4-9/10"),
+])
+def test_uncached_stream_proxies_ranges_while_cache_fills(client, ytm, monkeypatch, range_header, status, body, content_range):
+    ytm.direct = True
+    monkeypatch.setattr(ytm_module, "read_range", lambda url, start, end: iter([AUDIO[start:end + 1]]))
+    call(client, "search3", query="remote")
+    headers = {"Range": range_header} if range_header else {}
+    response = client.get("/rest/stream", params={"u": "admin", "p": "secret", "id": "yt-vid1"}, headers=headers)
+    assert response.status_code == status and response.content == body
+    assert response.headers.get("content-range") == content_range
+    assert response.headers["content-length"] == str(len(body))
+
+
+def test_unsatisfiable_range(client, ytm, monkeypatch):
+    ytm.direct = True
+    call(client, "search3", query="remote")
+    response = client.get("/rest/stream", params={"u": "admin", "p": "secret", "id": "yt-vid1"}, headers={"Range": "bytes=50-"})
+    assert response.status_code == 416 and response.headers["content-range"] == "bytes */10"
