@@ -9,6 +9,15 @@ paths = ["~/Music"]
 [ytmusic]
 enabled = false   # search YouTube Music and stream from it
 cache = "cache"   # downloaded audio; tracks you star or add to a playlist download right away
+# auth = "browser.json"  # signed-in session from `ytmusicapi browser`; adds your plays to YouTube Music history
+
+# Play forwarding. Each play a client reports goes to every service set up here, retried until it is taken.
+[lastfm]
+api_key = ""      # from https://www.last.fm/api/account/create, then run `oasis lastfm` once to sign in
+secret = ""
+
+[listenbrainz]
+token = ""        # from https://listenbrainz.org/settings/
 
 [[users]]
 name = "admin"

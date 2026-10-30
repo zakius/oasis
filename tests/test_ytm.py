@@ -16,11 +16,16 @@ DUPLICATE = {"videoId": "vid2", "title": "one", "artists": [{"name": "Beta"}], "
 
 
 class FakeYtm:
+    account = None
+
     def __init__(self, cache: Path):
         self.cache, self.fetched, self.direct = cache, [], False
 
     def search(self, query, limit):
         return [track_row(SEARCH_ITEM), track_row(DUPLICATE)][:limit]
+
+    def match(self, track):
+        return None
 
     def resolve(self, video_id):
         if not self.direct:

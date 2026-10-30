@@ -15,9 +15,10 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import cover, scan, ytm
+from . import cover, forward, scan, ytm
 from .config import Config
 from .db import connect
+from .forward import Forwarder
 from .ytm import YouTubeMusic
 
 log = logging.getLogger(__name__)
@@ -135,9 +136,14 @@ def index_letter(name: str) -> str:
 
 
 class Api:
-    def __init__(self, config: Config, ytm=None):
+    def __init__(self, config: Config, ytm=None, services=None):
         self.config = config
-        self.ytm = ytm or (YouTubeMusic(config.ytm_cache) if config.ytm_cache else None)
+        self.ytm = ytm or (YouTubeMusic(config.ytm_cache, config.ytm_auth) if config.ytm_cache else None)
+        if services is None:
+            db = self._db()
+            services = forward.services(config, db, self.ytm)
+            db.close()
+        self.forwarder = Forwarder(self._db, services, self.ytm.match if self.ytm else None)
         self.scanning = False
         self.scan_lock = threading.Lock()
 
@@ -396,12 +402,16 @@ class Api:
 
     def scrobble(self, db, p, user):
         if p.get("submission", "true") == "false":
+            for id in p.all("id")[:1]:
+                self.forwarder.now_playing(forward.listen_for(self._one(db, "select * from track where id = ?", id), time.time()))
             return {}
         times = p.all("time")
         for i, id in enumerate(p.all("id")):
+            self._one(db, "select 1 from track where id = ?", id)
             played = int(times[i]) / 1000 if i < len(times) else time.time()
             db.execute("insert into stat(id, play_count, played) values (?, 1, ?) on conflict(id) do update "
                        "set play_count = play_count + 1, played = excluded.played", (id, played))
+            self.forwarder.enqueue(db, id, played)
         return {}
 
     def getNowPlaying(self, db, p, user):
@@ -571,8 +581,8 @@ def respond(fmt: str, payload: dict, error: Fail | None = None) -> Response:
     return Response(b'<?xml version="1.0" encoding="UTF-8"?>' + tostring(root), media_type="application/xml")
 
 
-def create_app(config: Config, scan_on_start: bool = True, ytm=None) -> Starlette:
-    api = Api(config, ytm)
+def create_app(config: Config, scan_on_start: bool = True, ytm=None, services=None) -> Starlette:
+    api = Api(config, ytm, services)
 
     async def endpoint(request: Request):
         p = Params(request, await request.body())
@@ -598,6 +608,8 @@ def create_app(config: Config, scan_on_start: bool = True, ytm=None) -> Starlett
     async def lifespan(app):
         if scan_on_start:
             api._start_scan()
+        if api.forwarder.services:
+            api.forwarder.start()
         yield
 
     return Starlette(routes=[Route("/rest/{method}", endpoint, methods=["GET", "POST"])], lifespan=lifespan)

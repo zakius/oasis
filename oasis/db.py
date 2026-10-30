@@ -27,6 +27,11 @@ create table if not exists playlist(
     id integer primary key, name text not null, owner text not null, comment text,
     created real not null, changed real not null
 );
+create table if not exists outbox(
+    id integer primary key, service text not null, track_id text not null, played real not null,
+    attempts int not null default 0, next_try real not null
+);
+create table if not exists setting(key text primary key, value text);
 create table if not exists playlist_entry(
     playlist_id int not null references playlist(id) on delete cascade,
     pos int not null, track_id text not null

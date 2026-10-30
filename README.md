@@ -10,9 +10,14 @@ Early. oasis serves a local music library over the Subsonic API, so any Subsonic
 
 With `[ytmusic] enabled = true`, searches also return YouTube Music songs after the local matches. A YouTube Music result that matches a local track (same artist and title, length within 5 seconds) shows up as the local track. YouTube Music tracks join the library while they are starred or in a playlist, and download into the cache when they join. Other tracks download when first played. Uncached tracks start in about 0.2 seconds: oasis gets the audio URL with one visionOS player request, plays straight from YouTube, and fills the cache in the background. If that client stops working, oasis falls back to yt-dlp, whose URLs only work after about 5 seconds. No account is needed yet. Running from source needs `node` or `bun` on `PATH`; the container image includes node.
 
+Plays that clients report (`scrobble`) go to Last.fm, ListenBrainz and YouTube Music history, whichever are set up in `oasis.toml`. oasis keeps each play until the service takes it, so plays made offline or during an outage arrive later. Plays of local tracks reach YouTube Music history too: oasis finds the same song there (same title, length within 5 seconds) and remembers the match. Clients should not scrobble to Last.fm themselves, or plays count twice.
+
+- Last.fm: set `api_key` and `secret`, then run `oasis lastfm` (in the container: `docker compose run --rm oasis lastfm`) and allow access in the browser.
+- ListenBrainz: set `token`.
+- YouTube Music history: run `ytmusicapi browser` and paste request headers from a signed-in music.youtube.com tab, then set `auth` to the file it writes.
+
 Planned:
 
-- Play forwarding to Last.fm, ListenBrainz and YouTube Music history, also for local copies.
 - Recommendation radios as playlists that grow while you listen.
 
 ## Run

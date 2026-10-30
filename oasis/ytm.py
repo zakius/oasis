@@ -65,11 +65,12 @@ def read_range(url: str, start: int, end: int):
 
 
 class YouTubeMusic:
-    def __init__(self, cache: Path):
+    def __init__(self, cache: Path, auth: Path | None = None):
         from ytmusicapi import YTMusic
         self.cache = cache
         self.cache.mkdir(parents=True, exist_ok=True)
         self.api = YTMusic()
+        self.account = YTMusic(str(auth)) if auth else None  # for history
         self.visitor = self.api.headers.get("X-Goog-Visitor-Id")
         self.api_lock = threading.Lock()
         self.locks = defaultdict(threading.Lock)
@@ -79,6 +80,19 @@ class YouTubeMusic:
         with self.api_lock:
             results = self.api.search(query, filter="songs", limit=limit)
         return [row for item in results[:limit] if (row := track_row(item))]
+
+    def match(self, track) -> str | None:
+        """The videoId of the same song on YouTube Music: same title and length within 5 s, preferring the same artist."""
+        found = [r for r in self.search(f"{track['artist']} {track['title']}", 10)
+                 if r["title"].casefold() == track["title"].casefold() and abs((r["duration"] or 0) - (track["duration"] or 0)) <= 5]
+        found.sort(key=lambda r: r["album_artist"].casefold() != track["album_artist"].casefold())
+        return found[0]["ref"] if found else None
+
+    def add_history(self, video_id: str):
+        if not self.account:
+            raise LookupError("no YouTube Music account configured")
+        with self.api_lock:
+            self.account.add_history_item(self.account.get_song(video_id))
 
     def resolve(self, video_id: str) -> Stream:
         """A playable audio URL from one visionOS player request (about 0.3 s), reused until it expires."""
