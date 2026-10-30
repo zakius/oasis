@@ -8,9 +8,10 @@ It pairs with **mirage**, a fooyin fork that shows the server's library as if it
 
 Early. oasis serves a local music library over the Subsonic API, so any Subsonic client works: Feishin, Symfonium, DSub, Supersonic, and others.
 
+With `[ytmusic] enabled = true`, searches also return YouTube Music songs after the local matches. A YouTube Music result that matches a local track (same artist and title, length within 5 seconds) shows up as the local track. YouTube Music tracks join the library while they are starred or in a playlist, and download into the cache when they join. Other tracks download when first played. A first play takes about 10 seconds to start, because YouTube makes new stream URLs wait about 5 seconds before they work; later plays come from the cache. No account is needed yet. Running from source needs `node` or `bun` on `PATH`; the container image includes node.
+
 Planned:
 
-- YouTube Music search and streaming. Tracks you star, add to a playlist, or play become part of the library.
 - Play forwarding to Last.fm, ListenBrainz and YouTube Music history, also for local copies.
 - Recommendation radios as playlists that grow while you listen.
 

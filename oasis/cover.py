@@ -1,4 +1,5 @@
 import base64
+import urllib.request
 from pathlib import Path
 
 import mutagen
@@ -29,5 +30,8 @@ def embedded(path: str) -> tuple[bytes, str] | None:
 def load(track_path: str, cover: str) -> tuple[bytes, str] | None:
     if cover == "embedded":
         return embedded(track_path)
+    if cover.startswith("https://"):
+        with urllib.request.urlopen(cover, timeout=15) as response:
+            return response.read(), response.headers.get_content_type()
     image = Path(cover)
     return image.read_bytes(), MIME.get(image.suffix.lower(), "image/jpeg")

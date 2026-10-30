@@ -18,6 +18,7 @@ from starlette.routing import Route
 from . import cover, scan
 from .config import Config
 from .db import connect
+from .ytm import YouTubeMusic
 
 log = logging.getLogger(__name__)
 
@@ -133,8 +134,9 @@ def index_letter(name: str) -> str:
 
 
 class Api:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, ytm=None):
         self.config = config
+        self.ytm = ytm or (YouTubeMusic(config.ytm_cache) if config.ytm_cache else None)
         self.scanning = False
         self.scan_lock = threading.Lock()
 
@@ -204,7 +206,7 @@ class Api:
 
     def _artists_index(self, db):
         groups: dict[str, list] = {}
-        for r in db.execute(ARTISTS + " group by t.artist_id order by t.album_artist collate nocase"):
+        for r in db.execute(ARTISTS + " where t.library = 1 group by t.artist_id order by t.album_artist collate nocase"):
             groups.setdefault(index_letter(r["name"]), []).append(artist(r))
         return {"ignoredArticles": "The A", "index": [{"name": k, "artist": v} for k, v in sorted(groups.items())]}
 
@@ -215,7 +217,9 @@ class Api:
         return {"indexes": {"lastModified": 0, **self._artists_index(db)}}
 
     def _artist_albums(self, db, artist_id):
-        return [album(r) for r in db.execute(ALBUMS + " where t.artist_id = ? group by t.album_id order by year, name", (artist_id,))]
+        # Albums seen only in streaming search results stay hidden unless the artist has nothing in the library.
+        sql = ALBUMS + " where t.artist_id = ? and t.library >= ? group by t.album_id order by year, name"
+        return [album(r) for r in db.execute(sql, (artist_id, 1))] or [album(r) for r in db.execute(sql, (artist_id, 0))]
 
     def _album_songs(self, db, album_id):
         return [song(r) for r in db.execute(SONGS + " where t.album_id = ? order by disc_no, track_no, title", (album_id,))]
@@ -241,7 +245,7 @@ class Api:
 
     def _album_list(self, db, p):
         kind = p.need("type")
-        where, args = [], []
+        where, args = ["t.library = 1"], []
         order = {
             "random": "random()", "newest": "created desc", "highest": "album_rating desc",
             "frequent": "plays desc", "recent": "last_played desc", "alphabeticalByName": "name collate nocase",
@@ -260,7 +264,7 @@ class Api:
         if kind == "byGenre":
             where.append("t.genre = ?")
             args.append(p.need("genre"))
-        sql = ALBUMS + (" where " + " and ".join(where) if where else "") + " group by t.album_id"
+        sql = ALBUMS + " where " + " and ".join(where) + " group by t.album_id"
         sql += (f" having {having}" if having else "") + f" order by {order} limit ? offset ?"
         return [album(r) for r in db.execute(sql, (*args, min(p.int("size", 10), 500), p.int("offset", 0)))]
 
@@ -271,7 +275,7 @@ class Api:
         return {"albumList": {"album": self._album_list(db, p)}}
 
     def getRandomSongs(self, db, p, user):
-        where, args = ["1"], []
+        where, args = ["t.library = 1"], []
         if genre := p.get("genre"):
             where.append("t.genre = ?")
             args.append(genre)
@@ -285,19 +289,19 @@ class Api:
         return {"randomSongs": {"song": [song(r) for r in db.execute(sql, (*args, min(p.int("size", 10), 500)))]}}
 
     def getSongsByGenre(self, db, p, user):
-        sql = SONGS + " where t.genre = ? order by t.album_artist, t.album, t.disc_no, t.track_no limit ? offset ?"
+        sql = SONGS + " where t.library = 1 and t.genre = ? order by t.album_artist, t.album, t.disc_no, t.track_no limit ? offset ?"
         rows = db.execute(sql, (p.need("genre"), min(p.int("count", 10), 500), p.int("offset", 0)))
         return {"songsByGenre": {"song": [song(r) for r in rows]}}
 
     def getGenres(self, db, p, user):
-        rows = db.execute("select genre, count(*) n, count(distinct album_id) a from track where genre is not null group by genre order by genre")
+        rows = db.execute("select genre, count(*) n, count(distinct album_id) a from track where library = 1 and genre is not null group by genre order by genre")
         return {"genres": {"genre": [{"value": r["genre"], "songCount": r["n"], "albumCount": r["a"]} for r in rows]}}
 
     def _search(self, db, p):
         terms = [t for t in p.get("query", "").replace('"', "").split() if t]
 
         def match(columns: str):
-            return " and ".join([f"({columns}) like ?"] * len(terms)) or "1", [f"%{t}%" for t in terms]
+            return " and ".join(["t.library = 1", *[f"({columns}) like ?"] * len(terms)]), [f"%{t}%" for t in terms]
 
         cond, args = match("t.album_artist")
         artists = db.execute(ARTISTS + f" where {cond} group by t.artist_id order by t.album_artist collate nocase limit ? offset ?",
@@ -308,7 +312,46 @@ class Api:
         cond, args = match("t.title || ' ' || t.artist || ' ' || t.album")
         songs = db.execute(SONGS + f" where {cond} order by t.album_artist, t.album, t.disc_no, t.track_no limit ? offset ?",
                            (*args, p.int("songCount", 20), p.int("songOffset", 0)))
-        return {"artist": [artist(r) for r in artists], "album": [album(r) for r in albums], "song": [song(r) for r in songs]}
+        songs = [song(r) for r in songs]
+        if self.ytm and terms and p.int("songOffset", 0) == 0:
+            known = {s["id"] for s in songs}
+            try:
+                found = [self._remember(db, row) for row in self.ytm.search(" ".join(terms), p.int("songCount", 20))]
+            except Exception as e:
+                log.warning("YouTube Music search failed: %s", e)
+                found = []
+            songs += [song(self._one(db, SONGS + " where t.id = ?", id)) for id in dict.fromkeys(found) if id not in known]
+        return {"artist": [artist(r) for r in artists], "album": [album(r) for r in albums], "song": songs}
+
+    def _remember(self, db, row: dict) -> str:
+        """Caches a streaming track's metadata and returns its id, or the id of the local copy of the same song."""
+        local = db.execute("select id from track where source = 'local' and artist_id = ? and title = ? collate nocase "
+                           "and abs(duration - ?) <= 5", (row["artist_id"], row["title"], row["duration"] or 0)).fetchone()
+        if local:
+            db.execute("update track set ytm_id = ? where id = ?", (row["ytm_id"], local["id"]))
+            return local["id"]
+        updates = ", ".join(f"{k} = excluded.{k}" for k in row if k not in ("id", "library", "created"))
+        db.execute(f"insert into track({', '.join(row)}) values ({', '.join('?' * len(row))}) "
+                   f"on conflict(id) do update set {updates}", list(row.values()))
+        return row["id"]
+
+    def _touch(self, db, ids):
+        """Streaming tracks join the library while starred or in a playlist; joining starts their download."""
+        for id in ids:
+            r = db.execute("select ref, library from track where id = ? and source = 'ytm'", (id,)).fetchone()
+            if r is None:
+                continue
+            kept = db.execute("select exists(select 1 from stat where id = ? and starred is not null) "
+                              "or exists(select 1 from playlist_entry where track_id = ?)", (id, id)).fetchone()[0]
+            db.execute("update track set library = ? where id = ?", (kept, id))
+            if kept and not r["library"] and self.ytm:
+                threading.Thread(target=self._prefetch, args=(r["ref"],), daemon=True).start()
+
+    def _prefetch(self, video_id):
+        try:
+            self.ytm.fetch(video_id)
+        except Exception as e:
+            log.warning("download of %s failed: %s", video_id, e)
 
     def search3(self, db, p, user):
         return {"searchResult3": self._search(db, p)}
@@ -336,6 +379,7 @@ class Api:
     def _set_starred(self, db, p, value):
         for id in p.all("id") + p.all("albumId") + p.all("artistId"):
             db.execute("insert into stat(id, starred) values (?, ?) on conflict(id) do update set starred = excluded.starred", (id, value))
+        self._touch(db, p.all("id"))
         return {}
 
     def star(self, db, p, user):
@@ -419,9 +463,11 @@ class Api:
         return {"playlist": self._playlist(db, self._own_playlist(db, p.need("id"), user), True)}
 
     def _set_entries(self, db, playlist_id, track_ids):
+        old = [r[0] for r in db.execute("select track_id from playlist_entry where playlist_id = ?", (playlist_id,))]
         db.execute("delete from playlist_entry where playlist_id = ?", (playlist_id,))
         db.executemany("insert into playlist_entry values (?, ?, ?)", [(playlist_id, i, t) for i, t in enumerate(track_ids)])
         db.execute("update playlist set changed = ? where id = ?", (time.time(), playlist_id))
+        self._touch(db, set(old) | set(track_ids))
 
     def createPlaylist(self, db, p, user):
         if id := p.get("playlistId"):
@@ -446,22 +492,37 @@ class Api:
         return {}
 
     def deletePlaylist(self, db, p, user):
-        db.execute("delete from playlist where id = ?", (self._own_playlist(db, p.need("id"), user)["id"],))
+        playlist_id = self._own_playlist(db, p.need("id"), user)["id"]
+        self._set_entries(db, playlist_id, [])
+        db.execute("delete from playlist where id = ?", (playlist_id,))
         return {}
 
     def getCoverArt(self, db, p, user):
         id = p.need("id")
         column = {"ar-": "artist_id", "al-": "album_id"}.get(id[:3], "id")
         r = self._one(db, f"select ref, cover from track where {column} = ? and cover is not null "
-                         "order by cover = 'embedded', disc_no, track_no limit 1", id)
-        image = cover.load(r["ref"], r["cover"])
+                         "order by source != 'local', cover = 'embedded', disc_no, track_no limit 1", id)
+        try:
+            image = cover.load(r["ref"], r["cover"])
+        except OSError as e:
+            log.warning("cover %s unavailable: %s", r["cover"], e)
+            image = None
         if image is None:
             raise Fail(NOT_FOUND, "Cover art not found")
         return Response(image[0], media_type=image[1], headers={"Cache-Control": "public, max-age=86400"})
 
     def stream(self, db, p, user):
-        r = self._one(db, "select ref, content_type from track where id = ?", p.need("id"))
-        return FileResponse(r["ref"], media_type=r["content_type"])
+        r = self._one(db, "select source, ref, content_type from track where id = ?", p.need("id"))
+        if r["source"] == "local":
+            return FileResponse(r["ref"], media_type=r["content_type"])
+        if not self.ytm:
+            raise Fail(NOT_FOUND, "YouTube Music is not enabled")
+        try:
+            path = self.ytm.cached(r["ref"]) or self.ytm.fetch(r["ref"])
+        except Exception as e:
+            log.warning("download of %s failed: %s", r["ref"], e)
+            raise Fail(NOT_FOUND, "Stream unavailable")
+        return FileResponse(path, media_type=r["content_type"])
 
     def download(self, db, p, user):
         return self.stream(db, p, user)
@@ -479,8 +540,8 @@ def respond(fmt: str, payload: dict, error: Fail | None = None) -> Response:
     return Response(b'<?xml version="1.0" encoding="UTF-8"?>' + tostring(root), media_type="application/xml")
 
 
-def create_app(config: Config, scan_on_start: bool = True) -> Starlette:
-    api = Api(config)
+def create_app(config: Config, scan_on_start: bool = True, ytm=None) -> Starlette:
+    api = Api(config, ytm)
 
     async def endpoint(request: Request):
         p = Params(request, await request.body())

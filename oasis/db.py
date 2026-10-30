@@ -5,14 +5,16 @@ from pathlib import Path
 SCHEMA = """
 create table if not exists track(
     id text primary key,
-    source text not null,           -- 'local' now; streaming backends later
-    ref text not null unique,       -- file path for local tracks
+    source text not null,           -- 'local' or 'ytm'
+    ref text not null unique,       -- file path, or the videoId for 'ytm'
     root text,
     title text, artist text, album_artist text, album text,
     artist_id text, album_id text,
     track_no int, disc_no int, year int, genre text,
     duration int, bitrate int, size int, suffix text, content_type text,
-    cover text,                     -- 'embedded', an image path, or null
+    cover text,                     -- 'embedded', an image path or URL, or null
+    ytm_id text,                    -- YouTube Music videoId, also for local tracks matched to one
+    library int not null default 1, -- 0 for streaming tracks only seen in search or radio
     mtime real, created real
 );
 create index if not exists track_album on track(album_id);

@@ -7,6 +7,8 @@ COPY oasis ./oasis
 RUN --mount=type=cache,target=/root/.cache/pip /opt/venv/bin/pip install .
 
 FROM python:3.14-slim
+# yt-dlp needs node to solve YouTube's JS challenge.
+COPY --from=node:24-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=build /opt/venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1
 RUN useradd --system --uid 1000 --home-dir /config oasis && mkdir /config && chown oasis /config

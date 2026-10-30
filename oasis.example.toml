@@ -6,6 +6,10 @@ database = "oasis.db"     # relative paths resolve against this file's directory
 [library]
 paths = ["~/Music"]
 
+[ytmusic]
+enabled = false   # search YouTube Music and stream from it
+cache = "cache"   # downloaded audio; tracks you star or add to a playlist download right away
+
 [[users]]
 name = "admin"
 password = "change-me"
