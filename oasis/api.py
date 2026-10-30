@@ -31,6 +31,28 @@ log = logging.getLogger(__name__)
 VERSION = "1.16.1"
 NOT_FOUND, MISSING, AUTH, DENIED = 70, 10, 40, 50
 MIX_OWNER = "YouTube Music"
+# YouTube Music's fixed personal mix ids in its own order (the names are localized), as in roma's Mixes.kt.
+MIX_ORDER = [
+    "RDTMAK5uy_kset8DisdE7LSD4TNjEVvrKRTmG7a56sY",  # My Supermix
+    "RDTMAK5uy_nGQKSMIkpr4o9VI_2i56pkGliD6FQRo50",  # My Mix 1
+    "RDTMAK5uy_lz2owBgwWf1mjzyn_NbxzMViQzIg8IAIg",  # My Mix 2
+    "RDTMAK5uy_k5UUl0lmrrfrjMpsT0CoMpdcBz1ruAO1k",  # My Mix 3
+    "RDTMAK5uy_nTsa0Irmcu2li2-qHBoZxtrpG9HuC3k_Q",  # My Mix 4
+    "RDTMAK5uy_lfZhS7zmIcmUhsKtkWylKzc0EN0LW90-s",  # My Mix 5
+    "RDTMAK5uy_k78ni6Y4fyyl0r2eiKkBEICh9Q5wJdfXk",  # My Mix 6
+    "RDTMAK5uy_lfhhWWw9v71CPrR7MRMHgZzbH6Vku9iJc",  # My Mix 7
+    "RDTMAK5uy_n_5IN6hzAOwdCnM8D8rzrs3vDl12UcZpA",  # Discover Mix
+    "RDTMAK5uy_lr0LWzGrq6FU9GIxWvFHTRPQD2LHMqlFA",  # New Release Mix
+    "RDTMAK5uy_nilrsVWxrKskY0ZUpVZ3zpB0u4LwWTVJ4",  # Replay Mix
+]
+
+
+def playlist_order(r) -> tuple:
+    """Mixes first in YouTube Music's order, then Liked Music, then everything else by name."""
+    mix = r["mix"] or ""
+    if mix.startswith("RDTMAK"):
+        return 0, MIX_ORDER.index(mix) if mix in MIX_ORDER else len(MIX_ORDER), r["name"].casefold()
+    return (1 if mix == "LM" else 2), 0, r["name"].casefold()
 MIX_REFRESH = 6 * 3600
 
 
@@ -648,7 +670,7 @@ class Api:
         return {**result, "entry": songs} if entries else result
 
     def getPlaylists(self, db, p, user):
-        rows = db.execute("select * from playlist where owner = ? order by mix is not null, name collate nocase", (user,))
+        rows = sorted(db.execute("select * from playlist where owner = ?", (user,)), key=playlist_order)
         return {"playlists": {"playlist": [self._playlist(db, r, False) for r in rows]}}
 
     def _own_playlist(self, db, id, user):

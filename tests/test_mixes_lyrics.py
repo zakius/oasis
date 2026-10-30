@@ -157,3 +157,15 @@ def test_transcoded_stream_decodes(client, tmp_path):
     probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(out)],
                            capture_output=True, text=True)
     assert probe.stdout.strip() == "opus"
+
+
+def test_playlists_list_mixes_first_in_youtube_order(client, ytm):
+    names = {"RDTMAK5uy_lfhhWWw9v71CPrR7MRMHgZzbH6Vku9iJc": "Mroczna moc", "RDTMAK5uy_nGQKSMIkpr4o9VI_2i56pkGliD6FQRo50": "Bunt",
+             "RDTMAK5uy_zzOther": "Chill Mix", "RDTMAK5uy_kset8DisdE7LSD4TNjEVvrKRTmG7a56sY": "My Supermix",
+             "RDTMAK5uy_nilrsVWxrKskY0ZUpVZ3zpB0u4LwWTVJ4": "Replay Mix", "LM": "Liked Music", "PLa": "aaa"}
+    ytm.current = {id: ["m1"] for id in names}
+    ytm.playlists = lambda client: [{"id": id, "title": name, "description": None, "cover": None} for id, name in names.items()]
+    link(client)
+    client.app.state.api._refresh_mixes("admin")
+    call(client, "createPlaylist", name="Zebra")
+    assert list(playlists(client)) == ["My Supermix", "Bunt", "Mroczna moc", "Replay Mix", "Chill Mix", "Liked Music", "aaa", "Zebra"]
