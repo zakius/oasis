@@ -1,5 +1,7 @@
-"""Account pages: sign in with the Subsonic user, link YouTube Music, Last.fm and ListenBrainz, manage users."""
+"""Account pages: sign in with the Subsonic user, link YouTube Music, Last.fm and ListenBrainz, manage users. Music
+pages: find any artist or album on MusicBrainz, follow or want it, and see what oasis is looking for."""
 import json
+import re
 import time
 import urllib.request
 from html import escape
@@ -10,7 +12,8 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
-from . import accounts
+from . import accounts, acquire, musicbrainz, releases
+from .acquire import MB_IDS, TYPES, Acquire
 from .forward import LastFm
 
 COOKIE = "oasis_session"
@@ -31,11 +34,14 @@ input, textarea, button { font: inherit; } textarea { width: 100%; min-height: 6
 input[type=text], input[type=password] { width: 100%; box-sizing: border-box; margin: .2rem 0 .6rem; padding: .4rem; }
 button { padding: .4rem 1rem; border-radius: 8px; border: 1px solid #888; cursor: pointer; }
 .ok { color: #1a7f37; } .error { color: #c62828; } .muted { opacity: .7; font-size: .9rem; }
-ol { padding-left: 1.2rem; } form.inline { display: inline; } td { padding: .2rem .6rem .2rem 0; }
+ol { padding-left: 1.2rem; } form.inline { display: inline; } td { padding: .2rem .6rem .2rem 0; vertical-align: top; }
+li { margin: .25rem 0; } form.inline button { padding: .1rem .6rem; font-size: .85rem; }
 """
 
 
 STATES = {"added": "waiting for TorBox", "downloading": "TorBox downloading", "fetching": "copying here", "importing": "importing"}
+MBID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+MUSIC_NAV = '<p><a href="/account">Your account</a> · <a href="/music">Find music</a> · <a href="/music/wanted">Wanted</a></p>'
 
 
 def ago(ts: float) -> str:
@@ -56,8 +62,22 @@ def page(title: str, body: str, message: str = "", error: str = "") -> HTMLRespo
 
 
 def back(path: str, message: str = "", error: str = "") -> RedirectResponse:
-    query = f"?message={quote(message)}" if message else f"?error={quote(error)}" if error else ""
-    return RedirectResponse(path + query, status_code=303)
+    query = f"message={quote(message)}" if message else f"error={quote(error)}" if error else ""
+    return RedirectResponse(path + ("&" if "?" in path else "?") + query if query else path, status_code=303)
+
+
+def details(*parts) -> str:
+    return '<span class="muted">' + escape(" · ".join(str(p) for p in parts if p)) + '</span>'
+
+
+def about(a: dict) -> str:
+    """A MusicBrainz artist's type, country, years and disambiguation."""
+    life = a.get("life-span") or {}
+    return details(a.get("type"), a.get("country"), "–".join(filter(None, [(life.get(k) or "")[:4] for k in ("begin", "end")])), a.get("disambiguation"))
+
+
+def credited(g: dict) -> str:
+    return "".join(c["name"] + (c.get("joinphrase") or "") for c in g.get("artist-credit") or [])
 
 
 def routes(api) -> list[Route]:
@@ -127,6 +147,7 @@ def routes(api) -> list[Route]:
                         '<a href="https://listenbrainz.org/settings/" target="_blank">listenbrainz.org/settings</a>'
                         '<input type="text" name="token"></label><button>Link</button></form>')
         admin = '<p><a href="/admin">Manage users</a> · <a href="/admin/artists">Artist settings</a></p>' if user["admin"] else ""
+        admin = '<p><a href="/music">Find music</a> · <a href="/music/wanted">Wanted</a></p>' + admin
         body = (f'<div>Signed in as <b>{escape(user["name"])}</b>. <form class="inline" method="post" action="/logout">'
                 f'<button>Sign out</button></form></div>{admin}{status(db)}'
                 f'<section><h2>YouTube Music</h2>{youtube}</section>'
@@ -284,6 +305,164 @@ def routes(api) -> list[Route]:
         accounts.delete(db, name)
         return back("/admin", message=f"Deleted {name}.")
 
+    def catalogue(handler):
+        """A music page, for any signed-in user: it needs oasis's own catalogue (acquire.py)."""
+        def run(db, request, user, form):
+            if not isinstance(api.library, Acquire):
+                return page("Find music", MUSIC_NAV, error='oasis\'s own catalogue is off ([acquire] catalogue = "oasis" turns it on).')
+            return handler(db, request, user, form)
+        return signed_in(run)
+
+    def mine(db, user, kind: str, mbid: str) -> list[str]:
+        """The ids the user wants the artist or album under."""
+        ids = acquire.refs(db, kind, mbid)
+        return [r[0] for r in db.execute(f"select ref from wanted where user = ? and kind = ? and ref in ({','.join('?' * len(ids))})",
+                                         (user["name"], kind, *ids))]
+
+    def want_button(kind: str, mbid: str, on: bool, here: str) -> str:
+        label = {("album", True): "Want", ("album", False): "Unwant", ("artist", True): "Follow", ("artist", False): "Unfollow"}[kind, on]
+        return (f'<form class="inline" method="post" action="/music/want"><input type="hidden" name="kind" value="{kind}">'
+                f'<input type="hidden" name="mbid" value="{escape(mbid)}"><input type="hidden" name="on" value="{"1" if on else ""}">'
+                f'<input type="hidden" name="next" value="{escape(here)}"><button>{label}</button></form>')
+
+    def followed(db, mbid: str) -> bool:
+        ids = acquire.refs(db, "artist", mbid)
+        return bool(db.execute(f"select 1 from wanted where kind = 'artist' and ref in ({','.join('?' * len(ids))})", list(ids)).fetchone())
+
+    def artist_state(db, mbid: str) -> str:
+        return " ".join(filter(None, ["in the library" if acquire.library_id(db, MB_IDS["artist"] + mbid) else "",
+                                      "followed" if followed(db, mbid) else ""]))
+
+    def album_line(db, user, g: dict, here: str, by: bool = True) -> str:
+        row = db.execute("select state, error from want_album where rg = ?", (g["id"],)).fetchone()
+        state = "in the library" if acquire.library_id(db, MB_IDS["album"] + g["id"]) or row and row["state"] == "have" else \
+            {"missing": "wanted", "downloading": "downloading", "skipped": f"left out: {row['error']}"}[row["state"]] if row else ""
+        credit = g.get("artist-credit") or []
+        artist = f' — <a href="/music/artist/{credit[0]["artist"]["id"]}">{escape(credited(g))}</a>' if by and credit else ""
+        info = details(g.get("primary-type"), *(g.get("secondary-types") or []), (g.get("first-release-date") or "")[:4], g.get("disambiguation"))
+        return (f'<li>{escape(g["title"])}{artist} {info} <b>{escape(state)}</b> '
+                f'{want_button("album", g["id"], not mine(db, user, "album", g["id"]), here)}</li>')
+
+    def find_music(db, request, user, form):
+        q = request.query_params
+        text, kind, error = q.get("q", "").strip(), "album" if q.get("kind") == "album" else "artist", q.get("error", "")
+        checked = lambda k: " checked" if k == kind else ""
+        body = (f'{MUSIC_NAV}<section><form><input type="text" name="q" value="{escape(text)}" placeholder="An artist or album, in any '
+                f'script" autofocus><label><input type="radio" name="kind" value="artist"{checked("artist")}> Artists</label> '
+                f'<label><input type="radio" name="kind" value="album"{checked("album")}> Albums</label> <button>Search MusicBrainz</button>'
+                f'</form></section>')
+        if text:
+            try:
+                found = acquire.find(db, kind, text)
+            except OSError as e:
+                found, error = [], f"MusicBrainz didn't answer: {e}"
+            here = f"/music?q={quote(text)}&kind={kind}"
+            lines = [album_line(db, user, g, here) for g in found] if kind == "album" else [
+                f'<li><a href="/music/artist/{a["id"]}">{escape(a["name"])}</a> {about(a)} <b>{artist_state(db, a["id"])}</b></li>' for a in found]
+            body += f'<section><ul>{"".join(lines)}</ul></section>' if lines else '<p class="muted">MusicBrainz knows nothing by that name.</p>'
+        return page("Find music", body, q.get("message", ""), error)
+
+    def music_artist(db, request, user, form):
+        q, mbid = request.query_params, request.path_params["mbid"]
+        try:
+            if not MBID.fullmatch(mbid):
+                raise LookupError(mbid)
+            info, groups = musicbrainz.get(releases.ALIASES.format(mbid), db, releases.KEEP_ALIASES), acquire.release_groups(db, mbid)
+        except LookupError:
+            return back("/music", error="MusicBrainz has no such artist.")
+        except OSError as e:
+            return back("/music", error=f"MusicBrainz didn't answer: {e}")
+        here = f"/music/artist/{mbid}"
+        body = (f'{MUSIC_NAV}<section><p>{about(info)}</p><p><b>{artist_state(db, mbid)}</b> '
+                f'{want_button("artist", mbid, not mine(db, user, "artist", mbid), here)}</p><p class="muted">Following wants its albums, EPs and '
+                f'singles, new ones too, except repackages, singles whose songs are on its albums and what has no official release.</p></section>')
+        for kind in TYPES:
+            rows = sorted((g for g in groups if g.get("primary-type") == kind), key=lambda g: g.get("first-release-date") or "9999")
+            if rows:
+                body += f'<section><h2>{kind}s</h2><ul>{"".join(album_line(db, user, g, here, by=False) for g in rows)}</ul></section>'
+        return page(info["name"], body, q.get("message", ""), q.get("error", ""))
+
+    def set_want(db, request, user, form):
+        kind, mbid, here = form.get("kind"), form.get("mbid", ""), form.get("next", "")
+        here = here if here.startswith("/music") else "/music"
+        if kind not in MB_IDS or not MBID.fullmatch(mbid):
+            return back(here, error="Nothing to want.")
+        if form.get("on"):  # under the library's id once it has it, as clients see it
+            api._want(db, user["name"], kind, [acquire.library_id(db, MB_IDS[kind] + mbid) or MB_IDS[kind] + mbid], time.time())
+            return back(here, message="Followed: its albums are searched for." if kind == "artist" else "Wanted: it is searched for.")
+        api._want(db, user["name"], kind, mine(db, user, kind, mbid), None)
+        return back(here, message="Unfollowed. Files already here stay." if kind == "artist" else "Unwanted. Files already here stay.")
+
+    def wanted(db, request, user, form):
+        q, acq = request.query_params, api.library
+        active = {r["rg"]: r for r in db.execute("select d.hash, d.state, coalesce(t.rg, d.album_mbid) rg from download d left join download_target t "
+                                                 "on t.hash = d.hash where d.state not in ('done', 'failed') and coalesce(t.rg, d.album_mbid) is not null")}
+
+        def state(r) -> str:
+            if d := active.get(r["rg"]):
+                seen = api.downloads.seen.get(d["hash"]) if api.downloads else None
+                return f"downloading {seen[0]:.0%}" if d["state"] == "downloading" and seen else STATES.get(d["state"], d["state"])
+            if r["state"] == "downloading":
+                return "downloading"
+            if r["rg"] in acq.soon:
+                return "searched next"
+            if (r["error"] or "").startswith(("download failed", "search failed")):
+                return f'<span class="error">{escape(r["error"])}</span>'
+            return f'not found yet, searched {ago(r["searched"])}' if r["searched"] else "waiting for its first search"
+
+        action = lambda rg, name, label: (f'<form class="inline" method="post" action="/music/wanted/{escape(rg)}/{name}">'
+                                          f'<button>{label}</button></form>')
+        rows = db.execute("select * from want_album where state in ('missing', 'downloading') order by state != 'downloading', "
+                          "reason != 'starred', artist collate nocase, first_date").fetchall()
+        lines = "".join(
+            f'<tr><td><a href="/music/artist/{escape(r["artist_mbid"])}">{escape(r["artist"] or "")}</a> – {escape(r["title"])} '
+            f'{details(r["primary_type"], (r["first_date"] or "")[:4], "starred" if r["reason"] == "starred" else "")}</td><td>{state(r)}</td><td>'
+            + (action(r["rg"], "search", "Search now") if r["state"] == "missing" else action(r["rg"], "block", "Block, try another"))
+            + action(r["rg"], "give-up", "Give up") + '</td></tr>' for r in rows)
+        counts = dict(db.execute("select state, count(*) from want_album group by state").fetchall())
+        body = (f'{MUSIC_NAV}<section><p>{counts.get("missing", 0)} albums to find, {counts.get("downloading", 0)} downloading; '
+                f'{counts.get("have", 0)} wanted ones are here, {counts.get("skipped", 0)} of followed artists are left out.</p>'
+                f'<p class="muted">Giving up stops the search; files already here stay.</p>'
+                f'<table>{lines}</table></section>')
+        lost = db.execute("select li.*, exists (select 1 from wanted w where w.kind = li.kind and w.ref = li.ref and w.user = ?) mine "
+                          "from lidarr_item li where li.state = 'failed' and exists (select 1 from wanted w where w.kind = li.kind "
+                          "and w.ref = li.ref)", (user["name"],)).fetchall()
+        if lost:
+            names = {"album": ("select album_artist || ' – ' || album from track where album_id = ?",
+                               "select a.name || ' – ' || r.title from ytm_release r join ytm_artist a using (artist_id) where r.album_id = ?"),
+                     "artist": ("select album_artist from track where artist_id = ?", "select name from ytm_artist where artist_id = ?")}
+            name = lambda r: next((row[0] for sql in names[r["kind"]] if (row := db.execute(sql, (r["ref"],)).fetchone())), r["ref"])
+            body += ('<section><h2>Not found on MusicBrainz</h2><p class="muted">Starred, but oasis can\'t tell which MusicBrainz '
+                     'artist or album it is; it asks again later. Find it above and want it from there instead.</p><ul>' + "".join(
+                         f'<li>{escape(name(r))} {details(r["kind"])} <span class="error">{escape(r["error"] or "")}</span> ' + (
+                             f'<form class="inline" method="post" action="/music/unwant"><input type="hidden" name="kind" value="{r["kind"]}">'
+                             f'<input type="hidden" name="ref" value="{escape(r["ref"])}"><button>Give up</button></form>' if r["mine"] else "")
+                         + '</li>' for r in lost) + '</ul></section>')
+        return page("Wanted", body, q.get("message", ""), q.get("error", ""))
+
+    def wanted_action(db, request, user, form):
+        rg, action = request.path_params["rg"], request.path_params["action"]
+        row = db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
+        if row is None or action not in ("search", "block", "give-up"):
+            return back("/music/wanted", error="That album isn't wanted any more.")
+        name = f'{row["artist"]} – {row["title"]}'
+        if action == "block" and not (api.downloads and api.downloads.block(db, rg)):
+            return back("/music/wanted", error=f"Nothing is downloading for {name} that can still be stopped.")
+        if action in ("search", "block"):
+            api.library.soon.add(rg)
+            api.library.wake.set()
+            return back("/music/wanted", message=f"{name} is searched next, in a minute or two." if action == "search" else
+                        f"Blocked that release of {name}; the next search picks another.")
+        api._want(db, user["name"], "album", mine(db, user, "album", rg), None)
+        db.execute("insert or replace into given_up values (?, ?)", (rg, time.time()))
+        db.execute("update want_album set state = 'skipped', error = 'given up' where rg = ? and reason = 'followed'", (rg,))
+        return back("/music/wanted", message=f"Gave up on {name}. Files already here stay.")
+
+    def unwant(db, request, user, form):
+        if form.get("kind") in MB_IDS:
+            api._want(db, user["name"], form["kind"], [form.get("ref", "")], None)
+        return back("/music/wanted", message="Given up.")
+
     async def home(request: Request):
         return RedirectResponse("/account")
 
@@ -303,6 +482,12 @@ def routes(api) -> list[Route]:
         Route("/account/listenbrainz", signed_in(link_listenbrainz), methods=["POST"]),
         Route("/account/password", signed_in(change_password), methods=["POST"]),
         Route("/admin", signed_in(admin, admin=True)),
+        Route("/music", catalogue(find_music)),
+        Route("/music/artist/{mbid}", catalogue(music_artist)),
+        Route("/music/want", catalogue(set_want), methods=["POST"]),
+        Route("/music/unwant", catalogue(unwant), methods=["POST"]),
+        Route("/music/wanted", catalogue(wanted)),
+        Route("/music/wanted/{rg}/{action:str}", catalogue(wanted_action), methods=["POST"]),
         Route("/admin/users", signed_in(create_user, admin=True), methods=["POST"]),
         Route("/admin/users/{name}/delete", signed_in(delete_user, admin=True), methods=["POST"]),
     ]

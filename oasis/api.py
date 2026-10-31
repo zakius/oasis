@@ -19,8 +19,8 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import accounts, artists, cover, dedupe, forward, lyrics, scan, web, ytm
-from .acquire import SECONDARY, Acquire
+from . import accounts, acquire, artists, cover, dedupe, forward, lyrics, musicbrainz, releases, scan, web, ytm
+from .acquire import MB_IDS, SECONDARY, Acquire
 from .config import Config
 from .credits import PERFORMANCE_ROLES, Credits
 from .db import connect, make_id, move_track, remember, resolve
@@ -95,6 +95,8 @@ def to_xml(tag: str, value: dict) -> Element:
 
 SONG_ID_PARAMS = ("id", "songId", "songIdToAdd")
 ARTIST_ID_PARAMS = ("id", "artistId")
+MOVED_PARAMS = (*SONG_ID_PARAMS, "albumId", "artistId")
+FIND_FROM = 3  # characters a search needs before MusicBrainz is asked too
 
 
 class Params:
@@ -119,12 +121,13 @@ class Params:
         return value
 
     def follow_moves(self, db):
-        """Song ids a client still holds for streams that became local files point at the local track, and artist ids
-        of another name of an artist at the artist."""
-        ids = {v for k, v in self.multi if k in SONG_ID_PARAMS and v.startswith("yt-")}
+        """Ids a client still holds for streams that became local files, and for MusicBrainz-only artists and albums
+        that arrived, point at the library's, and artist ids of another name of an artist at the artist."""
+        ids = {v for k, v in self.multi if k in MOVED_PARAMS and v.startswith(("yt-", *MB_IDS.values()))}
         if ids:
             moved = dict(db.execute(f"select old_id, new_id from moved where old_id in ({','.join('?' * len(ids))})", list(ids)))
-            self.multi = [(k, moved.get(v, v) if k in SONG_ID_PARAMS else v) for k, v in self.multi]
+            moved |= {id: here for id in ids - moved.keys() if (here := acquire.library_id(db, id))}  # arrived since acquire's last pass
+            self.multi = [(k, moved.get(v, v) if k in MOVED_PARAMS else v) for k, v in self.multi]
         self.multi = [(k, resolve(db, v) if k in ARTIST_ID_PARAMS and v.startswith("ar-") else v) for k, v in self.multi]
 
 
@@ -542,6 +545,12 @@ class Api:
         return [song(r) for r in db.execute(SONGS + " where t.album_id = ? order by disc_no, track_no is null, track_no, title", (album_id,))]
 
     def getArtist(self, db, p, user):
+        if acquire.mbid_of(id := p.need("id")):
+            info = self._musicbrainz(releases.ALIASES.format(acquire.mbid_of(id)), db, releases.KEEP_ALIASES)
+            groups = self._musicbrainz(acquire.release_groups, db, acquire.mbid_of(id))
+            albums = [self._mb_album(db, g) for g in sorted(groups, key=lambda g: g.get("first-release-date") or "9999")
+                      if g.get("primary-type") in acquire.TYPES]
+            return {"artist": {**self._mb_artist(db, info), "albumCount": len(albums), "album": albums}}
         r = db.execute(ARTISTS + " where t.artist_id = ? group by t.artist_id", (p.need("id"),)).fetchone()
         if r is None:
             return self._credited_artist(db, p.need("id"))
@@ -581,6 +590,9 @@ class Api:
                        (make_id("al-", name, x["title"]), artist_id, x["browse_id"], x["title"], x["year"], x["type"], x["cover"]))
 
     def getAlbum(self, db, p, user):
+        if acquire.mbid_of(id := p.need("id")):
+            return {"album": {**self._mb_album(db, self._musicbrainz(acquire.GROUP.format(acquire.mbid_of(id)), db, acquire.KEEP_GROUP)),
+                              "song": []}}  # nothing to play until it arrives
         self._complete_album(db, p.need("id"))
         r = self._one(db, ALBUMS + " where t.album_id = ? group by t.album_id", p.need("id"))
         return {"album": {**album(r), "song": self._album_songs(db, r["id"])}}
@@ -689,6 +701,7 @@ class Api:
         artists = db.execute(ARTISTS + f" where {cond} group by t.artist_id order by t.album_artist collate nocase limit ? offset ?",
                              (*args, p.int("artistCount", 20), p.int("artistOffset", 0)))
         cond, args = match("t.album || ' ' || t.album_artist")
+        artists = [artist(r) for r in artists]
         albums = db.execute(ALBUMS + f" where {cond} group by t.album_id order by name collate nocase limit ? offset ?",
                             (*args, p.int("albumCount", 20), p.int("albumOffset", 0)))
         cond, args = match("t.title || ' ' || t.artist || ' ' || t.album")
@@ -703,7 +716,61 @@ class Api:
                 log.warning("YouTube Music search failed: %s", e)
                 found = []
             songs += [song(self._one(db, SONGS + " where t.id = ?", id)) for id in dict.fromkeys(found) if id not in known]
-        return {"artist": [artist(r) for r in artists], "album": [album(r) for r in albums], "song": songs}
+        albums = [album(r) for r in albums]
+        text = " ".join(terms)
+        if isinstance(self.library, Acquire) and len(text) >= FIND_FROM:
+            # MusicBrainz last, for what neither the library nor YouTube Music has: these can be starred like any other.
+            names = {ytm.fold(x) for x in [*(a["name"] for a in artists), *(s.get("artist") for s in songs)] if x}
+            titles = {ytm.fold(x) for x in [*(a["name"] for a in albums), *(s.get("album") for s in songs)] if x}
+            if p.int("artistOffset", 0) == 0 and (room := p.int("artistCount", 20) - len(artists)) > 0:
+                artists += [self._mb_artist(db, a) for a in self._find(db, "artist", text)
+                            if ytm.fold(a["name"]) not in names and not acquire.library_id(db, MB_IDS["artist"] + a["id"])][:room]
+            if p.int("albumOffset", 0) == 0 and (room := p.int("albumCount", 20) - len(albums)) > 0:
+                albums += [self._mb_album(db, g) for g in self._find(db, "album", text)
+                           if ytm.fold(g["title"]) not in titles and not acquire.library_id(db, MB_IDS["album"] + g["id"])][:room]
+        return {"artist": artists, "album": albums, "song": songs}
+
+    def _find(self, db, kind, text) -> list[dict]:
+        try:
+            return acquire.find(db, kind, text)
+        except (OSError, LookupError) as e:
+            log.warning("MusicBrainz search failed: %s", e)
+            return []
+
+    def _musicbrainz(self, get, *args):
+        """get(*args) for a MusicBrainz-only item: an URL, or a function asking MusicBrainz."""
+        try:
+            return musicbrainz.get(get, *args) if isinstance(get, str) else get(*args)
+        except LookupError:
+            raise Fail(NOT_FOUND, "Data not found") from None
+        except OSError as e:
+            raise Fail(0, f"MusicBrainz didn't answer: {e}") from None
+
+    def _wanted(self, db, kind, id) -> dict:
+        """Starred and oasisWanted of an artist or album, as album() and artist() give them."""
+        starred = db.execute("select starred from stat where id = ?", (id,)).fetchone()
+        item = db.execute("select state, error from lidarr_item where kind = ? and ref = ?", (kind, id)).fetchone()
+        state = WANTED_STATES.get(item and item["state"])
+        return {"starred": iso(starred and starred[0]), "oasisWanted": state, "oasisWantedError": item["error"] if state else None}
+
+    def _mb_artist(self, db, a: dict) -> dict:
+        """A MusicBrainz artist (search result or lookup) the library doesn't have."""
+        id = MB_IDS["artist"] + a["id"]
+        return clean({"id": id, "name": a["name"], "albumCount": 0, "musicBrainzId": a["id"], **self._wanted(db, "artist", id)})
+
+    def _mb_album(self, db, g: dict) -> dict:
+        """A MusicBrainz release group: the library's album when it has arrived, else one without songs."""
+        if local := acquire.library_id(db, MB_IDS["album"] + g["id"]):
+            return album(self._one(db, ALBUMS + " where t.album_id = ? group by t.album_id", local))
+        id, credit = MB_IDS["album"] + g["id"], g.get("artist-credit") or []
+        artist_id = MB_IDS["artist"] + credit[0]["artist"]["id"] if credit else None
+        artist_id = artist_id and (acquire.library_id(db, artist_id) or artist_id)
+        year = (g.get("first-release-date") or "")[:4]
+        return clean({"id": id, "name": g["title"], "title": g["title"], "album": g["title"],
+                      "artist": "".join(c["name"] + (c.get("joinphrase") or "") for c in credit) or None, "artistId": artist_id,
+                      "parent": artist_id, "isDir": True, "songCount": 0, "duration": 0, "year": int(year) if year.isdigit() else None,
+                      "releaseTypes": [t for t in [g.get("primary-type"), *(g.get("secondary-types") or [])] if t] or None,
+                      **self._wanted(db, "album", id)})
 
     def _touch(self, db, ids):
         """Streaming tracks are in the library while starred or in a playlist (radios aside)."""
@@ -750,19 +817,24 @@ class Api:
         return {"starred": self._starred(db)}
 
     def _set_starred(self, db, p, value, user):
-        for id in p.all("id") + p.all("albumId") + p.all("artistId"):
+        for id in p.all("id"):
             db.execute("insert into stat(id, starred) values (?, ?) on conflict(id) do update set starred = excluded.starred", (id, value))
         self._touch(db, p.all("id"))
-        # A starred album or artist is one the user wants in the library (see acquire.py, or lidarr.py).
-        for kind, ids in (("album", p.all("albumId")), ("artist", p.all("artistId"))):
-            for id in ids:
-                if value:
-                    db.execute("insert or ignore into wanted values (?, ?, ?)", (user, kind, id))
-                else:
-                    db.execute("delete from wanted where user = ? and kind = ? and ref = ?", (user, kind, id))
-        if self.library and (p.all("albumId") or p.all("artistId")):
-            self.library.wake.set()
+        self._want(db, user, "album", p.all("albumId"), value)
+        self._want(db, user, "artist", p.all("artistId"), value)
         return {}
+
+    def _want(self, db, user, kind, ids, value):
+        """Stars albums or artists, or takes the star back (value None): a starred album or artist is one the user
+        wants in the library (see acquire.py, or lidarr.py). The dashboard's want and follow are stars too."""
+        for id in ids:
+            db.execute("insert into stat(id, starred) values (?, ?) on conflict(id) do update set starred = excluded.starred", (id, value))
+            if value:
+                db.execute("insert or ignore into wanted values (?, ?, ?)", (user, kind, id))
+            else:
+                db.execute("delete from wanted where user = ? and kind = ? and ref = ?", (user, kind, id))
+        if self.library and ids:
+            self.library.wake.set()
 
     def star(self, db, p, user):
         return self._set_starred(db, p, time.time(), user)

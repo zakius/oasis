@@ -7,6 +7,7 @@ import urllib.parse
 import pytest
 
 from conftest import call, make_client
+from test_accounts import sign_in
 from oasis import acquire, musicbrainz
 from oasis.acquire import Acquire
 from oasis.db import connect
@@ -23,7 +24,7 @@ class MusicBrainz:
     official edition), searches by query."""
 
     def __init__(self):
-        self.catalogues, self.songs, self.artists, self.found, self.releases, self.asked = {}, {}, [], [], {}, []
+        self.catalogues, self.songs, self.artists, self.found, self.releases, self.asked, self.info = {}, {}, [], [], {}, [], {}
 
     def __call__(self, url, db=None, keep=0):
         self.asked.append(url)
@@ -46,7 +47,7 @@ class MusicBrainz:
         if path == "release-group":
             return {"release-groups": self.found}
         if path.startswith("artist/"):  # aliases, for the search
-            return {"name": "Beta", "aliases": []}
+            return self.info.get(path.split("/")[1], {"name": "Beta", "aliases": []})
         raise AssertionError(url)
 
 
@@ -331,3 +332,137 @@ def test_downloads_failing_make_the_album_due_again(tmp_path):
     assert made.groups(db) == {"g"}
     made.fail(db, db.execute("select * from download").fetchone(), "dead torrent")
     assert db.execute("select next_search, error from want_album").fetchone()[:] == (None, "download failed: dead torrent") and made.groups(db) == set()
+
+
+KENSHI, STRAY, LEMON, BOOTLEG = "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222", \
+    "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"
+
+
+def kenshi(mb):
+    """An artist only MusicBrainz has, found by an alias in another script."""
+    credit = (KENSHI, "米津玄師")
+    mb.artists = [{"id": KENSHI, "name": "米津玄師", "type": "Person", "country": "JP", "life-span": {"begin": "1991-03-10"},
+                   "disambiguation": "J-pop", "aliases": [{"name": "Kenshi Yonezu"}]}]
+    mb.info[KENSHI] = {**mb.artists[0], "aliases": []}
+    mb.catalogues[KENSHI] = [group(STRAY, "STRAY SHEEP", date="2020-08-05", artist=credit), group(LEMON, "Lemon", "Single", "2018", artist=credit),
+                             group(BOOTLEG, "BOOTLEG", date="2017", artist=credit)]
+    mb.found = mb.catalogues[KENSHI][:1]
+    mb.songs.update({STRAY: ["感電", "Lemon"], LEMON: ["Lemon"], BOOTLEG: ["灰色と青"]})
+
+
+def test_musicbrainz_searches_are_cached_and_their_words_escaped(tmp_path, monkeypatch):
+    sent = []
+
+    def urlopen(request, timeout):
+        sent.append(request.full_url)
+        return io.BytesIO(json.dumps({"artists": [{"id": KENSHI, "name": "米津玄師"}]}).encode())
+    monkeypatch.setattr(musicbrainz.urllib.request, "urlopen", urlopen)
+    db = connect(tmp_path / "oasis.db")
+    assert acquire.find(db, "artist", 'Kenshi "Yonezu":') == acquire.find(db, "artist", "kenshi yonezu") == [{"id": KENSHI, "name": "米津玄師"}]
+    assert sent == [acquire.MB + "artist?query=kenshi%20yonezu&limit=25&fmt=json"]  # once
+    assert acquire.find(db, "album", "?!") == [] and len(sent) == 1
+
+
+def test_the_dashboard_finds_follows_and_wants_any_artist_or_album(client, mb):
+    kenshi(mb)
+    sign_in(client)
+    found = client.get("/music", params={"q": "Kenshi Yonezu"}).text
+    assert f'href="/music/artist/{KENSHI}">米津玄師</a>' in found and "Person · JP · 1991 · J-pop" in found
+    page = client.get(f"/music/artist/{KENSHI}").text
+    assert page.index("STRAY SHEEP") < page.index("<h2>Singles</h2>") < page.index("Lemon") and "Follow</button>" in page
+    page = client.post("/music/want", data={"kind": "artist", "mbid": KENSHI, "on": "1", "next": f"/music/artist/{KENSHI}"}).text
+    assert "Followed" in page and "<b>followed</b>" in page and "Unfollow</button>" in page
+    sync(client)
+    assert wants(client) == {"STRAY SHEEP": ("missing", "followed", "searched, no release found yet"), "Lemon": ("skipped", "followed",
+                             "its songs are on the artist's albums"), "BOOTLEG": ("missing", "followed", None)}
+    page = client.post("/music/want", data={"kind": "album", "mbid": LEMON, "on": "1", "next": f"/music/artist/{KENSHI}"}).text
+    assert "Wanted: it is searched for" in page
+    sync(client)
+    assert wants(client)["Lemon"] == ("missing", "starred", None)  # wanting is starring: never left out
+    db = client.app.state.api._db()
+    assert [tuple(r) for r in db.execute("select user, kind, ref from wanted order by kind")] == [("admin", "album", "al-mb-" + LEMON), ("admin", "artist", "ar-mb-" + KENSHI)]
+    assert db.execute("select starred is not null from stat where id = ?", ("al-mb-" + LEMON,)).fetchone()[0] == 1  # as clients see it
+    found = client.get("/music", params={"q": "stray sheep", "kind": "album"}).text
+    assert f'— <a href="/music/artist/{KENSHI}">米津玄師</a>' in found and "Album · 2020" in found and "<b>wanted</b>" in found
+    client.post("/music/want", data={"kind": "album", "mbid": LEMON, "next": "/music"})
+    client.post("/music/want", data={"kind": "artist", "mbid": KENSHI, "next": "https://elsewhere"})
+    sync(client)
+    assert wants(client) == {} and db.execute("select count(*) from wanted").fetchone()[0] == 0
+    assert "MusicBrainz has no such artist" in client.get("/music/artist/nope").text
+
+
+def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up(client, mb, monkeypatch):
+    kenshi(mb)
+    sign_in(client)
+    api, now = client.app.state.api, time.time()
+    client.post("/music/want", data={"kind": "artist", "mbid": KENSHI, "on": "1"})
+    client.post("/music/want", data={"kind": "album", "mbid": LEMON, "on": "1"})
+    sync(client)
+    db = api._db()
+    db.execute("update want_album set error = 'download failed: dead torrent' where rg = ?", (LEMON,))
+    db.execute("update want_album set searched = ?, next_search = ? where rg = ?", (now, now + 3600, STRAY))
+    db.execute("insert into download(hash, album_id, album_mbid, title, state, created, updated) values ('h', 0, ?, 'B', 'downloading', ?, ?)",
+               (BOOTLEG, now, now))
+    downloads = Downloads(api._db, None, None, "dl")
+    downloads.client, downloads.seen["h"] = type("TorBox", (), {"delete_torrent": lambda self, id: None})(), (0.42, now)
+    api.downloads = downloads
+    api.library.downloads.active.add(BOOTLEG)
+    sync(client)
+    page = client.get("/music/wanted").text
+    assert page.index("BOOTLEG") < page.index("Lemon") < page.index("STRAY SHEEP")  # downloading, starred, followed
+    assert "downloading 42%" in page and "download failed: dead torrent" in page and "not found yet, searched 0 min ago" in page
+
+    assert "searched next" in client.post(f"/music/wanted/{STRAY}/search").text
+    monkeypatch.setattr(api.library, "search", lambda db, row: setattr(api.library, "searched", row["rg"]))
+    api.library.last_search = 0  # a search gap later
+    sync(client)
+    assert api.library.searched == STRAY  # before the starred album
+
+    assert "Blocked that release" in client.post(f"/music/wanted/{BOOTLEG}/block").text
+    assert db.execute("select state from download").fetchone()[0] == "failed" and db.execute("select 1 from release_block where hash = 'h'").fetchone()
+    assert "Nothing is downloading" in client.post(f"/music/wanted/{BOOTLEG}/block").text
+    api.library.downloads.active.clear()
+
+    assert "Gave up on 米津玄師 – BOOTLEG" in client.post(f"/music/wanted/{BOOTLEG}/give-up").text
+    client.post(f"/music/wanted/{LEMON}/give-up")
+    db.execute("update lidarr_item set catalogued = 0")
+    sync(client)
+    sync(client)
+    assert {t: w[:2] for t, w in wants(client).items()} == {"STRAY SHEEP": ("missing", "followed"), "Lemon": ("skipped", "followed"),
+                                                            "BOOTLEG": ("skipped", "followed")}
+    assert wants(client)["BOOTLEG"][2] == "given up" and db.execute("select count(*) from wanted where kind = 'album'").fetchone()[0] == 0
+    client.post("/music/want", data={"kind": "album", "mbid": BOOTLEG, "on": "1"})
+    sync(client)
+    assert wants(client)["BOOTLEG"][:2] == ("missing", "starred")  # wanted again after all
+
+
+def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_that_keep_their_ids_once_here(client, mb):
+    kenshi(mb)
+    mb.artists.append({"id": "mb-beta", "name": "Beta"})  # in the library: left out
+    client.app.state.api._db().execute("insert into mb_artist(mbid, artist_id, name) values ('mb-beta', ?, 'Beta')", (artist_id(client, "Beta"),))
+    found = call(client, "search3", query="Kenshi Yonezu")["searchResult3"]
+    assert [a["id"] for a in found["artist"]] == ["ar-mb-" + KENSHI] and [a["id"] for a in found["album"]] == ["al-mb-" + STRAY]
+    assert found["album"][0]["artistId"] == "ar-mb-" + KENSHI and found["album"][0]["year"] == 2020
+    asked = len(mb.asked)
+    assert call(client, "search3", query="Ke")["searchResult3"]["artist"] == [] and len(mb.asked) == asked  # too short to ask
+
+    artist = call(client, "getArtist", id="ar-mb-" + KENSHI)["artist"]
+    assert artist["name"] == "米津玄師" and [a["name"] for a in artist["album"]] == ["BOOTLEG", "Lemon", "STRAY SHEEP"]
+    call(client, "star", albumId="al-mb-" + STRAY)
+    call(client, "star", artistId="ar-mb-" + KENSHI)
+    sync(client)
+    album = call(client, "getAlbum", id="al-mb-" + STRAY)["album"]
+    assert album["song"] == [] and album["oasisWanted"] == "wanted" and album["starred"]
+    assert wants(client)["STRAY SHEEP"][:2] == ("missing", "starred") and wants(client)["BOOTLEG"][1] == "followed"
+
+    db = client.app.state.api._db()  # it arrives
+    db.execute("update track set mb_release_group = ? where album = 'First'", (STRAY,))
+    beta = artist_id(client, "Beta")
+    db.execute("insert into mb_artist(mbid, artist_id, name) values (?, ?, '米津玄師')", (KENSHI, beta))
+    sync(client)
+    local = album_of(client, "First")["id"]
+    assert [r[0] for r in db.execute("select ref from wanted order by kind")] == [local, beta] and wants(client)["STRAY SHEEP"][0] == "have"
+    assert call(client, "getAlbum", id="al-mb-" + STRAY)["album"]["id"] == local and call(client, "getArtist", id="ar-mb-" + KENSHI)["artist"]["id"] == beta
+    assert album_of(client, "First")["starred"] and call(client, "search3", query="Kenshi Yonezu")["searchResult3"]["artist"] == []
+    call(client, "unstar", albumId="al-mb-" + STRAY)
+    assert db.execute("select count(*) from wanted where kind = 'album'").fetchone()[0] == 0

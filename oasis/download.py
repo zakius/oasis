@@ -409,6 +409,16 @@ class Downloads:
         db.execute("update want_album set next_search = null, error = ? where rg = ?", (f"download failed: {why}", row["album_mbid"]))
         log.info("download %s failed: %s", row["title"], why)
 
+    def block(self, db, rg: str) -> bool:
+        """Blocks the release TorBox is downloading for the album, so its next search picks another; a bundle's albums
+        all search again. False when none is (files already being fetched or imported are let finish)."""
+        rows = db.execute("select * from download where state in ('added', 'downloading') and (album_mbid = ? or hash in "
+                          "(select hash from download_target where rg = ?))", (rg, rg)).fetchall()
+        for row in rows:
+            self.fail(db, row, "blocked by a user")
+            db.execute("update want_album set next_search = null where rg in (select rg from download_target where hash = ?)", (row["hash"],))
+        return bool(rows)
+
     def delete(self, row):
         try:
             self.torbox().delete_torrent(row["torbox_id"])
