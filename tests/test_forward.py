@@ -71,6 +71,15 @@ def test_unknown_track_scrobble_fails(setup):
     assert call(client, "scrobble", id="tr-missing")["error"]["code"] == 70
 
 
+def test_scrobble_batch_skips_unknown_ids_without_half_commits(setup):
+    client, services, db = setup
+    one, two = song_id(client, "One"), song_id(client, "Two")
+    assert call(client, "scrobble", id=[one, "tr-missing", two], time=[1000, 2000, 3000])["status"] == "ok"
+    counts = dict(db.execute("select id, play_count from stat where id in (?, ?)", (one, two)).fetchall())
+    assert counts == {one: 1, two: 1}
+    assert db.execute("select played from play where track_id = ?", (two,)).fetchone()[0] == 3
+
+
 def test_youtube_history_matches_local_tracks_once(setup):
     client, _, db = setup
     id = song_id(client, "One")

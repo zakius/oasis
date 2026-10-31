@@ -183,9 +183,16 @@ def test_stream_moves_to_its_new_local_copy(library, tmp_path, ytm):
         try:
             scan(db, [library])
             local = next(s for s in call(client, "search3", query="Brand New")["searchResult3"]["song"] if s.get("path"))
-            assert call(client, "getSong", id=stream)["error"]["code"] == 70
             entry = call(client, "getPlaylist", id=playlist["id"])["playlist"]["entry"][0]
             assert entry["id"] == local["id"] and entry["starred"] and entry["playCount"] == 1 and entry["youtubeId"] == "vidNew"
+            # The old stream id keeps working for clients that still hold it.
+            assert call(client, "getSong", id=stream)["song"]["id"] == local["id"]
+            call(client, "scrobble", id=stream)
+            call(client, "unstar", id=stream)
+            assert call(client, "getSong", id=local["id"])["song"]["playCount"] == 2
+            assert "starred" not in call(client, "getSong", id=local["id"])["song"]
+            response = client.get("/rest/stream", params={"u": "admin", "p": "secret", "id": stream})
+            assert response.status_code == 200 and response.content == extra.read_bytes()
         finally:
             extra.unlink()
             scan(db, [library])

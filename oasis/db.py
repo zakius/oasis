@@ -43,6 +43,7 @@ create table if not exists user(
     lastfm_session text, lastfm_name text,
     listenbrainz_token text
 );
+create table if not exists moved(old_id text primary key, new_id text not null);  -- stream ids now local
 create table if not exists play(user text not null, track_id text not null, played real not null);
 create index if not exists play_track on play(track_id);
 create table if not exists session(token text primary key, user text not null, expires real not null);
@@ -123,4 +124,7 @@ def adopt_local_copies(db):
                    "played = max(coalesce(stat.played, 0), coalesce(excluded.played, 0))", (local, stream))
         for table, column in (("stat", "id"), ("lyrics", "track_id"), ("track", "id")):
             db.execute(f"delete from {table} where {column} = ?", (stream,))
+        # Clients keep the old id in queues and caches; it keeps working as an alias.
+        db.execute("update moved set new_id = ? where new_id = ?", (local, stream))
+        db.execute("insert or replace into moved values (?, ?)", (stream, local))
     return len(pairs)

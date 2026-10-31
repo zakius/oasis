@@ -86,6 +86,9 @@ def to_xml(tag: str, value: dict) -> Element:
     return elem
 
 
+SONG_ID_PARAMS = ("id", "songId", "songIdToAdd")
+
+
 class Params:
     def __init__(self, request: Request, body: bytes):
         self.multi = [*request.query_params.multi_items(), *parse_qsl(body.decode())]
@@ -106,6 +109,13 @@ class Params:
         if value is None:
             raise Fail(MISSING, f"Required parameter '{key}' is missing")
         return value
+
+    def follow_moves(self, db):
+        """Song ids a client still holds for streams that became local files point at the local track."""
+        ids = {v for k, v in self.multi if k in SONG_ID_PARAMS and v.startswith("yt-")}
+        if ids:
+            moved = dict(db.execute(f"select old_id, new_id from moved where old_id in ({','.join('?' * len(ids))})", list(ids)))
+            self.multi = [(k, moved.get(v, v) if k in SONG_ID_PARAMS else v) for k, v in self.multi]
 
 
 SONG_COLUMNS = """t.*, s.starred, s.rating, s.play_count, s.played"""
@@ -544,15 +554,20 @@ class Api:
             for id in p.all("id")[:1]:
                 self.forwarder.now_playing(db, user, forward.listen_for(self._one(db, "select * from track where id = ?", id), time.time()))
             return {}
+        # Every id is checked before anything is written, so a retried batch can't count plays twice.
         times = p.all("time")
-        for i, id in enumerate(p.all("id")):
-            self._one(db, "select 1 from track where id = ?", id)
-            played = int(times[i]) / 1000 if i < len(times) else time.time()
+        plays = [(id, int(times[i]) / 1000 if i < len(times) else time.time()) for i, id in enumerate(p.all("id"))]
+        known = [(id, played) for id, played in plays if db.execute("select 1 from track where id = ?", (id,)).fetchone()]
+        if plays and not known:
+            raise Fail(NOT_FOUND, "Data not found")
+        for id, _ in set(plays) - set(known):
+            log.info("scrobble for unknown song %s skipped", id)
+        for id, played in known:
             db.execute("insert into stat(id, play_count, played) values (?, 1, ?) on conflict(id) do update "
                        "set play_count = play_count + 1, played = excluded.played", (id, played))
             db.execute("insert into play values (?, ?, ?)", (user, id, played))
             self.forwarder.enqueue(db, user, id, played)
-        self.recommender.played(db, user, p.all("id"))
+        self.recommender.played(db, user, [id for id, _ in known])
         return {}
 
     def _lyrics(self, db, r) -> lyrics.Lyrics | None:
@@ -904,6 +919,7 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
             db = api._db()
             try:
                 user = api._authenticate(db, p)
+                p.follow_moves(db)
                 result = handler(api, db, p, user)
                 return result if isinstance(result, Response) else respond(fmt, result)
             except Fail as e:
