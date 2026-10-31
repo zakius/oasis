@@ -407,7 +407,15 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     filtered = client.get("/music/wanted", params={"type": "Single", "q": "stray"}).text
     assert "STRAY SHEEP" not in filtered or "Lemon" not in filtered
     library = client.get("/music/library").text
-    assert "米津玄師" in library and "Lemon" in library and "wanted" in library and "downloading" in library
+    assert "米津玄師" in library and f"/music/library/artist/{KENSHI}" in library
+    artist = client.get(f"/music/library/artist/{KENSHI}").text
+    assert "Lemon" in artist and "downloading" in artist and f"/music/cover/al-mb-{LEMON}" in artist
+    song_id = db.execute("select id from track where source = 'local' limit 1").fetchone()[0]
+    album_id = db.execute("select album_id from track where id = ?", (song_id,)).fetchone()[0]
+    title = db.execute("select title from track where id = ?", (song_id,)).fetchone()[0]
+    assert title in client.get(f"/music/library/album/{album_id}").text
+    song = client.get(f"/music/library/song/{song_id}").text
+    assert "Format" in song and "File" in song
 
     assert "searched next" in client.post(f"/music/wanted/{STRAY}/search").text
     monkeypatch.setattr(api.library, "search", lambda db, row: setattr(api.library, "searched", row["rg"]))
