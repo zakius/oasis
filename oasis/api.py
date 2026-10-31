@@ -301,6 +301,9 @@ class Api:
         self.ytm = ytm or (YouTubeMusic(config.ytm_cache) if config.ytm_cache else None)
         db = self._db()
         accounts.sync_config_users(db, config.users)
+        if not config.lastfm_key:  # oasis.toml wins over the dashboard
+            settings = dict(db.execute("select key, value from setting where key in ('lastfm_key', 'lastfm_secret')").fetchall())
+            config.lastfm_key, config.lastfm_secret = settings.get("lastfm_key"), settings.get("lastfm_secret")
         artists.reidentify(db)
         artists.configure(db, config.artists)
         db.close()
@@ -317,6 +320,13 @@ class Api:
 
     def _db(self):
         return connect(self.config.database)
+
+    def _set_lastfm_app(self, db, key: str, secret: str):
+        """Checks a Last.fm API key and secret with a signed call, then keeps and uses them."""
+        LastFm(key, secret, None).call({"method": "auth.getToken"})
+        db.executemany("insert or replace into setting values (?, ?)", [("lastfm_key", key), ("lastfm_secret", secret)])
+        self.config.lastfm_key, self.config.lastfm_secret = key, secret
+        self.recommender.lastfm = LastFm(key, secret, None)
 
     def _start_scan(self):
         if not self.scan_lock.acquire(blocking=False):

@@ -53,7 +53,23 @@ def test_web_sign_in_and_link_services(client):
     assert "Wrong" not in client.post("/account/youtube", data={"headers": "nothing"}).text
     assert "no YouTube sign-in cookie" in client.post("/account/youtube", data={"headers": "nothing"}).text
     assert "unlinked" in client.post("/account/youtube/unlink").text
-    assert "Needs <code>[lastfm] api_key</code>" in client.get("/account").text
+    assert "last.fm/api/account/create" in client.get("/account").text
+
+
+def test_an_admin_connects_oasis_to_lastfm_on_the_dashboard(client, monkeypatch):
+    from oasis.forward import LastFm, Rejected
+
+    def call(self, params):
+        if self.secret != "right":
+            raise Rejected("Last.fm: Invalid method signature supplied")
+        return {"token": "t"}
+    monkeypatch.setattr(LastFm, "call", call)
+    sign_in(client)
+    assert "Invalid method signature" in client.post("/account/lastfm/app", data={"key": "k", "secret": "wrong"}).text
+    assert "Sign in with Last.fm" in client.post("/account/lastfm/app", data={"key": "k", "secret": "right"}).text
+    assert client.app.state.api.recommender.lastfm.api_key == "k"
+    db = client.app.state.api._db()
+    assert dict(db.execute("select key, value from setting").fetchall()) == {"lastfm_key": "k", "lastfm_secret": "right"}
 
 
 def test_admin_manages_users_who_then_use_subsonic(client):

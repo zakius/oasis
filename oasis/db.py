@@ -47,6 +47,7 @@ create table if not exists artist_link(  -- separate artists close to each other
     source text not null, primary key(artist_id, other_id, kind)
 );
 create index if not exists artist_link_other on artist_link(other_id);
+create table if not exists setting(key text primary key, value text);  -- settings made on the dashboard
 create table if not exists stat(
     id text primary key,            -- any track, album or artist id
     starred real, rating int, play_count int not null default 0, played real

@@ -20,8 +20,8 @@ enabled = false   # search YouTube Music and stream from it
 cache = "cache"   # downloaded audio; tracks you star or add to a playlist download right away
 
 [lastfm]
-# App credentials from https://www.last.fm/api/account/create. Each user then signs in to Last.fm on the account page;
-# the key also adds Last.fm's similar tracks to radios.
+# App credentials from https://www.last.fm/api/account/create, or entered by an admin on the account page. Each user
+# then signs in to Last.fm on the account page; the key also adds Last.fm's similar tracks to radios.
 api_key = ""
 secret = ""
 

@@ -14,6 +14,13 @@ from .forward import LastFm
 
 COOKIE = "oasis_session"
 
+LASTFM_APP_STEPS = """<p>First connect oasis itself to Last.fm (once, for every user):</p><ol>
+<li>Signed in to Last.fm, open <a href="https://www.last.fm/api/account/create" target="_blank">last.fm/api/account/create</a>.</li>
+<li>Fill in any application name, for example <i>oasis</i>; leave the callback URL empty.</li>
+<li>Copy the <b>API key</b> and <b>Shared secret</b> it shows here.</li></ol>
+<form method="post" action="/account/lastfm/app"><label>API key<input type="text" name="key"></label>
+<label>Shared secret<input type="password" name="secret"></label><button>Connect</button></form>"""
+
 STYLE = """
 body { font: 16px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; color: #1d1d1f; background: #fafafa; }
 @media (prefers-color-scheme: dark) { body { color: #e8e8e8; background: #161616; } section { background: #202020 !important; } }
@@ -100,7 +107,7 @@ def routes(api) -> list[Route]:
                    if user["ytm_auth"] else YOUTUBE_STEPS)
         if not api.ytm:
             youtube = '<p class="muted">YouTube Music is off on this server (<code>[ytmusic] enabled</code>).</p>'
-        lastfm = ('<p class="muted">Needs <code>[lastfm] api_key</code> and <code>secret</code> on the server.</p>'
+        lastfm = ((LASTFM_APP_STEPS if user["admin"] else '<p class="muted">An admin needs to connect oasis to Last.fm first.</p>')
                   if not (api.config.lastfm_key and api.config.lastfm_secret) else
                   f'<p class="ok">Linked as <b>{escape(user["lastfm_name"] or "")}</b>.</p><form method="post" '
                   f'action="/account/lastfm/unlink"><button>Unlink</button></form>' if user["lastfm_session"] else
@@ -150,6 +157,14 @@ def routes(api) -> list[Route]:
             return back("/account", error=f"Last.fm sign-in failed: {e}")
         accounts.set_field(db, user["name"], lastfm_session=key, lastfm_name=name)
         return back("/account", message=f"Last.fm linked as {name}.")
+
+    def lastfm_app(db, request, user, form):
+        key, secret = form.get("key", "").strip(), form.get("secret", "").strip()
+        try:
+            api._set_lastfm_app(db, key, secret)
+        except Exception as e:
+            return back("/account", error=f"Last.fm didn't accept these: {e}")
+        return back("/account", message="oasis is connected to Last.fm. Now sign in with your Last.fm account.")
 
     def unlink_lastfm(db, request, user, form):
         accounts.set_field(db, user["name"], lastfm_session=None, lastfm_name=None)
@@ -218,6 +233,7 @@ def routes(api) -> list[Route]:
         Route("/account/youtube/unlink", signed_in(unlink_youtube), methods=["POST"]),
         Route("/account/lastfm", signed_in(lastfm_start)),
         Route("/account/lastfm/callback", signed_in(lastfm_callback), name="lastfm_callback"),
+        Route("/account/lastfm/app", signed_in(lastfm_app, admin=True), methods=["POST"]),
         Route("/account/lastfm/unlink", signed_in(unlink_lastfm), methods=["POST"]),
         Route("/account/listenbrainz", signed_in(link_listenbrainz), methods=["POST"]),
         Route("/account/password", signed_in(change_password), methods=["POST"]),
