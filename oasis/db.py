@@ -50,6 +50,13 @@ create table if not exists lidarr_item(
     mbid text, error text, updated real not null,
     primary key(kind, ref)
 );
+create table if not exists ytm_artist(  -- an artist's YouTube Music page, kept for a day
+    artist_id text primary key, name text, description text, image text, songs text, fetched real not null
+);
+create table if not exists ytm_release(  -- albums and singles from YouTube Music artist pages
+    album_id text primary key, artist_id text not null, browse_id text not null,
+    title text, year int, type text, cover text
+);
 create table if not exists moved(old_id text primary key, new_id text not null);  -- stream ids now local
 create table if not exists play(user text not null, track_id text not null, played real not null);
 create index if not exists play_track on play(track_id);

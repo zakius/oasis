@@ -25,7 +25,9 @@ Each play a client reports (`scrobble`) goes to the services its user linked. oa
 Recommendations mix several methods, taking turns so library songs come throughout: YouTube Music's radio for the song, Last.fm's similar tracks and the library songs of Last.fm's similar artists (with `[lastfm] api_key`), the artist's other library songs, songs played within an hour of it, and library songs of the same genre, closest in year first. Songs that aren't on YouTube Music still get a full list from the library. Local copies stand in for streaming tracks everywhere, other uploads of a song already known fold into it, and a stream that gains a local copy is moved onto it (stars, plays and playlist entries) at the next scan.
 
 - Clients' "instant mix" or "similar songs" (`getSimilarSongs2`) returns YouTube Music's radio for the song, album or artist.
-- `getTopSongs` lists an artist's most played library tracks, then their YouTube Music songs.
+- `getArtist` lists the library's albums by the artist, then the rest of their YouTube Music discography (albums, singles and EPs, newest first, with `releaseTypes`); opening one fetches its tracks. The artist's YouTube Music page is fetched on first open and kept for a day. These albums don't join the library lists.
+- `getTopSongs` lists an artist's most played library tracks, then their YouTube Music top songs.
+- `getArtistInfo2` adds YouTube Music's description and photo, with Last.fm's biography taking over when there is one.
 - `getArtistInfo2` returns the Last.fm biography and the similar artists that are in the library.
 - Opening an album known only from streaming search or radio fetches the whole album.
 - Radio playlists grow while you listen and keep 30 unplayed tracks queued. Each user gets a "Radio" playlist that follows everything they play, mixing YouTube Music radio and Last.fm picks for the last few songs. Any playlist whose name starts with "Radio" grows the same way from the songs played in it, so a playlist named "Radio" with one song is a station for that song. Radio tracks don't join the library.

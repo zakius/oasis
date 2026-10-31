@@ -159,6 +159,30 @@ class YouTubeMusic:
             return Lyrics(source, [(line.start_time, line.text) for line in found["lyrics"]], True)
         return Lyrics(source, [(None, line) for line in found["lyrics"].splitlines()], False)
 
+    def artist(self, name: str) -> dict | None:
+        """The YouTube Music artist of that name: description, photo, every album and single (with paged lists
+        followed), and where its top songs are. None when YouTube Music has no artist by that name."""
+        with self.api_lock:
+            found = next((a for a in self.api.search(name, filter="artists", limit=5) if fold(a.get("artist") or "") == fold(name)), None)
+            if not found:
+                return None
+            artist = self.api.get_artist(found["browseId"])
+            releases = []
+            for kind in ("albums", "singles"):
+                shelf = artist.get(kind) or {}
+                items = self.api.get_artist_albums(shelf["browseId"], shelf.get("params"), limit=None) \
+                    if shelf.get("browseId") and shelf.get("params") else shelf.get("results", [])
+                releases += [{"browse_id": r["browseId"], "title": r["title"], "year": int(r["year"]) if str(r.get("year") or "").isdigit() else None,
+                              "type": "album" if kind == "albums" else (r.get("type") or "single").lower(), "cover": big_cover(r.get("thumbnails"))}
+                             for r in items if r.get("browseId")]
+        return {"name": artist.get("name") or name, "description": artist.get("description"), "image": big_cover(artist.get("thumbnails")),
+                "releases": list({r["browse_id"]: r for r in releases}.values()), "songs": (artist.get("songs") or {}).get("browseId")}
+
+    def playlist_rows(self, playlist_id: str, limit: int) -> list[dict]:
+        with self.api_lock:
+            tracks = self.api.get_playlist(playlist_id, limit=limit)["tracks"]
+        return [row for t in tracks if (row := track_row(t))]
+
     def album(self, browse_id: str) -> list[dict]:
         with self.api_lock:
             album = self.api.get_album(browse_id)

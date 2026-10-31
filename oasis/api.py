@@ -21,7 +21,7 @@ from starlette.routing import Route
 
 from . import accounts, cover, forward, lyrics, scan, web, ytm
 from .config import Config
-from .db import connect, remember
+from .db import connect, make_id, remember
 from .forward import Forwarder, LastFm
 from .lidarr import Library, Lidarr
 from .recommend import Recommender, set_entries
@@ -375,7 +375,33 @@ class Api:
 
     def getArtist(self, db, p, user):
         r = self._one(db, ARTISTS + " where t.artist_id = ? group by t.artist_id", p.need("id"))
-        return {"artist": {**artist(r), "album": self._artist_albums(db, r["id"])}}
+        albums = self._artist_albums(db, r["id"])
+        known = {a["id"] for a in albums}
+        self._artist_page(db, r["id"], r["name"])
+        # The rest of the artist's discography on YouTube Music, newest first; opening one fetches its tracks.
+        albums += [clean({"id": x["album_id"], "name": x["title"], "title": x["title"], "album": x["title"], "artist": r["name"],
+                          "artistId": r["id"], "parent": r["id"], "isDir": True, "coverArt": x["album_id"] if x["cover"] else None,
+                          "year": x["year"], "releaseTypes": [x["type"].title()] if x["type"] else None})
+                   for x in db.execute("select * from ytm_release where artist_id = ? order by coalesce(year, 0) desc, title", (r["id"],))
+                   if x["album_id"] not in known]
+        return {"artist": {**artist(r), "albumCount": len(albums), "album": albums}}
+
+    def _artist_page(self, db, artist_id, name):
+        """Fetches the artist's YouTube Music page into ytm_artist and ytm_release, at most once a day."""
+        page = db.execute("select fetched from ytm_artist where artist_id = ?", (artist_id,)).fetchone()
+        if not self.ytm or (page and page["fetched"] > time.time() - 86400):
+            return
+        try:
+            found = self.ytm.artist(name)
+        except Exception as e:
+            log.info("YouTube Music artist %s unavailable: %s", name, e)
+            return
+        db.execute("insert or replace into ytm_artist values (?, ?, ?, ?, ?, ?)", (artist_id, *(
+            (found["name"], found["description"], found["image"], found["songs"]) if found else (name, None, None, None)), time.time()))
+        for x in (found or {}).get("releases", []):
+            # Ids follow the oasis artist, so these albums sit with the local ones and merge with an album of the same title.
+            db.execute("insert or replace into ytm_release values (?, ?, ?, ?, ?, ?, ?)",
+                       (make_id("al-", name, x["title"]), artist_id, x["browse_id"], x["title"], x["year"], x["type"], x["cover"]))
 
     def getAlbum(self, db, p, user):
         self._complete_album(db, p.need("id"))
@@ -383,11 +409,13 @@ class Api:
         return {"album": {**album(r), "song": self._album_songs(db, r["id"])}}
 
     def _complete_album(self, db, album_id):
-        """Fetches the rest of an album that is only known from streaming tracks seen in search or radio."""
+        """Fetches the rest of an album that is only known from streaming tracks seen in search or radio, or only
+        from an artist's YouTube Music page."""
         if not self.ytm or album_id in self.completed:
             return
         sources = db.execute("select source, ytm_album from track where album_id = ?", (album_id,)).fetchall()
-        browse_id = next((r["ytm_album"] for r in sources if r["ytm_album"]), None)
+        release = db.execute("select * from ytm_release where album_id = ?", (album_id,)).fetchone()
+        browse_id = next((r["ytm_album"] for r in sources if r["ytm_album"]), None) or (release and release["browse_id"])
         if not browse_id or any(r["source"] == "local" for r in sources):
             return
         try:
@@ -395,8 +423,10 @@ class Api:
         except Exception as e:
             log.info("album %s unavailable: %s", browse_id, e)
             return
-        for row in rows:
-            remember(db, row)
+        ids = [remember(db, row) for row in rows]
+        if release:  # file them under the artist page's album, whatever spelling YouTube credits the tracks with
+            db.executemany("update track set album_id = ?, artist_id = ? where id = ? and source = 'ytm'",
+                           [(album_id, release["artist_id"], id) for id in ids])
         self.completed.add(album_id)
 
     def getSong(self, db, p, user):
@@ -630,19 +660,23 @@ class Api:
 
     def _artist_info(self, db, p):
         r = self._one(db, ARTISTS + " where t.artist_id = ? group by t.artist_id", p.need("id"))
+        self._artist_page(db, r["id"], r["name"])
+        page = db.execute("select description, image from ytm_artist where artist_id = ?", (r["id"],)).fetchone()
+        youtube = clean({"biography": page["description"], "smallImageUrl": page["image"], "mediumImageUrl": page["image"],
+                         "largeImageUrl": page["image"]}) if page else {}
         if not self.recommender.lastfm:
-            return {}
+            return youtube
         try:
             info = self.recommender.lastfm.artist_info(r["name"])
         except Exception as e:
             log.info("Last.fm artist info failed: %s", e)
-            return {}
+            return youtube
         names = [a["name"] for a in info.get("similar", {}).get("artist", [])][:p.int("count", 20)]
         similar = [artist(a) for name in names for a in db.execute(
             ARTISTS + " where t.library = 1 and t.album_artist = ? collate nocase group by t.artist_id", (name,))]
         bio = info.get("bio", {}).get("summary", "")
-        return clean({"biography": bio.split("<a href")[0].strip() or None, "lastFmUrl": info.get("url"),
-                      "musicBrainzId": info.get("mbid") or None, "similarArtist": similar})
+        return {**youtube, **clean({"biography": bio.split("<a href")[0].strip() or None, "lastFmUrl": info.get("url"),
+                                    "musicBrainzId": info.get("mbid") or None, "similarArtist": similar})}
 
     def getArtistInfo2(self, db, p, user):
         return {"artistInfo2": self._artist_info(db, p)}
@@ -679,7 +713,13 @@ class Api:
                                         "t.album_artist = ? collate nocase order by coalesce(s.play_count, 0) desc limit ?", (name, count))]
         if self.ytm and len(ids) < count:
             try:
-                rows = [r for r in self.ytm.search(name, count) if name.casefold() in (r["album_artist"].casefold(), r["artist"].casefold())]
+                # The artist's own top songs list on YouTube Music; a search when the page has none.
+                owner = db.execute("select artist_id from track where album_artist = ? collate nocase limit 1", (name,)).fetchone()
+                if owner:
+                    self._artist_page(db, owner[0], name)
+                page = owner and db.execute("select songs from ytm_artist where artist_id = ?", (owner[0],)).fetchone()
+                rows = self.ytm.playlist_rows(page["songs"], count) if page and page["songs"] else \
+                    [r for r in self.ytm.search(name, count) if name.casefold() in (r["album_artist"].casefold(), r["artist"].casefold())]
                 ids += [remember(db, r) for r in rows]
             except Exception as e:
                 log.warning("YouTube Music top songs failed: %s", e)
@@ -812,8 +852,9 @@ class Api:
             r = self._one(db, "select null as ref, cover from playlist where id = ? and cover is not null", id[3:])
         else:
             column = {"ar-": "artist_id", "al-": "album_id"}.get(id[:3], "id")
-            r = self._one(db, f"select ref, cover from track where {column} = ? and cover is not null "
-                             "order by source != 'local', cover = 'embedded', disc_no, track_no limit 1", id)
+            r = db.execute(f"select ref, cover from track where {column} = ? and cover is not null "
+                           "order by source != 'local', cover = 'embedded', disc_no, track_no limit 1", (id,)).fetchone() or \
+                self._one(db, "select null as ref, cover from ytm_release where album_id = ? and cover is not null", id)
         try:
             image = cover.load(r["ref"], r["cover"])
         except OSError as e:

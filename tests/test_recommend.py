@@ -196,3 +196,27 @@ def test_stream_moves_to_its_new_local_copy(library, tmp_path, ytm):
         finally:
             extra.unlink()
             scan(db, [library])
+
+
+def test_artist_page_lists_the_whole_youtube_discography(client, ytm, monkeypatch):
+    beta = next(a for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"] if a["name"] == "Beta")
+    pages = []
+    def artist(name):
+        pages.append(name)
+        return {"name": "Beta", "description": "A band.", "image": "https://img/beta", "songs": "PLtop", "releases": [
+            {"browse_id": "MPREb_first", "title": "First", "year": 2001, "type": "album", "cover": "https://img/first"},
+            {"browse_id": "MPREb_new", "title": "Newer Album", "year": 2020, "type": "album", "cover": "https://img/new"},
+            {"browse_id": "MPREb_single", "title": "A Single", "year": 2021, "type": "single", "cover": None}]}
+    monkeypatch.setattr(ytm, "artist", artist, raising=False)
+    monkeypatch.setattr(ytm, "playlist_rows", lambda playlist_id, limit: [track_row(item("top1", "Hit", artist="Beta"))], raising=False)
+    albums = call(client, "getArtist", id=beta["id"])["artist"]["album"]
+    assert [a["name"] for a in albums] == ["First", "A Single", "Newer Album"]  # the local album once, then newest first
+    assert albums[1]["releaseTypes"] == ["Single"] and albums[2]["year"] == 2020
+    call(client, "getArtist", id=beta["id"])
+    assert pages == ["Beta"]  # fetched once a day
+    newer = albums[2]
+    album = call(client, "getAlbum", id=newer["id"])["album"]
+    assert titles(album["song"]) == ["Track 1", "Track 2", "Track 3"] and album["artistId"] == beta["id"]
+    assert [s["title"] for s in call(client, "getTopSongs", artist="Beta")["topSongs"]["song"]][-1] == "Hit"
+    info = call(client, "getArtistInfo2", id=beta["id"])["artistInfo2"]
+    assert info["largeImageUrl"] == "https://img/beta"
