@@ -18,6 +18,7 @@ RETRY_ERROR = 300       # seconds before retrying after Lidarr or MusicBrainz er
 SEARCH_GAP = 60         # seconds between album searches, so a burst of stars doesn't trip the debrid service's rate limit
 RESEARCH = 6 * 3600     # seconds before searching again for an album that got nothing
 GRAB_WAIT = 600         # seconds after a search before "nothing grabbed" counts
+GRAB_TRIES = 5          # accepted releases tried in turn when grabbing fails
 MAX_ACTIVE = 8          # running downloads at which no new search starts: TorBox Pro has 10 slots, two stay free for anime
 UPGRADE_AGAIN = 7 * 86400  # seconds between searches for a lossless copy of an album downloaded lossy
 CATALOGUE_TYPES = {"Album", "EP"}  # what of a followed artist's back catalogue gets downloaded; singles repeat album tracks
@@ -98,15 +99,24 @@ class Lidarr:
         names (most Japanese releases: '[2022.09.07] Creepy Nuts 3rdアルバム「アンサンブル・プレイ」[FLAC]'), grabs one
         whose name has the artist and the album title; returns its hash, since Lidarr won't import it on its own."""
         releases = self.releases(album_id)
-        if accepted := [r for r in releases if not r.get("rejections")]:
-            self.grab(accepted[0])  # Lidarr lists best first
-            return None
+        # Lidarr lists best first. A release whose torrent the download client can't fetch fails to grab: the next one.
+        for release in [r for r in releases if not r.get("rejections")][:GRAB_TRIES]:
+            if self.try_grab(release):
+                return None
         album = self.album_by_id(album_id)
-        if pick := unparsed_match(releases, album["artist"]["artistName"], album["title"]):
-            self.grab(pick, albumId=album_id, artistId=album["artistId"])
+        if (pick := unparsed_match(releases, album["artist"]["artistName"], album["title"])) \
+                and self.try_grab(pick, albumId=album_id, artistId=album["artistId"]):
             log.info("grabbed %s for %s - %s, which Lidarr can't read", pick["title"], album["artist"]["artistName"], album["title"])
             return (pick.get("infoHash") or "").lower() or None
         return None
+
+    def try_grab(self, release: dict, **ids) -> bool:
+        try:
+            self.grab(release, **ids)
+            return True
+        except OSError as e:
+            log.info("couldn't grab %s: %s", release["title"], e)
+            return False
 
     def tracks(self, album: dict) -> list[dict]:
         """The tracks of the album's smallest edition: bonus discs of live versions don't make it a repackage."""
@@ -347,7 +357,13 @@ class Library:
             self.search_catalogue(db, queued_albums)
 
     def search(self, db, album_id: int):
-        if hash := self.lidarr.search_album(album_id):  # the doctor imports it into this album
+        """Never raises: a search that fails still counts, so the next search moves on to another album."""
+        try:
+            hash = self.lidarr.search_album(album_id)
+        except OSError as e:
+            log.warning("search for Lidarr album %d failed: %s", album_id, e)
+            return
+        if hash:  # the doctor imports it into this album
             db.execute("insert or replace into lidarr_rescue values (?, ?, ?)", (hash, album_id, time.time()))
 
     def search_catalogue(self, db, queued_albums: set):

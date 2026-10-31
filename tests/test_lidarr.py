@@ -256,3 +256,22 @@ def test_search_grabs_lidarrs_pick_or_an_unparsed_match_and_remembers_the_latter
     assert calls[-1][2] == {"guid": "Creepy Nuts 3rdアルバム「アンサンブル・プレイ」[FLAC]", "indexerId": 1, "albumId": 5, "artistId": 9}
     grabbed = results["release?albumId=5"][0]["infoHash"].lower()
     assert [tuple(r) for r in db.execute("select hash, album_id from lidarr_rescue")] == [(grabbed, 5)]
+
+
+def test_a_release_that_fails_to_grab_gives_way_to_the_next_and_a_failed_search_still_counts(client):
+    lidarr = Lidarr("http://lidarr", "key")
+    grabs = []
+
+    def call(method, path, body=None):
+        if method == "POST":
+            grabs.append(body["guid"])
+            if body["guid"] == "dead":
+                raise OSError("Lidarr POST release: 500 Download client failed to add torrent by url")
+            return None
+        if path == "release?albumId=6":
+            return [release("dead", rejections=[]), release("alive", rejections=[])]
+        raise OSError("Lidarr GET release: 500")
+    lidarr.call = call
+    assert lidarr.search_album(6) is None and grabs == ["dead", "alive"]
+    library = lidarr_module.Library(client.app.state.api._db, lidarr)
+    library.search(client.app.state.api._db(), 7)  # the search itself fails: logged, not raised
