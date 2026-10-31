@@ -80,6 +80,9 @@ create table if not exists lidarr_item(
     retry_at real, updated real not null,
     primary key(kind, ref)
 );
+create table if not exists lidarr_rescue(  -- releases oasis grabbed that Lidarr can't tie to their album by name
+    hash text primary key, album_id int not null, grabbed real not null
+);
 create table if not exists audio_pair(  -- dedupe verdicts, valid while both files are unchanged
     a text not null, b text not null, a_mtime real not null, b_mtime real not null, level int not null, primary key(a, b)
 );

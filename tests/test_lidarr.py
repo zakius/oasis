@@ -223,3 +223,36 @@ def test_a_followed_artists_singles_wait_behind_its_albums(client, lidarr):
         library.last_search -= lidarr_module.SEARCH_GAP
         sync(client)
     assert [c for c in lidarr.calls if c[0] == "search"] == [("search", 71), ("search", 70)]
+
+
+def release(title, rejections=("Unable to parse release",), size=400e6, seeders=5, quality="Unknown", **extra):
+    return {"title": title, "rejections": list(rejections), "size": size, "seeders": seeders, "guid": title, "indexerId": 1,
+            "infoHash": f"HASH-{len(title)}", "quality": {"quality": {"name": quality}}, **extra}
+
+
+def test_releases_lidarr_cant_read_are_matched_by_artist_and_album_title():
+    flac = release("[마신] [2022.09.07] Creepy Nuts 3rdアルバム「アンサンブル・プレイ」[FLAC 48kHz/24bit]", seeders=2)
+    mp3 = release("[마신] [2022.09.07] Creepy Nuts 3rdアルバム「アンサンブル・プレイ」[MP3 320K]", seeders=40)
+    single = release("[2025 07 05] TVアニメ「よふかしのうた Season 2」EDテーマ「眠れ」／Creepy Nuts [FLAC]")
+    rejected = release("Creepy Nuts - アンサンブル・プレイ [FLAC]", rejections=["Not enough seeders: 0"])
+    bundle = release("Creepy Nuts Discography アンサンブル・プレイ クリープ・ショー [FLAC]")
+    assert lidarr_module.unparsed_match([mp3, single, rejected, bundle, flac], "Creepy Nuts", "アンサンブル・プレイ") is flac
+    assert lidarr_module.unparsed_match([single], "Creepy Nuts", "アンサンブル・プレイ") is None
+    assert lidarr_module.unparsed_match([release("SawanoHiroyuki[nZk] V [FLAC]")], "SawanoHiroyuki[nZk]", "V") is None  # too short to tell
+
+
+def test_search_grabs_lidarrs_pick_or_an_unparsed_match_and_remembers_the_latter(client):
+    calls = []
+    lidarr = Lidarr("http://lidarr", "key")
+    results = {"release?albumId=5": [release("Creepy Nuts 3rdアルバム「アンサンブル・プレイ」[FLAC]")],
+               "album/5": {"title": "アンサンブル・プレイ", "artistId": 9, "artist": {"artistName": "Creepy Nuts"}},
+               "release?albumId=6": [release("Rammstein - Mutter (2001) [FLAC]", rejections=[]), release("Rammstein - Mutter [MP3]", rejections=[])]}
+    lidarr.call = lambda method, path, body=None: calls.append((method, path, body)) or results.get(path)
+    assert lidarr.search_album(6) is None and calls[-1][2] == {"guid": "Rammstein - Mutter (2001) [FLAC]", "indexerId": 1}
+    library = client.app.state.api.library or lidarr_module.Library(client.app.state.api._db, lidarr)
+    library.lidarr = lidarr
+    db = client.app.state.api._db()
+    library.search(db, 5)
+    assert calls[-1][2] == {"guid": "Creepy Nuts 3rdアルバム「アンサンブル・プレイ」[FLAC]", "indexerId": 1, "albumId": 5, "artistId": 9}
+    grabbed = results["release?albumId=5"][0]["infoHash"].lower()
+    assert [tuple(r) for r in db.execute("select hash, album_id from lidarr_rescue")] == [(grabbed, 5)]

@@ -93,8 +93,20 @@ class Lidarr:
         if album_ids:
             self.call("PUT", "album/monitor", {"albumIds": album_ids, "monitored": monitored})
 
-    def search_album(self, album_id: int):
-        self.call("POST", "command", {"name": "AlbumSearch", "albumIds": [album_id]})
+    def search_album(self, album_id: int) -> str | None:
+        """Searches and grabs the best release Lidarr accepts. When it accepts none only because it can't read the
+        names (most Japanese releases: '[2022.09.07] Creepy Nuts 3rdアルバム「アンサンブル・プレイ」[FLAC]'), grabs one
+        whose name has the artist and the album title; returns its hash, since Lidarr won't import it on its own."""
+        releases = self.call("GET", f"release?albumId={album_id}") or []
+        if accepted := [r for r in releases if not r.get("rejections")]:
+            self.call("POST", "release", {"guid": accepted[0]["guid"], "indexerId": accepted[0]["indexerId"]})  # Lidarr lists best first
+            return None
+        album = self.call("GET", f"album/{album_id}")
+        if pick := unparsed_match(releases, album["artist"]["artistName"], album["title"]):
+            self.call("POST", "release", {"guid": pick["guid"], "indexerId": pick["indexerId"], "albumId": album_id, "artistId": album["artistId"]})
+            log.info("grabbed %s for %s - %s, which Lidarr can't read", pick["title"], album["artist"]["artistName"], album["title"])
+            return (pick.get("infoHash") or "").lower() or None
+        return None
 
     def tracks(self, album: dict) -> list[dict]:
         """The tracks of the album's smallest edition: bonus discs of live versions don't make it a repackage."""
@@ -134,6 +146,24 @@ class Lidarr:
             if kind == "grabbed":
                 return f"grabbed {event.get('sourceTitle')}, then it left the queue"
         return "searched, nothing grabbed yet: no release found, or the download client refused it"
+
+
+UNPARSED = "Unable to parse"
+BUNDLES = re.compile(r"discograph|collection|complete|box ?set|anthology|全集|ディスコグラフィ", re.I)
+
+
+def unparsed_match(releases: list[dict], artist: str, title: str) -> dict | None:
+    """Of the releases Lidarr rejected only for names it can't read, the best whose name has the artist and the album
+    title: lossless first, then the most seeders. Titles too short to tell apart ('V', '1') are left alone, and so
+    are discographies, which hold the album but aren't it."""
+    artist, title = fold(artist), fold(title)
+    if len(artist) < 2 or len(title) < 4 or title.isdigit():
+        return None
+    found = [r for r in releases if r.get("rejections") and all(x.startswith(UNPARSED) for x in r["rejections"])
+             and artist in fold(r["title"]) and title in fold(r["title"]) and not BUNDLES.search(r["title"])
+             and 20e6 < (r.get("size") or 0) < 5e9]
+    lossless = lambda r: "flac" in r["title"].lower() or "FLAC" in r["quality"]["quality"]["name"]
+    return max(found, key=lambda r: (lossless(r), r.get("seeders") or 0), default=None)
 
 
 def artist_names(credit: str) -> list[str]:
@@ -273,12 +303,16 @@ class Library:
                           "and (searched is null or searched < ?) and exists (select 1 from wanted w where w.kind = 'album' "
                           "and w.ref = lidarr_item.ref) order by searched is not null, searched, rowid limit 1", (time.time() - RESEARCH,)).fetchone()
         if item is not None and item["lidarr_id"] not in queued_albums:
-            self.lidarr.search_album(item["lidarr_id"])
+            self.search(db, item["lidarr_id"])
             self.last_search = time.time()
             db.execute("update lidarr_item set searched = ?, error = 'searching' where kind = ? and ref = ?",
                        (self.last_search, item["kind"], item["ref"]))
         elif item is None:
             self.search_catalogue(db, queued_albums)
+
+    def search(self, db, album_id: int):
+        if hash := self.lidarr.search_album(album_id):  # lidarr-doctor imports it into this album
+            db.execute("insert or replace into lidarr_rescue values (?, ?, ?)", (hash, album_id, time.time()))
 
     def search_catalogue(self, db, queued_albums: set):
         followed = {r[0] for r in db.execute("select lidarr_id from lidarr_item where kind = 'artist' and lidarr_id is not null "
@@ -293,7 +327,7 @@ class Library:
             return
         # Never searched first, then albums and EPs before singles; stable, so Lidarr's newest-first order otherwise.
         album = min(due, key=lambda a: (a["id"] in searched, a.get("albumType") == "Single"))
-        self.lidarr.search_album(album["id"])
+        self.search(db, album["id"])
         self.last_search = time.time()
         db.execute("insert or replace into catalogue_search values (?, ?)", (album["id"], self.last_search))
 
