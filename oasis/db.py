@@ -43,6 +43,8 @@ create table if not exists user(
     lastfm_session text, lastfm_name text,
     listenbrainz_token text
 );
+create table if not exists play(user text not null, track_id text not null, played real not null);
+create index if not exists play_track on play(track_id);
 create table if not exists session(token text primary key, user text not null, expires real not null);
 create table if not exists lyrics(track_id text primary key, found text, fetched real not null);
 create table if not exists playlist_entry(
@@ -103,3 +105,22 @@ def remember(db, row: dict) -> str:
     db.execute(f"insert into track({', '.join(row)}) values ({', '.join('?' * len(row))}) "
                f"on conflict(id) do update set {updates}", list(row.values()))
     return row["id"]
+
+
+def adopt_local_copies(db):
+    """Points streams that now have a local copy (same artist and title, length within 5 s) at the local file: playlist
+    entries, stars and plays move over and the stream entry goes, so nothing keeps streaming what's on disk."""
+    pairs = db.execute("select y.id stream, y.ref video, l.id local from track y join track l on l.source = 'local' "
+                       "and l.artist_id = y.artist_id and l.title = y.title collate nocase "
+                       "and abs(coalesce(l.duration, 0) - coalesce(y.duration, 0)) <= 5 where y.source = 'ytm'").fetchall()
+    for stream, video, local in pairs:
+        db.execute("update track set ytm_id = ? where id = ? and coalesce(ytm_id, '') = ''", (video, local))
+        for table in ("playlist_entry", "play", "outbox"):
+            db.execute(f"update {table} set track_id = ? where track_id = ?", (local, stream))
+        db.execute("insert into stat(id, starred, rating, play_count, played) select ?, starred, rating, play_count, played "
+                   "from stat where id = ? on conflict(id) do update set starred = coalesce(stat.starred, excluded.starred), "
+                   "rating = coalesce(stat.rating, excluded.rating), play_count = stat.play_count + excluded.play_count, "
+                   "played = max(coalesce(stat.played, 0), coalesce(excluded.played, 0))", (local, stream))
+        for table, column in (("stat", "id"), ("lyrics", "track_id"), ("track", "id")):
+            db.execute(f"delete from {table} where {column} = ?", (stream,))
+    return len(pairs)

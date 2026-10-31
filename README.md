@@ -22,7 +22,7 @@ Users in `oasis.toml` are admins, and their passwords are set there. Admins add 
 
 Each play a client reports (`scrobble`) goes to the services its user linked. oasis keeps each play until the service takes it, so plays made offline or during an outage arrive later. Plays of local tracks reach YouTube Music history too: oasis finds the same song there (same title, length within 5 seconds) and remembers the match. Clients should not scrobble to Last.fm themselves, or plays count twice.
 
-Recommendations come from YouTube Music radio, plus Last.fm's similar tracks when `[lastfm] api_key` is set. Local copies stand in for streaming tracks everywhere, and other uploads of a song already known fold into it.
+Recommendations mix several methods, taking turns so library songs come throughout: YouTube Music's radio for the song, Last.fm's similar tracks and the library songs of Last.fm's similar artists (with `[lastfm] api_key`), the artist's other library songs, songs played within an hour of it, and library songs of the same genre, closest in year first. Songs that aren't on YouTube Music still get a full list from the library. Local copies stand in for streaming tracks everywhere, other uploads of a song already known fold into it, and a stream that gains a local copy is moved onto it (stars, plays and playlist entries) at the next scan.
 
 - Clients' "instant mix" or "similar songs" (`getSimilarSongs2`) returns YouTube Music's radio for the song, album or artist.
 - `getTopSongs` lists an artist's most played library tracks, then their YouTube Music songs.

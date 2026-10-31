@@ -6,7 +6,7 @@ from pathlib import Path
 
 import mutagen
 
-from .db import make_id
+from .db import adopt_local_copies, make_id
 
 log = logging.getLogger(__name__)
 
@@ -97,5 +97,6 @@ def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
                     changed += 1
     gone = [ref for ref in known if ref not in seen]
     db.executemany("delete from track where ref = ?", [(ref,) for ref in gone])
-    log.info("scan: %d updated, %d removed", changed, len(gone))
+    adopted = adopt_local_copies(db) if changed else 0
+    log.info("scan: %d updated, %d removed, %d streams now local", changed, len(gone), adopted)
     return changed + len(gone)

@@ -550,6 +550,7 @@ class Api:
             played = int(times[i]) / 1000 if i < len(times) else time.time()
             db.execute("insert into stat(id, play_count, played) values (?, 1, ?) on conflict(id) do update "
                        "set play_count = play_count + 1, played = excluded.played", (id, played))
+            db.execute("insert into play values (?, ?, ?)", (user, id, played))
             self.forwarder.enqueue(db, user, id, played)
         self.recommender.played(db, user, p.all("id"))
         return {}

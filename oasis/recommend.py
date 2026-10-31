@@ -1,4 +1,4 @@
-"""Song recommendations from YouTube Music radio and Last.fm, and radio playlists that grow as they are played."""
+"""Song recommendations from YouTube Music, Last.fm and the library itself, and radio playlists that grow as they are played."""
 import logging
 import threading
 import time
@@ -18,19 +18,69 @@ class Recommender:
     def __init__(self, connect, ytm, lastfm):
         self.connect, self.ytm, self.lastfm = connect, ytm, lastfm
         self.wake = threading.Event()
+        self.similar_artists: dict[str, list[str]] = {}  # Last.fm's answers by artist, kept while running
 
     def similar(self, db, seed, count: int, deep: bool = False) -> list[str]:
-        """Track ids like the seed track, local copies standing in for streaming ones. deep adds Last.fm's picks."""
-        sources = []
-        if self.ytm:
-            video_id = seed["ytm_id"] or self.ytm.match(seed)
-            if video_id:
-                db.execute("update track set ytm_id = ? where id = ?", (video_id, seed["id"]))
-                sources.append([remember(db, row) for row in self.ytm.radio(video_id, count)])
-        if deep and self.lastfm:
-            sources.append(self.from_lastfm(db, seed, min(count, 15)))
-        picks = [id for id in chain.from_iterable(zip_longest(*sources)) if id and id != seed["id"]]
+        """Track ids like the seed track, from every method at hand, taking turns so local songs come throughout.
+        YouTube Music's radio and Last.fm need the network; the library methods always give something."""
+        sources = [
+            ("YouTube Music radio", lambda: self.from_youtube(db, seed, count)),
+            ("Last.fm similar tracks", lambda: self.from_lastfm(db, seed, min(count, 15 if deep else 10)) if self.lastfm else []),
+            ("Last.fm similar artists", lambda: self.from_similar_artists(db, seed, count) if self.lastfm else []),
+            ("same artist", lambda: self.from_artist(db, seed, count)),
+            ("played together", lambda: self.from_plays(db, seed, count)),
+            ("same genre", lambda: self.from_tags(db, seed, count)),
+        ]
+        found = []
+        for name, source in sources:
+            try:
+                found.append(source())
+            except Exception as e:
+                log.info("%s failed: %s", name, e)
+        picks = [id for id in chain.from_iterable(zip_longest(*found)) if id and id != seed["id"]]
         return list(dict.fromkeys(picks))[:count]
+
+    def from_youtube(self, db, seed, count: int) -> list[str]:
+        if not self.ytm:
+            return []
+        video_id = seed["ytm_id"] if seed["ytm_id"] is not None else self.ytm.match(seed)
+        if seed["ytm_id"] is None:
+            db.execute("update track set ytm_id = ? where id = ?", (video_id or "", seed["id"]))
+        return [remember(db, row) for row in self.ytm.radio(video_id, count)] if video_id else []
+
+    def from_similar_artists(self, db, seed, count: int) -> list[str]:
+        """Library songs by the artists Last.fm calls similar, a few from each in turn."""
+        artist = seed["album_artist"] if seed["source"] == "ytm" else seed["artist"]
+        if artist not in self.similar_artists:
+            info = self.lastfm.artist_info(artist)
+            self.similar_artists[artist] = [a["name"] for a in info.get("similar", {}).get("artist", [])]
+        per_artist = [[r[0] for r in db.execute(
+            "select id from track where library = 1 and (album_artist = ? collate nocase or artist = ? collate nocase) "
+            "order by random() limit 3", (name, name))] for name in self.similar_artists[artist]]
+        return [id for id in chain.from_iterable(zip_longest(*per_artist)) if id][:count]
+
+    def from_artist(self, db, seed, count: int) -> list[str]:
+        """The artist's other library songs, most played first."""
+        return [r[0] for r in db.execute(
+            "select t.id from track t left join stat s on s.id = t.id where t.library = 1 and t.id != ? "
+            "and (t.artist_id = ? or t.artist = ? collate nocase) order by coalesce(s.play_count, 0) desc, random() limit ?",
+            (seed["id"], seed["artist_id"], seed["artist"], count))]
+
+    def from_plays(self, db, seed, count: int) -> list[str]:
+        """Songs played within an hour of the seed, by the same listener, most often first."""
+        return [r[0] for r in db.execute(
+            "select other.track_id, count(*) n from play mine join play other on other.user = mine.user "
+            "and other.track_id != mine.track_id and abs(other.played - mine.played) <= 3600 "
+            "join track t on t.id = other.track_id where mine.track_id = ? group by other.track_id order by n desc limit ?",
+            (seed["id"], count))]
+
+    def from_tags(self, db, seed, count: int) -> list[str]:
+        """Library songs of the same genre by other artists, closest in year first. Era alone says too little."""
+        if not seed["genre"]:
+            return []
+        return [r[0] for r in db.execute(
+            "select id from track where library = 1 and genre = ? collate nocase and artist_id != ? "
+            "order by abs(coalesce(year, 0) - ?), random() limit ?", (seed["genre"], seed["artist_id"], seed["year"] or 0, count))]
 
     def from_lastfm(self, db, seed, count: int) -> list[str]:
         artist = seed["album_artist"] if seed["source"] == "ytm" else seed["artist"]

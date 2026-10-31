@@ -32,6 +32,12 @@ class FakeYtm:
         local_copy = track_row(item("two-yt", "Two", artist="Beta", album="First", duration=2))
         return [local_copy] + [track_row(item(f"{video_id}-{i}", f"{video_id} song {i}")) for i in range(limit - 1)]
 
+    def cached(self, video_id):
+        return None
+
+    def fetch(self, video_id):
+        pass
+
     def album(self, browse_id):
         return [track_row(item(f"alb{i}", f"Track {i}")) | {"track_no": i} for i in (1, 2, 3)]
 
@@ -70,15 +76,29 @@ def titles(songs):
     return [s["title"] for s in songs]
 
 
-def test_similar_songs_use_radio_with_local_copies(client, ytm):
-    songs = call(client, "getSimilarSongs2", id=song_id(client, "One"), count=4)["similarSongs2"]["song"]
+def test_similar_songs_mix_radio_with_library_methods(client, ytm):
+    songs = call(client, "getSimilarSongs2", id=song_id(client, "One"), count=12)["similarSongs2"]["song"]
     assert ytm.radios == ["one-yt"]
-    assert titles(songs) == ["Two", "one-yt song 0", "one-yt song 1", "one-yt song 2"]
-    assert songs[0]["id"] == song_id(client, "Two")  # the local copy, not the stream
+    assert songs[0]["title"] == "Two" and songs[0]["id"] == song_id(client, "Two")  # radio's first pick, as the local copy
+    titles_ = titles(songs)
+    assert "one-yt song 0" in titles_ and "Song B" in titles_  # YouTube radio and Last.fm's library pick both come
+    assert len(songs) == len(set(s["id"] for s in songs)) and song_id(client, "One") not in [s["id"] for s in songs]
 
 
-def test_similar_songs_without_youtube_match_is_empty(client):
-    assert call(client, "getSimilarSongs2", id=song_id(client, "Song A"))["similarSongs2"] == {"song": []}
+def test_song_missing_on_youtube_still_gets_library_songs(client, ytm):
+    songs = titles(call(client, "getSimilarSongs2", id=song_id(client, "Song A"))["similarSongs2"]["song"])
+    assert ytm.radios == []
+    assert "Song B" in songs                     # same artist
+    assert {"One", "Two"} & set(songs)           # Last.fm's similar artist Beta
+
+
+def test_played_together_comes_from_history(api, client):
+    a, b, c = song_id(client, "Song A"), song_id(client, "One"), song_id(client, "untagged")
+    for id, t in ((a, 1000), (c, 1100), (a, 90000), (c, 90100), (b, 200000)):
+        call(client, "scrobble", id=id, time=t * 1000)
+    db = api._db()
+    seed = db.execute("select * from track where id = ?", (a,)).fetchone()
+    assert api.recommender.from_plays(db, seed, 10) == [c]
 
 
 def test_lastfm_picks_map_to_library_or_youtube(api, client):
@@ -115,8 +135,9 @@ def test_radio_playlist_grows_as_it_is_played(api, client):
     db = api._db()
     api.recommender.top_up(db, db.execute("select * from playlist where id = ?", (radio["id"],)).fetchone())
     first = entries(client, radio["id"])
-    # YouTube Music radio and Last.fm picks take turns.
-    assert first[:5] == ["One", "Two", "Song B", "one-yt song 0", "Tune"] and len(first) == 30
+    # YouTube Music radio, Last.fm and the library's own methods take turns.
+    assert first[0] == "One" and len(first) == 30 and len(set(first)) == 30
+    assert {"Two", "one-yt song 0", "Song B", "Tune"} <= set(first)
     assert "one-yt song 1" not in {s["title"] for s in call(client, "search3", query="")["searchResult3"]["song"]}
 
     played = call(client, "getPlaylist", id=radio["id"])["playlist"]["entry"][20]
@@ -131,7 +152,8 @@ def test_first_play_creates_a_radio_that_follows_listening(api, client):
     radio = next(p for p in call(client, "getPlaylists")["playlists"]["playlist"] if p["name"] == "Radio")
     db = api._db()
     api.recommender.top_up(db, db.execute("select * from playlist where id = ?", (radio["id"],)).fetchone())
-    assert entries(client, radio["id"])[:3] == ["Two", "Song B", "one-yt song 0"]
+    queued = entries(client, radio["id"])
+    assert queued[0] == "Two" and {"Song B", "one-yt song 0"} <= set(queued) and "One" not in queued
 
 
 def test_other_uploads_of_a_song_merge_and_albums_place_them(api, client, ytm):
@@ -144,3 +166,26 @@ def test_other_uploads_of_a_song_merge_and_albums_place_them(api, client, ytm):
     album = call(client, "getAlbum", id=remote["albumId"])["album"]
     assert titles(album["song"]) == ["Track 1", "Track 2", "Track 3", "Gamma Hit"]
     assert next(s for s in album["song"] if s["title"] == "Track 2")["id"] == first
+
+
+def test_stream_moves_to_its_new_local_copy(library, tmp_path, ytm):
+    from conftest import make_track
+    from oasis.db import connect, remember
+    from oasis.scan import scan
+    with make_client(library, tmp_path / "oasis.db", ytm) as client:
+        db = connect(tmp_path / "oasis.db")
+        stream = remember(db, track_row(item("vidNew", "Brand New", artist="Beta", album="First", duration=2)))
+        call(client, "star", id=stream)
+        playlist = call(client, "createPlaylist", name="Mine", songId=stream)["playlist"]
+        call(client, "scrobble", id=stream, time=5_000_000)
+        extra = library / "Beta/First/09.flac"
+        make_track(extra, title="Brand New", artist="Beta", album="First", tracknumber="9")
+        try:
+            scan(db, [library])
+            local = next(s for s in call(client, "search3", query="Brand New")["searchResult3"]["song"] if s.get("path"))
+            assert call(client, "getSong", id=stream)["error"]["code"] == 70
+            entry = call(client, "getPlaylist", id=playlist["id"])["playlist"]["entry"][0]
+            assert entry["id"] == local["id"] and entry["starred"] and entry["playCount"] == 1 and entry["youtubeId"] == "vidNew"
+        finally:
+            extra.unlink()
+            scan(db, [library])
