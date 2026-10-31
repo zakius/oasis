@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 
 RETRY_NO_MATCH = 1800   # seconds before looking an unmatched name up again
 RETRY_ERROR = 300       # seconds before retrying after Lidarr or MusicBrainz errors
-SEARCH_GAP = 180        # seconds between album searches, so a burst of stars doesn't trip the debrid service's rate limit
+SEARCH_GAP = 60         # seconds between album searches, so a burst of stars doesn't trip the debrid service's rate limit
 RESEARCH = 6 * 3600     # seconds before searching again for an album that got nothing
 GRAB_WAIT = 600         # seconds after a search before "nothing grabbed" counts
 MAX_ACTIVE = 8          # running downloads at which no new search starts: TorBox Pro has 10 slots, two stay free for anime
