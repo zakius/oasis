@@ -5,7 +5,7 @@ bands with their members. Links lead the similar artists clients show and feed r
 groups win over MusicBrainz."""
 from itertools import combinations
 
-from .db import artist_id, make_id, move_stat
+from .db import artist_id, make_id, move_stat, resolve
 
 PERSONA, RELATED, MEMBER = "persona", "related", "member"
 CLOSENESS = (PERSONA, RELATED, MEMBER)
@@ -39,6 +39,7 @@ def link(db, a: str, b: str, kind: str, source: str):
 def configure(db, settings: dict):
     """Applies the user's [artists] settings: merge (lists whose later names become the first), separate (names never
     merged into another artist) and related (groups of separate artists that belong together)."""
+    before = dict(db.execute("select id, artist_id from artist_alias where id != artist_id").fetchall())
     db.execute("delete from artist_alias where source = 'config'")
     db.execute("delete from artist_link where source = 'config'")
     for name in settings.get("separate", []):
@@ -49,6 +50,11 @@ def configure(db, settings: dict):
     for group in settings.get("related", []):
         for a, b in combinations([artist_id(db, name) for name in group], 2):
             link(db, a, b, RELATED, "config")
+    for id, target in before.items():  # a merge taken back or overridden: that name's songs and credits leave the artist
+        if (now := resolve(db, id)) != target:
+            for table, name, own in (("track", "album_artist", ""), ("credit", "artist_name", " and mbid is null")):
+                rows = db.execute(f"select rowid, {name} from {table} where artist_id = ?{own}", (target,)).fetchall()
+                db.executemany(f"update {table} set artist_id = ? where rowid = ?", [(now, r) for r, n in rows if make_id("ar-", n) == id])
     merge(db)
 
 

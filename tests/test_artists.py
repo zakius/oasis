@@ -95,3 +95,19 @@ def test_the_users_merges_and_splits_win(tmp_path):
         page = call(client, "getArtist", id=make_id("ar-", "Beta"))["artist"]
         assert [a["name"] for a in page["album"]] == ["One", "Two"]
         assert call(client, "getArtist", id=make_id("ar-", "Kenshi Yonezu"))["artist"]["id"] == make_id("ar-", "Kenshi Yonezu")
+
+
+def test_artist_settings_on_the_dashboard_apply_at_once_and_merges_can_be_taken_back(tmp_path):
+    with client_for(tmp_path, related=[["Mori Calliope", "DEMONDICE"]]) as client:
+        client.post("/login", data={"name": "admin", "password": "secret"})
+        page = client.get("/admin/artists").text
+        assert "Mori Calliope; DEMONDICE" in page  # oasis.toml's groups until saved here
+        saved = client.post("/admin/artists", data={"related": "Gawr Gura; Senzawa\nlonely", "merge": "Beta; Beta Band", "separate": ""}).text
+        assert "Saved" in saved and "Gawr Gura; Senzawa" in saved and "lonely" not in saved
+        assert "similarArtist" not in call(client, "getArtistInfo2", id=make_id("ar-", "DEMONDICE"))["artistInfo2"]
+        assert len(call(client, "getArtist", id=make_id("ar-", "Beta"))["artist"]["album"]) == 2
+
+        client.post("/admin/artists", data={"related": "", "merge": "", "separate": ""})
+        assert [a["name"] for a in call(client, "getArtist", id=make_id("ar-", "Beta"))["artist"]["album"]] == ["One"]
+        assert [a["name"] for a in call(client, "getArtist", id=make_id("ar-", "Beta Band"))["artist"]["album"]] == ["Two"]
+        assert "Status" in client.get("/account").text and "artists in the library" in client.get("/account").text

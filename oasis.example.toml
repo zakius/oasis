@@ -9,7 +9,8 @@ dedupe = false    # store each audio stream once: copies of a song in several ed
                   # each keeping its own tags. Needs the library writable and on btrfs or XFS.
 
 [artists]
-# One MusicBrainz artist is one artist whatever the spelling; these settle what MusicBrainz can't.
+# One MusicBrainz artist is one artist whatever the spelling; these settle what MusicBrainz can't. Admins edit them on
+# the dashboard (Artist settings); these are used until saved there.
 # merge = [["米津玄師", "Kenshi Yonezu"]]              # the later names become the first
 # separate = ["Phoenix"]                              # never merged into an artist that goes by it too
 # related = [["Mori Calliope", "DEMONDICE"]]          # separate artists that belong together: shown first among

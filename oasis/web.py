@@ -117,9 +117,9 @@ def routes(api) -> list[Route]:
                         '<form method="post" action="/account/listenbrainz"><label>User token from '
                         '<a href="https://listenbrainz.org/settings/" target="_blank">listenbrainz.org/settings</a>'
                         '<input type="text" name="token"></label><button>Link</button></form>')
-        admin = '<p><a href="/admin">Manage users</a></p>' if user["admin"] else ""
+        admin = '<p><a href="/admin">Manage users</a> · <a href="/admin/artists">Artist settings</a></p>' if user["admin"] else ""
         body = (f'<div>Signed in as <b>{escape(user["name"])}</b>. <form class="inline" method="post" action="/logout">'
-                f'<button>Sign out</button></form></div>{admin}'
+                f'<button>Sign out</button></form></div>{admin}{status(db)}'
                 f'<section><h2>YouTube Music</h2>{youtube}</section>'
                 f'<section><h2>Last.fm</h2><p class="muted">Your plays are scrobbled here. Turn off scrobbling in your apps, '
                 f'or plays count twice.</p>{lastfm}</section>'
@@ -192,6 +192,57 @@ def routes(api) -> list[Route]:
         accounts.set_field(db, user["name"], password=form["password"])
         return back("/account", message="Password changed. Update it in your apps.")
 
+    def status(db) -> str:
+        """What oasis is busy with: downloads, the MusicBrainz fill and dedupe."""
+        count = lambda sql: db.execute(sql).fetchone()[0]
+        songs, albums, artists = db.execute("select count(*), count(distinct album_id), count(distinct artist_id) from track "
+                                            "where source = 'local'").fetchone()
+        lines = [f"{songs} songs, {albums} albums, {artists} artists in the library."]
+        if api.library:
+            try:
+                lidarr = api.library.lidarr
+                queue = lidarr.call("GET", "queue?pageSize=50&includeAlbum=true&includeArtist=true")["records"]
+                missing = lidarr.call("GET", "wanted/missing?pageSize=1&monitored=true")["totalRecords"]
+                downloading = "".join(
+                    f'<li>{escape(q.get("artist", {}).get("artistName", ""))} – {escape(q.get("album", {}).get("title", q["title"]))} '
+                    f'<span class="muted">{100 - round(100 * q["sizeleft"] / q["size"]) if q.get("size") else 0}%</span></li>' for q in queue)
+                lines.append(f'Downloading {len(queue)}{":" if queue else "."}<ul>{downloading}</ul>' if queue else "Nothing downloading.")
+                lines.append(f'{missing} more albums Lidarr is looking for.')
+            except Exception as e:
+                lines.append(f'<span class="error">Lidarr didn\'t answer: {escape(str(e))}</span>')
+        filled = count("select count(*) from track where source = 'local' and credits_at is not null")
+        known = count("select count(*) from track where source = 'local' and mb_release is not null")
+        artists_done = count("select count(*) from mb_artist where fetched is not null and mbid in (select mbid from credit)")
+        artists_all = count("select count(*) from mb_artist where mbid in (select mbid from credit)")
+        lines.append(f'MusicBrainz: credits for {filled} of {known} songs, names and links for {artists_done} of {artists_all} artists.')
+        shared = db.execute("select count(*), coalesce(sum(t.size), 0) from audio_shared a join track t on t.ref = a.path").fetchone()
+        if api.config.dedupe:
+            lines.append(f'Dedupe: {shared[0]} copies share another file\'s audio, saving {shared[1] / 1e9:.1f} GB.')
+        return '<section><h2>Status</h2>' + "".join(f'<p>{line}</p>' for line in lines) + '</section>'
+
+    def artist_settings(db, request, user, form):
+        q, settings = request.query_params, api._artist_settings(db)
+        lines = lambda key: escape("\n".join("; ".join(group) for group in settings.get(key, [])))
+        body = ('<p><a href="/account">Back to your account</a></p><form method="post" action="/admin/artists">'
+                '<section><h2>Related artists</h2><p class="muted">One group per line, names separated by <code>;</code>. '
+                'Separate artists that belong together: they come first among each other\'s similar artists and mix into each '
+                f'other\'s radios. Clients only ever see them as related.</p><textarea name="related">{lines("related")}</textarea></section>'
+                '<section><h2>Same artist</h2><p class="muted">One artist per line: the name to show, then its other names, '
+                'separated by <code>;</code>. For names MusicBrainz doesn\'t know belong together.</p>'
+                f'<textarea name="merge">{lines("merge")}</textarea></section>'
+                '<section><h2>Keep separate</h2><p class="muted">One name per line. MusicBrainz lists it as another name of '
+                'some artist, but here it\'s someone else.</p>'
+                f'<textarea name="separate">{escape(chr(10).join(settings.get("separate", [])))}</textarea></section>'
+                '<button>Save</button></form>')
+        return page("Artist settings", body, q.get("message", ""), q.get("error", ""))
+
+    def save_artist_settings(db, request, user, form):
+        groups = lambda key: [names for line in form.get(key, "").splitlines() if len(names := [n.strip() for n in line.split(";") if n.strip()]) > 1]
+        settings = {"related": groups("related"), "merge": groups("merge"),
+                    "separate": [n.strip() for n in form.get("separate", "").splitlines() if n.strip()]}
+        api._set_artist_settings(db, settings)
+        return back("/admin/artists", message="Saved. Artist pages, similar artists and radios use it now.")
+
     def admin(db, request, user, form):
         q = request.query_params
         rows = "".join(
@@ -227,6 +278,8 @@ def routes(api) -> list[Route]:
     return [
         Route("/", home),
         Route("/login", login, methods=["GET", "POST"]),
+        Route("/admin/artists", signed_in(artist_settings, admin=True)),
+        Route("/admin/artists", signed_in(save_artist_settings, admin=True), methods=["POST"]),
         Route("/logout", signed_in(logout), methods=["POST"]),
         Route("/account", signed_in(account)),
         Route("/account/youtube", signed_in(link_youtube), methods=["POST"]),

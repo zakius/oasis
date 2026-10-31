@@ -305,7 +305,7 @@ class Api:
             settings = dict(db.execute("select key, value from setting where key in ('lastfm_key', 'lastfm_secret')").fetchall())
             config.lastfm_key, config.lastfm_secret = settings.get("lastfm_key"), settings.get("lastfm_secret")
         artists.reidentify(db)
-        artists.configure(db, config.artists)
+        artists.configure(db, self._artist_settings(db))
         db.close()
         services_for = (lambda db, user: services) if services is not None else \
             (lambda db, user: forward.user_services(config, self.ytm, accounts.get(db, user)))
@@ -320,6 +320,15 @@ class Api:
 
     def _db(self):
         return connect(self.config.database)
+
+    def _artist_settings(self, db) -> dict:
+        """The dashboard's artist settings; oasis.toml's [artists] until they are first saved there."""
+        row = db.execute("select value from setting where key = 'artists'").fetchone()
+        return json.loads(row[0]) if row else self.config.artists
+
+    def _set_artist_settings(self, db, settings: dict):
+        db.execute("insert or replace into setting values ('artists', ?)", (json.dumps(settings, ensure_ascii=False),))
+        artists.configure(db, settings)
 
     def _set_lastfm_app(self, db, key: str, secret: str):
         """Checks a Last.fm API key and secret with a signed call, then keeps and uses them."""
