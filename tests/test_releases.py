@@ -64,7 +64,7 @@ def test_variants_bundles_videos_and_sizes_are_not_the_album():
     assert reject(result("Linkin Park - The Hunting Party (2014) [FLAC 16-44] remastered"), party) is None
     assert reject(result("Linkin Park - The Hunting Party (Live in Texas) 2014"), party) == "variant: live"
     assert reject(result("Rammstein - Feuer Frei! [2002, Tanz-Metal, Industrial, DVD5]"), want("Feuer Frei!", "Rammstein")) == "video"
-    assert reject(result("Linkin Park - Meteora - 2003, FLAC (image+.cue), lossless"), meteora) == "disc image"
+    assert reject(result("Linkin Park - Meteora - 2003, FLAC (image+.cue), lossless"), meteora) is None
     assert reject(result("Linkin Park - Meteora - 2003, FLAC (tracks+.cue), lossless"), meteora) is None
     assert reject(result("Jeris Johnson   Dragonborn (2024) Mp3 320kbps [PMEDIA] ⭐️", size=100e6), want("Dragonborn", "Jeris Johnson")) is None
     assert reject(result("Metallica - Hardwired To Self Destruct (2016)"), want("Hardwired…To Self-Destruct", "Metallica")) is None
@@ -85,6 +85,11 @@ def test_rank_puts_lossless_first_then_cached_then_seeders_and_drops_uncached_se
     picks = rank([v0, dead, mp3_cached, flac, twin, flac_cached], {"bb", "cc"})
     assert [r["infoHash"] for r in picks] == ["bb", "aa", "cc", "dd"] and picks[1] is flac
     assert [r["infoHash"] for r in rank([v0, mp3_cached, flac], {"cc"}, upgrade=True)] == ["aa"]  # here lossy already: lossless only
+
+
+def test_a_disc_image_comes_after_a_file_per_track():
+    image, tracks = result("A - B (image+.cue) [FLAC]", "aa", seeders=90), result("A - B (tracks+.cue) [FLAC]", "bb", seeders=1)
+    assert [r["infoHash"] for r in rank([image, tracks], {"aa"})] == ["bb", "aa"]
 
 
 def test_queries_drop_brackets_and_try_the_album_alone_and_the_native_names():

@@ -1,12 +1,14 @@
 """oasis's own import of a finished download: finds the MusicBrainz edition of the album the files are (by titles,
 numbers and durations), writes that edition's tags into them the way Picard does, and places them in the library as
 Lidarr names its files, "Artist/Album (Year)/NN - Title.ext", so they sit with what Lidarr imported before. Library
-files are never overwritten or deleted: a lossy file a lossless copy replaces moves to .replaced."""
+files are never overwritten or deleted: a lossy file a lossless copy replaces moves to .replaced. A disc image (one
+audio file and a cue sheet) is split into a file per track first."""
 import fcntl
 import logging
 import os
 import re
 import shutil
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -29,6 +31,8 @@ EDITIONS = "https://musicbrainz.org/ws/2/release?release-group={}&inc=media+reco
 KEEP_EDITIONS = 7 * 86400  # seconds a release group's editions stay cached
 COVER_ART = "https://coverartarchive.org/release/{}/front"
 SLACK = 5, 0.03            # a file's length may differ from the track's by 5 s or 3 %, whichever is more
+SPLIT = ".oasis-split"     # a download's disc images, split, in <download>/.oasis-split/<image>/
+CUE_LINE = re.compile(r'\s*(FILE|TRACK|TITLE|INDEX)\s+(?:"(.*)"|(\S+))(?:\s+(\S+))?', re.I)
 
 
 def title_of(path: str, artist: str) -> str:
@@ -108,6 +112,77 @@ def pick(releases: list[dict], files: list[dict]) -> tuple[dict, dict]:
     if best is None:
         raise LookupError("no edition matches")
     return best[1], best[2]
+
+
+def cue_text(data: bytes) -> str:
+    """Cue sheets are UTF-8 (perhaps with a BOM), UTF-16, Shift-JIS or CP1251. CP1251 Cyrillic reads as Shift-JIS
+    too, but as half-width kana, which Japanese cue sheets don't use."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    try:
+        if not re.search("[\uff61-\uff9f]", text := data.decode("cp932")):
+            return text
+    except UnicodeDecodeError:
+        pass
+    return data.decode("cp1251", errors="replace")
+
+
+def cue(path: Path) -> list[tuple[str, list[dict]]]:
+    """A cue sheet's files, each with its tracks: number, title and start (seconds; INDEX 01, frames of 1/75 s)."""
+    files = []
+    for line in cue_text(path.read_bytes()).splitlines():
+        if not (m := CUE_LINE.match(line)):
+            continue
+        command, value = m[1].upper(), m[2] if m[2] is not None else m[3]
+        tracks = files[-1][1] if files else []
+        if command == "FILE":
+            files.append((value, []))
+        elif command == "TRACK" and files and value.isdigit():
+            tracks.append({"number": int(value), "title": None, "start": None})
+        elif command == "TITLE" and tracks:
+            tracks[-1]["title"] = value
+        elif command == "INDEX" and tracks and value == "01" and (t := re.fullmatch(r"(\d+):(\d+):(\d+)", m[4] or "")):
+            tracks[-1]["start"] = int(t[1]) * 60 + int(t[2]) + int(t[3]) / 75
+    return [(name, [t for t in tracks if t["start"] is not None]) for name, tracks in files]
+
+
+def image_of(sheet: Path, name: str) -> Path | None:
+    """The audio file a cue sheet names: as named, else of its name or the sheet's with another suffix (sheets often
+    name the .wav the image was ripped to), else the folder's only audio file."""
+    folder = sheet.parent
+    if (folder / name).is_file() and (folder / name).suffix.lower().lstrip(".") in AUDIO:
+        return folder / name
+    audio = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower().lstrip(".") in AUDIO]
+    stems = {Path(name.replace("\\", "/")).stem.casefold(), sheet.stem.casefold()}
+    return next((p for p in audio if p.stem.casefold() in stems), None) or (audio[0] if len(audio) == 1 else None)
+
+
+def split(folder: Path) -> set[Path]:
+    """Splits the disc images below folder by their cue sheets; returns the images. Lossless images become FLAC
+    (sample-exact cuts need a decode); lossy ones are cut as they are. Each image is a disc of its own, in order."""
+    images = {}
+    for sheet in sorted(p for p in folder.rglob("*") if p.suffix.lower() == ".cue" and SPLIT not in p.parts):
+        for name, tracks in cue(sheet):
+            if len(tracks) > 1 and (image := image_of(sheet, name)) and image not in images:
+                images[image] = tracks
+    for disc, (image, tracks) in enumerate(images.items(), 1):
+        suffix = ".flac" if lossless(image) else image.suffix.lower()
+        for track, after in zip(tracks, [*tracks[1:], None]):
+            target = folder / SPLIT / str(disc) / f"{disc}-{track['number']:02} {clean(track['title'] or '')[:100]}{suffix}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tags = [a for k, v in (("title", track["title"]), ("track", track["number"]), ("disc", disc if len(images) > 1 else None)) if v
+                    for a in ("-metadata", f"{k}={v}")]
+            try:
+                subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-ss", f"{track['start']:.6f}", "-i", str(image),
+                                *(["-t", f"{after['start'] - track['start']:.6f}"] if after else []), "-map", "0:a:0", "-map_metadata", "-1",
+                                *tags, "-c:a", "flac" if suffix == ".flac" else "copy", str(target)], check=True, capture_output=True, timeout=1800)
+            except subprocess.CalledProcessError as e:
+                raise LookupError(f"can't split {image.name}: {e.stderr.decode(errors='replace').strip()[-200:]}") from None
+    return set(images)
 
 
 def editions(db, group: str) -> list[dict]:
@@ -206,11 +281,12 @@ class Importer:
     def place(self, folder: Path, group: str) -> Path:
         """Imports the download in folder as an edition of the release group; returns the album folder.
         LookupError when no edition matches."""
+        images = split(folder)
         db = self.connect()
         try:
             releases = editions(db, group)
             artist = releases[0]["artist-credit"][0]["name"] if releases else ""
-            files = [read(p, artist) for p in sorted(folder.rglob("*")) if p.is_file() and p.suffix.lower().lstrip(".") in AUDIO]
+            files = [read(p, artist) for p in sorted(folder.rglob("*")) if p.is_file() and p.suffix.lower().lstrip(".") in AUDIO and p not in images]
             release, mapping = pick(releases, files)
             album = self.album_folder(db, release)
         finally:
@@ -223,7 +299,7 @@ class Importer:
                 write(source, tags_for(release, medium, track))
                 where = album / clean(f"{medium.get('format') or 'Unknown'} {medium['position']:02}") if multi else album
                 placed += self.put(source, where / (clean(f"{track['position']:02} - {track['title']}") + source.suffix.lower()))
-        self.cover(release, {f["path"].parent for f in mapping.values()}, album)
+        self.cover(release, {f["path"].parent for f in mapping.values()} | {i.parent for i in images}, album)
         log.info("imported %d of %d tracks as %s (%s %s, %s) into %s", placed, len(mapping), release["title"], release.get("country"),
                  release.get("date"), release["id"], album)
         return album

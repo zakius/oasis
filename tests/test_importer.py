@@ -137,6 +137,47 @@ def test_other_formats_carry_the_same_tags_for_the_scan(make, tmp_path, root, su
            ("Beta", "ISRC0", "Label", "album; live", "2001", ["mb-beta"])
 
 
+def sheet(path, image, *titles, encoding="utf-8", starts=(0, 2, 5)):
+    lines = ['REM GENRE Pop', 'PERFORMER "Beta"', 'TITLE "First"', f'FILE "{image}" WAVE']
+    for n, (title, start) in enumerate(zip(titles, starts), 1):
+        lines += [f"  TRACK {n:02} AUDIO", f'    TITLE "{title}"', '    PERFORMER "Beta"', f"    INDEX 01 00:{start:02}:00"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes("\r\n".join(lines).encode(encoding))
+
+
+def test_a_disc_image_is_split_by_its_cue_sheet_into_lossless_tracks(make, tmp_path, root):
+    image = tmp_path / "dl/Beta - First/Beta - First.flac"
+    image.parent.mkdir(parents=True)
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=duration=9", "-ar", "96000", "-c:a", "flac", "-sample_fmt", "s32",
+                    "-metadata", "title=First", str(image)], check=True)
+    # Shift-JIS, naming the .wav it was ripped to
+    sheet(image.with_suffix(".cue"), "Beta - First.wav", "いち", "に", "さん", encoding="cp932")
+    album = make(edition("standard", [("いち", 2), ("に", 3), ("さん", 4)])).place(tmp_path / "dl", "rg-1")
+    assert sorted(p.name for p in album.iterdir()) == ["01 - いち.flac", "02 - に.flac", "03 - さん.flac"]
+    three = mutagen.File(album / "03 - さん.flac")
+    assert (three.info.bits_per_sample, three.info.sample_rate, round(three.info.length, 2)) == (24, 96000, 4.0)
+    assert three["title"] == ["さん"] and three["musicbrainz_albumid"] == ["standard"]
+    assert image.exists()  # the download's files stay as they came
+
+
+def test_disc_images_of_a_multi_disc_lossy_album_are_cut_as_they_are(make, tmp_path, root):
+    for disc in (1, 2):
+        audio(tmp_path / f"dl/CD{disc}/image.mp3", 5)
+    sheet(tmp_path / "dl/CD1/image.cue", "image.mp3", "Один", "Два", encoding="cp1251", starts=(0, 2))
+    sheet(tmp_path / "dl/CD2/image.cue", "image.mp3", "Три", "Четыре", encoding="utf-8-sig", starts=(0, 3))
+    album = make(edition("two", [("Один", 2), ("Два", 3)], [("Три", 3), ("Четыре", 2)])).place(tmp_path / "dl", "rg-1")
+    assert sorted(str(p.relative_to(album)) for p in album.rglob("*.mp3")) == \
+           ["CD 01/01 - Один.mp3", "CD 01/02 - Два.mp3", "CD 02/01 - Три.mp3", "CD 02/02 - Четыре.mp3"]
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "utf-16", "cp932", "cp1251"])
+def test_cue_sheets_are_read_in_their_encoding(tmp_path, encoding):
+    titles = {"cp932": ["アンサンブル・プレイ", "日本語"], "cp1251": ["Кино", "Группа крови"]}.get(encoding, ["Ünïcode", "日本語"])
+    sheet(tmp_path / "a.cue", "a.flac", *titles, encoding=encoding)
+    assert [(t["number"], t["title"], t["start"]) for _, tracks in importer.cue(tmp_path / "a.cue") for t in tracks] == \
+           [(1, titles[0], 0), (2, titles[1], 2)]
+
+
 def test_credits_and_imports_share_one_musicbrainz_pace(tmp_path, monkeypatch):
     sent = []
 

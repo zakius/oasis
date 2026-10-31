@@ -3,7 +3,7 @@ Names come in any script and shape ('[마신] [2022.09.07] Creepy Nuts 3rdアル
 so the name and the album are both folded to words and compared word by word; each kana, kanji or Hangul syllable
 is a word of its own, as those scripts don't space words. A wrong album is worse than none: variants (live,
 instrumentals, deluxe...), bundles and videos are left out, and so are short or self-titled names that don't pin the
-album down. The importer's edition match comes after, as a second check.
+album down. Disc images are tried after a file per track. The importer's edition match comes after, as a second check.
 Discographies and other bundles TorBox has cached are read by their file lists: each folder that is one wanted album
 becomes a target, and only its files are fetched."""
 import logging
@@ -28,7 +28,7 @@ VARIANTS = re.compile(r"\b(best of|greatest hits|very best|the essential|antholo
 VARIANTS_JA = re.compile(r"インスト|カラオケ|ライ[ブヴ]|リミックス|オフボーカル")
 BUNDLES = re.compile(r"discograph|collection|complete|box ?set|anthology|全集|ディスコグラフィ", re.I)
 VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|\d{3,4}p|x26[45]|h ?26[45]|hevc|mkv|avi|video)\b")
-IMAGE = re.compile(r"\b(image|img) cue\b")  # one file for the whole disc: the importer takes a file per track
+IMAGE = re.compile(r"\b(image|img) cue\b")  # one file for the whole disc, which the importer splits: a file per track is surer
 LOSSLESS = re.compile(r"\b(flac|alac|wav|lossless|24 ?bits?|hi ?res|ape)\b")
 MP3_320 = re.compile(r"\b320( ?k| ?kbps| ?kbit)?\b")
 V0 = re.compile(r"\bv0\b")
@@ -131,8 +131,6 @@ def reject(release: dict, want: dict) -> str | None:
         return f"not the variant: {sorted(missing)[0]}"
     if VIDEO.search(text) and not VIDEO.search(title_text):
         return "video"
-    if IMAGE.search(text):
-        return "disc image"
     if BUNDLES.search(name) and not BUNDLES.search(title):
         return "bundle"
     compact, names = "".join(words(title)), {"".join(words(n)) for n in want["names"]}
@@ -153,12 +151,14 @@ def reject(release: dict, want: dict) -> str | None:
 
 
 def rank(releases: list[dict], have: set[str], upgrade: bool = False) -> list[dict]:
-    """Best first: lossless, then cached on TorBox (it has those at once, seeders or not), then quality, then seeders.
+    """Best first: lossless, then a file per track over a disc image, then cached on TorBox (it has those at once,
+    seeders or not), then quality, then seeders.
     A release TorBox hasn't cached needs a seeder. The same torrent from several indexers is tried once."""
     usable = [r for r in releases if hash_of(r) in have or (r.get("seeders") or 0) >= 1]
     if upgrade:
         usable = [r for r in usable if quality(r["title"]) == 3]
-    usable.sort(key=lambda r: (quality(r["title"]) == 3, hash_of(r) in have, quality(r["title"]), r.get("seeders") or 0), reverse=True)
+    usable.sort(key=lambda r: (quality(r["title"]) == 3, not IMAGE.search(" ".join(words(r["title"]))), hash_of(r) in have, quality(r["title"]),
+                               r.get("seeders") or 0), reverse=True)
     return unique(usable, lambda r: hash_of(r) or r["guid"])
 
 
