@@ -1,14 +1,16 @@
+import email.message
 import io
 import json
 import threading
 import time
+import urllib.error
 import urllib.parse
 
 import pytest
 
 from conftest import call, make_client
 from test_accounts import sign_in
-from oasis import acquire, musicbrainz
+from oasis import acquire, cover, musicbrainz
 from oasis.acquire import Acquire, artist_names
 from oasis.db import connect
 from oasis.download import Downloads
@@ -433,7 +435,7 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     assert wants(client)["BOOTLEG"][:2] == ("missing", "starred")  # wanted again after all
 
 
-def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_that_keep_their_ids_once_here(client, mb):
+def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_that_keep_their_ids_once_here(client, mb, monkeypatch):
     kenshi(mb)
     mb.artists.append({"id": "mb-beta", "name": "Beta"})  # in the library: left out
     client.app.state.api._db().execute("insert into mb_artist(mbid, artist_id, name) values ('mb-beta', ?, 'Beta')", (artist_id(client, "Beta"),))
@@ -455,6 +457,24 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     sync(client)
     album = call(client, "getAlbum", id="al-mb-" + STRAY)["album"]
     assert album["song"] == [] and album["oasisWanted"] == "wanted" and album["starred"]
+    assert album["coverArt"] == "al-mb-" + STRAY
+    covers = []
+
+    def urlopen(url, timeout):
+        covers.append(url)
+        if STRAY not in url:
+            raise urllib.error.HTTPError(url, 404, "no cover", {}, None)
+        response = io.BytesIO(b"jpeg")
+        response.headers = email.message.Message()
+        response.headers["Content-Type"] = "image/jpeg"
+        return response
+
+    monkeypatch.setattr(cover.urllib.request, "urlopen", urlopen)
+    params = {"u": "admin", "p": "secret"}
+    response = client.get("/rest/getCoverArt", params={**params, "id": "al-mb-" + STRAY})
+    assert (response.status_code, response.content, response.headers["content-type"]) == (200, b"jpeg", "image/jpeg")
+    assert covers == [f"https://coverartarchive.org/release-group/{STRAY}/front-500"] and "max-age" in response.headers["cache-control"]
+    assert "error" in client.get("/rest/getCoverArt", params={**params, "id": "al-mb-" + LEMON, "f": "json"}).text  # none there
     assert wants(client)["STRAY SHEEP"][:2] == ("missing", "starred") and wants(client)["BOOTLEG"][1] == "followed"
     for method, key in (("getStarred2", "starred2"), ("getStarred", "starred")):
         starred = call(client, method)[key]
@@ -469,6 +489,9 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     sync(client)
     local = album_of(client, "First")["id"]
     assert [r[0] for r in db.execute("select ref from wanted order by kind")] == [local, beta] and wants(client)["STRAY SHEEP"][0] == "have"
+    asked, response = len(covers), client.get("/rest/getCoverArt", params={**params, "id": "al-mb-" + STRAY})
+    assert len(covers) == asked and response.status_code == 200 and \
+           response.content == client.get("/rest/getCoverArt", params={**params, "id": local}).content  # the library's now
     assert call(client, "getAlbum", id="al-mb-" + STRAY)["album"]["id"] == local and call(client, "getArtist", id="ar-mb-" + KENSHI)["artist"]["id"] == beta
     assert album_of(client, "First")["starred"] and call(client, "search3", query="Kenshi Yonezu")["searchResult3"]["artist"] == []
     call(client, "unstar", albumId="al-mb-" + STRAY)

@@ -25,6 +25,7 @@ CATALOGUE = MB + "release-group?artist={}&type=album|ep|single&inc=artist-credit
 PSEUDO = MB + "release?artist={}&status=pseudo-release&inc=release-groups&limit=100&offset={}&fmt=json"  # transliterations, translations
 EDITIONS = MB + "release?release-group={}&status=official&inc=recordings&limit=100&fmt=json"
 GROUP = MB + "release-group/{}?inc=artist-credits&fmt=json"
+GROUP_COVER = "https://coverartarchive.org/release-group/{}/front-500"  # the Cover Art Archive's front image, 500 px
 RELEASE = MB + "release/{}?inc=release-groups&fmt=json"
 SEARCH = MB + "{}?query={}&limit=25&fmt=json"
 KEEP_FIND = 7 * 86400                # the dashboard's and clients' searches

@@ -754,7 +754,7 @@ class Api:
         artist_id = MB_IDS["artist"] + credit[0]["artist"]["id"] if credit else None
         artist_id = artist_id and (acquire.library_id(db, artist_id) or artist_id)
         year = (g.get("first-release-date") or "")[:4]
-        return clean({"id": id, "name": g["title"], "title": g["title"], "album": g["title"],
+        return clean({"id": id, "name": g["title"], "title": g["title"], "album": g["title"], "coverArt": id,
                       "artist": "".join(c["name"] + (c.get("joinphrase") or "") for c in credit) or None, "artistId": artist_id,
                       "parent": artist_id, "isDir": True, "songCount": 0, "duration": 0, "year": int(year) if year.isdigit() else None,
                       "releaseTypes": [t for t in [g.get("primary-type"), *(g.get("secondary-types") or [])] if t] or None,
@@ -1115,7 +1115,10 @@ class Api:
 
     def getCoverArt(self, db, p, user):
         id = p.need("id")
-        if id.startswith("pl-"):
+        id = acquire.mbid_of(id) and acquire.library_id(db, id) or id
+        if id.startswith(MB_IDS["album"]):  # a MusicBrainz-only album until it arrives
+            r = {"ref": None, "cover": acquire.GROUP_COVER.format(acquire.mbid_of(id))}
+        elif id.startswith("pl-"):
             r = self._one(db, "select null as ref, cover from playlist where id = ? and cover is not null", id[3:])
         else:
             column = {"ar-": "artist_id", "al-": "album_id"}.get(id[:3], "id")
