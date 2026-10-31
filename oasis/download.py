@@ -3,7 +3,9 @@ fetches the files over HTTP into its staging folder and imports them. rdtclient 
 TorBox's slots and queue are read directly, files keep their paths inside the torrent, and oasis keeps its own record
 of which hash is which album. oasis places the files itself (importer.py), or with import = "lidarr" has Lidarr
 import them. Nothing seeds from here."""
+import hashlib
 import logging
+import re
 import shutil
 import threading
 import time
@@ -73,6 +75,37 @@ def source(release: dict) -> dict:
     return {"magnet": f"magnet:?xt=urn:btih:{hash_of(release)}"}
 
 
+def info_hash(found: dict) -> str:
+    """The hash of what source() found: from the magnet link, or the .torrent's info dictionary."""
+    if m := re.search(r"btih:([0-9a-f]{40})", found.get("magnet") or "", re.I):
+        return m[1].lower()
+    data, i = found.get("torrent") or b"", 1
+    try:
+        while data[:1] == b"d" and data[i:i + 1] != b"e":
+            key_end = bencoded_end(data, i)
+            value_end = bencoded_end(data, key_end)
+            if data[i:key_end] == b"4:info":
+                return hashlib.sha1(data[key_end:value_end]).hexdigest()
+            i = value_end
+    except (ValueError, IndexError):  # not a .torrent
+        pass
+    return ""
+
+
+def bencoded_end(data: bytes, i: int) -> int:
+    """Where the bencoded value starting at i ends."""
+    kind = data[i:i + 1]
+    if kind == b"i":
+        return data.index(b"e", i) + 1
+    if kind in (b"l", b"d"):
+        i += 1
+        while data[i:i + 1] != b"e":
+            i = bencoded_end(data, i)
+        return i + 1
+    colon = data.index(b":", i)
+    return colon + 1 + int(data[i:colon])
+
+
 def inside(path: str) -> Path:
     """A path inside the torrent, kept below the staging folder."""
     return Path(*[p for p in PurePosixPath(path).parts if p not in ("/", "..", ".")])
@@ -127,7 +160,15 @@ class Downloads:
             choose(self.lidarr.releases(album_id), album["artist"]["artistName"], album["title"], blocked, tb.cached)
         for release in picks[:GRAB_TRIES]:
             try:
-                added = tb.add(release["title"], **source(release))
+                found = source(release)
+            except OSError as e:
+                log.info("couldn't add %s to TorBox: %s", release["title"], e)
+                continue
+            if info_hash(found) in blocked:  # listed without its hash, it is one that failed before
+                log.info("%s failed before: next", release["title"])
+                continue
+            try:
+                added = tb.add(release["title"], **found)
             except OSError as e:
                 log.info("couldn't add %s to TorBox: %s", release["title"], e)
                 continue

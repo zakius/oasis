@@ -1,11 +1,12 @@
+import hashlib
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from oasis import releases
+from oasis import download, releases
 from oasis.db import connect
-from oasis.download import source
+from oasis.download import info_hash, source
 from oasis.releases import find, queries, rank, reject, target
 from test_download import db, downloads, lidarr, torbox  # noqa: F401 (fixtures)
 
@@ -170,3 +171,19 @@ def test_with_prowlarr_the_search_is_oasiss_own_and_lidarr_lists_nothing(downloa
     assert downloads.search(db, 5)
     assert torbox.added == [("Artist - Album [MP3]", "magnet:?xt=urn:btih:ef01", None)]  # the seedless FLAC nobody cached is no use
     assert db.execute("select hash, album_id, state from download").fetchone()[:] == ("ef01", 5, "added")
+
+
+def test_a_release_listed_without_its_hash_is_skipped_when_it_failed_before(downloads, lidarr, torbox, db, monkeypatch):
+    info = b"d6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces0:e"
+    torrent = b"d8:announce3:url4:info" + info + b"e"
+    assert info_hash({"torrent": torrent}) == hashlib.sha1(info).hexdigest() and info_hash({"torrent": b"<html>"}) == ""
+    assert info_hash({"magnet": "magnet:?xt=urn:btih:" + "AB" * 20 + "&dn=x"}) == "ab" * 20
+    monkeypatch.setattr(releases.musicbrainz, "get", lambda url, db, keep: {"name": "Artist", "aliases": []})
+    lidarr.albums_of = lambda artist_id: []
+    monkeypatch.setattr(download, "source", lambda release: {"torrent": torrent} if release["guid"] == "guid-Artist - Album [FLAC]"
+                        else {"magnet": release["magnetUrl"]})
+    db.execute("insert into release_block values (?, 'dead', 0)", (hashlib.sha1(info).hexdigest(),))
+    downloads.prowlarr = Prowlarr({"Artist Album": [result("Artist - Album [FLAC]", seeders=9, downloadUrl="http://prowlarr/1/download"),
+                                                    result("Artist - Album [MP3]", "ef01", magnetUrl="magnet:?xt=urn:btih:ef01")]})
+    assert downloads.search(db, 5)
+    assert torbox.added == [("Artist - Album [MP3]", "magnet:?xt=urn:btih:ef01", None)]
