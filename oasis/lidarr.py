@@ -142,6 +142,13 @@ class Lidarr:
         return ({r["albumId"] for r in records if r.get("albumId")}, {r["artistId"] for r in records if r.get("artistId")},
                 sum(r.get("trackedDownloadState") == "downloading" for r in records))
 
+    def queued_groups(self) -> set[str]:
+        """The release groups of the albums in Lidarr's queue: its RSS grabs, which oasis's search leaves alone."""
+        return {r["album"]["foreignAlbumId"] for r in self.call("GET", "queue?pageSize=1000&includeAlbum=true")["records"] if r.get("album")}
+
+    def all_albums(self) -> list[dict]:
+        return self.call("GET", "album") or []
+
     def queue(self) -> list[dict]:
         """Every download, with those Lidarr ties to no artist."""
         return self.call("GET", "queue?pageSize=500&includeUnknownArtistItems=true")["records"]
@@ -333,6 +340,9 @@ class Library:
             return "sent", self.why_nothing(db, album["id"])
         return "sent", "waiting for its search" if not item["searched"] else "searching"
 
+    def still_to_find(self, db) -> int:
+        return self.lidarr.call("GET", "wanted/missing?pageSize=1&monitored=true")["totalRecords"]
+
     def why_nothing(self, db, album_id: int) -> str:
         failed = db.execute("select error from download where album_id = ? and state = 'failed' order by updated desc limit 1",
                             (album_id,)).fetchone() if self.downloads else None
@@ -382,7 +392,7 @@ class Library:
         now = time.time()
         try:
             if self.downloads:
-                return now if self.downloads.search(db, album_id) else now - RESEARCH + RETRY_FULL
+                return now - RESEARCH + RETRY_FULL if self.downloads.search(db, album_id) is False else now
             self.lidarr.search_album(album_id)
         except OSError as e:
             log.warning("search for Lidarr album %d failed: %s", album_id, e)
@@ -403,7 +413,7 @@ class Library:
         album = min(due, key=lambda a: (a["id"] in searched, a.get("albumType") == "Single"))
         searched = self.search(db, album["id"])
         self.last_search = time.time()
-        db.execute("insert or replace into catalogue_search values (?, ?)", (album["id"], searched))
+        db.execute("insert or replace into catalogue_search(album_id, searched, mbid) values (?, ?, ?)", (album["id"], searched, album.get("foreignAlbumId")))
 
     def release(self, db, item):
         """Nobody wants it any more: stop Lidarr looking for it, and for an artist's albums not downloaded yet. Files stay."""

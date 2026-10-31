@@ -84,23 +84,34 @@ def target(db, lidarr, album: dict) -> dict:
     """What the search looks for: the artist under all its names (MusicBrainz aliases, Lidarr's name), the title,
     year, discs, the artist's other albums and EPs (a name holding one is a bundle), and whether the album is here
     lossy already (then only lossless will do)."""
-    artist, names = album["artist"], [album["artist"]["artistName"]]
+    artist = album["artist"]
     albums = [a for a in lidarr.albums_of(album["artistId"]) if a.get("albumType") in ("Album", "EP")]
-    titles = {"".join(words(t)) for t in [album["title"], *(a["title"] for a in albums)]}
+    names = aliases(db, artist["artistName"], artist.get("foreignArtistId"), [album["title"], *(a["title"] for a in albums)])
+    return {"artist": artist["artistName"], "names": names, "title": album["title"], "year": (album.get("releaseDate") or "")[:4],
+            "native": native(names), "discs": next((r.get("mediumCount") or 1 for r in album.get("releases") or [] if r.get("monitored")), 1),
+            "others": [a["title"] for a in albums if a["id"] != album["id"]],
+            "upgrade": bool((album.get("statistics") or {}).get("trackFileCount"))}
+
+
+def native(names: list[str]) -> list[str]:
+    """The names written wholly in another script than Latin, to search by too."""
+    return [n for n in names if all(ord(c) > 0x24f for c in n if c.isalpha())][:NATIVE_QUERIES]
+
+
+def aliases(db, name: str, mbid: str | None, titles: list[str]) -> list[str]:
+    """The artist's name and its MusicBrainz name and aliases; titles: its albums and EPs."""
+    names, titles = [name], {"".join(words(t)) for t in titles}
     try:
-        found = musicbrainz.get(ALIASES.format(artist["foreignArtistId"]), db, KEEP_ALIASES)
+        if not mbid:
+            raise LookupError("no MusicBrainz id")
+        found = musicbrainz.get(ALIASES.format(mbid), db, KEEP_ALIASES)
         # Search hints ('LP' for Linkin Park), very short aliases and former names that are album titles ('Hybrid
         # Theory') would match names that aren't the artist's.
         names += [found["name"], *(a["name"] for a in found.get("aliases") or [] if a.get("type") != "Search hint"
                                    and len(n := "".join(words(a["name"]))) >= (2 if CJK.search(a["name"]) else 3) and n not in titles)]
     except (OSError, LookupError, KeyError) as e:
-        log.info("no MusicBrainz aliases for %s: %s", artist["artistName"], e)
-    names = unique([n for n in names if words(n)], lambda n: "".join(words(n)))
-    return {"artist": artist["artistName"], "names": names, "title": album["title"], "year": (album.get("releaseDate") or "")[:4],
-            "native": [n for n in names if all(ord(c) > 0x24f for c in n if c.isalpha())][:NATIVE_QUERIES],
-            "discs": next((r.get("mediumCount") or 1 for r in album.get("releases") or [] if r.get("monitored")), 1),
-            "others": [a["title"] for a in albums if a["id"] != album["id"]],
-            "upgrade": bool((album.get("statistics") or {}).get("trackFileCount"))}
+        log.info("no MusicBrainz aliases for %s: %s", name, e)
+    return unique([n for n in names if words(n)], lambda n: "".join(words(n)))
 
 
 def reject(release: dict, want: dict) -> str | None:

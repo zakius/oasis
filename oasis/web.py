@@ -219,8 +219,7 @@ def routes(api) -> list[Route]:
                 f'{": " + escape(r["error"]) if r["error"] and r["state"] == "failed" else ""}</span></li>' for r in recent) + '</ul>')
         if api.library:
             try:
-                missing = api.library.lidarr.call("GET", "wanted/missing?pageSize=1&monitored=true")["totalRecords"]
-                lines.append(f'{missing} more albums still to find.')
+                lines.append(f'{api.library.still_to_find(db)} more albums still to find.')
             except Exception as e:
                 lines.append(f'<span class="error">Lidarr didn\'t answer: {escape(str(e))}</span>')
         filled = count("select count(*) from track where source = 'local' and credits_at is not null")

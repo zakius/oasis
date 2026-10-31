@@ -151,13 +151,31 @@ class Downloads:
     def albums(self, db) -> set[int]:
         return {r[0] for r in db.execute("select album_id from download where state not in ('done', 'failed')")}
 
-    def search(self, db, album_id: int) -> bool:
-        """Searches the indexers (through Prowlarr, else Lidarr) and sends the best pick to TorBox. False when TorBox had
-        no free slot and queued it: the queued copy goes, the release isn't at fault, and the album is due again soon."""
-        album, tb = self.lidarr.album_by_id(album_id), self.torbox()
-        blocked = {r[0] for r in db.execute("select hash from release_block")}
+    def groups(self, db) -> set[str]:
+        return {r[0] for r in db.execute("select album_mbid from download where state not in ('done', 'failed') and album_mbid is not null")}
+
+    def search(self, db, album_id: int) -> bool | None:
+        """Searches the indexers (through Prowlarr, else Lidarr) for Lidarr's album and sends the best pick to TorBox;
+        see send."""
+        album, tb, blocked = self.lidarr.album_by_id(album_id), self.torbox(), self.blocked(db)
         picks = releases.find(self.prowlarr, releases.target(db, self.lidarr, album), blocked, tb.cached) if self.prowlarr else \
             choose(self.lidarr.releases(album_id), album["artist"]["artistName"], album["title"], blocked, tb.cached)
+        return self.send(db, picks, blocked, album_id, album.get("foreignAlbumId"), f"{album['artist']['artistName']} - {album['title']}")
+
+    def find(self, db, want: dict, group: str) -> bool | None:
+        """Searches Prowlarr for an album of oasis's own catalogue (acquire.py); see send."""
+        blocked = self.blocked(db)
+        return self.send(db, releases.find(self.prowlarr, want, blocked, self.torbox().cached), blocked, 0, group,
+                         f"{want['artist']} - {want['title']}")
+
+    def blocked(self, db) -> set[str]:
+        return {r[0] for r in db.execute("select hash from release_block")}
+
+    def send(self, db, picks: list[dict], blocked: set, album_id: int, group: str | None, label: str) -> bool | None:
+        """Sends the first pick TorBox takes. True when one went, None when none would, False when TorBox had no free
+        slot and queued it: the queued copy goes, the release isn't at fault, and the album is due again soon.
+        album_id: Lidarr's, 0 for albums only oasis's catalogue has."""
+        tb = self.torbox()
         for release in picks[:GRAB_TRIES]:
             try:
                 found = source(release)
@@ -181,10 +199,10 @@ class Downloads:
             now = time.time()
             db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated) "
                        "values (?, ?, ?, ?, ?, ?, 'added', ?, ?)", (added["hash"].lower(), release.get("guid"), album_id,
-                                                                    album.get("foreignAlbumId"), release["title"], added["torrent_id"], now, now))
-            log.info("sent %s to TorBox for %s - %s", release["title"], album["artist"]["artistName"], album["title"])
+                                                                    group, release["title"], added["torrent_id"], now, now))
+            log.info("sent %s to TorBox for %s", release["title"], label)
             return True
-        return True
+        return None
 
     def cycle(self):
         db = self.connect()
@@ -331,6 +349,7 @@ class Downloads:
         self.set(db, row, "failed", why)
         db.execute("update lidarr_item set searched = null where kind = 'album' and lidarr_id = ?", (row["album_id"],))
         db.execute("delete from catalogue_search where album_id = ?", (row["album_id"],))
+        db.execute("update want_album set next_search = null, error = ? where rg = ?", (f"download failed: {why}", row["album_mbid"]))
         log.info("download %s failed: %s", row["title"], why)
 
     def delete(self, row):

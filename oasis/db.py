@@ -79,6 +79,7 @@ create table if not exists lidarr_item(
     mbid text, lidarr_id int, error text,   -- error: why it isn't downloading, for clients to show
     searched real,                          -- albums: last search; artists: when the back catalogue was monitored
     retry_at real, updated real not null,
+    catalogued real,                        -- artists: when oasis last read their catalogue from MusicBrainz (see acquire.py)
     primary key(kind, ref)
 );
 create table if not exists lidarr_rescue(  -- releases oasis grabbed that Lidarr can't tie to their album by name
@@ -101,7 +102,24 @@ create table if not exists audio_pair(  -- dedupe verdicts, valid while both fil
 create table if not exists audio_shared(  -- files dedupe made reflinks of a kept copy
     path text primary key, kept text not null, mtime real not null, kept_mtime real not null
 );
-create table if not exists catalogue_search(album_id int primary key, searched real not null);  -- followed artists' albums, by Lidarr id
+create table if not exists catalogue_search(  -- followed artists' albums Lidarr's catalogue searched, by Lidarr id
+    album_id int primary key, searched real not null,
+    mbid text                               -- the release group, for oasis's own catalogue to carry the search over
+);
+create table if not exists want_album(  -- albums oasis looks for: starred ones and followed artists' catalogues (see acquire.py)
+    rg text primary key,                    -- MusicBrainz release group
+    artist_mbid text not null, artist text, title text not null,
+    primary_type text, secondary_types text, first_date text,  -- secondary types joined with '; '
+    reason text not null,                   -- starred, followed
+    state text not null,                    -- missing, downloading, have, skipped
+    searched real, next_search real, tries int not null default 0,
+    error text                              -- why it is skipped, or what its last search found
+);
+create index if not exists want_album_artist on want_album(artist_mbid);
+create table if not exists mb_group(  -- each release group's smallest official edition, read from MusicBrainz (see acquire.py)
+    rg text primary key, tracks int not null, discs int not null,  -- tracks: 0 when it has no official edition; discs: the most of any
+    songs text not null, fetched real not null  -- the smallest edition's song keys (JSON)
+);
 create table if not exists ytm_artist(  -- an artist's YouTube Music page, kept for a day
     artist_id text primary key, name text, description text, image text, songs text, fetched real not null
 );
@@ -156,7 +174,8 @@ def connect(path: Path) -> sqlite3.Connection:
     if path not in migrated:
         db.executescript(SCHEMA)
         migrate(db)
-        db.execute("create index if not exists track_release on track(mb_release)")  # on a column migrate may add
+        db.execute("create index if not exists track_release on track(mb_release)")  # on columns migrate may add
+        db.execute("create index if not exists track_group on track(mb_release_group)")
         migrated.add(path)
     return db
 

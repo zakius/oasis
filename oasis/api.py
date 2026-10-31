@@ -20,6 +20,7 @@ from starlette.responses import FileResponse, JSONResponse, Response, StreamingR
 from starlette.routing import Route
 
 from . import accounts, artists, cover, dedupe, forward, lyrics, scan, web, ytm
+from .acquire import SECONDARY, Acquire
 from .config import Config
 from .credits import PERFORMANCE_ROLES, Credits
 from .db import connect, make_id, move_track, remember, resolve
@@ -327,7 +328,10 @@ class Api:
                                    Importer(self._db, config.library[0]) if torbox.get("import", "oasis") == "oasis" else None,
                                    Prowlarr(**config.prowlarr) if config.prowlarr else None) \
             if torbox and torbox.get("downloads") else None
-        self.library = Library(self._db, lidarr, self.downloads) if lidarr else None
+        # oasis's own catalogue needs oasis's search, download and import; else, or with catalogue = "lidarr", Lidarr's.
+        own = self.downloads and self.downloads.prowlarr and self.downloads.own and config.acquire.get("catalogue", "oasis") == "oasis"
+        self.library = Acquire(self._db, self.downloads, lidarr, config.acquire.get("secondary_types", SECONDARY)) if own else \
+            Library(self._db, lidarr, self.downloads) if lidarr else None
         self.scanning = self.scan_again = False
         self.scan_lock = threading.Lock()
         self.credits = Credits(self._db)
@@ -384,7 +388,7 @@ class Api:
         for old, new in renamed:
             move_track(db, make_id("tr-", old), make_id("tr-", new))
         db.commit()
-        if renamed and self.library:
+        if renamed and self.library and self.library.lidarr:
             try:
                 self.library.lidarr.rescan(sorted({str(Path(new).parent) for _, new in renamed}))
             except OSError as e:
@@ -748,7 +752,7 @@ class Api:
         for id in p.all("id") + p.all("albumId") + p.all("artistId"):
             db.execute("insert into stat(id, starred) values (?, ?) on conflict(id) do update set starred = excluded.starred", (id, value))
         self._touch(db, p.all("id"))
-        # A starred album or artist is one the user wants in the library: Lidarr gets it (see lidarr.py).
+        # A starred album or artist is one the user wants in the library (see acquire.py, or lidarr.py).
         for kind, ids in (("album", p.all("albumId")), ("artist", p.all("artistId"))):
             for id in ids:
                 if value:
