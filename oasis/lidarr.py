@@ -18,6 +18,8 @@ RETRY_ERROR = 300       # seconds before retrying after Lidarr or MusicBrainz er
 SEARCH_GAP = 180        # seconds between album searches, so a burst of stars doesn't trip the debrid service's rate limit
 RESEARCH = 6 * 3600     # seconds before searching again for an album that got nothing
 GRAB_WAIT = 600         # seconds after a search before "nothing grabbed" counts
+MAX_ACTIVE = 3          # downloads in Lidarr's queue above which no new search starts
+CATALOGUE_TYPES = {"Album", "EP"}  # what of a followed artist's back catalogue gets downloaded; singles repeat album tracks
 
 
 class Lidarr:
@@ -71,7 +73,7 @@ class Lidarr:
         return self.call("GET", f"album?artistId={artist_id}") or []
 
     def add_artist(self, found: dict) -> dict:
-        """Follows the artist: new releases get monitored, the back catalogue doesn't, and nothing is searched."""
+        """Follows the artist for new releases; the back catalogue is monitored after Lidarr's first refresh, and searched paced."""
         body = {**found, **self.defaults(), "monitored": True, "monitorNewItems": "all",
                 "addOptions": {"monitor": "none", "searchForMissingAlbums": False}}
         return self.call("POST", "artist", body)
@@ -92,6 +94,9 @@ class Lidarr:
     def follow_artist(self, artist: dict, follow: bool):
         """Following monitors the artist for new releases; unfollowing unmonitors it. Albums keep their own monitoring."""
         self.call("PUT", f"artist/{artist['id']}", {**artist, "monitored": follow, "monitorNewItems": "all" if follow else "none"})
+
+    def missing(self) -> list[dict]:
+        return self.call("GET", "wanted/missing?page=1&pageSize=5000&monitored=true&sortKey=releaseDate&sortDirection=descending")["records"]
 
     def queued(self) -> tuple[set[int], set[int]]:
         records = self.call("GET", "queue?pageSize=1000")["records"]
@@ -156,7 +161,7 @@ class Library:
                         state, error = self.want(db, item, queued_albums, queued_artists)
                         set_state(db, item, state, error)
                     else:
-                        self.release(item)
+                        self.release(db, item)
                         db.execute("delete from lidarr_item where kind = ? and ref = ?", (item["kind"], item["ref"]))
                 except LookupError as e:
                     set_state(db, item, "failed", str(e), retry=RETRY_NO_MATCH)
@@ -196,8 +201,9 @@ class Library:
                 return "followed", None
             if not artist["monitored"] or artist.get("monitorNewItems") != "all":
                 self.lidarr.follow_artist(artist, True)
+            db.execute("update lidarr_item set lidarr_id = ? where kind = ? and ref = ?", (artist["id"], item["kind"], item["ref"]))
             if not item["searched"]:
-                self.clear_back_catalogue(db, item, artist)
+                self.monitor_catalogue(db, item, artist)
             return ("downloading" if artist["id"] in queued_artists else "followed"), None
 
         album = self.lidarr.album(mbid)
@@ -215,35 +221,48 @@ class Library:
             return "sent", self.lidarr.why_nothing(album["id"])
         return "sent", "waiting for its search" if not item["searched"] else "searching"
 
-    def clear_back_catalogue(self, db, item, artist):
-        """Once Lidarr has the artist's albums, unmonitors those released before it was followed (Lidarr's first
-        refresh counts them as new), except albums users starred on their own. Done once per artist."""
+    def monitor_catalogue(self, db, item, artist):
+        """Once Lidarr has the artist's albums, monitors its albums and EPs so the paced search downloads them.
+        Done once per artist, so albums unmonitored in Lidarr afterwards stay that way."""
         albums = self.lidarr.albums_of(artist["id"])
         if not albums:
             return  # first refresh still pending
-        starred = {r[0] for r in db.execute("select mbid from lidarr_item where kind = 'album' and mbid is not null")}
-        followed = artist.get("added") or ""
-        old = [a["id"] for a in albums if a["monitored"] and a["foreignAlbumId"] not in starred
-               and (a.get("releaseDate") or "") <= followed]
-        self.lidarr.set_albums(old, False)
+        self.lidarr.set_albums([a["id"] for a in albums if not a["monitored"] and a.get("albumType") in CATALOGUE_TYPES], True)
         db.execute("update lidarr_item set searched = ? where kind = ? and ref = ?", (time.time(), item["kind"], item["ref"]))
 
     def search_next(self, db, queued_albums: set):
-        """Searches one album at a time, SEARCH_GAP apart: first those never searched, then ones that got nothing."""
-        if time.time() - self.last_search < SEARCH_GAP:
+        """Searches one album at a time, SEARCH_GAP apart and only while few downloads run: starred albums first, then
+        followed artists' back catalogues, newest first; each time those never searched before ones that got nothing."""
+        if time.time() - self.last_search < SEARCH_GAP or len(queued_albums) >= MAX_ACTIVE:
             return
         item = db.execute("select * from lidarr_item where kind = 'album' and state = 'sent' and lidarr_id is not null "
                           "and (searched is null or searched < ?) and exists (select 1 from wanted w where w.kind = 'album' "
                           "and w.ref = lidarr_item.ref) order by searched is not null, searched, rowid limit 1", (time.time() - RESEARCH,)).fetchone()
-        if item is None or item["lidarr_id"] in queued_albums:
-            return
-        self.lidarr.search_album(item["lidarr_id"])
-        self.last_search = time.time()
-        db.execute("update lidarr_item set searched = ?, error = 'searching' where kind = ? and ref = ?",
-                   (self.last_search, item["kind"], item["ref"]))
+        if item is not None and item["lidarr_id"] not in queued_albums:
+            self.lidarr.search_album(item["lidarr_id"])
+            self.last_search = time.time()
+            db.execute("update lidarr_item set searched = ?, error = 'searching' where kind = ? and ref = ?",
+                       (self.last_search, item["kind"], item["ref"]))
+        elif item is None:
+            self.search_catalogue(db, queued_albums)
 
-    def release(self, item):
-        """Nobody wants it any more: stop Lidarr looking for it. Files already downloaded stay."""
+    def search_catalogue(self, db, queued_albums: set):
+        followed = {r[0] for r in db.execute("select lidarr_id from lidarr_item where kind = 'artist' and lidarr_id is not null "
+                                             "and exists (select 1 from wanted w where w.kind = 'artist' and w.ref = lidarr_item.ref)")}
+        if not followed:
+            return
+        searched = dict(db.execute("select album_id, searched from catalogue_search").fetchall())
+        due = [a for a in self.lidarr.missing() if a["artistId"] in followed and a["id"] not in queued_albums
+               and searched.get(a["id"], 0) < time.time() - RESEARCH]
+        if not due:
+            return
+        album = min(due, key=lambda a: a["id"] in searched)  # stable: keeps Lidarr's newest-first order otherwise
+        self.lidarr.search_album(album["id"])
+        self.last_search = time.time()
+        db.execute("insert or replace into catalogue_search values (?, ?)", (album["id"], self.last_search))
+
+    def release(self, db, item):
+        """Nobody wants it any more: stop Lidarr looking for it, and for an artist's albums not downloaded yet. Files stay."""
         if not item["mbid"]:
             return
         if item["kind"] == "album":
@@ -251,6 +270,9 @@ class Library:
                 self.lidarr.set_albums([album["id"]], False)
         elif artist := self.lidarr.artist(item["mbid"]):
             self.lidarr.follow_artist(artist, False)
+            starred = {r[0] for r in db.execute("select mbid from lidarr_item where kind = 'album' and mbid is not null")}
+            self.lidarr.set_albums([a["id"] for a in self.lidarr.albums_of(artist["id"]) if a["monitored"]
+                                    and a["foreignAlbumId"] not in starred and not (a.get("statistics") or {}).get("trackFileCount")], False)
 
 
 def set_state(db, item, state: str, error: str | None, retry: float | None = None):

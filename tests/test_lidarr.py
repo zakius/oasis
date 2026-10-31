@@ -38,7 +38,7 @@ class FakeLidarr(Lidarr):
 
     def set_albums(self, album_ids, monitored):
         self.calls.append(("set_albums", tuple(album_ids), monitored))
-        for album in self.albums.values():
+        for album in [*self.albums.values(), *(a for albums in self.artist_albums.values() for a in albums)]:
             if album["id"] in album_ids:
                 album["monitored"] = monitored
 
@@ -51,6 +51,10 @@ class FakeLidarr(Lidarr):
     def follow_artist(self, artist, follow):
         self.calls.append(("follow", artist["id"], follow))
         artist["monitored"] = follow
+
+    def missing(self):
+        return [{**a, "artistId": artist_id} for artist_id, albums in self.artist_albums.items() for a in albums
+                if a["monitored"] and not a.get("have")]
 
     def queued(self):
         return self.queue_albums, set()
@@ -121,23 +125,32 @@ def test_unstarred_album_is_only_unmonitored_once_nobody_wants_it(client, lidarr
     assert "oasisWanted" not in album_of(client, "First")
 
 
-def test_starred_artist_is_followed_for_new_releases_only(client, lidarr):
+def test_starred_artist_gets_its_catalogue_searched_paced(client, lidarr):
     artist = next(a for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"] if a["name"] == "The Alpha")
     call(client, "star", artistId=artist["id"])
     sync(client)
     assert ("add_artist", "mb-The Alpha") in lidarr.calls and not any(c[0] == "search" for c in lidarr.calls)
     shown = next(a for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"] if a["name"] == "The Alpha")
     assert "oasisWanted" not in shown  # followed: nothing to show
-    # After Lidarr's first refresh, the back catalogue it monitored is unmonitored once; newer releases stay.
-    lidarr.artists["mb-The Alpha"]["added"] = "2026-01-01T00:00:00Z"
-    lidarr.artist_albums[100] = [{"id": 50, "monitored": True, "foreignAlbumId": "mb-old", "releaseDate": "2010-05-01T00:00:00Z"},
-                                 {"id": 51, "monitored": True, "foreignAlbumId": "mb-new", "releaseDate": "2026-06-01T00:00:00Z"}]
+    # After Lidarr's first refresh, albums and EPs get monitored once; singles don't.
+    lidarr.artist_albums[100] = [{"id": 50, "monitored": False, "albumType": "Album", "foreignAlbumId": "mb-50"},
+                                 {"id": 51, "monitored": False, "albumType": "EP", "foreignAlbumId": "mb-51"},
+                                 {"id": 52, "monitored": False, "albumType": "Single", "foreignAlbumId": "mb-52"}]
+    library = client.app.state.api.library
     sync(client)
     sync(client)
-    assert [c for c in lidarr.calls if c[0] == "set_albums"] == [("set_albums", (50,), False)]
+    assert [c for c in lidarr.calls if c[0] == "set_albums"] == [("set_albums", (50, 51), True)]
+    assert [c for c in lidarr.calls if c[0] == "search"] == [("search", 50)]
+    library.last_search -= lidarr_module.SEARCH_GAP
+    lidarr.queue_albums.update({1, 2, 50})  # busy: no new search
+    sync(client)
+    assert [c for c in lidarr.calls if c[0] == "search"] == [("search", 50)]
+    lidarr.queue_albums.clear()
+    sync(client)
+    assert [c for c in lidarr.calls if c[0] == "search"] == [("search", 50), ("search", 51)]
     call(client, "unstar", artistId=artist["id"])
     sync(client)
-    assert ("follow", 100, False) in lidarr.calls
+    assert ("follow", 100, False) in lidarr.calls and ("set_albums", (50, 51), False) in lidarr.calls
 
 
 def test_no_match_fails_with_reason_and_waits_while_errors_retry_soon(client, lidarr, monkeypatch):

@@ -48,10 +48,11 @@ create table if not exists lidarr_item(
     kind text not null, ref text not null,  -- 'album' or 'artist', and its oasis id
     state text not null,                    -- wanted, sent, downloading, have, followed (artists), failed
     mbid text, lidarr_id int, error text,   -- error: why it isn't downloading, for clients to show
-    searched real,                          -- albums: last search; artists: when the back catalogue was unmonitored
+    searched real,                          -- albums: last search; artists: when the back catalogue was monitored
     retry_at real, updated real not null,
     primary key(kind, ref)
 );
+create table if not exists catalogue_search(album_id int primary key, searched real not null);  -- followed artists' albums, by Lidarr id
 create table if not exists ytm_artist(  -- an artist's YouTube Music page, kept for a day
     artist_id text primary key, name text, description text, image text, songs text, fetched real not null
 );
