@@ -16,6 +16,11 @@ cache = "cache"   # downloaded audio; tracks you star or add to a playlist downl
 api_key = ""
 secret = ""
 
+# Starred albums and artists are downloaded through Lidarr (see README).
+# [lidarr]
+# url = "http://lidarr:8686"
+# api_key = ""
+
 # Admins. More users can be added on the account page (http://<host>:4533/admin) or with Subsonic's createUser.
 [[users]]
 name = "admin"

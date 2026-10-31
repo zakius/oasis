@@ -23,6 +23,7 @@ from . import accounts, cover, forward, lyrics, scan, web, ytm
 from .config import Config
 from .db import connect, remember
 from .forward import Forwarder, LastFm
+from .lidarr import Library, Lidarr
 from .recommend import Recommender, set_entries
 from .ytm import YouTubeMusic
 
@@ -125,13 +126,14 @@ select t.album_id as id, t.album as name, t.album_artist as artist, t.artist_id,
        count(*) as song_count, sum(t.duration) as duration, min(t.created) as created,
        max(t.year) as year, max(t.genre) as genre, max(t.cover is not null) as has_cover,
        s.starred as album_starred, s.rating as album_rating,
-       coalesce(sum(ps.play_count), 0) as plays, max(ps.played) as last_played
+       coalesce(sum(ps.play_count), 0) as plays, max(ps.played) as last_played, li.state as lidarr_state
 from track t left join stat s on s.id = t.album_id left join stat ps on ps.id = t.id
+left join lidarr_item li on li.kind = 'album' and li.ref = t.album_id
 """
 ARTISTS = """
 select t.artist_id as id, t.album_artist as name, count(distinct t.album_id) as album_count,
-       max(t.cover is not null) as has_cover, s.starred, s.rating
-from track t left join stat s on s.id = t.artist_id
+       max(t.cover is not null) as has_cover, s.starred, s.rating, li.state as lidarr_state
+from track t left join stat s on s.id = t.artist_id left join lidarr_item li on li.kind = 'artist' and li.ref = t.artist_id
 """
 
 
@@ -149,6 +151,11 @@ def song(r) -> dict:
     })
 
 
+LIDARR_KEYS = ("url", "api_key", "root_folder", "quality_profile", "metadata_profile")
+# Lidarr progress of starred albums and artists, for clients that show it; complete ones need no badge.
+WANTED_STATES = {"wanted": "wanted", "sent": "wanted", "downloading": "downloading", "failed": "failed"}
+
+
 def album(r) -> dict:
     return clean({
         "id": r["id"], "name": r["name"], "title": r["name"], "album": r["name"], "artist": r["artist"],
@@ -156,6 +163,7 @@ def album(r) -> dict:
         "coverArt": r["id"] if r["has_cover"] else None, "songCount": r["song_count"], "duration": r["duration"],
         "created": iso(r["created"]), "year": r["year"], "genre": r["genre"], "starred": iso(r["album_starred"]),
         "userRating": r["album_rating"], "playCount": r["plays"], "played": iso(r["last_played"]),
+        "oasisWanted": WANTED_STATES.get(r["lidarr_state"]),
     })
 
 
@@ -163,6 +171,7 @@ def artist(r) -> dict:
     return clean({
         "id": r["id"], "name": r["name"], "albumCount": r["album_count"],
         "coverArt": r["id"] if r["has_cover"] else None, "starred": iso(r["starred"]), "userRating": r["rating"],
+        "oasisWanted": WANTED_STATES.get(r["lidarr_state"]),
     })
 
 
@@ -196,6 +205,7 @@ class Api:
         lastfm = LastFm(config.lastfm_key, config.lastfm_secret or "", None) if config.lastfm_key else None
         self.recommender = Recommender(self._db, self.ytm, lastfm)
         self.completed: set[str] = set()
+        self.library = Library(self._db, Lidarr(**{k: v for k, v in config.lidarr.items() if k in LIDARR_KEYS})) if config.lidarr else None
         self.scanning = False
         self.scan_lock = threading.Lock()
 
@@ -532,17 +542,26 @@ class Api:
     def getStarred(self, db, p, user):
         return {"starred": self._starred(db)}
 
-    def _set_starred(self, db, p, value):
+    def _set_starred(self, db, p, value, user):
         for id in p.all("id") + p.all("albumId") + p.all("artistId"):
             db.execute("insert into stat(id, starred) values (?, ?) on conflict(id) do update set starred = excluded.starred", (id, value))
         self._touch(db, p.all("id"))
+        # A starred album or artist is one the user wants in the library: Lidarr gets it (see lidarr.py).
+        for kind, ids in (("album", p.all("albumId")), ("artist", p.all("artistId"))):
+            for id in ids:
+                if value:
+                    db.execute("insert or ignore into wanted values (?, ?, ?)", (user, kind, id))
+                else:
+                    db.execute("delete from wanted where user = ? and kind = ? and ref = ?", (user, kind, id))
+        if self.library and (p.all("albumId") or p.all("artistId")):
+            self.library.wake.set()
         return {}
 
     def star(self, db, p, user):
-        return self._set_starred(db, p, time.time())
+        return self._set_starred(db, p, time.time(), user)
 
     def unstar(self, db, p, user):
-        return self._set_starred(db, p, None)
+        return self._set_starred(db, p, None, user)
 
     def setRating(self, db, p, user):
         rating = p.int("rating", 0) or None
@@ -935,6 +954,8 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
             return
         api._start_scan()
         api.forwarder.start()
+        if api.library:
+            api.library.start()
         if api.ytm:
             threading.Thread(target=api._mix_loop, daemon=True).start()
         api.recommender.start()

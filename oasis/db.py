@@ -43,6 +43,13 @@ create table if not exists user(
     lastfm_session text, lastfm_name text,
     listenbrainz_token text
 );
+create table if not exists wanted(user text not null, kind text not null, ref text not null, primary key(user, kind, ref));
+create table if not exists lidarr_item(
+    kind text not null, ref text not null,  -- 'album' or 'artist', and its oasis id
+    state text not null,                    -- wanted, sent, downloading, have, failed
+    mbid text, error text, updated real not null,
+    primary key(kind, ref)
+);
 create table if not exists moved(old_id text primary key, new_id text not null);  -- stream ids now local
 create table if not exists play(user text not null, track_id text not null, played real not null);
 create index if not exists play_track on play(track_id);

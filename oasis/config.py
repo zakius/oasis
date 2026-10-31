@@ -13,6 +13,7 @@ class Config:
     ytm_cache: Path | None = None
     lastfm_key: str | None = None
     lastfm_secret: str | None = None
+    lidarr: dict | None = None  # url, api_key, and optionally root_folder, quality_profile, metadata_profile
 
 
 def load(path: Path) -> Config:
@@ -28,4 +29,5 @@ def load(path: Path) -> Config:
         ytm_cache=base / Path(ytm.get("cache", "cache")).expanduser() if ytm.get("enabled") else None,
         lastfm_key=lastfm.get("api_key") or None,
         lastfm_secret=lastfm.get("secret") or None,
+        lidarr=data["lidarr"] if data.get("lidarr", {}).get("url") and data["lidarr"].get("api_key") else None,
     )

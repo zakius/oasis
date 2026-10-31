@@ -36,6 +36,23 @@ Lyrics (`getLyricsBySongId`, OpenSubsonic `songLyrics`, and `getLyrics`) come fr
 
 `stream` transcodes when a client asks for `format=opus` (in WebM), `mp3` or `aac`, or for a `maxBitRate` below the file's bitrate; `timeOffset` starts partway in. Transcoding needs `ffmpeg` on `PATH`, which the container includes. Without it, oasis sends the original file.
 
+## Lidarr
+
+With a `[lidarr]` section, starring an album or artist (`star` with `albumId` or `artistId`, as clients do for "add to library") makes oasis get it through Lidarr; `unstar` lets it go. Clients need nothing beyond standard Subsonic.
+
+```toml
+[lidarr]
+url = "http://lidarr:8686"
+api_key = "..."            # Lidarr → Settings → General
+# root_folder = "/music"   # defaults: the first root folder and its default profiles
+# quality_profile = 4
+# metadata_profile = 1
+```
+
+oasis keeps who wants what, and a worker reconciles Lidarr with it after every star or unstar and every 5 minutes. A wanted album is looked up on MusicBrainz through Lidarr by artist and title (punctuation and case aside), added with only that album monitored, and searched; a wanted artist is added with everything monitored. Once no user wants an item, oasis only unmonitors it; downloaded files stay. Items that fail (no MusicBrainz match, Lidarr down) are retried after 30 minutes. An album known only by a romanized YouTube Music title may not match MusicBrainz's original-script title. Lidarr downloads into the music folder, the scan picks the files up, and streams of the same songs move onto them.
+
+Albums and artists carry `oasisWanted`: `wanted`, `downloading` or `failed` while Lidarr works on them, and nothing once they're complete or nobody wants them.
+
 ## Run
 
 ```sh
