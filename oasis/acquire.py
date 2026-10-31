@@ -7,6 +7,7 @@ is only asked what its own RSS grabs are downloading. [acquire] catalogue = "lid
 import itertools
 import json
 import logging
+import re
 import threading
 import time
 import urllib.parse
@@ -25,6 +26,7 @@ GROUP = MB + "release-group/{}?inc=artist-credits&fmt=json"
 RELEASE = MB + "release/{}?inc=release-groups&fmt=json"
 SEARCH = MB + "{}?query={}&limit=25&fmt=json"
 TYPES = ("Album", "EP", "Single")
+VIDEO = re.compile(r"video|^dvd$|blu-ray|hd-dvd|vhs|^s?vcd$|laserdisc|umd", re.I)  # MusicBrainz's medium formats; DVD-Audio is audio
 SECONDARY = ("Soundtrack",)          # secondary types wanted besides none, as Lidarr's metadata profile had them
 RECATALOGUE = 86400                  # seconds between reads of a followed artist's catalogue: new releases show within a day
 KEEP_CATALOGUE = RECATALOGUE - 3600  # so the daily read is fresh, and searches in between ask nothing
@@ -79,7 +81,7 @@ class Acquire:
                 except LookupError as e:
                     set_state(db, item, "failed", str(e), retry=RETRY_NO_MATCH)
                 except Exception as e:  # MusicBrainz down, timeouts: soon again
-                    log.warning("acquire: %s %s: %s", item["kind"], item["ref"], e)
+                    log.warning("%s %s: %s", item["kind"], item["ref"], e)
                     set_state(db, item, item["state"] if item["mbid"] else "wanted", str(e)[:300], retry=RETRY_ERROR)
             # One catalogue a pass: a first read of many artists takes MusicBrainz minutes, and searches go on meanwhile.
             due = db.execute("select * from lidarr_item where kind = 'artist' and mbid is not null and coalesce(catalogued, 0) < ? "
@@ -89,7 +91,7 @@ class Acquire:
                 try:
                     self.catalogue(db, due)
                 except (OSError, LookupError) as e:
-                    log.warning("acquire: catalogue of %s: %s", due["mbid"], e)
+                    log.warning("catalogue of %s: %s", due["mbid"], e)
                     set_state(db, due, due["state"], str(e)[:300], retry=RETRY_ERROR)
             self.map_releases(db)
             self.update_states(db)
@@ -99,17 +101,23 @@ class Acquire:
             db.close()
 
     def carry(self, db):
-        """Once: ties Lidarr's searches of followed artists' albums to their release groups, so new rows carry them over."""
-        if self.carried or not self.lidarr:
+        """Once, while Lidarr is up: ties Lidarr's searches to release groups, so new rows carry them over, and keeps
+        the albums and EPs Lidarr was looking for as wanted, whatever the catalogue's filter says: nothing wanted is lost."""
+        if self.carried or not self.lidarr or db.execute("select 1 from setting where key = 'acquire_carried'").fetchone():
+            self.carried = True
             return
         try:
-            if db.execute("select 1 from catalogue_search where mbid is null limit 1").fetchone():
-                groups = {a["id"]: a["foreignAlbumId"] for a in self.lidarr.all_albums()}
-                db.executemany("update catalogue_search set mbid = ? where album_id = ? and mbid is null",
-                               [(groups[i], i) for (i,) in db.execute("select album_id from catalogue_search").fetchall() if i in groups])
-            self.carried = True
+            groups = {a["id"]: a["foreignAlbumId"] for a in self.lidarr.all_albums()}
+            missing = [a for a in self.lidarr.missing() if a.get("albumType") != "Single"]
         except OSError as e:
-            log.warning("acquire: Lidarr's albums: %s", e)
+            log.warning("Lidarr's albums: %s", e)
+            return
+        db.executemany("update catalogue_search set mbid = ? where album_id = ? and mbid is null",
+                       [(groups[i], i) for (i,) in db.execute("select album_id from catalogue_search").fetchall() if i in groups])
+        db.executemany("insert or ignore into catalogue_search(album_id, searched, mbid) values (?, 0, ?)", [(a["id"], a["foreignAlbumId"]) for a in missing])
+        db.execute("update lidarr_item set catalogued = null where kind = 'artist'")
+        db.execute("insert into setting values ('acquire_carried', ?)", (str(time.time()),))
+        self.carried = True
 
     def want(self, db, item) -> tuple[str, str | None]:
         rg = item["mbid"]
@@ -192,22 +200,27 @@ class Acquire:
         """The smallest official edition's track count and song keys, and the most discs of any; tracks 0 without one."""
         if row := db.execute("select * from mb_group where rg = ? and fetched > ?", (rg, time.time() - KEEP_EDITIONS)).fetchone():
             return {"tracks": row["tracks"], "discs": row["discs"], "songs": set(json.loads(row["songs"]))}
-        found = [r for r in musicbrainz.get(EDITIONS.format(rg)).get("releases") or [] if r.get("media")]
-        count = lambda r: sum(len(m.get("tracks") or []) for m in r["media"])
+        # Video discs aren't the album: a DVD-only live edition would be its smallest.
+        found = [media for r in musicbrainz.get(EDITIONS.format(rg)).get("releases") or []
+                 if (media := [m for m in r.get("media") or [] if not VIDEO.search(m.get("format") or "")])]
+        count = lambda media: sum(len(m.get("tracks") or []) for m in media)
         smallest = min((r for r in found if count(r)), key=count, default=None)
-        songs = {song_key(t["title"]) for m in smallest["media"] for t in m.get("tracks") or []} if smallest else set()
-        edition = {"tracks": count(smallest) if smallest else 0, "discs": max((len(r["media"]) for r in found), default=1), "songs": songs}
+        songs = {song_key(t["title"]) for m in smallest for t in m.get("tracks") or []} if smallest else set()
+        edition = {"tracks": count(smallest) if smallest else 0, "discs": max(map(len, found), default=1), "songs": songs}
         db.execute("insert or replace into mb_group values (?, ?, ?, ?, ?)", (rg, edition["tracks"], edition["discs"], json.dumps(sorted(songs)), time.time()))
         return edition
 
     def catalogue(self, db, item):
         """Reads the followed artist's catalogue into want_album. Left out: repackages (best-ofs, deluxe and anniversary
         editions, re-recordings, albums most of whose songs are on its earlier ones), singles whose songs are all on its
-        albums or EPs, and what has no official release. Starred albums and albums with files never are."""
+        albums or EPs, and what has no official release. Starred albums, albums with files and albums and EPs Lidarr
+        looked for never are."""
         groups = sorted(self.browse(db, item["mbid"]), key=lambda g: g.get("first-release-date") or "9999")
         editions = {g["id"]: self.edition(db, g["id"]) for g in groups}
         starred = {r[0] for r in db.execute("select mbid from lidarr_item where kind = 'album' and mbid is not null")}
-        kept = lambda g: g["id"] not in why or g["id"] in starred or self.have_files(db, g["id"])
+        lidarrs = {r[0] for r in db.execute("select mbid from catalogue_search where mbid is not null")}  # see carry
+        kept = lambda g: g["id"] not in why or g["id"] in starred or self.have_files(db, g["id"]) or \
+            g["primary-type"] != "Single" and g["id"] in lidarrs
         seen, why = set(), {}
         for g in (g for g in groups if g["primary-type"] != "Single"):
             songs = editions[g["id"]]["songs"]
@@ -233,7 +246,7 @@ class Acquire:
         db.executemany("delete from want_album where rg = ?", [(rg,) for (rg,) in db.execute(
             "select rg from want_album where artist_mbid = ? and reason = 'followed'", (item["mbid"],)).fetchall() if rg not in listed])
         db.execute("update lidarr_item set catalogued = ?, error = null, retry_at = null where kind = 'artist' and ref = ?", (time.time(), item["ref"]))
-        log.info("acquire: catalogue of %s: %d release groups, %d left out", name or item["mbid"], len(groups), len(skipped))
+        log.info("catalogue of %s: %d release groups, %d left out", name or item["mbid"], len(groups), len(skipped))
 
     def have_files(self, db, rg: str) -> bool:
         return bool(db.execute("select 1 from track where mb_release_group = ? and source = 'local'", (rg,)).fetchone())
@@ -263,7 +276,7 @@ class Acquire:
             except LookupError:
                 group = ""  # MusicBrainz doesn't have it: not asked again
             except OSError as e:
-                log.info("acquire: release group of %s: %s", release, e)
+                log.info("release group of %s: %s", release, e)
                 return
             db.execute("update track set mb_release_group = ? where mb_release = ? and mb_release_group is null", (group, release))
 
@@ -291,7 +304,7 @@ class Acquire:
             try:
                 groups |= self.lidarr.queued_groups()
             except OSError as e:
-                log.info("acquire: Lidarr's queue: %s", e)
+                log.info("Lidarr's queue: %s", e)
         return groups
 
     def search_next(self, db):
@@ -314,7 +327,7 @@ class Acquire:
         try:
             sent = self.downloads.find(db, self.target(db, row), row["rg"])
         except (OSError, LookupError) as e:
-            log.warning("acquire: search for %s - %s failed: %s", row["artist"], row["title"], e)
+            log.warning("search for %s - %s failed: %s", row["artist"], row["title"], e)
             sent, error = None, f"search failed: {e}"[:300]
         self.last_search = now = time.time()
         if sent is False:  # TorBox had no free slot

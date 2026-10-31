@@ -34,8 +34,9 @@ class MusicBrainz:
             return {"release-groups": groups[int(q["offset"]):][:100], "release-group-count": len(groups)}
         if path == "release":
             songs = self.songs.get(q["release-group"])
-            return {"releases": [] if songs is None else [{"media": [{"tracks": [{"title": s} for s in songs]}]},
-                                                          {"media": [{"tracks": [{"title": s} for s in songs + ["Bonus"]]}] * 2}]}
+            video = {"format": "DVD-Video", "tracks": [{"title": "Live"}]}  # the smallest edition, but not the album
+            return {"releases": [] if songs is None else [{"media": [{"tracks": [{"title": s} for s in songs]}]}, {"media": [video]},
+                                                          {"media": [{"tracks": [{"title": s} for s in songs + ["Bonus"]]}] * 2 + [video]}]}
         if path.startswith("release-group/"):
             return next(g for gs in self.catalogues.values() for g in gs if g["id"] == path.split("/")[1])
         if path.startswith("release/"):
@@ -67,7 +68,7 @@ class FakeDownloads:
 
 class FakeLidarr:
     def __init__(self):
-        self.calls, self.queue, self.albums = [], set(), []
+        self.calls, self.queue, self.albums, self.missing_albums = [], set(), [], []
 
     def queued_groups(self):
         self.calls.append("queue")
@@ -76,6 +77,10 @@ class FakeLidarr:
     def all_albums(self):
         self.calls.append("albums")
         return self.albums
+
+    def missing(self):
+        self.calls.append("missing")
+        return self.missing_albums
 
     def rescan(self, folders):
         self.calls.append("rescan")
@@ -252,16 +257,22 @@ def test_unfollowing_drops_the_catalogue_but_keeps_starred_albums_and_unstarring
     assert wants(client)["Greatest Hits"] == ("skipped", "followed", "a repackage")  # back in the catalogue, left out again
 
 
-def test_lidarrs_searches_carry_over_and_lidarr_is_asked_nothing_else(client, mb, lidarr):
+def test_lidarrs_searches_and_wanted_albums_carry_over_once_and_lidarr_is_asked_nothing_else(client, mb, lidarr):
     db = client.app.state.api._db()
     searched = time.time() - 3600
     db.execute("insert into catalogue_search(album_id, searched) values (12, ?)", (searched,))
     lidarr.albums = [{"id": 12, "foreignAlbumId": "g-second"}, {"id": 13, "foreignAlbumId": "g-ost"}]
+    lidarr.missing_albums = [{"id": 14, "foreignAlbumId": "g-again", "albumType": "Album"}, {"id": 15, "foreignAlbumId": "g-one", "albumType": "Single"}]
     follow_beta(client, mb)
     row = db.execute("select * from want_album where rg = 'g-second'").fetchone()
     assert (row["searched"], row["tries"], row["next_search"]) == (searched, 1, searched + acquire.RESEARCH)
     assert db.execute("select searched from want_album where rg = 'g-ost'").fetchone()[0] is not None  # never searched: first
-    assert set(lidarr.calls) == {"albums", "queue"}  # no lookups, no monitoring
+    assert wants(client)["Again"] == ("missing", "followed", None)  # Lidarr looked for it: not left out
+    assert wants(client)["One"][0] == "skipped"  # singles go by the singles rule
+    assert set(lidarr.calls) == {"albums", "missing", "queue"}  # no lookups, no monitoring
+    lidarr.calls.clear()
+    Acquire(client.app.state.api._db, FakeDownloads(), lidarr).reconcile()
+    assert "albums" not in lidarr.calls and "missing" not in lidarr.calls  # once
 
 
 def test_catalogue_reads_keep_musicbrainzs_pace(tmp_path, monkeypatch):
