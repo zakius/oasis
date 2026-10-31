@@ -153,7 +153,7 @@ def test_starred_artist_gets_its_catalogue_searched_paced(client, lidarr):
     assert [c for c in lidarr.calls if c[0] == "set_albums"] == [("set_albums", (50, 51), True), ("set_albums", (), False)]
     assert [c for c in lidarr.calls if c[0] == "search"] == [("search", 50)]
     library.last_search -= lidarr_module.SEARCH_GAP
-    lidarr.queue_albums.update({1, 2, 50})  # busy: no new search
+    lidarr.queue_albums.update({*range(1, lidarr_module.MAX_ACTIVE), 50})  # busy: no new search
     sync(client)
     assert [c for c in lidarr.calls if c[0] == "search"] == [("search", 50)]
     lidarr.queue_albums.clear()
