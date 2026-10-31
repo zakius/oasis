@@ -56,8 +56,11 @@ class FakeLidarr(Lidarr):
         return [{**a, "artistId": artist_id} for artist_id, albums in self.artist_albums.items() for a in albums
                 if a["monitored"] and not a.get("have")]
 
+    def cutoff_unmet(self):
+        return []
+
     def queued(self):
-        return self.queue_albums, set()
+        return self.queue_albums, set(), len(self.queue_albums)
 
     def why_nothing(self, album_id):
         return "searched, nothing grabbed yet"

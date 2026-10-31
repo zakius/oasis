@@ -18,7 +18,8 @@ RETRY_ERROR = 300       # seconds before retrying after Lidarr or MusicBrainz er
 SEARCH_GAP = 180        # seconds between album searches, so a burst of stars doesn't trip the debrid service's rate limit
 RESEARCH = 6 * 3600     # seconds before searching again for an album that got nothing
 GRAB_WAIT = 600         # seconds after a search before "nothing grabbed" counts
-MAX_ACTIVE = 3          # downloads in Lidarr's queue above which no new search starts
+MAX_ACTIVE = 2          # running downloads at which no new search starts: TorBox's plan has 3 slots, one stays free for anime
+UPGRADE_AGAIN = 7 * 86400  # seconds between searches for a lossless copy of an album downloaded lossy
 CATALOGUE_TYPES = {"Album", "EP"}  # what of a followed artist's back catalogue gets downloaded; singles repeat album tracks
 
 
@@ -98,9 +99,14 @@ class Lidarr:
     def missing(self) -> list[dict]:
         return self.call("GET", "wanted/missing?page=1&pageSize=5000&monitored=true&sortKey=releaseDate&sortDirection=descending")["records"]
 
-    def queued(self) -> tuple[set[int], set[int]]:
+    def cutoff_unmet(self) -> list[dict]:
+        return self.call("GET", "wanted/cutoff?page=1&pageSize=5000&monitored=true&sortKey=releaseDate&sortDirection=descending")["records"]
+
+    def queued(self) -> tuple[set[int], set[int], int]:
+        """Albums and artists in Lidarr's queue, and how many of its downloads still run."""
         records = self.call("GET", "queue?pageSize=1000")["records"]
-        return {r["albumId"] for r in records if r.get("albumId")}, {r["artistId"] for r in records if r.get("artistId")}
+        return ({r["albumId"] for r in records if r.get("albumId")}, {r["artistId"] for r in records if r.get("artistId")},
+                sum(r.get("trackedDownloadState") == "downloading" for r in records))
 
     def why_nothing(self, album_id: int) -> str:
         """The reason an album searched for isn't downloading, from Lidarr's history."""
@@ -151,7 +157,7 @@ class Library:
         try:
             for kind, ref in db.execute("select distinct kind, ref from wanted").fetchall():
                 db.execute("insert or ignore into lidarr_item(kind, ref, state, updated) values (?, ?, 'wanted', ?)", (kind, ref, time.time()))
-            queued_albums, queued_artists = self.lidarr.queued()
+            queued_albums, queued_artists, running = self.lidarr.queued()
             for item in db.execute("select * from lidarr_item").fetchall():
                 wanted = db.execute("select 1 from wanted where kind = ? and ref = ?", (item["kind"], item["ref"])).fetchone()
                 if wanted and (item["retry_at"] or 0) > time.time():
@@ -168,7 +174,8 @@ class Library:
                 except Exception as e:  # Lidarr or MusicBrainz down, timeouts: soon again
                     log.warning("Lidarr: %s %s: %s", item["kind"], item["ref"], e)
                     set_state(db, item, "wanted" if not item["mbid"] else item["state"], str(e)[:300], retry=RETRY_ERROR)
-            self.search_next(db, queued_albums)
+            if running < MAX_ACTIVE:
+                self.search_next(db, queued_albums)
         finally:
             db.close()
 
@@ -233,7 +240,7 @@ class Library:
     def search_next(self, db, queued_albums: set):
         """Searches one album at a time, SEARCH_GAP apart and only while few downloads run: starred albums first, then
         followed artists' back catalogues, newest first; each time those never searched before ones that got nothing."""
-        if time.time() - self.last_search < SEARCH_GAP or len(queued_albums) >= MAX_ACTIVE:
+        if time.time() - self.last_search < SEARCH_GAP:
             return
         item = db.execute("select * from lidarr_item where kind = 'album' and state = 'sent' and lidarr_id is not null "
                           "and (searched is null or searched < ?) and exists (select 1 from wanted w where w.kind = 'album' "
@@ -252,8 +259,9 @@ class Library:
         if not followed:
             return
         searched = dict(db.execute("select album_id, searched from catalogue_search").fetchall())
-        due = [a for a in self.lidarr.missing() if a["artistId"] in followed and a["id"] not in queued_albums
-               and searched.get(a["id"], 0) < time.time() - RESEARCH]
+        due = lambda albums, every: [a for a in albums if a["artistId"] in followed and a["id"] not in queued_albums
+                                     and searched.get(a["id"], 0) < time.time() - every]
+        due = due(self.lidarr.missing(), RESEARCH) or due(self.lidarr.cutoff_unmet(), UPGRADE_AGAIN)  # then lossy ones, for lossless
         if not due:
             return
         album = min(due, key=lambda a: a["id"] in searched)  # stable: keeps Lidarr's newest-first order otherwise
