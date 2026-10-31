@@ -1,15 +1,16 @@
+import json
 import time
 
 import pytest
 
 from conftest import call, make_client
 from oasis import lidarr as lidarr_module
-from oasis.lidarr import Library, Lidarr, artist_names
+from oasis.lidarr import Library, Lidarr, adopt, adoptable, artist_names
 
 
 class FakeLidarr(Lidarr):
     def __init__(self):
-        self.albums, self.artists, self.queue_albums, self.calls, self.artist_albums, self.album_tracks = {}, {}, set(), [], {}, {}
+        self.albums, self.by_mbid, self.queue_albums, self.calls, self.artist_albums, self.album_tracks = {}, {}, set(), [], {}, {}
 
     def find_album(self, artist, title):
         self.calls.append(("find_album", artist, title))
@@ -22,7 +23,7 @@ class FakeLidarr(Lidarr):
         return self.albums.get(mbid)
 
     def artist(self, mbid):
-        return self.artists.get(mbid)
+        return self.by_mbid.get(mbid)
 
     def add_album(self, found):
         self.calls.append(("add_album", found["foreignAlbumId"]))
@@ -32,9 +33,12 @@ class FakeLidarr(Lidarr):
 
     def add_artist(self, found):
         self.calls.append(("add_artist", found["foreignArtistId"]))
-        artist = {"id": 100 + len(self.artists), "monitored": True, "monitorNewItems": "all"}
-        self.artists[found["foreignArtistId"]] = artist
+        artist = {"id": 100 + len(self.by_mbid), "monitored": True, "monitorNewItems": "all", "artistName": found["artistName"]}
+        self.by_mbid[found["foreignArtistId"]] = artist
         return artist
+
+    def artists(self):
+        return [{**a, "foreignArtistId": mbid} for mbid, a in self.by_mbid.items()]
 
     def set_albums(self, album_ids, monitored):
         self.calls.append(("set_albums", tuple(album_ids), monitored))
@@ -203,6 +207,32 @@ def test_no_match_fails_with_reason_and_waits_while_errors_retry_soon(client, li
     shown = album_of(client, "First")
     assert shown["oasisWanted"] == "wanted" and "503" in shown["oasisWantedError"]
     assert abs(db.execute("select retry_at - updated from lidarr_item").fetchone()[0] - lidarr_module.RETRY_ERROR) < 5
+
+
+def test_artists_followed_in_lidarr_itself_are_adopted_once_by_mbid_and_searched(client, lidarr, tmp_path):
+    starred = next(a for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"] if a["name"] == "Beta")
+    call(client, "star", artistId=starred["id"])
+    sync(client)  # Beta: followed through oasis, Lidarr 100
+    lidarr.by_mbid.update({"mb-hunter-de": {"id": 7, "artistName": "Hunter", "monitored": True, "monitorNewItems": "all"},
+                           "mb-hunter-pl": {"id": 8, "artistName": "Hunter", "monitored": True, "monitorNewItems": "all"},
+                           "mb-alpha": {"id": 9, "artistName": "The Alpha", "monitored": True, "monitorNewItems": "all"},
+                           "mb-ost": {"id": 10, "artistName": "Composer", "monitored": False, "monitorNewItems": "none"}})  # a starred album's
+    lidarr.artist_albums[7] = [{"id": 80, "monitored": False, "albumType": "Album", "foreignAlbumId": "mb-80", "title": "Bez", "releaseDate": "2005"},
+                               {"id": 81, "monitored": True, "albumType": "Single", "foreignAlbumId": "mb-81", "title": "Kiedy", "releaseDate": "2006"}]
+    db = client.app.state.api._db()
+    found = adoptable(db, lidarr)
+    assert sorted(a["id"] for a in found) == [7, 8, 9]
+    adopt(db, lidarr, "zakius", found, tmp_path / "snapshot.json")
+    assert {a["id"]: a["monitoredAlbumIds"] for a in json.loads((tmp_path / "snapshot.json").read_text())} == {7: [81], 8: [], 9: []}
+    rows = {r["lidarr_id"]: r for r in db.execute("select * from lidarr_item where kind = 'artist'")}
+    assert rows[7]["ref"] != rows[8]["ref"] and rows[7]["state"] == rows[8]["state"] == "followed"  # one name, two artists
+    assert all(db.execute("select 1 from wanted where kind = 'artist' and ref = ?", (rows[i]["ref"],)).fetchone() for i in (7, 8, 9))
+    shown = call(client, "getStarred2")["starred2"]["artist"]
+    assert {a["name"] for a in shown} == {"Beta", "The Alpha"} and rows[9]["ref"] == next(a["id"] for a in shown if a["name"] == "The Alpha")
+    assert adoptable(db, lidarr) == []  # a second run changes nothing
+    sync(client)  # the Hunters have no tracks in oasis: still followed, catalogue monitored, searched
+    assert all(r["state"] == "followed" and r["error"] is None for r in db.execute("select * from lidarr_item where kind = 'artist'"))
+    assert ("set_albums", (80,), True) in lidarr.calls and [c for c in lidarr.calls if c[0] == "search"] == [("search", 80)]
 
 
 def test_collaboration_credits_split_into_artist_names():

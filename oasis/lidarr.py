@@ -8,7 +8,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
+from .db import artist_id
 from .ytm import fold
 
 log = logging.getLogger(__name__)
@@ -68,6 +70,9 @@ class Lidarr:
                     next((a for a in mine if fold(title) and (fold(title) in fold(a["title"]) or fold(a["title"]) in fold(title))), None):
                 return match
         return None
+
+    def artists(self) -> list[dict]:
+        return self.call("GET", "artist") or []
 
     def artist(self, mbid: str) -> dict | None:
         return next(iter(self.call("GET", f"artist?mbId={mbid}") or []), None)
@@ -274,6 +279,10 @@ class Library:
         row = db.execute(f"select album_artist, album from track where {column} = ? limit 1", (item["ref"],)).fetchone() or \
             (db.execute("select a.name album_artist, r.title album from ytm_release r join ytm_artist a on a.artist_id = r.artist_id "
                         "where r.album_id = ?", (item["ref"],)).fetchone() if item["kind"] == "album" else None)
+        if row is None and item["kind"] == "artist" and item["mbid"]:  # followed before any of its music arrived
+            known = db.execute("select name from mb_artist where mbid = ?", (item["mbid"],)).fetchone()
+            if name := known[0] if known else (self.lidarr.artist(item["mbid"]) or {}).get("artistName"):
+                return name, None
         if row is None:
             raise LookupError("not in oasis any more")
         return row["album_artist"], row["album"] if item["kind"] == "album" else None
@@ -395,6 +404,36 @@ class Library:
             starred = {r[0] for r in db.execute("select mbid from lidarr_item where kind = 'album' and mbid is not null")}
             self.lidarr.set_albums([a["id"] for a in self.lidarr.albums_of(artist["id"]) if a["monitored"]
                                     and a["foreignAlbumId"] not in starred and not (a.get("statistics") or {}).get("trackFileCount")], False)
+
+
+def adoptable(db, lidarr: Lidarr) -> list[dict]:
+    """Artists followed in Lidarr itself, which oasis doesn't follow. Those Lidarr has only for a starred album aren't
+    followed: they are monitored for no new releases."""
+    followed = {r[0] for r in db.execute("select mbid from lidarr_item where kind = 'artist' and mbid is not null")}
+    return [a for a in lidarr.artists() if a["foreignArtistId"] not in followed and a["monitored"] and a.get("monitorNewItems") == "all"]
+
+
+def adopt(db, lidarr: Lidarr, user: str, artists: list[dict], snapshot: Path):
+    """Makes the user follow the artists in oasis, as if starred, so the paced search covers their missing albums. Their
+    Lidarr monitoring is saved to snapshot first, for rollback: the first reconcile monitors their albums and EPs and
+    drops repackages. The MusicBrainz id decides who each artist is: names like 'Hunter' are ambiguous."""
+    snapshot.write_text(json.dumps([{**{k: a.get(k) for k in ("id", "artistName", "foreignArtistId", "monitored", "monitorNewItems")},
+                                     "monitoredAlbumIds": [b["id"] for b in lidarr.albums_of(a["id"]) if b["monitored"]]}
+                                    for a in artists], indent=1))
+    db.execute("begin immediate")  # reconcile releases an item nobody wants: the row and its want land together
+    try:
+        for a in artists:
+            id, now = artist_id(db, a["artistName"], a["foreignArtistId"]), time.time()
+            db.execute("insert into lidarr_item(kind, ref, state, mbid, lidarr_id, updated) values ('artist', ?, 'followed', ?, ?, ?) "
+                       "on conflict(kind, ref) do update set state = excluded.state, mbid = excluded.mbid, lidarr_id = excluded.lidarr_id, "
+                       "error = null, retry_at = null, searched = null where lidarr_item.mbid is null", (id, a["foreignArtistId"], a["id"], now))
+            db.execute("insert or ignore into wanted values (?, 'artist', ?)", (user, id))
+            db.execute("insert into stat(id, starred) values (?, ?) on conflict(id) do update set starred = coalesce(stat.starred, excluded.starred)",
+                       (id, now))
+        db.execute("commit")
+    except BaseException:
+        db.execute("rollback")
+        raise
 
 
 def song_key(title: str) -> str:

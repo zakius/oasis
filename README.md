@@ -55,6 +55,8 @@ oasis keeps who wants what, and a worker reconciles Lidarr with it after every s
 
 Albums and artists carry `oasisWanted`: `wanted`, `downloading` (only while Lidarr's queue holds it) or `failed`, with the reason in `oasisWantedError` (for example "searched, nothing grabbed yet"), and nothing once an album is complete, an artist is followed, or nobody wants it.
 
+`oasis adopt-lidarr --user NAME` makes NAME follow, as if starred, every artist followed in Lidarr itself that oasis doesn't follow yet, by MusicBrainz id; `--dry-run` only lists them. It first saves their Lidarr monitoring to `adopt-lidarr-<date>.json` next to the database, since the next reconcile monitors their albums and EPs. Unstarring one undoes it.
+
 With a `[torbox]` section as well, a worker fixes what Lidarr and rdtclient leave stuck, every 5 minutes (see `oasis/doctor.py`): failed imports go in against whichever edition of the album the files cover, or the release is blocklisted and searched again; downloads rdtclient finished but never completed get imported; TorBox's queued items, untracked and dead torrents are deleted so its active slots stay free; and slow downloads are swapped for a copy TorBox has cached. It needs the downloads folder at the same path Lidarr sees it.
 
 ```toml
