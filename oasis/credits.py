@@ -23,7 +23,8 @@ MUSICBRAINZ = "https://musicbrainz.org/ws/2/release/{}?fmt=json&inc=artist-credi
               "release-groups+artist-rels+recording-level-rels+work-rels+work-level-rels"
 USER_AGENT = "oasis/0.1 ( https://github.com/zakius/oasis )"
 GAP = 1.1             # seconds between MusicBrainz requests
-RETRY = 300           # seconds before retrying after MusicBrainz errors
+RETRY = 30, 600       # seconds before retrying after MusicBrainz errors (503 when busy): first, doubling up to the last
+IDLE = 300            # seconds between looks for new releases when nothing woke the worker
 NOT_FOUND = -1        # credits_at for releases MusicBrainz doesn't have
 
 # MusicBrainz relationship -> role, for recordings, works and whole releases.
@@ -155,18 +156,23 @@ class Credits:
     def __init__(self, connect, fetch=None):
         self.connect, self.fetch = connect, fetch or fetch_release
         self.wake = threading.Event()
+        self.retry = RETRY[0]
 
     def start(self):
         threading.Thread(target=self.run, daemon=True).start()
 
     def run(self):
         while True:
+            wait = IDLE
             try:
                 while self.step():
                     time.sleep(GAP)
+            except OSError as e:
+                log.warning("MusicBrainz: %s; again in %d s", e, self.retry)
+                wait, self.retry = self.retry, min(self.retry * 2, RETRY[1])
             except Exception:
                 log.exception("credits failed")
-            self.wake.wait(RETRY)
+            self.wake.wait(wait)
             self.wake.clear()
 
     def step(self) -> bool:
@@ -184,10 +190,8 @@ class Credits:
                 db.execute("update track set credits_at = ? where mb_release = ?", (NOT_FOUND, release))
                 db.commit()
                 return True
-            except OSError as e:
-                log.warning("MusicBrainz release %s: %s", release, e)
-                return False
             apply(db, data)
+            self.retry = RETRY[0]
             db.commit()
             return True
         finally:
@@ -258,4 +262,4 @@ def fetch_release(mbid: str) -> dict:
     except urllib.error.HTTPError as e:
         if e.code == 404:
             raise LookupError(mbid) from e
-        raise OSError(f"MusicBrainz: {e.code}") from e
+        raise OSError(f"release {mbid}: {e.code}") from e
