@@ -21,7 +21,7 @@ from starlette.routing import Route
 
 from . import accounts, cover, dedupe, forward, lyrics, scan, web, ytm
 from .config import Config
-from .credits import Credits
+from .credits import PERFORMANCE_ROLES, Credits
 from .db import connect, make_id, move_track, remember
 from .forward import Forwarder, LastFm
 from .lidarr import Library, Lidarr
@@ -203,12 +203,22 @@ def describe(db, payload: dict) -> dict:
 
 
 def credits_of(db, track_ids: list[str]) -> dict[str, list]:
-    """Each track's credits: MusicBrainz's when it has them, else the file's tags."""
-    rows = db.execute(f"select * from credit where track_id in ({','.join('?' * len(track_ids))}) order by position", track_ids).fetchall()
+    """Each track's credits: MusicBrainz's when it has them, else the file's tags; plus the performance credits
+    MusicBrainz has for other releases of the same audio (see credits.performance_credits)."""
+    marks = ",".join("?" * len(track_ids))
+    rows = db.execute(f"select * from credit where track_id in ({marks}) order by position", track_ids).fetchall()
     found = {}
     for r in rows:
         found.setdefault(r["track_id"], {}).setdefault(r["source"], []).append(r)
-    return {t: sources.get("musicbrainz") or sources.get("tags", []) for t, sources in found.items()}
+    mine = {t: sources.get("musicbrainz") or sources.get("tags", []) for t, sources in found.items()}
+    siblings = db.execute(f"select t.id, o.id other from track t join audio_pair p on p.level > 0 and t.ref in (p.a, p.b) "
+                          f"join track o on o.ref = case when p.a = t.ref then p.b else p.a end where t.id in ({marks})", track_ids).fetchall()
+    for r in siblings:
+        extra = [c for c in db.execute("select * from credit where track_id = ? and source = 'musicbrainz' order by position", (r["other"],))
+                 if c["role"] in PERFORMANCE_ROLES]
+        have = {(c["role"], c["sub_role"], c["artist_id"]) for c in mine.get(r["id"], [])}
+        mine[r["id"]] = [*mine.get(r["id"], []), *(c for c in extra if (c["role"], c["sub_role"], c["artist_id"]) not in have)]
+    return mine
 
 
 def people(credits, role: str) -> tuple[list[dict], str | None]:

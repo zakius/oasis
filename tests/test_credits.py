@@ -89,3 +89,28 @@ def test_credits_survive_rescans_and_files_without_musicbrainz_use_their_tags(cl
     plain = song_named(client, "Plain")
     assert plain["displayComposer"] == "Tag Composer"
     assert {(c["role"], c["artist"]["name"]) for c in plain["contributors"]} == {("composer", "Tag Composer"), ("lyricist", "Tag Lyricist")}
+
+
+def test_one_performance_entered_twice_in_musicbrainz_shares_its_credits_but_not_its_artist_credit(client, library):
+    other_release = {**RELEASE, "id": "rel-2", "label-info": [], "media": [{"tracks": [{
+        "id": "track-2", "title": "Run", "artist-credit": [{"name": "Gawr Gura", "artist": {"id": "gura", "name": "Gawr Gura"}, "joinphrase": ""}],
+        "recording": {"id": "rec-2", "relations": [{"type": "instrument", "attributes": ["bass"], "artist": {"id": "nate", "name": "Nate Mendel"}}]}}]}]}
+    make_track(library / "Single/01.flac", title="Run", artist="Gawr Gura", album="Single",
+               musicbrainz_albumid="rel-2", musicbrainz_releasetrackid="track-2")
+    db = client.app.state.api._db()
+    scan(db, [library])
+    first, second = str(library / "Songs/01.flac"), str(library / "Single/01.flac")
+    db.execute("insert into audio_pair values (?, ?, 0, 0, 1)", tuple(sorted((first, second))))  # dedupe found one stream
+    releases = {"rel-1": RELEASE, "rel-2": other_release}
+    credits = Credits(client.app.state.api._db, fetch=releases.__getitem__)
+    while credits.step():
+        pass
+
+    run = next(s for s in call(client, "search3", query="Run")["searchResult3"]["song"] if s["album"] == "Songs")
+    single = next(s for s in call(client, "search3", query="Run")["searchResult3"]["song"] if s["album"] == "Single")
+    assert ("performer", "bass", "Nate Mendel") in {(c["role"], c.get("subRole"), c["artist"]["name"]) for c in run["contributors"]}
+    assert ("performer", "guitar", "Dave Grohl") in {(c["role"], c.get("subRole"), c["artist"]["name"]) for c in single["contributors"]}
+    assert run["displayArtist"] == "Gura feat. Calli" and single["displayArtist"] == "Gawr Gura"  # as each release prints it
+    assert "Nate Mendel (bass)" in mutagen.File(first).tags["PERFORMER"]  # filled first, extended when the other came
+    assert "Dave Grohl (guitar)" in mutagen.File(second).tags["PERFORMER"]
+    assert mutagen.File(first).tags["COMPOSER"] == ["Someone Already Tagged"]

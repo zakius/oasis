@@ -15,6 +15,7 @@ import mutagen
 from mutagen._vorbis import VCommentDict
 
 from .db import make_id
+from .dedupe import retagged, same_audio
 
 log = logging.getLogger(__name__)
 
@@ -117,11 +118,11 @@ def tag_credits(tags) -> list[dict]:
 
 
 def write_tags(path: str, fields: dict, credits: list[dict]) -> bool:
-    """Adds what the file lacks (Vorbis comments: FLAC, Ogg); returns whether it changed."""
+    """Adds what the file lacks (Vorbis comments: FLAC, Ogg), never removing a value; returns whether it changed."""
     audio = mutagen.File(path)
     if audio is None or not isinstance(audio.tags, VCommentDict):
         return False
-    tags, before = audio.tags, len(audio.tags)
+    tags = audio.tags
     by_role = {}
     for c in credits:
         by_role.setdefault(c["role"], []).append(c)
@@ -133,11 +134,16 @@ def write_tags(path: str, fields: dict, credits: list[dict]) -> bool:
     for role, tag in TAGS.items():
         people = by_role.get(role, [])
         wanted[tag] = [f"{c['name']} ({c['sub_role']})" if role == "performer" and c["sub_role"] else c["name"] for c in people]
+    changed = False
     for tag, values in wanted.items():
         values = list(dict.fromkeys(v for v in values if v))
-        if values and not tags.get(tag):
-            tags[tag] = values
-    if len(tags) == before:
+        have = tags.get(tag) or []
+        # Only adds: an empty tag is filled, and one holding nothing but values from here gains the rest; a tag with
+        # anything else in it (someone's own edit) stays as it is.
+        if set(have) < set(values):
+            tags[tag] = [*have, *(v for v in values if v not in have)]
+            changed = True
+    if not changed:
         return False
     audio.save()
     return True
@@ -198,15 +204,42 @@ def apply(db, data: dict):
             continue
         fields = {**release, **entry["fields"]}
         store(db, row["id"], entry["credits"], "musicbrainz")
-        try:
-            write_tags(row["ref"], fields, entry["credits"])
-        except OSError as e:  # read-only library: the database still has it all
-            log.info("can't write tags to %s: %s", row["ref"], e)
+        retag(db, row["ref"], fields, performance_credits(db, row["ref"], entry["credits"]))
+        for other in same_audio(db, row["ref"]):  # releases filled earlier gain what this one adds
+            own = [dict(c) for c in db.execute("select c.* from credit c join track t on t.id = c.track_id where t.ref = ? "
+                                               "and c.source = 'musicbrainz' order by c.position", (other,))]
+            if own:
+                retag(db, other, {}, performance_credits(db, other, own))
         columns = [k for k in ("label", "release_types", "isrc", "original_date", "mb_recording", "genres") if fields.get(k)]
         genres = json.loads(fields.get("genres") or "[]")
         db.execute(f"update track set {', '.join(f'{c} = ?' for c in columns)}{', ' if columns else ''}"
                    "genre = coalesce(genre, ?), credits_at = ? where id = ?",
                    [*(fields[c] for c in columns), genres[0] if genres else None, time.time(), row["id"]])
+
+
+# Credits that describe the performance itself, the same for every release of one stream; the artist credit, album
+# artist, label and ISRC are what each release prints and stay its own.
+PERFORMANCE_ROLES = {"performer", "conductor", "producer", "mixer", "engineer", "remixer", "arranger", "composer", "lyricist", "writer"}
+
+
+def performance_credits(db, path: str, credits: list[dict]) -> list[dict]:
+    """`credits` plus what MusicBrainz credits on other releases of the same audio (dedupe's matches): one
+    performance entered twice and never merged gets the union of both entries' credits."""
+    others = same_audio(db, path)
+    if not others:
+        return credits
+    rows = db.execute(f"select c.* from credit c join track t on t.id = c.track_id where c.source = 'musicbrainz' and t.ref in "
+                      f"({','.join('?' * len(others))}) order by c.position", others).fetchall()
+    shared = [dict(r) for r in rows if r["role"] in PERFORMANCE_ROLES]
+    return dedupe_credits(credits + shared)
+
+
+def retag(db, path: str, fields: dict, credits: list[dict]):
+    try:
+        if write_tags(path, fields, credits):
+            retagged(db, path)
+    except OSError as e:  # read-only library: the database still has it all
+        log.info("can't write tags to %s: %s", path, e)
 
 
 def store(db, track_id: str, credits: list[dict], source: str):

@@ -221,6 +221,21 @@ def pictures_of(path: Path) -> list[Picture]:
     return audio.pictures if isinstance(audio, FLAC) else pictures(audio)
 
 
+def retagged(db, path: str):
+    """Tags of a file changed, its audio didn't: dedupe's verdicts and clone records for it stay valid."""
+    mtime = os.path.getmtime(path)
+    db.execute("update audio_shared set mtime = ? where path = ?", (mtime, path))
+    db.execute("update audio_shared set kept_mtime = ? where kept = ?", (mtime, path))
+    db.execute("update audio_pair set a_mtime = ? where a = ?", (mtime, path))
+    db.execute("update audio_pair set b_mtime = ? where b = ?", (mtime, path))
+
+
+def same_audio(db, path: str) -> list[str]:
+    """Other files dedupe found to hold the same stream."""
+    return [r[0] for r in db.execute("select b from audio_pair where a = ? and level > 0 union select a from audio_pair where b = ? and level > 0",
+                                     (path, path))]
+
+
 def run(db) -> list[tuple[str, str]]:
     """One pass over the library; returns the files it replaced, as (old path, new path)."""
     songs = defaultdict(list)

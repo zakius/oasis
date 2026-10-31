@@ -122,6 +122,8 @@ def migrate(db: sqlite3.Connection):
                 # SQLite adds a NOT NULL column only with a default.
                 constraint = (f" not null default {default}" if not_null else f" default {default}") if default is not None else ""
                 db.execute(f"alter table {table} add column {name} {kind}{constraint}")
+                if table == "track":
+                    db.execute("update track set mtime = null where source = 'local'")  # the next scan reads files for it
     current.close()
 
 
