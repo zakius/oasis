@@ -5,6 +5,8 @@ database = "oasis.db"     # relative paths resolve against this file's directory
 
 [library]
 paths = ["~/Music"]
+dedupe = false    # store each audio stream once: copies of a song in several editions become reflinks of the best one,
+                  # each keeping its own tags. Needs the library writable and on btrfs or XFS.
 
 [ytmusic]
 enabled = false   # search YouTube Music and stream from it

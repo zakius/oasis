@@ -52,6 +52,12 @@ create table if not exists lidarr_item(
     retry_at real, updated real not null,
     primary key(kind, ref)
 );
+create table if not exists audio_pair(  -- dedupe verdicts, valid while both files are unchanged
+    a text not null, b text not null, a_mtime real not null, b_mtime real not null, level int not null, primary key(a, b)
+);
+create table if not exists audio_shared(  -- files dedupe made reflinks of a kept copy
+    path text primary key, kept text not null, mtime real not null, kept_mtime real not null
+);
 create table if not exists catalogue_search(album_id int primary key, searched real not null);  -- followed artists' albums, by Lidarr id
 create table if not exists ytm_artist(  -- an artist's YouTube Music page, kept for a day
     artist_id text primary key, name text, description text, image text, songs text, fetched real not null
@@ -125,6 +131,21 @@ def remember(db, row: dict) -> str:
     return row["id"]
 
 
+def move_track(db, old: str, new: str):
+    """Moves playlist entries, plays, stars and ratings from one track to another and drops the old one; its id
+    keeps working as an alias, since clients keep ids in queues and caches."""
+    for table in ("playlist_entry", "play", "outbox"):
+        db.execute(f"update {table} set track_id = ? where track_id = ?", (new, old))
+    db.execute("insert into stat(id, starred, rating, play_count, played) select ?, starred, rating, play_count, played "
+               "from stat where id = ? on conflict(id) do update set starred = coalesce(stat.starred, excluded.starred), "
+               "rating = coalesce(stat.rating, excluded.rating), play_count = stat.play_count + excluded.play_count, "
+               "played = max(coalesce(stat.played, 0), coalesce(excluded.played, 0))", (new, old))
+    for table, column in (("stat", "id"), ("lyrics", "track_id"), ("track", "id")):
+        db.execute(f"delete from {table} where {column} = ?", (old,))
+    db.execute("update moved set new_id = ? where new_id = ?", (new, old))
+    db.execute("insert or replace into moved values (?, ?)", (old, new))
+
+
 def adopt_local_copies(db):
     """Points streams that now have a local copy (same artist and title, length within 5 s) at the local file: playlist
     entries, stars and plays move over and the stream entry goes, so nothing keeps streaming what's on disk."""
@@ -133,15 +154,5 @@ def adopt_local_copies(db):
                        "and abs(coalesce(l.duration, 0) - coalesce(y.duration, 0)) <= 5 where y.source = 'ytm'").fetchall()
     for stream, video, local in pairs:
         db.execute("update track set ytm_id = ? where id = ? and coalesce(ytm_id, '') = ''", (video, local))
-        for table in ("playlist_entry", "play", "outbox"):
-            db.execute(f"update {table} set track_id = ? where track_id = ?", (local, stream))
-        db.execute("insert into stat(id, starred, rating, play_count, played) select ?, starred, rating, play_count, played "
-                   "from stat where id = ? on conflict(id) do update set starred = coalesce(stat.starred, excluded.starred), "
-                   "rating = coalesce(stat.rating, excluded.rating), play_count = stat.play_count + excluded.play_count, "
-                   "played = max(coalesce(stat.played, 0), coalesce(excluded.played, 0))", (local, stream))
-        for table, column in (("stat", "id"), ("lyrics", "track_id"), ("track", "id")):
-            db.execute(f"delete from {table} where {column} = ?", (stream,))
-        # Clients keep the old id in queues and caches; it keeps working as an alias.
-        db.execute("update moved set new_id = ? where new_id = ?", (local, stream))
-        db.execute("insert or replace into moved values (?, ?)", (stream, local))
+        move_track(db, stream, local)
     return len(pairs)

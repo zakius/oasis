@@ -19,9 +19,9 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import accounts, cover, forward, lyrics, scan, web, ytm
+from . import accounts, cover, dedupe, forward, lyrics, scan, web, ytm
 from .config import Config
-from .db import connect, make_id, remember
+from .db import connect, make_id, move_track, remember
 from .forward import Forwarder, LastFm
 from .lidarr import Library, Lidarr
 from .recommend import Recommender, set_entries
@@ -223,11 +223,28 @@ class Api:
             db = self._db()
             try:
                 scan.scan(db, self.config.library)
+                if self.config.dedupe:
+                    self._dedupe(db)
             finally:
                 db.close()
                 self.scanning = False
                 self.scan_lock.release()
         threading.Thread(target=run, daemon=True).start()
+
+    def _dedupe(self, db):
+        replaced = dedupe.run(db)
+        if not replaced:
+            return
+        scan.scan(db, self.config.library)
+        renamed = [(old, new) for old, new in replaced if old != new]  # took the kept copy's format, so a new path and id
+        for old, new in renamed:
+            move_track(db, make_id("tr-", old), make_id("tr-", new))
+        db.commit()
+        if renamed and self.library:
+            try:
+                self.library.lidarr.rescan(sorted({str(Path(new).parent) for _, new in renamed}))
+            except OSError as e:
+                log.warning("dedupe: Lidarr rescan failed: %s", e)
 
     def _authenticate(self, db, p: Params) -> str:
         user = p.need("u")

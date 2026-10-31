@@ -103,6 +103,9 @@ class Lidarr:
             return self.call("GET", f"track?albumId={album['id']}") or []
         return self.call("GET", f"track?albumReleaseId={min(releases, key=lambda r: r['trackCount'])['id']}") or []
 
+    def rescan(self, folders: list[str]):
+        self.call("POST", "command", {"name": "RescanFolders", "folders": folders})
+
     def follow_artist(self, artist: dict, follow: bool):
         """Following monitors the artist for new releases; unfollowing unmonitors it. Albums keep their own monitoring."""
         self.call("PUT", f"artist/{artist['id']}", {**artist, "monitored": follow, "monitorNewItems": "all" if follow else "none"})

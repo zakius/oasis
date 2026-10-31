@@ -5,7 +5,7 @@ description = "OpenSubsonic server that merges a local library with streaming se
 readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.12"
-dependencies = ["starlette>=0.39", "uvicorn>=0.30", "mutagen>=1.47", "ytmusicapi>=1.10", "yt-dlp>=2025.11", "yt-dlp-ejs"]
+dependencies = ["starlette>=0.39", "uvicorn>=0.30", "mutagen>=1.47", "numpy>=2", "ytmusicapi>=1.10", "yt-dlp>=2025.11", "yt-dlp-ejs"]
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx2"]
