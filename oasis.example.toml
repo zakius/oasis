@@ -26,13 +26,13 @@ cache = "cache"   # downloaded audio; tracks you star or add to a playlist downl
 api_key = ""
 secret = ""
 
-# Starred albums and artists are downloaded through Lidarr (see README).
-# [lidarr]
-# url = "http://lidarr:8686"
-# api_key = ""
-# [torbox]                       # with [lidarr]: unstick Lidarr's downloads (README → Lidarr)
+# Starred albums and artists are searched on Prowlarr and downloaded through TorBox (README → Getting music).
+# [torbox]
 # rdt_db = "/rdt/rdtclient.db"
-# downloads = "/downloads/oasis"  # oasis downloads through TorBox itself (README → Lidarr)
+# downloads = "/downloads/oasis"
+# [prowlarr]
+# url = "http://prowlarr:9696"
+# api_key = ""
 
 # Admins. More users can be added on the account page (http://<host>:4533/admin) or with Subsonic's createUser.
 [[users]]

@@ -9,7 +9,7 @@ import pytest
 from conftest import call, make_client
 from test_accounts import sign_in
 from oasis import acquire, musicbrainz
-from oasis.acquire import Acquire
+from oasis.acquire import Acquire, artist_names
 from oasis.db import connect
 from oasis.download import Downloads
 
@@ -71,26 +71,6 @@ class FakeDownloads:
         return self.result
 
 
-class FakeLidarr:
-    def __init__(self):
-        self.calls, self.queue, self.albums, self.missing_albums = [], set(), [], []
-
-    def queued_groups(self):
-        self.calls.append("queue")
-        return self.queue
-
-    def all_albums(self):
-        self.calls.append("albums")
-        return self.albums
-
-    def missing(self):
-        self.calls.append("missing")
-        return self.missing_albums
-
-    def rescan(self, folders):
-        self.calls.append("rescan")
-
-
 @pytest.fixture
 def mb(monkeypatch):
     fake = MusicBrainz()
@@ -99,14 +79,9 @@ def mb(monkeypatch):
 
 
 @pytest.fixture
-def lidarr():
-    return FakeLidarr()
-
-
-@pytest.fixture
-def client(library, tmp_path, lidarr, mb):
+def client(library, tmp_path, mb):
     with make_client(library, tmp_path / "oasis.db") as c:
-        c.app.state.api.library = Acquire(c.app.state.api._db, FakeDownloads(), lidarr)
+        c.app.state.api.library = Acquire(c.app.state.api._db, FakeDownloads())
         yield c
 
 
@@ -176,7 +151,7 @@ def test_have_counts_library_tracks_and_maps_files_tagged_without_their_release_
     assert {r[0] for r in db.execute("select mb_release_group from track where album = 'First'")} == {"g-first"}
 
 
-def test_missing_albums_are_searched_in_order_and_again_ever_further_apart(client, mb, lidarr, monkeypatch):
+def test_missing_albums_are_searched_in_order_and_again_ever_further_apart(client, mb, monkeypatch):
     follow_beta(client, mb)
     acq, now = client.app.state.api.library, [time.time()]
     monkeypatch.setattr(time, "time", lambda: now[0])
@@ -186,11 +161,9 @@ def test_missing_albums_are_searched_in_order_and_again_ever_further_apart(clien
         sync(client)
         return acq.downloads.found[-1] if acq.downloads.found else None
     assert acq.downloads.found == ["g-ost"]  # newest album first; singles after albums and EPs
-    lidarr.queue.add("g-second")  # Lidarr's RSS grab has it
-    assert search() == "g-new"
-    lidarr.queue.clear()
     assert search() == "g-second"
-    assert search() == "g-second" and len(acq.downloads.found) == 3  # nothing due: no search
+    assert search() == "g-new"
+    assert search() == "g-new" and len(acq.downloads.found) == 3  # nothing due: no search
     db = client.app.state.api._db()
     row = db.execute("select * from want_album where rg = 'g-ost'").fetchone()
     assert (row["tries"], row["next_search"] - row["searched"], row["error"]) == (1, 6 * 3600, "searched, no release found yet")
@@ -229,6 +202,12 @@ def test_an_artist_with_gaps_gets_a_weekly_bundle_search_in_an_album_searchs_pla
     now[0] += acquire.BUNDLE_AGAIN
     sync(client)
     assert acq.downloads.found[2][0] == "bundle"
+
+
+def test_collaboration_credits_split_into_artist_names():
+    assert artist_names("SawanoHiroyuki[nZk]:mizuki") == ["SawanoHiroyuki[nZk]:mizuki", "SawanoHiroyuki[nZk]", "SawanoHiroyuki", "mizuki"]
+    assert artist_names("Falling In Reverse, Corey Taylor, Serj Tankian")[:2] == ["Falling In Reverse, Corey Taylor, Serj Tankian", "Falling In Reverse"]
+    assert artist_names("A feat. B")[1:] == ["A", "B"] and artist_names("X × Y")[1:] == ["X", "Y"]
 
 
 def test_a_new_star_resolves_through_musicbrainz_search_exact_matches_only(client, mb):
@@ -279,22 +258,17 @@ def test_unfollowing_drops_the_catalogue_but_keeps_starred_albums_and_unstarring
     assert wants(client)["Greatest Hits"] == ("skipped", "followed", "a repackage")  # back in the catalogue, left out again
 
 
-def test_lidarrs_searches_and_wanted_albums_carry_over_once_and_lidarr_is_asked_nothing_else(client, mb, lidarr):
+def test_what_lidarr_searched_and_looked_for_still_counts_once_it_is_gone(client, mb):
     db = client.app.state.api._db()
     searched = time.time() - 3600
-    db.execute("insert into catalogue_search(album_id, searched) values (12, ?)", (searched,))
-    lidarr.albums = [{"id": 12, "foreignAlbumId": "g-second"}, {"id": 13, "foreignAlbumId": "g-ost"}]
-    lidarr.missing_albums = [{"id": 14, "foreignAlbumId": "g-again", "albumType": "Album"}, {"id": 15, "foreignAlbumId": "g-one", "albumType": "Single"}]
+    db.executemany("insert into catalogue_search(album_id, searched, mbid) values (?, ?, ?)",
+                   [(12, searched, "g-second"), (14, 0, "g-again"), (15, 0, "g-one")])  # as carried over from Lidarr
     follow_beta(client, mb)
     row = db.execute("select * from want_album where rg = 'g-second'").fetchone()
     assert (row["searched"], row["tries"], row["next_search"]) == (searched, 1, searched + acquire.RESEARCH)
     assert db.execute("select searched from want_album where rg = 'g-ost'").fetchone()[0] is not None  # never searched: first
     assert wants(client)["Again"] == ("missing", "followed", None)  # Lidarr looked for it: not left out
     assert wants(client)["One"][0] == "skipped"  # singles go by the singles rule
-    assert set(lidarr.calls) == {"albums", "missing", "queue"}  # no lookups, no monitoring
-    lidarr.calls.clear()
-    Acquire(client.app.state.api._db, FakeDownloads(), lidarr).reconcile()
-    assert "albums" not in lidarr.calls and "missing" not in lidarr.calls  # once
 
 
 def test_catalogue_reads_keep_musicbrainzs_pace(tmp_path, monkeypatch):
@@ -327,8 +301,7 @@ def test_downloads_failing_make_the_album_due_again(tmp_path):
     class TorBox:
         def delete_torrent(self, id):
             pass
-    made = Downloads(lambda: connect(tmp_path / "oasis.db"), None, None, str(tmp_path / "dl"))
-    made.client = TorBox()
+    made = Downloads(lambda: connect(tmp_path / "oasis.db"), TorBox, None, None, str(tmp_path / "dl"))
     assert made.groups(db) == {"g"}
     made.fail(db, db.execute("select * from download").fetchone(), "dead torrent")
     assert db.execute("select next_search, error from want_album").fetchone()[:] == (None, "download failed: dead torrent") and made.groups(db) == set()
@@ -403,7 +376,7 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     db.execute("update want_album set searched = ?, next_search = ? where rg = ?", (now, now + 3600, STRAY))
     db.execute("insert into download(hash, album_id, album_mbid, title, state, created, updated) values ('h', 0, ?, 'B', 'downloading', ?, ?)",
                (BOOTLEG, now, now))
-    downloads = Downloads(api._db, None, None, "dl")
+    downloads = Downloads(api._db, None, None, None, "dl")
     downloads.client, downloads.seen["h"] = type("TorBox", (), {"delete_torrent": lambda self, id: None})(), (0.42, now)
     api.downloads = downloads
     api.library.downloads.active.add(BOOTLEG)

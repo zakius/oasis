@@ -3,11 +3,9 @@ import time
 import pytest
 
 from oasis.db import connect
-from oasis.doctor import Doctor
 from oasis import download
-from oasis.download import Downloads, choose
-from oasis.lidarr import Library
-from test_doctor import FakeLidarr, FakeTorBox, proposal, torrent
+from oasis.download import Downloads
+from test_doctor import FakeTorBox, torrent
 
 
 class TorBox(FakeTorBox):
@@ -32,9 +30,35 @@ def tb(id, hash, **extra):
     return {"download_state": "downloading", "download_finished": False, "download_present": False, **torrent(id, hash, **extra)}
 
 
-def offer(guid, hash, weight, *rejections, **extra):
-    return {"guid": guid, "indexerId": 1, "title": f"Artist - Album {guid}", "infoHash": hash, "qualityWeight": weight, "size": 300e6,
-            "rejections": list(rejections), "quality": {"quality": {"name": "FLAC"}}, "protocol": "torrent", **extra}
+def result(title, hash="", seeders=5, size=400e6, **extra):
+    return {"title": title, "infoHash": hash, "seeders": seeders, "size": size, "guid": f"guid-{title}", "indexerId": 1, **extra}
+
+
+class Prowlarr:
+    def __init__(self, results):
+        self.results, self.asked = results, []
+
+    def search(self, query):
+        self.asked.append(query)
+        return self.results.get(query, [])
+
+
+class Importer:
+    """importer.py's place: records what it got, and fails for the release groups in failing."""
+    def __init__(self):
+        self.placed, self.failing = [], set()
+
+    def place(self, folder, group):
+        self.placed.append((folder, group))
+        if group in self.failing:
+            raise LookupError("no edition matches")
+
+
+WANT = {"artist": "Artist", "names": ["Artist"], "title": "Album", "year": "", "others": [], "discs": 1, "upgrade": False, "native": []}
+
+
+def offer(hash, quality="FLAC", **extra):
+    return result(f"Artist - Album [{quality}]", hash, magnetUrl=f"magnet:?xt=urn:btih:{hash}", **extra)
 
 
 def files(tmp_path, *names):
@@ -50,53 +74,31 @@ def db(tmp_path):
 
 
 @pytest.fixture
-def lidarr():
-    fake = FakeLidarr()
-    fake.albums[5] = {"id": 5, "artistId": 9, "title": "Album", "foreignAlbumId": "mb-album", "artist": {"artistName": "Artist"},
-                      "releases": [], "statistics": {"trackFileCount": 0, "trackCount": 2}}
-    return fake
-
-
-@pytest.fixture
 def torbox(tmp_path):
     return TorBox(tmp_path)
 
 
 @pytest.fixture
-def downloads(tmp_path, lidarr, torbox, monkeypatch):
+def downloads(tmp_path, torbox, monkeypatch):
     monkeypatch.setattr(download, "PACE", 0)
-    made = Downloads(lambda: connect(tmp_path / "oasis.db"), lidarr, Doctor(None, lidarr, "unused"), str(tmp_path / "dl"), stall_hours=1)
-    made.client, made.imported = torbox, lambda: made.scans.append(1)
+    made = Downloads(lambda: connect(tmp_path / "oasis.db"), lambda: torbox, Importer(), Prowlarr({}), str(tmp_path / "dl"), stall_hours=1,
+                     imported=lambda: made.scans.append(1))
     made.scans = []
     return made
 
 
-def test_cached_releases_win_at_equal_or_better_quality_whatever_their_seeders():
-    releases = [offer("best", "aa", 10), offer("worse", "bb", 5), offer("seedless", "cc", 10, "Not enough seeders: 0"),
-                offer("wrong", "dd", 20, "Wrong format"), offer("blocked", "ee", 10)]
-    picks = choose(releases, "Artist", "Album", {"ee"}, lambda hashes: {"bb", "cc", "dd", "ee"} & set(hashes))
-    assert [r["guid"] for r in picks] == ["seedless", "best", "worse"]
-    # The best accepted release is cached itself: no lesser cached one jumps it.
-    picks = choose(releases[:3], "Artist", "Album", set(), lambda hashes: {"aa", "bb"})
-    assert [r["guid"] for r in picks] == ["best", "worse"]
-    # A seedless release nobody has cached isn't eligible, and doesn't raise the bar for the cached ones.
-    picks = choose([offer("dead", "ff", 20, "Not enough seeders: 0"), *releases[:2]], "Artist", "Album", set(), lambda hashes: {"bb"})
-    assert [r["guid"] for r in picks] == ["best", "worse"]
+def finished(id, hash, names, tmp_path):
+    return {**tb(id, hash, progress=1, active=False), "download_state": "completed", "download_finished": True, "download_present": True,
+            "files": files(tmp_path, *names)}
 
 
-def test_an_unparsed_match_comes_last_and_blocked_guids_are_skipped():
-    releases = [offer("odd", "", 1, "Unable to parse release"), offer("g1", None, 10), offer("ok", "aa", 10)]
-    picks = choose(releases, "Artist", "Album", {"g1"}, lambda hashes: set())
-    assert [r["guid"] for r in picks] == ["ok", "odd"]
-
-
-def test_a_search_sends_the_pick_to_torbox_and_the_files_are_fetched_and_imported(downloads, lidarr, torbox, db, tmp_path):
-    lidarr.offers[5] = [offer("a", "abcd", 10, magnetUrl="magnet:?xt=urn:btih:abcd&dn=x")]
-    assert downloads.search(db, 5)
-    assert torbox.added == [("Artist - Album a", "magnet:?xt=urn:btih:abcd&dn=x", None)]
+def test_a_find_sends_the_pick_to_torbox_and_the_files_are_fetched_and_placed(downloads, torbox, db, tmp_path):
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
+    assert downloads.find(db, WANT, "mb-album")
+    assert torbox.added == [("Artist - Album [FLAC]", "magnet:?xt=urn:btih:abcd", None)]
     row = db.execute("select * from download").fetchone()
-    assert (row["hash"], row["album_id"], row["album_mbid"], row["torbox_id"], row["state"]) == ("abcd", 5, "mb-album", 71, "added")
-    assert downloads.albums(db) == {5}
+    assert (row["hash"], row["album_id"], row["album_mbid"], row["torbox_id"], row["state"]) == ("abcd", 0, "mb-album", 71, "added")
+    assert downloads.groups(db) == {"mb-album"}
 
     torbox.list = [tb(71, "abcd", progress=0.5)]
     downloads.cycle()
@@ -106,69 +108,60 @@ def test_a_search_sends_the_pick_to_torbox_and_the_files_are_fetched_and_importe
     assert db.execute("select state from download").fetchone()[0] == "downloading"
 
     folder = tmp_path / "dl" / "abcd"
-    lidarr.proposed[str(folder)] = [proposal(str(folder / "Album/01.flac"), tracks=[1]), proposal(str(folder / "Album/02.flac"), tracks=[2])]
-    torbox.list = [{**tb(71, "abcd", progress=1, active=False), "download_state": "completed", "download_finished": True,
-                    "download_present": True, "files": files(tmp_path, "Album/01.flac", "Album/02.flac", "Album/rip.log", "Album/cover.jpg")}]
+    torbox.list = [finished(71, "abcd", ["Album/01.flac", "Album/02.flac", "Album/rip.log", "Album/cover.jpg"], tmp_path)]
     downloads.cycle()
     assert sorted(torbox.links) == [0, 1, 3]  # no log
-    assert [f["path"] for f in lidarr.imported[0]] == [str(folder / "Album/01.flac"), str(folder / "Album/02.flac")]
-    assert lidarr.mode == "move" and lidarr.imported[0][0]["downloadId"] is None
+    assert downloads.own.placed == [(folder, "mb-album")]
     assert db.execute("select state from download").fetchone()[0] == "done"
-    assert torbox.deleted == [71] and not folder.exists() and downloads.albums(db) == set() and downloads.scans == [1]
+    assert torbox.deleted == [71] and not folder.exists() and downloads.groups(db) == set() and downloads.scans == [1]
 
 
-def test_two_same_named_files_in_different_folders_both_arrive_and_a_restart_mid_fetch_resumes(downloads, lidarr, torbox, db, tmp_path):
-    lidarr.offers[5] = [offer("a", "abcd", 10)]
-    downloads.search(db, 5)
+def test_two_same_named_files_in_different_folders_both_arrive_and_a_restart_mid_fetch_resumes(downloads, torbox, db, tmp_path):
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
+    downloads.find(db, WANT, "mb-album")
     names = ["Album/CD1/01 Intro.flac", "Album/CD2/01 Intro.flac", "Album/CD1/folder.jpg", "Album/CD2/folder.jpg"]
-    torbox.list = [{**tb(71, "abcd", progress=1, active=False), "download_state": "completed", "download_finished": True,
-                    "download_present": True, "files": files(tmp_path, *names)}]
+    torbox.list = [finished(71, "abcd", names, tmp_path)]
     folder = tmp_path / "dl" / "abcd"
     (folder / "Album/CD1").mkdir(parents=True)
     (folder / "Album/CD2").mkdir()
     (folder / names[0]).write_bytes((tmp_path / "cdn" / "0").read_bytes())  # fetched before the restart
     (folder / names[1]).write_bytes(b"cut short")
     db.execute("update download set state = 'fetching'")
-    lidarr.imports_land = False  # import fails: the files stay for inspection
+    downloads.own.failing.add("mb-album")  # import fails: the files stay for inspection
     downloads.cycle()
     assert sorted(torbox.links) == [1, 2, 3]
     assert [(folder / n).read_bytes() for n in names] == [(tmp_path / "cdn" / str(i)).read_bytes() for i in range(4)]
     row = db.execute("select state, error from download").fetchone()
-    assert tuple(row) == ("failed", "import failed: the files match no edition of the album") and folder.exists()
-    assert {r[0] for r in db.execute("select hash from release_block")} == {"a", "abcd"}
+    assert tuple(row) == ("failed", "import failed: no edition matches") and folder.exists()
+    assert {r[0] for r in db.execute("select hash from release_block")} == {"guid-Artist - Album [FLAC]", "abcd"}
 
 
-def test_a_dead_torrent_is_deleted_blocked_and_its_album_searched_again(downloads, lidarr, torbox, db, tmp_path):
-    lidarr.offers[5] = [offer("a", "abcd", 10), offer("b", "bcde", 9)]
-    db.execute("insert into lidarr_item(kind, ref, state, lidarr_id, searched, updated) values ('album', 'al-1', 'downloading', 5, 1, 0)")
-    downloads.search(db, 5)
+def test_a_dead_torrent_is_deleted_blocked_and_the_next_find_takes_another(downloads, torbox, db):
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd"), offer("bcde", "MP3 320")]
+    downloads.find(db, WANT, "mb-album")
     db.execute("update download set created = ?", (time.time() - 7200,))
     torbox.list = [tb(71, "abcd", progress=0, seeds=0)]
     downloads.cycle()
     assert torbox.deleted == [71] and db.execute("select state from download").fetchone()[0] == "failed"
-    assert db.execute("select searched from lidarr_item").fetchone()[0] is None
-    downloads.search(db, 5)
+    downloads.find(db, WANT, "mb-album")
     assert [a[1] for a in torbox.added][-1] == "magnet:?xt=urn:btih:bcde"
 
 
-def test_a_torrent_still_moving_or_seeded_is_not_dead(downloads, lidarr, torbox, db):
-    lidarr.offers[5] = [offer("a", "abcd", 10)]
-    downloads.search(db, 5)
+def test_a_torrent_still_moving_or_seeded_is_not_dead(downloads, torbox, db):
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
+    downloads.find(db, WANT, "mb-album")
     db.execute("update download set created = ?", (time.time() - 7200,))
     torbox.list = [tb(71, "abcd", progress=0, seeds=2)]
     downloads.cycle()
     assert torbox.deleted == [] and db.execute("select state from download").fetchone()[0] == "downloading"
 
 
-def test_a_queued_add_is_dropped_without_blocking_and_the_album_comes_back_soon(downloads, lidarr, torbox, db, tmp_path):
-    lidarr.offers[5] = [offer("a", "abcd", 10)]
+def test_a_queued_add_is_dropped_without_blocking(downloads, torbox, db):
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
     torbox.full = True
-    library = Library(lambda: connect(tmp_path / "oasis.db"), lidarr, downloads)
-    before = time.time()
-    searched = library.search(db, 5)
+    assert downloads.find(db, WANT, "mb-album") is False  # acquire.py makes the album due again soon
     assert torbox.dropped == [90] and db.execute("select count(*) from release_block").fetchone()[0] == 0
     assert db.execute("select count(*) from download").fetchone()[0] == 0
-    assert before - 6 * 3600 < searched < before - 6 * 3600 + 700  # due again after RETRY_FULL, not RESEARCH
 
 
 def test_the_slot_rule_counts_every_active_torbox_torrent_anime_included(downloads, torbox):
@@ -176,50 +169,3 @@ def test_the_slot_rule_counts_every_active_torbox_torrent_anime_included(downloa
     assert downloads.room()
     torbox.list.append(torrent(8, "seeding", progress=1))
     assert not downloads.room()
-
-
-def test_with_downloads_the_library_searches_through_them_and_shows_them_downloading(downloads, lidarr, torbox, db, tmp_path):
-    from test_lidarr import FakeLidarr as LibraryLidarr
-    fake = LibraryLidarr()
-    fake.releases, fake.album_by_id = lidarr.releases, lidarr.album_by_id
-    lidarr.albums[1], lidarr.offers[1] = {**lidarr.albums[5], "id": 1}, [offer("a", "abcd", 10)]  # the fake's id for the album
-    downloads.lidarr = fake
-    library = Library(lambda: connect(tmp_path / "oasis.db"), fake, downloads)
-    db.execute("insert into track(id, source, ref, album_artist, album, album_id) values ('t', 'local', '/x', 'Artist', 'Album', 'al-1')")
-    db.execute("insert into user(name, password, created) values ('u', 'p', 0)")
-    db.execute("insert into wanted values ('u', 'album', 'al-1')")
-    torbox.list = [torrent(i, f"anime{i}") for i in range(8)]
-    library.reconcile()
-    assert torbox.added == [] and ("search", 1) not in fake.calls  # TorBox full: no search
-    torbox.list = []
-    library.reconcile()
-    assert len(torbox.added) == 1 and ("search", 1) not in fake.calls  # not through Lidarr's grab
-    library.reconcile()
-    assert db.execute("select state from lidarr_item").fetchone()[0] == "downloading"
-
-
-def test_with_its_own_importer_oasis_places_the_files_and_lidarr_rescans_the_album(downloads, lidarr, torbox, db, tmp_path):
-    class Own:
-        def place(self, folder, group):
-            placed.append((folder, group))
-            if group == "mb-other":
-                raise LookupError("no edition matches")
-            return tmp_path / "music/Artist/Album (2001)"
-
-    placed, downloads.own = [], Own()
-    lidarr.offers[5] = [offer("a", "abcd", 10)]
-    downloads.search(db, 5)
-    torbox.list = [{**tb(71, "abcd", progress=1, active=False), "download_state": "completed", "download_finished": True,
-                    "download_present": True, "files": files(tmp_path, "Album/01.flac")}]
-    downloads.cycle()
-    folder = tmp_path / "dl" / "abcd"
-    assert placed == [(folder, "mb-album")] and lidarr.imported == [] and lidarr.rescanned == [str(tmp_path / "music/Artist/Album (2001)")]
-    assert db.execute("select state from download").fetchone()[0] == "done" and not folder.exists() and downloads.scans == [1]
-
-    lidarr.albums[5]["foreignAlbumId"], lidarr.offers[5] = "mb-other", [offer("b", "bcde", 10)]
-    downloads.search(db, 5)
-    torbox.list = [{**torbox.list[0], "id": 72, "hash": "bcde"}]
-    downloads.cycle()
-    row = db.execute("select state, error from download where hash = 'bcde'").fetchone()
-    assert tuple(row) == ("failed", "import failed: no edition matches") and (tmp_path / "dl/bcde/Album/01.flac").exists()
-    assert {r[0] for r in db.execute("select hash from release_block")} == {"b", "bcde"}

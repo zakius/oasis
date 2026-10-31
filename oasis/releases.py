@@ -13,7 +13,6 @@ from pathlib import PurePosixPath
 
 from . import musicbrainz
 from .importer import AUDIO, LOSSLESS as LOSSLESS_FILES, key, match, number_of, title_of
-from .lidarr import BUNDLES
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +26,7 @@ VARIANTS = re.compile(r"\b(best of|greatest hits|very best|the essential|antholo
                       r"re ?recorded|reissue|remix(es|ed)?|instrumentals?|inst|off vocal|karaoke|acapellas?|a ?cappellas?|live|unplugged|"
                       r"acoustic|demos?|tribute|orchestral|symphonic|piano|lullaby|8 ?bit|sped up|slowed|nightcore|tv size)\b")
 VARIANTS_JA = re.compile(r"インスト|カラオケ|ライ[ブヴ]|リミックス|オフボーカル")
+BUNDLES = re.compile(r"discograph|collection|complete|box ?set|anthology|全集|ディスコグラフィ", re.I)
 VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|\d{3,4}p|x26[45]|h ?26[45]|hevc|mkv|avi|video)\b")
 IMAGE = re.compile(r"\b(image|img) cue\b")  # one file for the whole disc: the importer takes a file per track
 LOSSLESS = re.compile(r"\b(flac|alac|wav|lossless|24 ?bits?|hi ?res|ape)\b")
@@ -85,19 +85,6 @@ def quality(name: str) -> int:
     """From the name: 3 lossless, 2 MP3 320, 1 V0, 0 anything else."""
     text = " ".join(words(name))
     return 3 if LOSSLESS.search(text) else 2 if MP3_320.search(text) else 1 if V0.search(text) else 0
-
-
-def target(db, lidarr, album: dict) -> dict:
-    """What the search looks for: the artist under all its names (MusicBrainz aliases, Lidarr's name), the title,
-    year, discs, the artist's other albums and EPs (a name holding one is a bundle), and whether the album is here
-    lossy already (then only lossless will do)."""
-    artist = album["artist"]
-    albums = [a for a in lidarr.albums_of(album["artistId"]) if a.get("albumType") in ("Album", "EP")]
-    names = aliases(db, artist["artistName"], artist.get("foreignArtistId"), [album["title"], *(a["title"] for a in albums)])
-    return {"artist": artist["artistName"], "names": names, "title": album["title"], "year": (album.get("releaseDate") or "")[:4],
-            "native": native(names), "discs": next((r.get("mediumCount") or 1 for r in album.get("releases") or [] if r.get("monitored")), 1),
-            "others": [a["title"] for a in albums if a["id"] != album["id"]],
-            "upgrade": bool((album.get("statistics") or {}).get("trackFileCount"))}
 
 
 def native(names: list[str]) -> list[str]:

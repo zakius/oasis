@@ -13,7 +13,7 @@ from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
 from . import accounts, acquire, musicbrainz, releases
-from .acquire import MB_IDS, TYPES, Acquire
+from .acquire import MB_IDS, TYPES
 from .forward import LastFm
 
 COOKIE = "oasis_session"
@@ -239,10 +239,7 @@ def routes(api) -> list[Route]:
                 f'<li>{"✓" if r["state"] == "done" else "✗"} {escape(r["title"])} <span class="muted">{ago(r["updated"])}'
                 f'{": " + escape(r["error"]) if r["error"] and r["state"] == "failed" else ""}</span></li>' for r in recent) + '</ul>')
         if api.library:
-            try:
-                lines.append(f'{api.library.still_to_find(db)} more albums still to find.')
-            except Exception as e:
-                lines.append(f'<span class="error">Lidarr didn\'t answer: {escape(str(e))}</span>')
+            lines.append(f'{api.library.still_to_find(db)} more albums still to find.')
         filled = count("select count(*) from track where source = 'local' and credits_at is not null")
         known = count("select count(*) from track where source = 'local' and mb_release is not null")
         artists_done = count("select count(*) from mb_artist where fetched is not null and mbid in (select mbid from credit)")
@@ -308,8 +305,8 @@ def routes(api) -> list[Route]:
     def catalogue(handler):
         """A music page, for any signed-in user: it needs oasis's own catalogue (acquire.py)."""
         def run(db, request, user, form):
-            if not isinstance(api.library, Acquire):
-                return page("Find music", MUSIC_NAV, error='oasis\'s own catalogue is off ([acquire] catalogue = "oasis" turns it on).')
+            if not api.library:
+                return page("Find music", MUSIC_NAV, error="Acquisition is off: it needs [torbox] with downloads and [prowlarr] in oasis.toml.")
             return handler(db, request, user, form)
         return signed_in(run)
 

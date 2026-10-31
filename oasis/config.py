@@ -14,11 +14,10 @@ class Config:
     ytm_cache: Path | None = None
     lastfm_key: str | None = None
     lastfm_secret: str | None = None
-    lidarr: dict | None = None  # url, api_key, and optionally root_folder, quality_profile, metadata_profile
     torbox: dict | None = None  # rdt_db (rdtclient's database, which holds the TorBox key), stall_hours, dry_run (see doctor.py),
-                                # downloads, max_active, import ("oasis" or "lidarr": who imports oasis's downloads; see download.py)
+                                # downloads, max_active (see download.py)
     prowlarr: dict | None = None  # url, api_key, tag (the music indexers'): oasis searches them itself (see releases.py)
-    acquire: dict = dataclasses.field(default_factory=dict)  # catalogue ("oasis" or "lidarr"), secondary_types, bundles (see acquire.py)
+    acquire: dict = dataclasses.field(default_factory=dict)  # secondary_types, bundles (see acquire.py)
     artists: dict = dataclasses.field(default_factory=dict)  # merge, separate and related names (see artists.py)
     dedupe: bool = False        # store each audio stream once (see dedupe.py); needs the library writable, on btrfs or XFS
 
@@ -41,5 +40,4 @@ def load(path: Path) -> Config:
         dedupe=data.get("library", {}).get("dedupe", False),
         torbox=data["torbox"] if data.get("torbox", {}).get("rdt_db") else None,
         prowlarr=data["prowlarr"] if data.get("prowlarr", {}).get("url") and data["prowlarr"].get("api_key") else None,
-        lidarr=data["lidarr"] if data.get("lidarr", {}).get("url") and data["lidarr"].get("api_key") else None,
     )

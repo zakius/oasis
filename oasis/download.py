@@ -1,9 +1,8 @@
 """oasis's own downloads: the release a search picks goes to TorBox, which downloads the torrent on its servers; oasis
-fetches the files over HTTP into its staging folder and imports them. rdtclient isn't involved, so
-TorBox's slots and queue are read directly, files keep their paths inside the torrent, and oasis keeps its own record
-of which hash is which album. oasis places the files itself (importer.py), or with import = "lidarr" has Lidarr
-import them. A cached bundle serves several albums: only their files are fetched, each album into
-<hash>/<release group>/, and each is imported on its own (download_target). Nothing seeds from here."""
+fetches the files over HTTP into its staging folder and places them itself (importer.py). rdtclient isn't involved,
+so TorBox's slots and queue are read directly, files keep their paths inside the torrent, and oasis keeps its own
+record of which hash is which album. A cached bundle serves several albums: only their files are fetched, each album
+into <hash>/<release group>/, and each is imported on its own (download_target). Nothing seeds from here."""
 import hashlib
 import json
 import logging
@@ -18,9 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 
 from . import releases
-from .doctor import CACHE_IGNORES
 from .importer import AUDIO, editions
-from .lidarr import GRAB_TRIES, unparsed_match
 from .releases import hash_of
 from .torbox import RateLimited
 
@@ -33,23 +30,7 @@ PARALLEL = 2             # files fetched at once
 PAUSE = 300              # seconds without file downloads after a 429
 FETCH_TRIES = 5          # polls in a row a file may fail to download before the release counts as broken
 KEEP_FAILED = 7 * 86400  # seconds a failed download's files stay for inspection
-
-
-def choose(offers: list[dict], artist: str, title: str, blocked: set, cached) -> list[dict]:
-    """The releases to try for an album, in turn: those TorBox has cached (it downloads them at once, seeders or not)
-    at least as good as the best eligible one, then those Lidarr accepts, best first, then one it can't read by name.
-    A release whose only faults are few seeders or a copy in Lidarr's queue is eligible only when cached."""
-    fresh = [r for r in offers if r.get("protocol") != "usenet" and not {hash_of(r), r.get("guid")} & blocked]
-    accepted = [r for r in fresh if not r.get("rejections")]
-    seedless = [r for r in fresh if r.get("rejections") and all(x.startswith(CACHE_IGNORES) for x in r["rejections"])]
-    have = cached(list(dict.fromkeys(h for r in accepted + seedless if (h := hash_of(r))))[:100])
-    eligible = [r for r in fresh if any(r is a for a in accepted) or (any(r is s for s in seedless) and hash_of(r) in have)]
-    best = max((r["qualityWeight"] for r in eligible), default=0)
-    picks = [r for r in eligible if hash_of(r) in have and r["qualityWeight"] >= best]
-    picks += [r for r in accepted if not any(r is p for p in picks)]
-    if (unparsed := unparsed_match(fresh, artist, title)) and not any(unparsed is p for p in picks):
-        picks.append(unparsed)
-    return picks
+GRAB_TRIES = 5           # picks tried in turn when TorBox won't take one
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -118,13 +99,10 @@ class Downloads:
     """Sends searches' picks to TorBox and walks each download through added -> downloading -> fetching ->
     importing -> done, or failed. The state is in the download table, so a restart resumes where it was."""
 
-    def __init__(self, connect, lidarr, importer, downloads: str, max_active: int = 8, stall_hours: float = 1, imported=lambda: None, own=None,
-                 prowlarr=None):
-        """importer: the doctor, for the TorBox key and Lidarr's import. own: oasis's Importer, which imports instead.
-        imported: called after each import. Lidarr tells oasis to scan after its own imports, not after ManualImport.
-        prowlarr: oasis searches the indexers itself; without, Lidarr's search lists the releases."""
-        self.connect, self.lidarr, self.importer, self.folder, self.imported, self.own = connect, lidarr, importer, Path(downloads), imported, own
-        self.prowlarr = prowlarr
+    def __init__(self, connect, torbox, importer, prowlarr, downloads: str, max_active: int = 8, stall_hours: float = 1, imported=lambda: None):
+        """torbox: makes the TorBox client (the doctor's, with the key rdtclient holds). importer: importer.py's.
+        imported: called after each import."""
+        self.connect, self.torbox_for, self.own, self.prowlarr, self.folder, self.imported = connect, torbox, importer, prowlarr, Path(downloads), imported
         self.max_active, self.stall = max_active, stall_hours * 3600
         self.client = None
         self.seen = {}       # hash -> (progress, since when)
@@ -132,7 +110,7 @@ class Downloads:
         self.pace, self.last_request, self.paused_until = threading.Lock(), 0.0, 0.0
 
     def torbox(self):
-        self.client = self.client or self.importer.torbox()  # the key rdtclient holds
+        self.client = self.client or self.torbox_for()
         return self.client
 
     def start(self):
@@ -142,7 +120,7 @@ class Downloads:
         while True:
             try:
                 self.cycle()
-            except Exception:  # TorBox or Lidarr down: next poll
+            except Exception:  # TorBox down: next poll
                 log.exception("downloads poll failed")
             time.sleep(INTERVAL)
 
@@ -151,25 +129,14 @@ class Downloads:
         anime's and seeding ones too; max_active of them leaves the rest for anime."""
         return sum(bool(t["active"]) for t in self.torbox().torrents()) < self.max_active
 
-    def albums(self, db) -> set[int]:
-        return {r[0] for r in db.execute("select album_id from download where state not in ('done', 'failed')")}
-
     def groups(self, db) -> set[str]:
         return {r[0] for r in db.execute("select album_mbid from download where state not in ('done', 'failed') and album_mbid is not null union "
                                          "select t.rg from download_target t join download d on d.hash = t.hash where d.state not in ('done', 'failed')")}
 
-    def search(self, db, album_id: int) -> bool | None:
-        """Searches the indexers (through Prowlarr, else Lidarr) for Lidarr's album and sends the best pick to TorBox;
-        see send."""
-        album, tb, blocked = self.lidarr.album_by_id(album_id), self.torbox(), self.blocked(db)
-        picks = releases.find(self.prowlarr, releases.target(db, self.lidarr, album), blocked, tb.cached) if self.prowlarr else \
-            choose(self.lidarr.releases(album_id), album["artist"]["artistName"], album["title"], blocked, tb.cached)
-        return self.send(db, picks, blocked, album_id, album.get("foreignAlbumId"), f"{album['artist']['artistName']} - {album['title']}")
-
     def find(self, db, want: dict, group: str) -> bool | None:
         """Searches Prowlarr for an album of oasis's own catalogue (acquire.py); see send."""
         blocked = self.blocked(db)
-        return self.send(db, releases.find(self.prowlarr, want, blocked, self.torbox().cached), blocked, 0, group,
+        return self.send(db, releases.find(self.prowlarr, want, blocked, self.torbox().cached), blocked, group,
                          f"{want['artist']} - {want['title']}")
 
     def bundle(self, db, want: dict, groups: list[dict], wanted: set[str]) -> bool | None:
@@ -178,17 +145,17 @@ class Downloads:
         blocked = self.blocked(db)
         picks = releases.bundles(self.prowlarr, want, groups, wanted, blocked, self.torbox().cached_files, lambda rg: editions(db, rg))
         for release, targets in picks[:GRAB_TRIES]:
-            if (sent := self.send(db, [release], blocked, 0, None, f"{want['artist']}: {len(targets)} albums", targets)) is not None:
+            if (sent := self.send(db, [release], blocked, None, f"{want['artist']}: {len(targets)} albums", targets)) is not None:
                 return sent
         return None
 
     def blocked(self, db) -> set[str]:
         return {r[0] for r in db.execute("select hash from release_block")}
 
-    def send(self, db, picks: list[dict], blocked: set, album_id: int, group: str | None, label: str, targets: dict | None = None) -> bool | None:
+    def send(self, db, picks: list[dict], blocked: set, group: str | None, label: str, targets: dict | None = None) -> bool | None:
         """Sends the first pick TorBox takes. True when one went, None when none would, False when TorBox had no free
         slot and queued it: the queued copy goes, the release isn't at fault, and the album is due again soon.
-        album_id: Lidarr's, 0 for albums only oasis's catalogue has. targets: a bundle's albums, {group: files}."""
+        group: the album's release group. targets: a bundle's albums, {group: files}."""
         tb = self.torbox()
         for release in picks[:GRAB_TRIES]:
             try:
@@ -212,7 +179,7 @@ class Downloads:
                 return False
             now = time.time()
             db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated) "
-                       "values (?, ?, ?, ?, ?, ?, 'added', ?, ?)", (added["hash"].lower(), release.get("guid"), album_id,
+                       "values (?, ?, 0, ?, ?, ?, 'added', ?, ?)", (added["hash"].lower(), release.get("guid"),
                                                                     group, release["title"], added["torrent_id"], now, now))
             db.execute("delete from download_target where hash = ?", (added["hash"].lower(),))
             db.executemany("insert into download_target(hash, rg, files, state) values (?, ?, ?, 'pending')",
@@ -233,7 +200,7 @@ class Downloads:
             for row in rows:
                 try:
                     self.step(db, row, torrents.get(row["torbox_id"]))
-                except Exception as e:  # Lidarr down mid-import, disk full: next poll
+                except Exception as e:  # disk full, MusicBrainz down mid-import: next poll
                     log.warning("download %s: %s", row["title"], e)
                     db.execute("update download set error = ?, updated = ? where hash = ?", (str(e)[:300], time.time(), row["hash"]))
         finally:
@@ -336,23 +303,16 @@ class Downloads:
     def finish(self, db, row):
         if db.execute("select 1 from download_target where hash = ?", (row["hash"],)).fetchone():
             return self.place_targets(db, row)
-        if self.own:
-            return self.place(db, row)
-        self.lidarr_import(db, row)
+        self.place(db, row)
 
     def place(self, db, row):
-        """oasis's own import. A download no edition matches fails; Lidarr rescans the album folder so it counts the
-        album present and doesn't search it again."""
+        """A download no edition matches fails."""
         folder = self.folder / row["hash"]
         try:
-            album = self.own.place(folder, row["album_mbid"])
+            self.own.place(folder, row["album_mbid"])
         except LookupError as e:
             return self.fail(db, row, f"import failed: {e}")
         self.done(db, row, folder)
-        try:
-            self.lidarr.rescan([str(album)])
-        except OSError as e:
-            log.warning("Lidarr rescan of %s failed: %s", album, e)
 
     def place_targets(self, db, row):
         """A bundle's albums, each imported on its own. One no edition matches is left out; the bundle fails, and is
@@ -360,30 +320,16 @@ class Downloads:
         folder = self.folder / row["hash"]
         for (rg,) in db.execute("select rg from download_target where hash = ? and state = 'pending'", (row["hash"],)).fetchall():
             try:
-                album = self.own.place(folder / rg, rg)
+                self.own.place(folder / rg, rg)
             except LookupError as e:
                 log.info("bundle %s: %s isn't there: %s", row["title"], rg, e)
                 db.execute("update download_target set state = 'failed' where hash = ? and rg = ?", (row["hash"], rg))
                 continue
             db.execute("update download_target set state = 'done' where hash = ? and rg = ?", (row["hash"], rg))
-            try:
-                self.lidarr.rescan([str(album)])
-            except OSError as e:
-                log.warning("Lidarr rescan of %s failed: %s", album, e)
         if db.execute("select 1 from download_target where hash = ? and state = 'done'", (row["hash"],)).fetchone():
             self.done(db, row, folder)
         else:
             self.fail(db, row, "import failed: no album of the bundle matched")
-
-    def lidarr_import(self, db, row):
-        """Imports the folder with the doctor's matcher, moving the files into the library. Lidarr can fail an import
-        after moving the files, and a restart can come between: an album complete in Lidarr counts as imported."""
-        folder = self.folder / row["hash"]
-        item = {"downloadId": None, "albumId": row["album_id"], "title": row["title"]}
-        if self.importer.try_import(item, str(folder), mode="move") or self.complete(row["album_id"]):
-            self.done(db, row, folder)
-        else:
-            self.fail(db, row, "import failed: the files match no edition of the album")
 
     def done(self, db, row, folder: Path):
         self.delete(row)
@@ -391,10 +337,6 @@ class Downloads:
         self.set(db, row, "done")
         log.info("imported %s", row["title"])
         self.imported()
-
-    def complete(self, album_id: int) -> bool:
-        stats = self.lidarr.album_by_id(album_id).get("statistics") or {}
-        return stats.get("trackFileCount", 0) >= stats.get("trackCount", 0) > 0
 
     def fail(self, db, row, why: str, block: bool = True):
         """Deletes the torrent and makes the album due for another search. A blocked release is never picked again.
@@ -404,8 +346,6 @@ class Downloads:
         if block:
             db.executemany("insert or replace into release_block values (?, ?, ?)", [(k, why, now) for k in (row["hash"], row["guid"]) if k])
         self.set(db, row, "failed", why)
-        db.execute("update lidarr_item set searched = null where kind = 'album' and lidarr_id = ?", (row["album_id"],))
-        db.execute("delete from catalogue_search where album_id = ?", (row["album_id"],))
         db.execute("update want_album set next_search = null, error = ? where rg = ?", (f"download failed: {why}", row["album_mbid"]))
         log.info("download %s failed: %s", row["title"], why)
 

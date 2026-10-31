@@ -5,19 +5,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from oasis import download, releases
-from oasis.db import connect
 from oasis.download import info_hash, source
-from oasis.releases import find, queries, rank, reject, target
-from test_download import db, downloads, files, lidarr, tb, torbox  # noqa: F401 (fixtures)
+from oasis.releases import find, queries, rank, reject
+from test_download import WANT, Prowlarr, db, downloads, files, result, tb, torbox  # noqa: F401 (fixtures)
 
 
 def want(title, *names, year="", others=(), discs=1, upgrade=False, native=()):
     return {"artist": names[0], "names": list(names), "title": title, "year": year, "others": list(others), "discs": discs,
             "upgrade": upgrade, "native": list(native)}
-
-
-def result(title, hash="", seeders=5, size=400e6, **extra):
-    return {"title": title, "infoHash": hash, "seeders": seeders, "size": size, "guid": f"guid-{title}", "indexerId": 1, **extra}
 
 
 CREEPY = want("アンサンブル・プレイ", "Creepy Nuts", "クリーピーナッツ", year="2022", others=["クリープ・ショー", "Case", "LEGION"])
@@ -98,15 +93,6 @@ def test_queries_drop_brackets_and_try_the_album_alone_and_the_native_names():
     assert queries(want("Living Things", "Linkin Park")) == ["Linkin Park Living Things", "Living Things"]
 
 
-class Prowlarr:
-    def __init__(self, results):
-        self.results, self.asked = results, []
-
-    def search(self, query):
-        self.asked.append(query)
-        return self.results.get(query, [])
-
-
 def test_find_stops_at_the_first_query_with_a_usable_release_and_skips_blocked_ones():
     creepy = {**CREEPY, "native": ["クリーピーナッツ"]}
     prowlarr = Prowlarr({"Creepy Nuts アンサンブル・プレイ": [result("Creepy Nuts - アンサンブル・プレイ [FLAC]", "aa", seeders=0),
@@ -121,25 +107,6 @@ def test_find_stops_at_the_first_query_with_a_usable_release_and_skips_blocked_o
     assert prowlarr.asked == ["Creepy Nuts アンサンブル・プレイ"]
     assert [r["infoHash"] for r in find(prowlarr, creepy, {"dd"}, lambda hashes: set())] == ["ee"]
     assert find(Prowlarr({}), creepy, set(), lambda hashes: set()) == []
-
-
-def test_target_reads_the_artists_names_from_musicbrainz_and_the_other_albums_from_lidarr(tmp_path, monkeypatch):
-    asked = []
-    monkeypatch.setattr(releases.musicbrainz, "get", lambda url, db, keep: asked.append(url) or {"name": "Creepy Nuts", "aliases": [
-        {"name": "クリーピーナッツ", "type": "Artist name"}, {"name": "CN", "type": "Artist name"}, {"name": "creepynuts", "type": "Search hint"},
-        {"name": "Case", "type": "Artist name"}]})  # a former name that is an album's title
-
-    class Lidarr:
-        def albums_of(self, artist_id):
-            return [{"id": 1, "title": "アンサンブル・プレイ", "albumType": "Album"}, {"id": 2, "title": "Case", "albumType": "Album"},
-                    {"id": 3, "title": "眠れ", "albumType": "Single"}]
-    album = {"id": 1, "artistId": 9, "title": "アンサンブル・プレイ", "releaseDate": "2022-09-07T00:00:00Z",
-             "artist": {"artistName": "Creepy Nuts", "foreignArtistId": "mb-cn"}, "releases": [{"mediumCount": 2, "monitored": True}],
-             "statistics": {"trackFileCount": 0}}
-    found = target(connect(tmp_path / "oasis.db"), Lidarr(), album)
-    assert asked == ["https://musicbrainz.org/ws/2/artist/mb-cn?inc=aliases&fmt=json"]
-    assert found == {"artist": "Creepy Nuts", "names": ["Creepy Nuts", "クリーピーナッツ"], "native": ["クリーピーナッツ"], "title": "アンサンブル・プレイ",
-                     "year": "2022", "discs": 2, "others": ["Case"], "upgrade": False}
 
 
 class Proxy(BaseHTTPRequestHandler):
@@ -163,31 +130,26 @@ def test_prowlarrs_proxied_magnet_link_is_followed_to_the_magnet():
     assert source({"magnetUrl": "magnet:?xt=urn:btih:ef"}) == {"magnet": "magnet:?xt=urn:btih:ef"}
 
 
-def test_with_prowlarr_the_search_is_oasiss_own_and_lidarr_lists_nothing(downloads, lidarr, torbox, db, tmp_path, monkeypatch):
-    monkeypatch.setattr(releases.musicbrainz, "get", lambda url, db, keep: {"name": "Artist", "aliases": []})
-    lidarr.albums_of = lambda artist_id: []
-    lidarr.releases = lambda album_id: pytest.fail("Lidarr's search isn't used")
+def test_a_seedless_release_only_counts_when_torbox_has_it_cached(downloads, torbox, db):
     downloads.prowlarr = Prowlarr({"Artist Album": [result("Artist - Album [FLAC]", "abcd", seeders=0, magnetUrl="magnet:?xt=urn:btih:abcd"),
                                                     result("Artist - Album [MP3]", "ef01", seeders=0, magnetUrl="magnet:?xt=urn:btih:ef01")]})
     torbox.have = {"ef01"}
-    assert downloads.search(db, 5)
+    assert downloads.find(db, WANT, "mb-album")
     assert torbox.added == [("Artist - Album [MP3]", "magnet:?xt=urn:btih:ef01", None)]  # the seedless FLAC nobody cached is no use
-    assert db.execute("select hash, album_id, state from download").fetchone()[:] == ("ef01", 5, "added")
+    assert db.execute("select hash, album_mbid, state from download").fetchone()[:] == ("ef01", "mb-album", "added")
 
 
-def test_a_release_listed_without_its_hash_is_skipped_when_it_failed_before(downloads, lidarr, torbox, db, monkeypatch):
+def test_a_release_listed_without_its_hash_is_skipped_when_it_failed_before(downloads, torbox, db, monkeypatch):
     info = b"d6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces0:e"
     torrent = b"d8:announce3:url4:info" + info + b"e"
     assert info_hash({"torrent": torrent}) == hashlib.sha1(info).hexdigest() and info_hash({"torrent": b"<html>"}) == ""
     assert info_hash({"magnet": "magnet:?xt=urn:btih:" + "AB" * 20 + "&dn=x"}) == "ab" * 20
-    monkeypatch.setattr(releases.musicbrainz, "get", lambda url, db, keep: {"name": "Artist", "aliases": []})
-    lidarr.albums_of = lambda artist_id: []
     monkeypatch.setattr(download, "source", lambda release: {"torrent": torrent} if release["guid"] == "guid-Artist - Album [FLAC]"
                         else {"magnet": release["magnetUrl"]})
     db.execute("insert into release_block values (?, 'dead', 0)", (hashlib.sha1(info).hexdigest(),))
     downloads.prowlarr = Prowlarr({"Artist Album": [result("Artist - Album [FLAC]", seeders=9, downloadUrl="http://prowlarr/1/download"),
                                                     result("Artist - Album [MP3]", "ef01", magnetUrl="magnet:?xt=urn:btih:ef01")]})
-    assert downloads.search(db, 5)
+    assert downloads.find(db, WANT, "mb-album")
     assert torbox.added == [("Artist - Album [MP3]", "magnet:?xt=urn:btih:ef01", None)]
 
 
@@ -255,13 +217,12 @@ def test_only_cached_bundles_with_wanted_albums_are_picked_most_albums_first():
     assert prowlarr.asked == ["Linkin Park discography", "Linkin Park"] and sorted(asked[0]) == ["aa", "cc", "ee"]  # dd isn't a bundle
 
 
-def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloads, lidarr, torbox, db, tmp_path, monkeypatch):
+def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloads, torbox, db, tmp_path, monkeypatch):
     class Own:
         def place(self, folder, group):
             placed[group] = sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file())
             if group in failing:
                 raise LookupError("no edition matches")
-            return tmp_path / "music" / group
 
     placed, failing, downloads.own = {}, {"g-mtm"}, Own()
     monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
@@ -283,7 +244,7 @@ def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloa
                       "g-mtm": ["CD1/01 Wake.flac", "CD1/02 Given Up.flac", "CD2/01 Leave Out All the Rest.flac", "folder.jpg"]}
     assert dict(db.execute("select rg, state from download_target").fetchall()) == {"g-ht": "done", "g-mtm": "failed"}
     assert db.execute("select state from download").fetchone()[0] == "done" and torbox.deleted == [71] and not (tmp_path / "dl/abcd").exists()
-    assert lidarr.rescanned == [str(tmp_path / "music/g-ht")] and downloads.groups(db) == set() and downloads.scans == [1]
+    assert downloads.groups(db) == set() and downloads.scans == [1]
 
     # None of a bundle's albums imports: it fails and is blocked.
     failing.add("g-ht")

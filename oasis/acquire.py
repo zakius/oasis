@@ -3,9 +3,8 @@ artist's albums, EPs and singles are read daily, and repackages and singles whos
 An album is here when the library holds as many of its tracks as its smallest edition has. Missing albums are searched
 (Prowlarr, then TorBox: download.py) one a minute, again and again, ever further apart; an artist with gaps gets a
 weekly search for cached discographies and bundles, which can fill many at once. Anything MusicBrainz has can be
-wanted, under ids of its own until it arrives (see adopt). want_album holds it all; Lidarr
-is only asked what its own RSS grabs are downloading. [acquire] catalogue = "lidarr" goes back to Lidarr's catalogue
-(lidarr.py's Library)."""
+wanted, under ids of its own until it arrives (see adopt). want_album holds the albums; lidarr_item, named from when
+Lidarr kept them, the stars and follows, under that name still so the code before can come back."""
 import itertools
 import json
 import logging
@@ -17,7 +16,6 @@ import urllib.parse
 from . import musicbrainz, releases
 from .db import move_stat, resolve
 from .importer import LOSSLESS
-from .lidarr import REPACKAGE, REPEATS, RETRY_ERROR, RETRY_FULL, RETRY_NO_MATCH, SEARCH_GAP, UPGRADE_AGAIN, artist_names, set_state, song_key
 from .ytm import fold
 
 log = logging.getLogger(__name__)
@@ -42,6 +40,14 @@ SINGLE_RESEARCH, SINGLE_MOST = 7 * 86400, 28 * 86400
 BUNDLE_AGAIN = 7 * 86400             # seconds between an artist's bundle searches
 MAP_RELEASES = 20                    # files tagged with a release but no release group, looked up per pass
 CLIENT_STATES = {"missing": "wanted", "downloading": "downloading", "have": "have"}  # lidarr_item's, which clients see
+RETRY_NO_MATCH = 1800     # seconds before looking an unmatched name up again
+RETRY_ERROR = 300         # seconds before retrying after MusicBrainz errors
+SEARCH_GAP = 60           # seconds between searches, so a burst of stars doesn't trip TorBox's rate limit
+RETRY_FULL = 600          # seconds before an album TorBox had no free slot for is searched again
+UPGRADE_AGAIN = 7 * 86400  # seconds between searches for a lossless copy of an album here lossy
+REPEATS = 0.6             # share of an album's songs already on the artist's earlier releases that makes it a repackage
+REPACKAGE = re.compile(r"\b(best of|greatest hits|very best|the essential|anthology|collection|singles|remaster(ed)?|anniversary|"
+                       r"deluxe|bonus ?tracks?|re-?recorded|reissue|remixes|instrumentals?|karaoke)\b", re.I)
 
 
 def lucene(text: str) -> str:
@@ -102,12 +108,11 @@ def adopt(db):
 
 
 class Acquire:
-    def __init__(self, connect, downloads, lidarr=None, secondary_types=SECONDARY, bundles=False):
-        """downloads: download.py's, with Prowlarr. lidarr: only for its queue, carrying its searches over, and rescans.
-        bundles: also search for cached discographies and bundles."""
-        self.connect, self.downloads, self.lidarr, self.allowed, self.bundles = connect, downloads, lidarr, set(secondary_types), bundles
+    def __init__(self, connect, downloads, secondary_types=SECONDARY, bundles=False):
+        """downloads: download.py's. bundles: also search for cached discographies and bundles."""
+        self.connect, self.downloads, self.allowed, self.bundles = connect, downloads, set(secondary_types), bundles
         self.wake = threading.Event()
-        self.last_search, self.carried = 0.0, False
+        self.last_search = 0.0
         self.soon: set[str] = set()  # release groups to search before any other (the dashboard's "search now")
 
     def start(self):
@@ -126,7 +131,6 @@ class Acquire:
         """One pass: stars and follows resolved or let go, one artist's catalogue read, states updated, one search."""
         db = self.connect()
         try:
-            self.carry(db)
             adopt(db)
             for kind, ref in db.execute("select distinct kind, ref from wanted").fetchall():
                 db.execute("insert or ignore into lidarr_item(kind, ref, state, updated) values (?, ?, 'wanted', ?)", (kind, ref, time.time()))
@@ -161,25 +165,6 @@ class Acquire:
                 self.search_next(db)
         finally:
             db.close()
-
-    def carry(self, db):
-        """Once, while Lidarr is up: ties Lidarr's searches to release groups, so new rows carry them over, and keeps
-        the albums and EPs Lidarr was looking for as wanted, whatever the catalogue's filter says: nothing wanted is lost."""
-        if self.carried or not self.lidarr or db.execute("select 1 from setting where key = 'acquire_carried'").fetchone():
-            self.carried = True
-            return
-        try:
-            groups = {a["id"]: a["foreignAlbumId"] for a in self.lidarr.all_albums()}
-            missing = [a for a in self.lidarr.missing() if a.get("albumType") != "Single"]
-        except OSError as e:
-            log.warning("Lidarr's albums: %s", e)
-            return
-        db.executemany("update catalogue_search set mbid = ? where album_id = ? and mbid is null",
-                       [(groups[i], i) for (i,) in db.execute("select album_id from catalogue_search").fetchall() if i in groups])
-        db.executemany("insert or ignore into catalogue_search(album_id, searched, mbid) values (?, 0, ?)", [(a["id"], a["foreignAlbumId"]) for a in missing])
-        db.execute("update lidarr_item set catalogued = null where kind = 'artist'")
-        db.execute("insert into setting values ('acquire_carried', ?)", (str(time.time()),))
-        self.carried = True
 
     def want(self, db, item) -> tuple[str, str | None]:
         rg = item["mbid"]
@@ -280,7 +265,7 @@ class Acquire:
         groups = sorted(self.browse(db, item["mbid"]), key=lambda g: g.get("first-release-date") or "9999")
         editions = {g["id"]: self.edition(db, g["id"]) for g in groups}
         starred = {r[0] for r in db.execute("select mbid from lidarr_item where kind = 'album' and mbid is not null")}
-        lidarrs = {r[0] for r in db.execute("select mbid from catalogue_search where mbid is not null")}  # see carry
+        lidarrs = {r[0] for r in db.execute("select mbid from catalogue_search where mbid is not null")}  # Lidarr's, carried over once
         kept = lambda g: g["id"] not in why or g["id"] in starred or self.have_files(db, g["id"]) or \
             g["primary-type"] != "Single" and g["id"] in lidarrs
         seen, why = set(), {}
@@ -361,16 +346,6 @@ class Acquire:
             log.warning("TorBox: %s", e)
             return False
 
-    def queued(self, db) -> set[str]:
-        """Release groups downloading: oasis's, and Lidarr's RSS grabs, which a search mustn't download twice."""
-        groups = self.downloads.groups(db)
-        if self.lidarr:
-            try:
-                groups |= self.lidarr.queued_groups()
-            except OSError as e:
-                log.info("Lidarr's queue: %s", e)
-        return groups
-
     def search_next(self, db):
         """One search, SEARCH_GAP apart: albums asked for on the dashboard first, then starred albums, then followed artists' albums and EPs, then their singles;
         each time those never searched first, then the newest. Then albums here only lossy, for a lossless copy weekly."""
@@ -380,7 +355,7 @@ class Acquire:
             return self.search(db, row)
         if self.bundles and self.bundle_next(db):
             return
-        now, queued = time.time(), self.queued(db)
+        now, queued = time.time(), self.downloads.groups(db)
         lossless = ", ".join(f"'{s}'" for s in LOSSLESS)
         rows = db.execute("select * from want_album w where (state = 'missing' and coalesce(next_search, 0) <= ?) or (state = 'have' and "
                           "coalesce(searched, 0) < ? and not exists (select 1 from track t where t.mb_release_group = w.rg and t.source = 'local' "
@@ -400,7 +375,7 @@ class Acquire:
             return False
         mbid, sent = row["artist_mbid"], None
         try:
-            groups, queued = self.browse(db, mbid), self.queued(db)
+            groups, queued = self.browse(db, mbid), self.downloads.groups(db)
             wanted = {rg for (rg,) in db.execute("select rg from want_album where artist_mbid = ? and state = 'missing'", (mbid,)) if rg not in queued}
             titles = [g["title"] for g in groups if g["primary-type"] != "Single"]
             names = releases.aliases(db, row["artist"], mbid, titles)
@@ -430,7 +405,8 @@ class Acquire:
                    (now, now + min(first * 2 ** row["tries"], most), None if sent else error, row["rg"]))
 
     def target(self, db, row) -> dict:
-        """What releases.find looks for, as releases.target makes it from Lidarr's album."""
+        """What releases.find looks for: the artist under all its names, the title, year, discs, the artist's other
+        albums and EPs (a name holding one is a bundle), and whether the album is here lossy already (then only lossless will do)."""
         try:
             others = [g["title"] for g in self.browse(db, row["artist_mbid"]) if g["primary-type"] != "Single" and g["id"] != row["rg"]]
         except (OSError, LookupError):
@@ -443,3 +419,22 @@ class Acquire:
 
     def still_to_find(self, db) -> int:
         return db.execute("select count(*) from want_album where state = 'missing'").fetchone()[0]
+
+
+def artist_names(credit: str) -> list[str]:
+    """Names to look a credit up by: the credit itself, then each artist of a collaboration, with and without
+    a bracketed suffix: 'SawanoHiroyuki[nZk]:mizuki' -> SawanoHiroyuki[nZk]:mizuki, SawanoHiroyuki[nZk], SawanoHiroyuki, mizuki."""
+    names = [credit]
+    for part in re.split(r"\s*(?:,|&|:|×|/|\bfeat\.?|\bft\.?|\bwith\b)\s*", credit, flags=re.I):
+        names += [part, re.sub(r"\s*[\[(][^\])]*[\])]\s*$", "", part)]
+    return [n for n in dict.fromkeys(n.strip() for n in names) if n]
+
+
+def song_key(title: str) -> str:
+    """'Du hast (Remastered 2017)', 'Du Hast - Live' -> 'duhast'."""
+    return fold(re.sub(r"\s+-\s+.*$", "", re.sub(r"\s*[(\[][^)\]]*[)\]]", "", title)))
+
+
+def set_state(db, item, state: str, error: str | None, retry: float | None = None):
+    db.execute("update lidarr_item set state = ?, error = ?, retry_at = ?, updated = ? where kind = ? and ref = ?",
+               (state, error, time.time() + retry if retry else None, time.time(), item["kind"], item["ref"]))

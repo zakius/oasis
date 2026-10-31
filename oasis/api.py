@@ -28,7 +28,6 @@ from .doctor import Doctor
 from .download import Downloads
 from .importer import Importer
 from .forward import Forwarder, LastFm
-from .lidarr import Library, Lidarr
 from .prowlarr import Prowlarr
 from .recommend import Recommender, set_entries
 from .ytm import YouTubeMusic
@@ -138,13 +137,13 @@ select t.album_id as id, t.album as name, t.album_artist as artist, t.artist_id,
        count(*) as song_count, sum(t.duration) as duration, min(t.created) as created,
        max(t.year) as year, max(t.genre) as genre, max(t.cover is not null) as has_cover,
        s.starred as album_starred, s.rating as album_rating,
-       coalesce(sum(ps.play_count), 0) as plays, max(ps.played) as last_played, li.state as lidarr_state, li.error as lidarr_error
+       coalesce(sum(ps.play_count), 0) as plays, max(ps.played) as last_played, li.state as want_state, li.error as want_error
 from track t left join stat s on s.id = t.album_id left join stat ps on ps.id = t.id
 left join lidarr_item li on li.kind = 'album' and li.ref = t.album_id
 """
 ARTISTS = """
 select t.artist_id as id, t.album_artist as name, count(distinct t.album_id) as album_count,
-       max(t.cover is not null) as has_cover, s.starred, s.rating, li.state as lidarr_state, li.error as lidarr_error
+       max(t.cover is not null) as has_cover, s.starred, s.rating, li.state as want_state, li.error as want_error
 from track t left join stat s on s.id = t.artist_id left join lidarr_item li on li.kind = 'artist' and li.ref = t.artist_id
 """
 
@@ -163,10 +162,9 @@ def song(r) -> dict:
     })
 
 
-LIDARR_KEYS = ("url", "api_key", "root_folder", "quality_profile", "metadata_profile")
 DOCTOR_KEYS = ("rdt_db", "stall_hours", "dry_run")
-# Lidarr progress of starred albums and artists, for clients that show it; complete albums and followed artists need no badge.
-WANTED_STATES = {"wanted": "wanted", "sent": "wanted", "downloading": "downloading", "failed": "failed"}
+# Acquisition progress of starred albums and artists, for clients that show it; complete albums and followed artists need no badge.
+WANTED_STATES = {"wanted": "wanted", "downloading": "downloading", "failed": "failed"}
 
 
 def album(r) -> dict:
@@ -176,8 +174,8 @@ def album(r) -> dict:
         "coverArt": r["id"] if r["has_cover"] else None, "songCount": r["song_count"], "duration": r["duration"],
         "created": iso(r["created"]), "year": r["year"], "genre": r["genre"], "starred": iso(r["album_starred"]),
         "userRating": r["album_rating"], "playCount": r["plays"], "played": iso(r["last_played"]),
-        "oasisWanted": WANTED_STATES.get(r["lidarr_state"]),
-        "oasisWantedError": r["lidarr_error"] if WANTED_STATES.get(r["lidarr_state"]) else None,
+        "oasisWanted": WANTED_STATES.get(r["want_state"]),
+        "oasisWantedError": r["want_error"] if WANTED_STATES.get(r["want_state"]) else None,
     })
 
 
@@ -185,8 +183,8 @@ def artist(r) -> dict:
     return clean({
         "id": r["id"], "name": r["name"], "albumCount": r["album_count"],
         "coverArt": r["id"] if r["has_cover"] else None, "starred": iso(r["starred"]), "userRating": r["rating"],
-        "oasisWanted": WANTED_STATES.get(r["lidarr_state"]),
-        "oasisWantedError": r["lidarr_error"] if WANTED_STATES.get(r["lidarr_state"]) else None,
+        "oasisWanted": WANTED_STATES.get(r["want_state"]),
+        "oasisWantedError": r["want_error"] if WANTED_STATES.get(r["want_state"]) else None,
     })
 
 
@@ -322,20 +320,14 @@ class Api:
         lastfm = LastFm(config.lastfm_key, config.lastfm_secret or "", None) if config.lastfm_key else None
         self.recommender = Recommender(self._db, self.ytm, lastfm)
         self.completed: set[str] = set()
-        lidarr = Lidarr(**{k: v for k, v in config.lidarr.items() if k in LIDARR_KEYS}) if config.lidarr else None
-        torbox = config.torbox if lidarr else None
-        self.doctor = Doctor(self._db, lidarr, **{k: v for k, v in torbox.items() if k in DOCTOR_KEYS}) if torbox else None
-        # Its own importer: the doctor's dry run mustn't stop downloads.
-        self.downloads = Downloads(self._db, lidarr, Doctor(self._db, lidarr, torbox["rdt_db"]), torbox["downloads"], torbox.get("max_active", 8),
-                                   torbox.get("stall_hours", 1), self._start_scan,
-                                   Importer(self._db, config.library[0]) if torbox.get("import", "oasis") == "oasis" else None,
-                                   Prowlarr(**config.prowlarr) if config.prowlarr else None) \
-            if torbox and torbox.get("downloads") else None
-        # oasis's own catalogue needs oasis's search, download and import; else, or with catalogue = "lidarr", Lidarr's.
-        own = self.downloads and self.downloads.prowlarr and self.downloads.own and config.acquire.get("catalogue", "oasis") == "oasis"
-        self.library = Acquire(self._db, self.downloads, lidarr, config.acquire.get("secondary_types", SECONDARY),
-                               config.acquire.get("bundles", True)) if own else \
-            Library(self._db, lidarr, self.downloads) if lidarr else None
+        torbox = config.torbox
+        self.doctor = Doctor(self._db, **{k: v for k, v in torbox.items() if k in DOCTOR_KEYS}) if torbox else None
+        # oasis's search, download and import: all three, or no acquisition.
+        self.downloads = Downloads(self._db, self.doctor.torbox, Importer(self._db, config.library[0]), Prowlarr(**config.prowlarr),
+                                   torbox["downloads"], torbox.get("max_active", 8), torbox.get("stall_hours", 1), self._start_scan) \
+            if torbox and torbox.get("downloads") and config.prowlarr else None
+        self.library = Acquire(self._db, self.downloads, config.acquire.get("secondary_types", SECONDARY),
+                               config.acquire.get("bundles", True)) if self.downloads else None
         self.scanning = self.scan_again = False
         self.scan_lock = threading.Lock()
         self.credits = Credits(self._db)
@@ -392,11 +384,6 @@ class Api:
         for old, new in renamed:
             move_track(db, make_id("tr-", old), make_id("tr-", new))
         db.commit()
-        if renamed and self.library and self.library.lidarr:
-            try:
-                self.library.lidarr.rescan(sorted({str(Path(new).parent) for _, new in renamed}))
-            except OSError as e:
-                log.warning("dedupe: Lidarr rescan failed: %s", e)
 
     def _authenticate(self, db, p: Params) -> str:
         user = p.need("u")
@@ -718,7 +705,7 @@ class Api:
             songs += [song(self._one(db, SONGS + " where t.id = ?", id)) for id in dict.fromkeys(found) if id not in known]
         albums = [album(r) for r in albums]
         text = " ".join(terms)
-        if isinstance(self.library, Acquire) and len(text) >= FIND_FROM:
+        if self.library and len(text) >= FIND_FROM:
             # MusicBrainz last, for what neither the library nor YouTube Music has: these can be starred like any other.
             names = {ytm.fold(x) for x in [*(a["name"] for a in artists), *(s.get("artist") for s in songs)] if x}
             titles = {ytm.fold(x) for x in [*(a["name"] for a in albums), *(s.get("album") for s in songs)] if x}
@@ -827,7 +814,7 @@ class Api:
 
     def _want(self, db, user, kind, ids, value):
         """Stars albums or artists, or takes the star back (value None): a starred album or artist is one the user
-        wants in the library (see acquire.py, or lidarr.py). The dashboard's want and follow are stars too."""
+        wants in the library (see acquire.py). The dashboard's want and follow are stars too."""
         for id in ids:
             db.execute("insert into stat(id, starred) values (?, ?) on conflict(id) do update set starred = excluded.starred", (id, value))
             if value:

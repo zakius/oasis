@@ -73,21 +73,21 @@ create table if not exists user(
     listenbrainz_token text
 );
 create table if not exists wanted(user text not null, kind text not null, ref text not null, primary key(user, kind, ref));
-create table if not exists lidarr_item(
+create table if not exists lidarr_item(  -- stars and follows (see acquire.py); named from Lidarr, kept so a rollback finds them
     kind text not null, ref text not null,  -- 'album' or 'artist', and its oasis id
-    state text not null,                    -- wanted, sent, downloading, have, followed (artists), failed
+    state text not null,                    -- wanted, downloading, have, followed (artists), failed
     mbid text, lidarr_id int, error text,   -- error: why it isn't downloading, for clients to show
     searched real,                          -- albums: last search; artists: when the back catalogue was monitored
     retry_at real, updated real not null,
     catalogued real,                        -- artists: when oasis last read their catalogue from MusicBrainz (see acquire.py)
     primary key(kind, ref)
 );
-create table if not exists lidarr_rescue(  -- releases oasis grabbed that Lidarr can't tie to their album by name
+create table if not exists lidarr_rescue(  -- unused since Lidarr left; kept for a rollback
     hash text primary key, album_id int not null, grabbed real not null
 );
 create table if not exists download(  -- releases oasis downloads through TorBox itself (see download.py)
     hash text primary key, guid text,       -- info hash; the indexer's id of the release
-    album_id int not null, album_mbid text, -- Lidarr's album, and its MusicBrainz id
+    album_id int not null, album_mbid text, -- Lidarr's album (0 since Lidarr left), and the release group
     title text, torbox_id int,
     state text not null,                    -- added, downloading, fetching, importing, done, failed
     error text, created real not null, updated real not null
@@ -109,7 +109,7 @@ create table if not exists audio_pair(  -- dedupe verdicts, valid while both fil
 create table if not exists audio_shared(  -- files dedupe made reflinks of a kept copy
     path text primary key, kept text not null, mtime real not null, kept_mtime real not null
 );
-create table if not exists catalogue_search(  -- followed artists' albums Lidarr's catalogue searched, by Lidarr id
+create table if not exists catalogue_search(  -- the albums Lidarr searched and looked for, by Lidarr id: carried over, read only
     album_id int primary key, searched real not null,
     mbid text                               -- the release group, for oasis's own catalogue to carry the search over
 );
