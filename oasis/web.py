@@ -1,6 +1,8 @@
 """Account pages: sign in with the Subsonic user, link YouTube Music, Last.fm and ListenBrainz, manage users. Music
 pages: find any artist or album on MusicBrainz, follow or want it, and see what oasis is looking for."""
 import json
+from collections import Counter
+from pathlib import Path
 import re
 import time
 import urllib.request
@@ -9,11 +11,12 @@ from urllib.parse import parse_qsl, quote, urlencode
 
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse
+from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
 from . import accounts, acquire, importer, musicbrainz, releases
 from .acquire import MB_IDS, TYPES
+from .artists import linked
 from .forward import LastFm
 
 COOKIE = "oasis_session"
@@ -54,22 +57,41 @@ details.group > summary .bulk { margin-left: auto; font-weight: normal; }
 details.artist { border-bottom: 1px solid #8883; padding: .35rem 0; } details.artist > summary, details.album > summary {
   display: flex; flex-wrap: wrap; gap: .25rem .75rem; align-items: baseline; }
 details.artist > summary b { font-size: 1.05rem; } details.album { margin: .2rem 0 .2rem 1.2rem; }
+.hero { display: flex; gap: 1.25rem; align-items: flex-start; } .hero > div { flex: 1; min-width: 0; }
+.cover { width: 11rem; height: 11rem; object-fit: cover; border-radius: 8px; background: #8882; flex: none; }
+.cover.small { width: 2.6rem; height: 2.6rem; border-radius: 4px; } td.thumb { width: 2.6rem; padding-right: 0; }
+dl.meta { display: grid; grid-template-columns: max-content 1fr; gap: .2rem 1rem; margin: 0; } dl.meta dt { opacity: .6; }
+dl.meta dd { margin: 0; overflow-wrap: anywhere; } code { font-size: .85em; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr)); gap: 1rem; }
+.card { display: flex; flex-direction: column; gap: .15rem; color: inherit; text-decoration: none; min-width: 0; }
+.card .cover { width: 100%; height: auto; aspect-ratio: 1; } .card b { font-weight: 600; overflow-wrap: anywhere; }
+a.card:hover b { text-decoration: underline; } .card.dim { opacity: .55; } .card .pill { align-self: flex-start; }
 .dim-row { opacity: .6; display: flex; flex-wrap: wrap; gap: .25rem .75rem; align-items: baseline; padding-left: 1em; }
 details.album > table { margin: .3rem 0 .6rem 1em; width: calc(100% - 1em); } .right { margin-left: auto; }
 .filters { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; } .filters input[type=text] { width: auto; flex: 1 1 12rem; margin: 0; }
-.filters select { font: inherit; padding: .35rem; }
+.filters select { font: inherit; padding: .35rem; max-width: 100%; }
 @media (max-width: 640px) {
   body { margin: 1rem auto; } section { padding: .8rem .9rem; }
-  table.grid thead { display: none; } table.grid, table.grid tbody, table.grid tr, table.grid td { display: block; width: 100%; box-sizing: border-box; }
-  table.grid tr { border-bottom: 1px solid #8884; padding: .45rem 0; } table.grid td { border: 0; padding: .05rem .2rem; }
-  table.grid td.lead { font-weight: 600; } table.grid td[data-label]::before { content: attr(data-label) " "; opacity: .55; font-size: .78rem; }
+  table.grid thead { display: none; } table.grid, table.grid tbody, table.grid tr { display: block; width: 100%; box-sizing: border-box; }
+  table.grid tr { border-bottom: 1px solid #8884; padding: .45rem 0; } table.grid td { display: inline-block; border: 0; padding: .05rem .6rem .05rem 0; }
+  table.grid td:empty { display: none; } table.grid td.lead, table.grid td.actions, table.grid td.block { display: block; width: 100%; box-sizing: border-box; }
+  table.grid td.lead { font-weight: 600; } table.grid td[data-unit]::after { content: " " attr(data-unit); opacity: .6; }
+  table.tracks tr { display: grid; grid-template-columns: 2rem 1fr auto; column-gap: .4rem; }
+  table.tracks td:nth-child(1) { grid-column: 1; grid-row: 1; } table.tracks td.lead { grid-column: 2; grid-row: 1; }
+  table.tracks td:nth-child(4) { grid-column: 3; grid-row: 1; } table.tracks td:nth-child(3) { grid-column: 2; grid-row: 2; }
+  table.tracks td:nth-child(5) { grid-column: 3; grid-row: 2; } table.tracks td { padding-right: 0; }
   .num, .actions { text-align: left; } .actions { padding-top: .3rem !important; } details.album { margin-left: .4rem; }
-  details.album > table { margin-left: 0; width: 100%; } details.group > summary .bulk { margin-left: 0; width: 100%; }
+  details.album > table { margin-left: 0; width: 100%; }
+  .hero { flex-direction: column; } .hero > .cover { width: 100%; height: auto; aspect-ratio: 1; max-width: 22rem; }
+  .cards { grid-template-columns: repeat(2, 1fr); gap: .75rem; } td.thumb { display: none !important; } details.group > summary .bulk { margin-left: 0; width: 100%; }
 }
 """
 
 
 STATES = {"added": "waiting for TorBox", "downloading": "TorBox downloading", "fetching": "copying here", "importing": "importing"}
+NO_COVER = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#8883"/>'
+            '<text x="50" y="64" font-size="42" text-anchor="middle" fill="#8889">♪</text></svg>')
+HIDE_BROKEN = 'onerror="this.removeAttribute(\'src\')"'  # a cover that fails shows the empty frame, not a broken image
 MBID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 MUSIC_NAV = ('<p><a href="/account">Your account</a> · <a href="/music/library">Library</a> · <a href="/music">Find music</a> · '
              '<a href="/music/wanted">Wanted</a></p>')
@@ -524,72 +546,201 @@ def routes(api) -> list[Route]:
         return page("Wanted", body, q.get("message", ""), q.get("error", ""), wide=True)
 
     def music_library(db, request, user, form):
-        """Every artist with music here or wanted: its albums, here or not yet, and an album's songs."""
+        """Every artist with music here or wanted, one row each; their pages go deeper."""
         q = request.query_params
         text, show = q.get("q", "").strip(), q.get("show", "")
-        tracks = db.execute("select t.*, s.play_count plays, s.starred from track t left join stat s on s.id = t.id where t.source = 'local' "
-                            "order by t.year, t.album collate nocase, t.disc_no, t.track_no, t.title").fetchall()
-        mbid_of = dict(db.execute("select artist_id, mbid from mb_artist").fetchall())
-        followed = {r[0] for r in db.execute("select ref from wanted where kind = 'artist'")}
-        artists: dict[str, dict] = {}
-        for t in tracks:
-            a = artists.setdefault(mbid_of.get(t["artist_id"]) or t["artist_id"], {"name": t["album_artist"], "ids": set(), "albums": {}, "wanted": []})
-            a["ids"].add(t["artist_id"])
-            a["albums"].setdefault(t["album_id"], []).append(t)
-        for w in db.execute("select * from want_album where state in ('missing', 'downloading') order by first_date").fetchall():
-            artists.setdefault(w["artist_mbid"], {"name": w["artist"], "ids": set(), "albums": {}, "wanted": []})["wanted"].append(w)
-        downloading = {r[0] for r in db.execute("select coalesce(t.rg, d.album_mbid) from download d left join download_target t on t.hash = d.hash "
-                                                "where d.state not in ('done', 'failed')")}
-
-        def fmt(rows) -> str:
-            kinds = sorted({r["suffix"] for r in rows if r["suffix"]})
-            lossy = [r["bitrate"] for r in rows if (r["suffix"] or "") not in importer.LOSSLESS and r["bitrate"]]
-            return " / ".join(k.upper() for k in kinds) + (f" {round(sum(lossy) / len(lossy))}k" if lossy else "")
-
-        def song(t, album_artist: str) -> str:
-            number = f'{t["disc_no"]}-{t["track_no"]}' if (t["disc_no"] or 1) > 1 else str(t["track_no"] or "")
-            by = f' <span class="muted">{escape(t["artist"])}</span>' if t["artist"] and t["artist"] != album_artist else ""
-            return (f'<tr><td class="num">{number}</td><td class="lead">{"★ " if t["starred"] else ""}{escape(t["title"])}{by}</td>'
-                    f'<td class="num">{length(t["duration"])}</td><td>{escape(fmt([t]))}</td><td class="num">{size(t["size"])}</td>'
-                    f'<td class="num">{t["plays"] or 0} plays</td></tr>')
-
-        def album(rows) -> str:
-            t = rows[0]
-            kind = (t["release_types"] or "").split(";")[0].strip().title()
-            info = " · ".join(filter(None, [str(t["year"] or ""), kind, f"{len(rows)} songs", length(sum(r["duration"] or 0 for r in rows)),
-                                            fmt(rows), size(sum(r["size"] or 0 for r in rows)), f'{sum(r["plays"] or 0 for r in rows)} plays']))
-            return (f'<details class="album"><summary><span>{escape(t["album"])}</span><span class="pill good">here</span>'
-                    f'<span class="muted">{escape(info)}</span></summary><table class="grid"><tbody>'
-                    + "".join(song(r, t["album_artist"]) for r in rows) + '</tbody></table></details>')
-
-        def missing(w) -> str:
-            state = ('<span class="pill busy">downloading</span>' if w["state"] == "downloading" or w["rg"] in downloading else
-                     f'<span class="pill">wanted · not found yet, searched {ago(w["searched"])}</span>' if w["searched"] else
-                     '<span class="pill">wanted · waiting for a first search</span>')
-            info = " · ".join(filter(None, [(w["first_date"] or "")[:4], w["primary_type"], "starred" if w["reason"] == "starred" else ""]))
-            return (f'<div class="album dim-row"><span>{escape(w["title"])}</span> {state} <span class="muted">{escape(info)}</span></div>')
-
-        body = (f'{MUSIC_NAV}<section><form class="filters"><input type="text" name="q" value="{escape(text)}" placeholder="Artist">'
-                f'<select name="show">' + "".join(f'<option value="{v}"{" selected" if v == show else ""}>{label}</option>' for v, label in
-                                                    (("", "Everything"), ("here", "Only what's here"), ("wanted", "Only artists with wanted albums")))
-                + '</select><button>Show</button></form></section><section>')
-        shown = 0
+        artists = library_artists(db)
+        rows = ""
         for key, a in sorted(artists.items(), key=lambda kv: (kv[1]["name"] or "").casefold()):
             if text and text.casefold() not in (a["name"] or "").casefold() or show == "here" and not a["albums"] or show == "wanted" and not a["wanted"]:
                 continue
-            shown += 1
-            rows = [t for album_rows in a["albums"].values() for t in album_rows]
-            pills = (('<span class="pill">followed</span>' if a["ids"] & followed or MBID.fullmatch(key) and acquire.refs(db, "artist", key) & followed else "")
-                     + (f'<span class="pill good">{len(a["albums"])} here</span>' if a["albums"] else "")
-                     + (f'<span class="pill">{len(a["wanted"])} wanted</span>' if a["wanted"] else ""))
-            info = " · ".join(filter(None, [f"{len(rows)} songs" if rows else "", length(sum(r["duration"] or 0 for r in rows)) if rows else "",
-                                            size(sum(r["size"] or 0 for r in rows)) if rows else ""]))
-            link = f' <a class="muted" href="/music/artist/{escape(key)}">discography</a>' if MBID.fullmatch(key) else ""
-            body += (f'<details class="artist"{" open" if text else ""}><summary><b>{escape(a["name"] or "")}</b>{pills}'
-                     f'<span class="muted">{escape(info)}</span>{link}</summary>'
-                     + "".join(album(r) for r in a["albums"].values()) + "".join(missing(w) for w in a["wanted"]) + '</details>')
-        body += ('' if shown else '<p class="muted">Nothing matches.</p>') + '</section>'
+            genres = ", ".join(a["genres"][:2])
+            rows += (f'<tr><td class="thumb">{picture(a["cover"], small=True)}</td><td class="lead"><a href="/music/library/artist/{quote(key)}">'
+                     f'{escape(a["name"] or "")}</a>{" <span class=pill>followed</span>" if a["followed"] else ""}'
+                     f'<div class="muted">{escape(genres)}</div></td>'
+                     f'<td class="num" data-unit="here">{a["albums"] or ""}</td><td class="num" data-unit="wanted">{a["wanted"] or ""}</td>'
+                     f'<td class="num" data-unit="songs">{a["songs"] or ""}</td>'
+                     f'<td class="num">{length(a["seconds"]) if a["seconds"] else ""}</td><td class="num">{size(a["bytes"]) if a["bytes"] else ""}</td></tr>')
+        options = "".join(f'<option value="{v}"{" selected" if v == show else ""}>{label}</option>'
+                          for v, label in (("", "Everything"), ("here", "With music here"), ("wanted", "With wanted albums")))
+        body = (f'{MUSIC_NAV}<section><form class="filters"><input type="text" name="q" value="{escape(text)}" placeholder="Artist">'
+                f'<select name="show">{options}</select><button>Show</button></form></section><section>'
+                + (f'<table class="grid"><thead><tr><th></th><th>Artist</th><th class="num">Albums here</th><th class="num">Wanted</th>'
+                   f'<th class="num">Songs</th><th class="num">Length</th><th class="num">Size</th></tr></thead><tbody>{rows}</tbody></table>'
+                   if rows else '<p class="muted">Nothing matches.</p>') + '</section>')
         return page("Library", body, q.get("message", ""), q.get("error", ""), wide=True)
+
+    def library_artists(db) -> dict[str, dict]:
+        """Artists by their page key (MusicBrainz id when known, else oasis id) with what's here and what's wanted."""
+        mbid_of = dict(db.execute("select artist_id, mbid from mb_artist").fetchall())
+        followed = {r[0] for r in db.execute("select ref from wanted where kind = 'artist'")}
+        artists: dict[str, dict] = {}
+        for r in db.execute("select artist_id, min(album_artist) name, count(distinct album_id) albums, count(*) songs, sum(duration) seconds, "
+                            "sum(size) bytes, max(album_id) album from track where source = 'local' group by artist_id"):
+            key = mbid_of.get(r["artist_id"]) or r["artist_id"]
+            artists[key] = {**dict(r), "wanted": 0, "followed": r["artist_id"] in followed, "cover": r["album"], "genres": []}
+        for r in db.execute("select artist_mbid, min(artist) name, count(*) n from want_album where state in ('missing', 'downloading') "
+                            "group by artist_mbid"):
+            a = artists.setdefault(r["artist_mbid"], {"name": r["name"], "albums": 0, "songs": 0, "seconds": 0, "bytes": 0, "cover": None,
+                                                      "followed": False, "genres": []})
+            a["wanted"] = r["n"]
+        for key, a in artists.items():
+            if MBID.fullmatch(key):
+                a["followed"] = a["followed"] or bool(acquire.refs(db, "artist", key) & followed)
+        for artist_id, genres in db.execute("select artist_id, group_concat(genres, '|') from track where source = 'local' and genres is not null "
+                                             "group by artist_id"):
+            counts = Counter(g for chunk in genres.split("|") for g in json.loads(chunk))
+            if a := artists.get(mbid_of.get(artist_id) or artist_id):
+                a["genres"] = [g for g, _ in counts.most_common(3)]
+        return artists
+
+    def picture(album_id: str | None, small: bool = False) -> str:
+        cls = "cover small" if small else "cover"
+        return (f'<img class="{cls}" loading="lazy" alt="" src="/music/cover/{quote(album_id)}" {HIDE_BROKEN}>' if album_id else f'<div class="{cls}"></div>')
+
+    def music_cover(db, request, user, form):
+        try:
+            return api.getCoverArt(db, type("P", (), {"need": lambda self, key: request.path_params["id"]})(), user)
+        except Exception:  # no cover anywhere: a quiet placeholder, not a broken image
+            return Response(NO_COVER, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=3600"})
+
+    def library_artist(db, request, user, form):
+        key = request.path_params["key"]
+        ids = [key] if key.startswith("ar-") else [r[0] for r in db.execute("select artist_id from mb_artist where mbid = ?", (key,))]
+        mbid = key if MBID.fullmatch(key) else db.execute("select mbid from mb_artist where artist_id = ?", (key,)).fetchone()
+        mbid = mbid if isinstance(mbid, str) or mbid is None else mbid[0]
+        marks = ",".join("?" * len(ids)) or "null"
+        albums = db.execute(f"select album_id, min(album) album, min(year) year, min(original_date) original, min(release_types) types, count(*) songs, "
+                            f"sum(duration) seconds, sum(size) bytes, group_concat(distinct upper(suffix)) formats, min(album_artist) artist "
+                            f"from track where source = 'local' and artist_id in ({marks}) group by album_id order by year, album", ids).fetchall()
+        wanted = db.execute("select * from want_album where artist_mbid = ? and state in ('missing', 'downloading') order by first_date", (mbid,)).fetchall() if mbid else []
+        name = (albums[0]["artist"] if albums else wanted[0]["artist"] if wanted else
+                (db.execute("select name from mb_artist where mbid = ?", (mbid,)).fetchone() or [key])[0])
+        info = db.execute(f"select * from ytm_artist where artist_id in ({marks}) and description is not null limit 1", ids).fetchone()
+        about = db.execute("select type from mb_artist where mbid = ?", (mbid,)).fetchone() if mbid else None
+        downloading = {r[0] for r in db.execute("select coalesce(t.rg, d.album_mbid) from download d left join download_target t on t.hash = d.hash "
+                                                "where d.state not in ('done', 'failed')")}
+        groups: dict[str, list] = {}
+        for a in albums:
+            kind = ((a["types"] or "album").split(";")[0].strip() or "album").title()
+            groups.setdefault("EP" if kind == "Ep" else kind, []).append(card(a))
+        for w in wanted:
+            state = ('<span class="pill busy">downloading</span>' if w["state"] == "downloading" or w["rg"] in downloading else
+                     f'<span class="pill">not found yet · {ago(w["searched"])}</span>' if w["searched"] else '<span class="pill">wanted</span>')
+            groups.setdefault(w["primary_type"] or "Album", []).append(
+                f'<div class="card dim"><img class="cover" loading="lazy" alt="" src="/music/cover/al-mb-{escape(w["rg"])}" '
+                f'{HIDE_BROKEN}>'
+                f'<b>{escape(w["title"])}</b><span class="muted">{escape((w["first_date"] or "")[:4])}</span>{state}</div>')
+        links = "".join(f'<a href="/music/library/artist/{quote(other)}">{escape(n)}</a> <span class="muted">{kind}</span> · '
+                        for other, kind in linked(db, ids[0]) if (n := link_name(db, other))) if ids else ""
+        appears = db.execute(f"select distinct t.album_id, t.album, t.album_artist, group_concat(distinct c.role) roles from credit c "
+                             f"join track t on t.id = c.track_id where c.artist_id in ({marks}) and t.artist_id not in ({marks}) "
+                             f"and c.role != 'albumartist' group by t.album_id order by t.year", ids + ids).fetchall() if ids else []
+        facts = [("Type", about[0] if about and about[0] else None), ("Albums here", len(albums) or None), ("Wanted", len(wanted) or None),
+                 ("Songs", sum(a["songs"] for a in albums) or None), ("Length", length(sum(a["seconds"] or 0 for a in albums)) if albums else None),
+                 ("Size", size(sum(a["bytes"] or 0 for a in albums)) if albums else None),
+                 ("MusicBrainz", f'<a href="https://musicbrainz.org/artist/{mbid}">{mbid[:8]}…</a> · <a href="/music/artist/{mbid}">full discography</a>'
+                  if mbid else None), ("Related", links.rstrip(" · ") or None)]
+        image = (f'<img class="cover" loading="lazy" alt="" src="{escape(info["image"])}" {HIDE_BROKEN}>'
+                 if info and info["image"]
+                 else picture(albums[-1]["album_id"] if albums else None))
+        body = (f'{MUSIC_NAV}<section class="hero">{image}<div>'
+                f'<dl class="meta">{dl(facts)}</dl>'
+                f'{"<p class=muted>" + escape(info["description"][:600]) + "</p>" if info else ""}</div></section>')
+        for kind in ("Album", "EP", "Single", "Compilation", "Soundtrack", "Live", "Other"):
+            if cards := groups.pop(kind, None):
+                body += f'<section><h2>{kind}s</h2><div class="cards">{"".join(cards)}</div></section>'
+        for kind, cards in groups.items():
+            body += f'<section><h2>{escape(kind)}</h2><div class="cards">{"".join(cards)}</div></section>'
+        if appears:
+            body += ('<section><h2>Also appears on</h2><table class="grid"><tbody>' + "".join(
+                f'<tr><td class="lead"><a href="/music/library/album/{quote(r["album_id"])}">{escape(r["album"])}</a> '
+                f'<span class="muted">{escape(r["album_artist"])}</span></td><td>{escape(r["roles"].replace(",", ", "))}</td></tr>'
+                for r in appears) + '</tbody></table></section>')
+        return page(name, body, wide=True)
+
+    def link_name(db, artist_id: str) -> str | None:
+        row = db.execute("select album_artist from track where artist_id = ? limit 1", (artist_id,)).fetchone() or \
+            db.execute("select name from credit where artist_id = ? limit 1", (artist_id,)).fetchone() or \
+            db.execute("select name from mb_artist where artist_id = ?", (artist_id,)).fetchone()
+        return row[0] if row else None
+
+    def card(a) -> str:
+        meta = " · ".join(filter(None, [str(a["year"] or ""), f'{a["songs"]} songs', length(a["seconds"]), a["formats"]]))
+        return (f'<a class="card" href="/music/library/album/{quote(a["album_id"])}">{picture(a["album_id"])}<b>{escape(a["album"])}</b>'
+                f'<span class="muted">{escape(meta)}</span></a>')
+
+    def dl(facts) -> str:
+        return "".join(f'<dt>{escape(k)}</dt><dd>{v}</dd>' for k, v in facts if v not in (None, "", 0))
+
+    def library_album(db, request, user, form):
+        album_id = request.path_params["id"]
+        tracks = db.execute("select t.*, s.play_count plays, s.played, s.starred, s.rating from track t left join stat s on s.id = t.id "
+                            "where t.album_id = ? order by t.disc_no, t.track_no, t.title", (album_id,)).fetchall()
+        if not tracks:
+            return back("/music/library", error="That album isn't here.")
+        t = tracks[0]
+        from .api import credits_of  # api imports this module
+        credits = credits_of(db, [r["id"] for r in tracks])
+        artist_key = (db.execute("select mbid from mb_artist where artist_id = ?", (t["artist_id"],)).fetchone() or [t["artist_id"]])[0]
+        genres = Counter(g for r in tracks if r["genres"] for g in json.loads(r["genres"]))
+        lossless = all((r["suffix"] or "") in importer.LOSSLESS for r in tracks)
+        bitrates = sorted({r["bitrate"] for r in tracks if r["bitrate"]})
+        fmt = ", ".join(sorted({(r["suffix"] or "").upper() for r in tracks})) + ("" if lossless else f' {bitrates[0]}–{bitrates[-1]} kbps'
+                                                                                   if len(bitrates) > 1 else f' {bitrates[0]} kbps' if bitrates else "")
+        facts = [("Artist", f'<a href="/music/library/artist/{quote(artist_key)}">{escape(t["album_artist"])}</a>'),
+                 ("Released", escape(t["original_date"] or str(t["year"] or ""))), ("Type", escape((t["release_types"] or "").replace(";", ","))),
+                 ("Label", escape(t["label"] or "")), ("Genres", escape(", ".join(g for g, _ in genres.most_common(5)))),
+                 ("Songs", len(tracks)), ("Discs", max((r["disc_no"] or 1) for r in tracks) if max((r["disc_no"] or 1) for r in tracks) > 1 else None),
+                 ("Length", length(sum(r["duration"] or 0 for r in tracks))), ("Format", escape(fmt)), ("Size", size(sum(r["size"] or 0 for r in tracks))),
+                 ("Plays", sum(r["plays"] or 0 for r in tracks) or None),
+                 ("MusicBrainz", f'<a href="https://musicbrainz.org/release/{escape(t["mb_release"])}">release</a>' if t["mb_release"] else None),
+                 ("Folder", f'<code>{escape(str(Path(t["ref"]).parent))}</code>' if t["source"] == "local" else None)]
+        multi = len({r["disc_no"] for r in tracks}) > 1
+        rows = ""
+        for r in tracks:
+            mine = credits.get(r["id"], [])
+            by = ", ".join(dict.fromkeys(c["name"] for c in mine if c["role"] == "artist")) or r["artist"]
+            writers = ", ".join(dict.fromkeys(c["name"] for c in mine if c["role"] in ("composer", "writer", "lyricist")))
+            number = f'{r["disc_no"]}.{r["track_no"]}' if multi else str(r["track_no"] or "")
+            rows += (f'<tr><td class="num">{number}</td><td class="lead"><a href="/music/library/song/{quote(r["id"])}">{escape(r["title"])}</a>'
+                     f'{" ★" if r["starred"] else ""}{f"<div class=muted>{escape(by)}</div>" if by and by != t["album_artist"] else ""}</td>'
+                     f'<td class="muted">{escape(writers)}</td><td class="num">{length(r["duration"])}</td>'
+                     f'<td class="num" data-unit="plays">{r["plays"] or ""}</td></tr>')
+        body = (f'{MUSIC_NAV}<section class="hero">{picture(album_id)}<dl class="meta">{dl(facts)}</dl></section>'
+                f'<section><table class="grid tracks"><thead><tr><th class="num">#</th><th>Title</th><th>Written by</th><th class="num">Length</th>'
+                f'<th class="num">Plays</th></tr></thead><tbody>{rows}</tbody></table></section>')
+        return page(t["album"], body, wide=True)
+
+    def library_song(db, request, user, form):
+        r = db.execute("select t.*, s.play_count plays, s.played, s.starred, s.rating from track t left join stat s on s.id = t.id where t.id = ?",
+                       (request.path_params["id"],)).fetchone()
+        if r is None:
+            return back("/music/library", error="That song isn't here.")
+        from .api import credits_of  # api imports this module
+        mine = credits_of(db, [r["id"]]).get(r["id"], [])
+        roles: dict[str, list] = {}
+        for c in mine:
+            if c["role"] not in ("albumartist",):
+                who = f'<a href="/music/library/artist/{quote(c["mbid"] or c["artist_id"])}">{escape(c["name"])}</a>'
+                roles.setdefault(c["role"], []).append(who + (f' <span class="muted">{escape(c["sub_role"])}</span>' if c["sub_role"] else ""))
+        order = ["artist", "performer", "composer", "lyricist", "writer", "arranger", "conductor", "producer", "remixer", "mixer", "engineer"]
+        credit_facts = [(role.title() + "s" if len(roles[role]) > 1 else role.title(), ", ".join(roles[role]))
+                        for role in sorted(roles, key=lambda x: order.index(x) if x in order else 99)]
+        shared = db.execute("select kept from audio_shared where path = ?", (r["ref"],)).fetchone()
+        lyrics = db.execute("select found is not null and found != '' from lyrics where track_id = ?", (r["id"],)).fetchone()
+        facts = [("Album", f'<a href="/music/library/album/{quote(r["album_id"])}">{escape(r["album"])}</a>'
+                 + (f' · disc {r["disc_no"]}' if (r["disc_no"] or 1) > 1 else "") + (f' · track {r["track_no"]}' if r["track_no"] else "")),
+                 *credit_facts, ("Length", length(r["duration"])), ("Genres", escape(", ".join(json.loads(r["genres"]) if r["genres"] else [r["genre"] or ""]))),
+                 ("ISRC", escape(r["isrc"] or "")),
+                 ("MusicBrainz", f'<a href="https://musicbrainz.org/recording/{escape(r["mb_recording"])}">recording</a>' if r["mb_recording"] else None),
+                 ("Format", escape(f'{(r["suffix"] or "").upper()} · {r["bitrate"]} kbps · {size(r["size"])}')),
+                 ("Plays", f'{r["plays"] or 0}' + (f' · last {ago(r["played"])}' if r["played"] else "")),
+                 ("Starred", "★" if r["starred"] else None), ("Lyrics", ("found" if lyrics[0] else "none found") if lyrics else None),
+                 ("Shares audio with", f'<code>{escape(shared[0])}</code>' if shared else None),
+                 ("File", f'<code>{escape(r["ref"])}</code>' if r["source"] == "local" else None)]
+        body = f'{MUSIC_NAV}<section class="hero">{picture(r["album_id"])}<dl class="meta">{dl(facts)}</dl></section>'
+        return page(r["title"], body, wide=True)
 
     def give_up(db, user, rg: str):
         api._want(db, user["name"], "album", mine(db, user, "album", rg), None)
@@ -650,6 +801,10 @@ def routes(api) -> list[Route]:
         Route("/music/unwant", catalogue(unwant), methods=["POST"]),
         Route("/music/wanted", catalogue(wanted)),
         Route("/music/library", catalogue(music_library)),
+        Route("/music/library/artist/{key}", catalogue(library_artist)),
+        Route("/music/library/album/{id}", catalogue(library_album)),
+        Route("/music/library/song/{id}", catalogue(library_song)),
+        Route("/music/cover/{id}", catalogue(music_cover)),
         Route("/music/wanted/give-up", catalogue(wanted_give_up), methods=["POST"]),
         Route("/music/wanted/{rg}/{action:str}", catalogue(wanted_action), methods=["POST"]),
         Route("/admin/users", signed_in(create_user, admin=True), methods=["POST"]),
