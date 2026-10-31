@@ -291,7 +291,8 @@ class Library:
         due = due(self.lidarr.missing(), RESEARCH) or due(self.lidarr.cutoff_unmet(), UPGRADE_AGAIN)  # then lossy ones, for lossless
         if not due:
             return
-        album = min(due, key=lambda a: a["id"] in searched)  # stable: keeps Lidarr's newest-first order otherwise
+        # Never searched first, then albums and EPs before singles; stable, so Lidarr's newest-first order otherwise.
+        album = min(due, key=lambda a: (a["id"] in searched, a.get("albumType") == "Single"))
         self.lidarr.search_album(album["id"])
         self.last_search = time.time()
         db.execute("insert or replace into catalogue_search values (?, ?)", (album["id"], self.last_search))

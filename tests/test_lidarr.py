@@ -209,3 +209,17 @@ def test_collaboration_credits_split_into_artist_names():
     assert artist_names("SawanoHiroyuki[nZk]:mizuki") == ["SawanoHiroyuki[nZk]:mizuki", "SawanoHiroyuki[nZk]", "SawanoHiroyuki", "mizuki"]
     assert artist_names("Falling In Reverse, Corey Taylor, Serj Tankian")[:2] == ["Falling In Reverse, Corey Taylor, Serj Tankian", "Falling In Reverse"]
     assert artist_names("A feat. B")[1:] == ["A", "B"] and artist_names("X × Y")[1:] == ["X", "Y"]
+
+
+def test_a_followed_artists_singles_wait_behind_its_albums(client, lidarr):
+    artist = next(a for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"] if a["name"] == "The Alpha")
+    call(client, "star", artistId=artist["id"])
+    sync(client)
+    lidarr.artist_albums[100] = [{"id": 70, "monitored": True, "albumType": "Single", "foreignAlbumId": "mb-70", "title": "New Single", "releaseDate": "2024"},
+                                 {"id": 71, "monitored": False, "albumType": "Album", "foreignAlbumId": "mb-71", "title": "Old Album", "releaseDate": "2001"}]
+    library = client.app.state.api.library
+    sync(client)
+    for _ in range(2):
+        library.last_search -= lidarr_module.SEARCH_GAP
+        sync(client)
+    assert [c for c in lidarr.calls if c[0] == "search"] == [("search", 71), ("search", 70)]
