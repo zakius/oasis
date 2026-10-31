@@ -6,8 +6,8 @@ LENGTH_SLACK) are compared by their decoded audio, and match when they are
 3. one master at another resolution, or lossy: lossless copies by their waveform after aligning and level matching,
    lossy ones by tonal balance and loudness over time, which codecs keep and remastering changes.
 
-Versions tagged as such (live, demo, acoustic, remix, edit...) never take part, and level 3 never joins files whose
-MusicBrainz recording ids differ. Of matching files the best is kept (lossless, then resolution, then the most
+Versions tagged as such (live, demo, acoustic, remix, edit...) never take part. MusicBrainz recording ids aren't
+consulted: the same audio often has several, from singles and compilations nobody merged. Of matching files the best is kept (lossless, then resolution, then the most
 complete, then the smallest FLAC), and every other one becomes a copy-on-write clone of it (btrfs/XFS reflink) with
 its own tags written back, so each edition keeps its file, folder and tags while the audio is stored once."""
 import fcntl
@@ -57,7 +57,7 @@ def probe(path: str) -> dict:
             "bitrate": number("bit_rate"), "lossless": codec in ("flac", "alac", "ape", "wavpack") or codec.startswith("pcm_"),
             "length": getattr(audio.info, "length", 0) if audio else 0, "size": os.path.getsize(path),
             "md5": getattr(audio.info, "md5_signature", 0) if isinstance(audio, FLAC) else 0,
-            "recording": first_tag(tags, "musicbrainz_trackid"), "release_type": first_tag(tags, "releasetype")}
+            "release_type": first_tag(tags, "releasetype")}
 
 
 def first_tag(tags, key: str) -> str:
@@ -273,8 +273,6 @@ def dedupe_song(db, rows) -> list[tuple[str, str]]:
                 ia, ib = info(a), info(b)
                 live = "live" in (ia["release_type"] + ib["release_type"]).lower()
                 result = 0 if live else compare(ia, ib)
-                if result == 3 and ia["recording"] and ib["recording"] and ia["recording"] != ib["recording"]:
-                    result = 0  # MusicBrainz says they're different recordings
             db.execute("insert or replace into audio_pair values (?, ?, ?, ?, ?)", (a, b, mtimes[a], mtimes[b], result))
             db.commit()
         else:
