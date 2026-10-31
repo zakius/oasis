@@ -9,7 +9,7 @@ from oasis.lidarr import Library, Lidarr, artist_names
 
 class FakeLidarr(Lidarr):
     def __init__(self):
-        self.albums, self.artists, self.queue_albums, self.calls, self.artist_albums = {}, {}, set(), [], {}
+        self.albums, self.artists, self.queue_albums, self.calls, self.artist_albums, self.album_tracks = {}, {}, set(), [], {}, {}
 
     def find_album(self, artist, title):
         self.calls.append(("find_album", artist, title))
@@ -47,6 +47,9 @@ class FakeLidarr(Lidarr):
 
     def albums_of(self, artist_id):
         return self.artist_albums.get(artist_id, [])
+
+    def tracks(self, album):
+        return [{"title": t} for t in self.album_tracks.get(album["id"], [])]
 
     def follow_artist(self, artist, follow):
         self.calls.append(("follow", artist["id"], follow))
@@ -136,13 +139,18 @@ def test_starred_artist_gets_its_catalogue_searched_paced(client, lidarr):
     shown = next(a for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"] if a["name"] == "The Alpha")
     assert "oasisWanted" not in shown  # followed: nothing to show
     # After Lidarr's first refresh, albums and EPs get monitored once; singles don't.
-    lidarr.artist_albums[100] = [{"id": 50, "monitored": False, "albumType": "Album", "foreignAlbumId": "mb-50"},
-                                 {"id": 51, "monitored": False, "albumType": "EP", "foreignAlbumId": "mb-51"},
-                                 {"id": 52, "monitored": False, "albumType": "Single", "foreignAlbumId": "mb-52"}]
+    lidarr.artist_albums[100] = [{"id": 50, "monitored": False, "albumType": "Album", "foreignAlbumId": "mb-50", "title": "Herzeleid", "releaseDate": "2001"},
+                                 {"id": 51, "monitored": False, "albumType": "EP", "foreignAlbumId": "mb-51", "title": "Neu EP", "releaseDate": "2002"},
+                                 {"id": 52, "monitored": False, "albumType": "Single", "foreignAlbumId": "mb-52", "title": "Engel", "releaseDate": "2003"},
+                                 {"id": 53, "monitored": False, "albumType": "Album", "foreignAlbumId": "mb-53", "title": "Live aus Berlin", "releaseDate": "2010"},
+                                 {"id": 54, "monitored": False, "albumType": "Album", "foreignAlbumId": "mb-54", "releaseDate": "2011",
+                                  "title": "Sehnsucht (Anniversary Edition)"}]
+    lidarr.album_tracks = {50: ["Engel", "Du hast", "Mein Herz"], 51: ["Neu"], 53: ["Engel (Remastered)", "Du Hast - Live", "Neu"]}
     library = client.app.state.api.library
     sync(client)
     sync(client)
-    assert [c for c in lidarr.calls if c[0] == "set_albums"] == [("set_albums", (50, 51), True)]
+    # 53 mostly repeats 50's songs, 54 is an anniversary edition: neither is monitored.
+    assert [c for c in lidarr.calls if c[0] == "set_albums"] == [("set_albums", (50, 51), True), ("set_albums", (), False)]
     assert [c for c in lidarr.calls if c[0] == "search"] == [("search", 50)]
     library.last_search -= lidarr_module.SEARCH_GAP
     lidarr.queue_albums.update({1, 2, 50})  # busy: no new search
@@ -154,6 +162,22 @@ def test_starred_artist_gets_its_catalogue_searched_paced(client, lidarr):
     call(client, "unstar", artistId=artist["id"])
     sync(client)
     assert ("follow", 100, False) in lidarr.calls and ("set_albums", (50, 51), False) in lidarr.calls
+
+
+def test_repackages_lidarr_monitors_later_are_unmonitored_unless_starred_or_downloaded(client, lidarr, monkeypatch):
+    artist = next(a for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"] if a["name"] == "The Alpha")
+    call(client, "star", artistId=artist["id"])
+    lidarr.artist_albums[100] = [{"id": 60, "monitored": False, "albumType": "Album", "foreignAlbumId": "mb-60", "title": "First", "releaseDate": "2001"}]
+    lidarr.album_tracks = {60: ["One", "Two"], 61: ["One", "Two", "Three"], 62: ["One", "Two"]}
+    sync(client)
+    sync(client)
+    lidarr.artist_albums[100] += [
+        {"id": 61, "monitored": True, "albumType": "Album", "foreignAlbumId": "mb-61", "title": "Greatest Hits", "releaseDate": "2020"},
+        {"id": 62, "monitored": True, "albumType": "Album", "foreignAlbumId": "mb-62", "title": "Hits", "releaseDate": "2021",
+         "statistics": {"trackFileCount": 2}}]
+    monkeypatch.setattr(time, "time", lambda real=time.time: real() + lidarr_module.RECHECK_CATALOGUE + 1)
+    sync(client)
+    assert ("set_albums", (61,), False) in lidarr.calls and not any(c[0] == "set_albums" and 62 in c[1] for c in lidarr.calls)
 
 
 def test_no_match_fails_with_reason_and_waits_while_errors_retry_soon(client, lidarr, monkeypatch):

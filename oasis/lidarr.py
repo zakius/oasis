@@ -21,6 +21,10 @@ GRAB_WAIT = 600         # seconds after a search before "nothing grabbed" counts
 MAX_ACTIVE = 2          # running downloads at which no new search starts: TorBox's plan has 3 slots, one stays free for anime
 UPGRADE_AGAIN = 7 * 86400  # seconds between searches for a lossless copy of an album downloaded lossy
 CATALOGUE_TYPES = {"Album", "EP"}  # what of a followed artist's back catalogue gets downloaded; singles repeat album tracks
+RECHECK_CATALOGUE = 86400  # seconds between passes dropping repackages Lidarr monitored as new releases
+REPEATS = 0.6              # share of an album's songs already on the artist's earlier releases that makes it a repackage
+REPACKAGE = re.compile(r"\b(best of|greatest hits|very best|the essential|anthology|collection|singles|remaster(ed)?|anniversary|"
+                       r"deluxe|bonus ?tracks?|re-?recorded|reissue|remixes|instrumentals?|karaoke)\b", re.I)
 
 
 class Lidarr:
@@ -91,6 +95,13 @@ class Lidarr:
 
     def search_album(self, album_id: int):
         self.call("POST", "command", {"name": "AlbumSearch", "albumIds": [album_id]})
+
+    def tracks(self, album: dict) -> list[dict]:
+        """The tracks of the album's smallest edition: bonus discs of live versions don't make it a repackage."""
+        releases = [r for r in album.get("releases") or [] if r.get("trackCount")]
+        if not releases:
+            return self.call("GET", f"track?albumId={album['id']}") or []
+        return self.call("GET", f"track?albumReleaseId={min(releases, key=lambda r: r['trackCount'])['id']}") or []
 
     def follow_artist(self, artist: dict, follow: bool):
         """Following monitors the artist for new releases; unfollowing unmonitors it. Albums keep their own monitoring."""
@@ -209,8 +220,8 @@ class Library:
             if not artist["monitored"] or artist.get("monitorNewItems") != "all":
                 self.lidarr.follow_artist(artist, True)
             db.execute("update lidarr_item set lidarr_id = ? where kind = ? and ref = ?", (artist["id"], item["kind"], item["ref"]))
-            if not item["searched"]:
-                self.monitor_catalogue(db, item, artist)
+            if (item["searched"] or 0) < time.time() - RECHECK_CATALOGUE:
+                self.monitor_catalogue(db, item, artist, first=not item["searched"])
             return ("downloading" if artist["id"] in queued_artists else "followed"), None
 
         album = self.lidarr.album(mbid)
@@ -228,13 +239,26 @@ class Library:
             return "sent", self.lidarr.why_nothing(album["id"])
         return "sent", "waiting for its search" if not item["searched"] else "searching"
 
-    def monitor_catalogue(self, db, item, artist):
-        """Once Lidarr has the artist's albums, monitors its albums and EPs so the paced search downloads them.
-        Done once per artist, so albums unmonitored in Lidarr afterwards stay that way."""
-        albums = self.lidarr.albums_of(artist["id"])
+    def monitor_catalogue(self, db, item, artist, first: bool):
+        """Monitors the artist's albums and EPs so the paced search downloads them, except repackages: best-ofs,
+        deluxe and anniversary editions, re-recordings, whose songs are mostly on its earlier releases. Monitoring
+        happens once per artist, so albums unmonitored in Lidarr afterwards stay that way; dropping repackages
+        repeats daily, for those Lidarr monitors as new releases. Albums with files or starred are left alone."""
+        albums = sorted((a for a in self.lidarr.albums_of(artist["id"]) if a.get("albumType") in CATALOGUE_TYPES),
+                        key=lambda a: a.get("releaseDate") or "")
         if not albums:
             return  # first refresh still pending
-        self.lidarr.set_albums([a["id"] for a in albums if not a["monitored"] and a.get("albumType") in CATALOGUE_TYPES], True)
+        starred = {r[0] for r in db.execute("select mbid from lidarr_item where kind = 'album' and mbid is not null")}
+        seen, keep = set(), set()
+        for album in albums:
+            songs = {song_key(t["title"]) for t in self.lidarr.tracks(album)}
+            if not REPACKAGE.search(album["title"]) and not (songs and len(songs & seen) >= REPEATS * len(songs)):
+                keep.add(album["id"])
+            seen |= songs
+        if first:
+            self.lidarr.set_albums([a["id"] for a in albums if a["id"] in keep and not a["monitored"]], True)
+        self.lidarr.set_albums([a["id"] for a in albums if a["id"] not in keep and a["monitored"] and a["foreignAlbumId"] not in starred
+                                and not (a.get("statistics") or {}).get("trackFileCount")], False)
         db.execute("update lidarr_item set searched = ? where kind = ? and ref = ?", (time.time(), item["kind"], item["ref"]))
 
     def search_next(self, db, queued_albums: set):
@@ -281,6 +305,11 @@ class Library:
             starred = {r[0] for r in db.execute("select mbid from lidarr_item where kind = 'album' and mbid is not null")}
             self.lidarr.set_albums([a["id"] for a in self.lidarr.albums_of(artist["id"]) if a["monitored"]
                                     and a["foreignAlbumId"] not in starred and not (a.get("statistics") or {}).get("trackFileCount")], False)
+
+
+def song_key(title: str) -> str:
+    """'Du hast (Remastered 2017)', 'Du Hast - Live' -> 'duhast'."""
+    return fold(re.sub(r"\s+-\s+.*$", "", re.sub(r"\s*[(\[][^)\]]*[)\]]", "", title)))
 
 
 def set_state(db, item, state: str, error: str | None, retry: float | None = None):
