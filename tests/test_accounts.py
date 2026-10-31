@@ -110,3 +110,14 @@ def test_client_links_youtube_with_its_cookie(client):
 def test_rejected_sign_in_gives_a_short_message(client):
     error = call(client, "oasisLinkYouTubeMusic", cookie="bad; __Secure-3PAPISID=b")["error"]
     assert error["message"] == "YouTube Music didn't accept that sign-in. Sign in again and retry."
+
+
+def test_status_shows_oasis_downloads_and_what_arrived_lately(client):
+    db = client.app.state.api._db()
+    rows = [("h1", "Mili - Hue [FLAC]", "downloading", None), ("h2", "Rammstein - Mutter [FLAC]", "done", None),
+            ("h3", "Mili - Hue [MPC]", "failed", "dead torrent: no seeds, no progress")]
+    db.executemany("insert into download(hash, album_id, title, state, error, created, updated) values (?, 1, ?, ?, ?, strftime('%s'), strftime('%s'))", rows)
+    sign_in(client)
+    page = client.get("/account").text
+    assert "Downloading 1:" in page and "Mili - Hue [FLAC]" in page and "TorBox downloading" in page
+    assert "✓ Rammstein - Mutter [FLAC]" in page and "dead torrent: no seeds, no progress" in page

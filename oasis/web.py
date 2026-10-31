@@ -1,5 +1,6 @@
 """Account pages: sign in with the Subsonic user, link YouTube Music, Last.fm and ListenBrainz, manage users."""
 import json
+import time
 import urllib.request
 from html import escape
 from urllib.parse import parse_qsl, quote
@@ -32,6 +33,14 @@ button { padding: .4rem 1rem; border-radius: 8px; border: 1px solid #888; cursor
 .ok { color: #1a7f37; } .error { color: #c62828; } .muted { opacity: .7; font-size: .9rem; }
 ol { padding-left: 1.2rem; } form.inline { display: inline; } td { padding: .2rem .6rem .2rem 0; }
 """
+
+
+STATES = {"added": "waiting for TorBox", "downloading": "TorBox downloading", "fetching": "copying here", "importing": "importing"}
+
+
+def ago(ts: float) -> str:
+    minutes = int((time.time() - ts) // 60)
+    return f"{minutes} min ago" if minutes < 120 else f"{minutes // 60} h ago"
 
 
 async def read_form(request: Request) -> dict:
@@ -198,16 +207,20 @@ def routes(api) -> list[Route]:
         songs, albums, artists = db.execute("select count(*), count(distinct album_id), count(distinct artist_id) from track "
                                             "where source = 'local'").fetchone()
         lines = [f"{songs} songs, {albums} albums, {artists} artists in the library."]
+        active = db.execute("select title, state, created from download where state not in ('done', 'failed') order by created").fetchall()
+        lines.append(f'Downloading {len(active)}:<ul>' + "".join(
+            f'<li>{escape(r["title"])} <span class="muted">{STATES.get(r["state"], r["state"])}, {ago(r["created"])}</span></li>'
+            for r in active) + '</ul>' if active else "Nothing downloading.")
+        recent = db.execute("select title, state, error, updated from download where state in ('done', 'failed') "
+                            "order by updated desc limit 5").fetchall()
+        if recent:
+            lines.append('Lately:<ul>' + "".join(
+                f'<li>{"✓" if r["state"] == "done" else "✗"} {escape(r["title"])} <span class="muted">{ago(r["updated"])}'
+                f'{": " + escape(r["error"]) if r["error"] and r["state"] == "failed" else ""}</span></li>' for r in recent) + '</ul>')
         if api.library:
             try:
-                lidarr = api.library.lidarr
-                queue = lidarr.call("GET", "queue?pageSize=50&includeAlbum=true&includeArtist=true")["records"]
-                missing = lidarr.call("GET", "wanted/missing?pageSize=1&monitored=true")["totalRecords"]
-                downloading = "".join(
-                    f'<li>{escape(q.get("artist", {}).get("artistName", ""))} – {escape(q.get("album", {}).get("title", q["title"]))} '
-                    f'<span class="muted">{100 - round(100 * q["sizeleft"] / q["size"]) if q.get("size") else 0}%</span></li>' for q in queue)
-                lines.append(f'Downloading {len(queue)}{":" if queue else "."}<ul>{downloading}</ul>' if queue else "Nothing downloading.")
-                lines.append(f'{missing} more albums Lidarr is looking for.')
+                missing = api.library.lidarr.call("GET", "wanted/missing?pageSize=1&monitored=true")["totalRecords"]
+                lines.append(f'{missing} more albums still to find.')
             except Exception as e:
                 lines.append(f'<span class="error">Lidarr didn\'t answer: {escape(str(e))}</span>')
         filled = count("select count(*) from track where source = 'local' and credits_at is not null")

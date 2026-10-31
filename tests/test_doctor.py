@@ -287,3 +287,14 @@ def test_dry_run_changes_nothing_and_logs_each_action(doctor, lidarr, torbox, rd
     lines = [r.getMessage() for r in caplog.records]
     assert [m.split(" ")[1] for m in lines if m.startswith("[dry]")] == ["import", "replace", "drop", "delete"]
     assert lines[-1] == "doctor: 2 downloads in Lidarr's queue, 1 TorBox torrents"
+
+
+def test_a_download_with_nothing_lidarr_can_import_is_replaced_once_it_has_waited(doctor, lidarr):
+    pending = lambda added: item(state="importPending", added=added, statusMessages=[
+        {"title": "x", "messages": ["No files found are eligible for import in /downloads/music/Feuer Frei! (UK DVD Single) [DVD5]/"]}])
+    lidarr.items = [pending(datetime.now(timezone.utc).isoformat())]
+    doctor.cycle()
+    assert lidarr.removed == []  # Lidarr may still be looking at it
+    lidarr.items = [pending("2026-10-31T17:34:29Z")]
+    doctor.cycle()
+    assert lidarr.removed == [(1, True, True)]

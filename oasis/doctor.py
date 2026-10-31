@@ -110,7 +110,10 @@ class Doctor:
         for item in queue:
             state = item.get("trackedDownloadState")
             messages = " ".join(m for s in item.get("statusMessages", []) for m in s.get("messages", []))
-            if state in ("importFailed", "importBlocked") and item.get("albumId"):
+            # Lidarr leaves a download with nothing it can import (a DVD, an archive) pending forever.
+            added = datetime.fromisoformat(item["added"].replace("Z", "+00:00")) if item.get("added") else now
+            nothing = state == "importPending" and "eligible for import" in messages and now - added > STUCK_AFTER
+            if (state in ("importFailed", "importBlocked") or nothing) and item.get("albumId"):
                 try:
                     if self.try_import(item):
                         continue
