@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import threading
+import unicodedata
 import time
 import urllib.request
 from collections import defaultdict
@@ -29,6 +30,12 @@ class Stream:
     content_type: str
     size: int
     expires: float
+
+
+def fold(text: str) -> str:
+    """Case, accents, spaces and punctuation aside: 'Suite‐Pee' (Unicode hyphen) and 'Suite-Pee' are the same title."""
+    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).casefold()
+    return re.sub(r"[\W_]+", "", text)
 
 
 def big_cover(thumbnails) -> str | None:
@@ -89,7 +96,7 @@ class YouTubeMusic:
     def find(self, artist: str, title: str, duration: int | None = None) -> dict | None:
         """The same song on YouTube Music: same title, and length within 5 s if known, else the same artist."""
         def same(r):
-            if r["title"].casefold() != title.casefold():
+            if fold(r["title"]) != fold(title):
                 return False
             if duration:
                 return abs((r["duration"] or 0) - duration) <= 5
