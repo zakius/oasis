@@ -456,6 +456,11 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     album = call(client, "getAlbum", id="al-mb-" + STRAY)["album"]
     assert album["song"] == [] and album["oasisWanted"] == "wanted" and album["starred"]
     assert wants(client)["STRAY SHEEP"][:2] == ("missing", "starred") and wants(client)["BOOTLEG"][1] == "followed"
+    for method, key in (("getStarred2", "starred2"), ("getStarred", "starred")):
+        starred = call(client, method)[key]
+        assert [(a["id"], a["name"]) for a in starred["artist"]] == [("ar-mb-" + KENSHI, "米津玄師")]
+        assert [(a["id"], a["name"], a["artistId"], a["oasisWanted"]) for a in starred["album"]] == \
+               [("al-mb-" + STRAY, "STRAY SHEEP", "ar-mb-" + KENSHI, "wanted")] and starred["album"][0]["starred"]
 
     # it arrives
     db.execute("update track set mb_release_group = ? where album = 'First'", (STRAY,))

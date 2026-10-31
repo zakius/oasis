@@ -791,12 +791,27 @@ class Api:
         def ids(prefix):
             return db.execute("select id from stat where starred is not null and id like ? order by starred desc", (prefix + "%",)).fetchall()
         return {
-            "artist": [artist(self._one(db, ARTISTS + " where t.artist_id = ? group by t.artist_id", r["id"])) for r in ids("ar-")
-                       if db.execute("select 1 from track where artist_id = ?", (r["id"],)).fetchone()],
-            "album": [album(self._one(db, ALBUMS + " where t.album_id = ? group by t.album_id", r["id"])) for r in ids("al-")
-                      if db.execute("select 1 from track where album_id = ?", (r["id"],)).fetchone()],
+            "artist": [a for r in ids("ar-") for a in ([artist(self._one(db, ARTISTS + " where t.artist_id = ? group by t.artist_id", r["id"]))]
+                                                      if db.execute("select 1 from track where artist_id = ?", (r["id"],)).fetchone()
+                                                      else self._starred_mb(db, "artist", r["id"]))],
+            "album": [a for r in ids("al-") for a in ([album(self._one(db, ALBUMS + " where t.album_id = ? group by t.album_id", r["id"]))]
+                                                     if db.execute("select 1 from track where album_id = ?", (r["id"],)).fetchone()
+                                                     else self._starred_mb(db, "album", r["id"]))],
             "song": [song(r) for r in db.execute(SONGS + " where s.starred is not null order by s.starred desc")],
         }
+
+    def _starred_mb(self, db, kind, id) -> list[dict]:
+        """A starred MusicBrainz-only artist or album, as getArtist and getAlbum give it (from mb_cache, where searching
+        and acquiring it put it); none while MusicBrainz doesn't answer, or for another id."""
+        if not (mbid := acquire.mbid_of(id)):
+            return []
+        try:
+            if kind == "artist":
+                return [self._mb_artist(db, musicbrainz.get(releases.ALIASES.format(mbid), db, releases.KEEP_ALIASES))]
+            return [self._mb_album(db, musicbrainz.get(acquire.GROUP.format(mbid), db, acquire.KEEP_GROUP))]
+        except (OSError, LookupError) as e:
+            log.info("starred %s unavailable: %s", id, e)
+            return []
 
     def getStarred2(self, db, p, user):
         return {"starred2": self._starred(db)}
