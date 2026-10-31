@@ -684,17 +684,17 @@ class Api:
         def match(columns: str):
             return " and ".join(["t.library = 1", *[f"({columns}) like ?"] * len(terms)]), [f"%{t}%" for t in terms]
 
+        # Every row is read before YouTube Music is asked: a cursor left open keeps its read snapshot, and remember()
+        # can't write from a snapshot that another connection's write (the mix refresh's) made stale: "database is locked".
         cond, args = match("t.album_artist")
-        artists = db.execute(ARTISTS + f" where {cond} group by t.artist_id order by t.album_artist collate nocase limit ? offset ?",
-                             (*args, p.int("artistCount", 20), p.int("artistOffset", 0)))
+        artists = [artist(r) for r in db.execute(ARTISTS + f" where {cond} group by t.artist_id order by t.album_artist collate nocase "
+                                                 "limit ? offset ?", (*args, p.int("artistCount", 20), p.int("artistOffset", 0)))]
         cond, args = match("t.album || ' ' || t.album_artist")
-        artists = [artist(r) for r in artists]
-        albums = db.execute(ALBUMS + f" where {cond} group by t.album_id order by name collate nocase limit ? offset ?",
-                            (*args, p.int("albumCount", 20), p.int("albumOffset", 0)))
+        albums = [album(r) for r in db.execute(ALBUMS + f" where {cond} group by t.album_id order by name collate nocase limit ? offset ?",
+                                               (*args, p.int("albumCount", 20), p.int("albumOffset", 0)))]
         cond, args = match("t.title || ' ' || t.artist || ' ' || t.album")
-        songs = db.execute(SONGS + f" where {cond} order by t.album_artist, t.album, t.disc_no, t.track_no limit ? offset ?",
-                           (*args, p.int("songCount", 20), p.int("songOffset", 0)))
-        songs = [song(r) for r in songs]
+        songs = [song(r) for r in db.execute(SONGS + f" where {cond} order by t.album_artist, t.album, t.disc_no, t.track_no limit ? offset ?",
+                                             (*args, p.int("songCount", 20), p.int("songOffset", 0)))]
         if self.ytm and terms and p.int("songOffset", 0) == 0:
             known = {s["id"] for s in songs}
             try:
@@ -703,7 +703,6 @@ class Api:
                 log.warning("YouTube Music search failed: %s", e)
                 found = []
             songs += [song(self._one(db, SONGS + " where t.id = ?", id)) for id in dict.fromkeys(found) if id not in known]
-        albums = [album(r) for r in albums]
         text = " ".join(terms)
         if self.library and len(text) >= FIND_FROM:
             # MusicBrainz last, for what neither the library nor YouTube Music has: these can be starred like any other.

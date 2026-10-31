@@ -4,6 +4,7 @@ import pytest
 
 from conftest import call, make_client
 from oasis import ytm as ytm_module
+from oasis.db import connect
 from oasis.ytm import Stream, track_row
 
 SEARCH_ITEM = {
@@ -74,6 +75,18 @@ def test_search_adds_streaming_results_after_local_and_merges_duplicates(client)
     songs = call(client, "search3", query="one")["searchResult3"]["song"]
     assert [s["title"] for s in songs] == ["One", "Remote Song"]
     assert songs[1]["id"] == "yt-vid1" and "path" not in songs[1]
+
+
+def test_a_search_isnt_locked_out_by_writes_landing_while_youtube_music_answers(client, ytm, tmp_path, monkeypatch):
+    def search(query, limit):  # the mix refresh writes meanwhile
+        other = connect(tmp_path / "oasis.db")
+        other.execute("insert into playlist(name, owner, created, changed) values ('mix', 'admin', 0, 0)")
+        other.close()
+        return [track_row(SEARCH_ITEM)]
+
+    monkeypatch.setattr(ytm, "search", search)
+    found = call(client, "search3", query="e")["searchResult3"]
+    assert "yt-vid1" in {s["id"] for s in found["song"]} and found["album"]
 
 
 def test_streaming_tracks_join_library_only_while_starred(client, ytm):
