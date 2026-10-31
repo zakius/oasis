@@ -62,12 +62,13 @@ def test_an_admin_connects_oasis_to_lastfm_on_the_dashboard(client, monkeypatch)
     def call(self, params):
         if self.secret != "right":
             raise Rejected("Last.fm: Invalid method signature supplied")
-        return {"token": "t"}
+        return {"session": {"key": "sk", "name": "zak"}} if params["method"] == "auth.getSession" else {"token": "t"}
     monkeypatch.setattr(LastFm, "call", call)
     sign_in(client)
     assert "Invalid method signature" in client.post("/account/lastfm/app", data={"key": "k", "secret": "wrong"}).text
     assert "Sign in with Last.fm" in client.post("/account/lastfm/app", data={"key": "k", "secret": "right"}).text
     assert client.app.state.api.recommender.lastfm.api_key == "k"
+    assert "Linked as <b>zak</b>" in client.get("/account/lastfm/callback", params={"token": "t"}).text
     db = client.app.state.api._db()
     assert dict(db.execute("select key, value from setting").fetchall()) == {"lastfm_key": "k", "lastfm_secret": "right"}
 

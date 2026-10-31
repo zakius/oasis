@@ -152,7 +152,7 @@ def routes(api) -> list[Route]:
 
     def lastfm_callback(db, request, user, form):
         try:
-            key, name = lastfm_service().session(request.query_params.get("token", ""))
+            key, name = lastfm_service().sign_in(request.query_params.get("token", ""))
         except Exception as e:
             return back("/account", error=f"Last.fm sign-in failed: {e}")
         accounts.set_field(db, user["name"], lastfm_session=key, lastfm_name=name)

@@ -68,7 +68,7 @@ class LastFm:
         """Last.fm's page where the user allows oasis; it comes back to callback with a token."""
         return f"https://www.last.fm/api/auth/?api_key={self.api_key}&cb={urllib.parse.quote(callback, safe='')}"
 
-    def session(self, token: str) -> tuple[str, str]:
+    def sign_in(self, token: str) -> tuple[str, str]:
         """Trades the token from the callback for a session key, which never expires, and the user name."""
         session = self.call({"method": "auth.getSession", "token": token})["session"]
         return session["key"], session["name"]
