@@ -243,7 +243,7 @@ def test_rule9_dead_torrents_are_replaced_in_lidarr_or_deleted(doctor, lidarr, t
 def test_rule10_slow_downloads_are_swapped_for_a_cached_copy(doctor, lidarr, torbox, rdt):
     track(rdt, "slow")
     lidarr.items = [item(1, "SLOW", state="downloading", status="downloading", trackedDownloadStatus="ok")]
-    offer = lambda guid, hash, weight, *rejections: {"guid": guid, "title": guid, "infoHash": hash, "qualityWeight": weight,
+    offer = lambda guid, hash, weight, *rejections: {"guid": guid, "indexerId": 1, "title": guid, "infoHash": hash, "qualityWeight": weight,
                                                      "rejections": list(rejections), "quality": {"quality": {"name": "FLAC"}}}
     lidarr.offers[5] = [offer("worse", "w", 5), offer("wrong", "x", 15, "Wrong format"), offer("uncached", "u", 12, "Not enough seeders: 0"),
                         offer("current", "SLOW", 10, "Release in queue"), offer("cached", "c", 10, "Release in queue")]
