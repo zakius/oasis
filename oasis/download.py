@@ -81,8 +81,9 @@ class Downloads:
     """Sends searches' picks to TorBox and walks each download through added -> downloading -> fetching ->
     importing -> done, or failed. The state is in the download table, so a restart resumes where it was."""
 
-    def __init__(self, connect, lidarr, importer, downloads: str, max_active: int = 8, stall_hours: float = 1):
-        self.connect, self.lidarr, self.importer, self.folder = connect, lidarr, importer, Path(downloads)
+    def __init__(self, connect, lidarr, importer, downloads: str, max_active: int = 8, stall_hours: float = 1, imported=lambda: None):
+        """imported: called after each import. Lidarr tells oasis to scan after its own imports, not after ManualImport."""
+        self.connect, self.lidarr, self.importer, self.folder, self.imported = connect, lidarr, importer, Path(downloads), imported
         self.max_active, self.stall = max_active, stall_hours * 3600
         self.client = None
         self.seen = {}       # hash -> (progress, since when)
@@ -242,6 +243,7 @@ class Downloads:
             shutil.rmtree(folder, ignore_errors=True)
             self.set(db, row, "done")
             log.info("imported %s", row["title"])
+            self.imported()
         else:
             self.fail(db, row, "import failed: the files match no edition of the album")
 

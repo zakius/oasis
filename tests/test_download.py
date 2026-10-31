@@ -66,7 +66,8 @@ def torbox(tmp_path):
 def downloads(tmp_path, lidarr, torbox, monkeypatch):
     monkeypatch.setattr(download, "PACE", 0)
     made = Downloads(lambda: connect(tmp_path / "oasis.db"), lidarr, Doctor(None, lidarr, "unused"), str(tmp_path / "dl"), stall_hours=1)
-    made.client = torbox
+    made.client, made.imported = torbox, lambda: made.scans.append(1)
+    made.scans = []
     return made
 
 
@@ -113,7 +114,7 @@ def test_a_search_sends_the_pick_to_torbox_and_the_files_are_fetched_and_importe
     assert [f["path"] for f in lidarr.imported[0]] == [str(folder / "Album/01.flac"), str(folder / "Album/02.flac")]
     assert lidarr.mode == "move" and lidarr.imported[0][0]["downloadId"] is None
     assert db.execute("select state from download").fetchone()[0] == "done"
-    assert torbox.deleted == [71] and not folder.exists() and downloads.albums(db) == set()
+    assert torbox.deleted == [71] and not folder.exists() and downloads.albums(db) == set() and downloads.scans == [1]
 
 
 def test_two_same_named_files_in_different_folders_both_arrive_and_a_restart_mid_fetch_resumes(downloads, lidarr, torbox, db, tmp_path):

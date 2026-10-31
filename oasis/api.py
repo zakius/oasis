@@ -321,7 +321,7 @@ class Api:
         self.doctor = Doctor(self._db, lidarr, **{k: v for k, v in torbox.items() if k in DOCTOR_KEYS}) if torbox else None
         # Its own importer: the doctor's dry run mustn't stop downloads.
         self.downloads = Downloads(self._db, lidarr, Doctor(self._db, lidarr, torbox["rdt_db"]), torbox["downloads"], torbox.get("max_active", 8),
-                                   torbox.get("stall_hours", 1)) if torbox and torbox.get("downloads") else None
+                                   torbox.get("stall_hours", 1), self._start_scan) if torbox and torbox.get("downloads") else None
         self.library = Library(self._db, lidarr, self.downloads) if lidarr else None
         self.scanning = False
         self.scan_lock = threading.Lock()
