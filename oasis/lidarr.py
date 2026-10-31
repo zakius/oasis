@@ -97,13 +97,13 @@ class Lidarr:
         """Searches and grabs the best release Lidarr accepts. When it accepts none only because it can't read the
         names (most Japanese releases: '[2022.09.07] Creepy Nuts 3rdアルバム「アンサンブル・プレイ」[FLAC]'), grabs one
         whose name has the artist and the album title; returns its hash, since Lidarr won't import it on its own."""
-        releases = self.call("GET", f"release?albumId={album_id}") or []
+        releases = self.releases(album_id)
         if accepted := [r for r in releases if not r.get("rejections")]:
-            self.call("POST", "release", {"guid": accepted[0]["guid"], "indexerId": accepted[0]["indexerId"]})  # Lidarr lists best first
+            self.grab(accepted[0])  # Lidarr lists best first
             return None
-        album = self.call("GET", f"album/{album_id}")
+        album = self.album_by_id(album_id)
         if pick := unparsed_match(releases, album["artist"]["artistName"], album["title"]):
-            self.call("POST", "release", {"guid": pick["guid"], "indexerId": pick["indexerId"], "albumId": album_id, "artistId": album["artistId"]})
+            self.grab(pick, albumId=album_id, artistId=album["artistId"])
             log.info("grabbed %s for %s - %s, which Lidarr can't read", pick["title"], album["artist"]["artistName"], album["title"])
             return (pick.get("infoHash") or "").lower() or None
         return None
@@ -133,6 +133,42 @@ class Lidarr:
         records = self.call("GET", "queue?pageSize=1000")["records"]
         return ({r["albumId"] for r in records if r.get("albumId")}, {r["artistId"] for r in records if r.get("artistId")},
                 sum(r.get("trackedDownloadState") == "downloading" for r in records))
+
+    def queue(self) -> list[dict]:
+        """Every download, with those Lidarr ties to no artist."""
+        return self.call("GET", "queue?pageSize=500&includeUnknownArtistItems=true")["records"]
+
+    def remove(self, queue_id: int, blocklist: bool, search: bool):
+        """Removes a download from the queue and the download client; blocklisting makes the next search pick another release."""
+        self.call("DELETE", f"queue/{queue_id}?" + urllib.parse.urlencode(
+            {"removeFromClient": "true", "blocklist": str(blocklist).lower(), "skipRedownload": str(not search).lower()}))
+
+    def releases(self, album_id: int) -> list[dict]:
+        """What the indexers have for the album, best first, with Lidarr's rejections."""
+        return self.call("GET", f"release?albumId={album_id}") or []
+
+    def grab(self, release: dict, **ids):
+        """ids (albumId, artistId) tie a release Lidarr can't read by name to its album."""
+        self.call("POST", "release", {"guid": release["guid"], "indexerId": release["indexerId"], **ids})
+
+    def album_by_id(self, album_id: int) -> dict:
+        return self.call("GET", f"album/{album_id}")
+
+    def release_tracks(self, release_id: int) -> list[dict]:
+        return self.call("GET", f"track?albumReleaseId={release_id}") or []
+
+    def proposals(self, **where) -> list[dict]:
+        """How Lidarr would import a download's files: where is downloadId, or folder (ignored when an id is given)."""
+        return self.call("GET", "manualimport?" + urllib.parse.urlencode({**where, "filterExistingFiles": "false"})) or []
+
+    def manual_import(self, files: list[dict]) -> dict:
+        return self.call("POST", "command", {"name": "ManualImport", "importMode": "auto", "replaceExistingFiles": False, "files": files})
+
+    def command(self, command_id: int) -> dict:
+        return self.call("GET", f"command/{command_id}")
+
+    def track_files(self, album_id: int) -> list[dict]:
+        return self.call("GET", f"trackfile?albumId={album_id}") or []
 
     def why_nothing(self, album_id: int) -> str:
         """The reason an album searched for isn't downloading, from Lidarr's history."""
@@ -311,7 +347,7 @@ class Library:
             self.search_catalogue(db, queued_albums)
 
     def search(self, db, album_id: int):
-        if hash := self.lidarr.search_album(album_id):  # lidarr-doctor imports it into this album
+        if hash := self.lidarr.search_album(album_id):  # the doctor imports it into this album
             db.execute("insert or replace into lidarr_rescue values (?, ?, ?)", (hash, album_id, time.time()))
 
     def search_catalogue(self, db, queued_albums: set):

@@ -55,6 +55,15 @@ oasis keeps who wants what, and a worker reconciles Lidarr with it after every s
 
 Albums and artists carry `oasisWanted`: `wanted`, `downloading` (only while Lidarr's queue holds it) or `failed`, with the reason in `oasisWantedError` (for example "searched, nothing grabbed yet"), and nothing once an album is complete, an artist is followed, or nobody wants it.
 
+With a `[torbox]` section as well, a worker fixes what Lidarr and rdtclient leave stuck, every 5 minutes (see `oasis/doctor.py`): failed imports go in against whichever edition of the album the files cover, or the release is blocklisted and searched again; downloads rdtclient finished but never completed get imported; TorBox's queued items, untracked and dead torrents are deleted so its active slots stay free; and slow downloads are swapped for a copy TorBox has cached. It needs the downloads folder at the same path Lidarr sees it.
+
+```toml
+[torbox]
+rdt_db = "/rdt/rdtclient.db"   # rdtclient's database, read from a copy for the TorBox key and its downloads
+# stall_hours = 1              # no progress this long: the download is dead
+# dry_run = true               # log what it would do, change nothing
+```
+
 ## Run
 
 ```sh

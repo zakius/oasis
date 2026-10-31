@@ -23,6 +23,7 @@ from . import accounts, artists, cover, dedupe, forward, lyrics, scan, web, ytm
 from .config import Config
 from .credits import PERFORMANCE_ROLES, Credits
 from .db import connect, make_id, move_track, remember, resolve
+from .doctor import Doctor
 from .forward import Forwarder, LastFm
 from .lidarr import Library, Lidarr
 from .recommend import Recommender, set_entries
@@ -314,6 +315,7 @@ class Api:
         self.recommender = Recommender(self._db, self.ytm, lastfm)
         self.completed: set[str] = set()
         self.library = Library(self._db, Lidarr(**{k: v for k, v in config.lidarr.items() if k in LIDARR_KEYS})) if config.lidarr else None
+        self.doctor = Doctor(self._db, self.library.lidarr, **config.torbox) if self.library and config.torbox else None
         self.scanning = False
         self.scan_lock = threading.Lock()
         self.credits = Credits(self._db)
@@ -1164,6 +1166,8 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
         api.forwarder.start()
         if api.library:
             api.library.start()
+        if api.doctor:
+            api.doctor.start()
         if api.ytm:
             threading.Thread(target=api._mix_loop, daemon=True).start()
         api.recommender.start()

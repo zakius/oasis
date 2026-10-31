@@ -30,6 +30,8 @@ secret = ""
 # [lidarr]
 # url = "http://lidarr:8686"
 # api_key = ""
+# [torbox]                       # with [lidarr]: unstick Lidarr's downloads (README → Lidarr)
+# rdt_db = "/rdt/rdtclient.db"
 
 # Admins. More users can be added on the account page (http://<host>:4533/admin) or with Subsonic's createUser.
 [[users]]
