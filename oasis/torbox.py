@@ -37,6 +37,11 @@ class TorBox:
         found = self.call("torrents/checkcached?format=list&list_files=false&hash=" + ",".join(hashes)) if hashes else None
         return {c["hash"].lower() for c in found or []}
 
+    def cached_files(self, hashes: list[str]) -> dict[str, list[dict]]:
+        """Of these hashes (at most 100), the ones TorBox has cached, with their files: {hash: [{name, size}]}."""
+        found = self.call("torrents/checkcached?format=list&list_files=true&hash=" + ",".join(hashes)) if hashes else None
+        return {c["hash"].lower(): c.get("files") or [] for c in found or []}
+
     def add(self, name: str, magnet: str | None = None, torrent: bytes | None = None) -> dict:
         """Adds a magnet link or .torrent file: {torrent_id, hash}, or {queued_id, hash} when no active slot was free.
         TorBox doesn't seed it, so it leaves the active slots once downloaded; it doesn't zip it, so files stay separate."""

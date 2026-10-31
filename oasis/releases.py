@@ -3,12 +3,16 @@ Names come in any script and shape ('[마신] [2022.09.07] Creepy Nuts 3rdアル
 so the name and the album are both folded to words and compared word by word; each kana, kanji or Hangul syllable
 is a word of its own, as those scripts don't space words. A wrong album is worse than none: variants (live,
 instrumentals, deluxe...), bundles and videos are left out, and so are short or self-titled names that don't pin the
-album down. The importer's edition match comes after, as a second check."""
+album down. The importer's edition match comes after, as a second check.
+Discographies and other bundles TorBox has cached are read by their file lists: each folder that is one wanted album
+becomes a target, and only its files are fetched."""
 import logging
 import re
 import unicodedata
+from pathlib import PurePosixPath
 
 from . import musicbrainz
+from .importer import AUDIO, LOSSLESS as LOSSLESS_FILES, key, match, number_of, title_of
 from .lidarr import BUNDLES
 
 log = logging.getLogger(__name__)
@@ -32,6 +36,9 @@ SIZES = 20e6, 5e9      # bytes a release may have, the most per disc
 ALIASES = "https://musicbrainz.org/ws/2/artist/{}?inc=aliases&fmt=json"
 KEEP_ALIASES = 30 * 86400
 NATIVE_QUERIES = 2     # searches by the artist's names in other scripts
+DISC = re.compile(r"^(?:cd|disc|disk)\s*(\d+)\b", re.I)  # a disc's folder inside its album's
+YEAR = re.compile(r"^(19|20)\d\d$")
+IMAGES = ("jpg", "jpeg", "png", "webp", "gif")
 
 
 def plain(text: str) -> str:
@@ -168,10 +175,13 @@ def rank(releases: list[dict], have: set[str], upgrade: bool = False) -> list[di
     return unique(usable, lambda r: hash_of(r) or r["guid"])
 
 
+def clean(text: str) -> str:
+    return " ".join(BRACKETS.sub(" ", unicodedata.normalize("NFKC", text)).split())
+
+
 def queries(want: dict) -> list[str]:
     """Artist and album; the album alone when distinctive; the album with the artist's names in other scripts.
     Brackets and quotes go: indexers find nothing for '[Rammstein]'."""
-    clean = lambda text: " ".join(BRACKETS.sub(" ", unicodedata.normalize("NFKC", text)).split())
     title = clean(want["title"])
     return list(dict.fromkeys([f"{clean(want['artist'])} {title}", *([title] if len(title.split()) >= 2 or len(title) >= 8 else []),
                                *(f"{clean(n)} {title}" for n in want["native"])]))
@@ -188,3 +198,100 @@ def find(prowlarr, want: dict, blocked: set, cached) -> list[dict]:
         if picks:
             return picks
     return []
+
+
+def is_bundle(release: dict, want: dict) -> bool:
+    """A discography or bundle of the artist: its name says so, or holds two of the artist's album titles.
+    want: artist, names, native, albums (the artist's album and EP titles)."""
+    tokens = words(release["title"])
+    artists = [s for n in want["names"] for s in spans(tokens, words(n))]
+    if not artists or VIDEO.search(" ".join(tokens)):
+        return False
+    names = {"".join(words(n)) for n in want["names"]}
+    held = {"".join(words(t)) for t in want["albums"] if len(j := "".join(words(t))) >= 4 and j not in names
+            and any(all(e <= a or b <= s for a, b in artists) for s, e in spans(tokens, words(t)))}
+    return bool(BUNDLES.search(release["title"])) or len(held) >= 2
+
+
+def bundle_queries(want: dict) -> list[str]:
+    return list(dict.fromkeys([f"{clean(want['artist'])} discography", clean(want["artist"]), *map(clean, want["native"])]))
+
+
+def folder_album(name: str, want: dict, groups: list[dict]) -> str | None:
+    """The release group an album folder inside a bundle is: its name holds the title apart from the artist's name,
+    and the year when it has one; variants, videos and disc images aren't the album. Of titles inside one another
+    the longest wins ('One More Light' over 'One'); two groups of one title that the year doesn't tell apart are
+    neither."""
+    tokens = words(name)
+    text, years = " ".join(tokens), {t for t in tokens if YEAR.match(t)}
+    artists = [s for n in want["names"] for s in spans(tokens, words(n))]
+    names = {"".join(words(n)) for n in want["names"]}
+    if IMAGE.search(text):
+        return None
+    fits = []
+    for g in groups:
+        title, year = words(g["title"]), (g.get("first-release-date") or "")[:4]
+        compact, title_text = "".join(title), " ".join(title)
+        if not compact or not any(all(e <= a or b <= s for a, b in artists) for s, e in spans(tokens, title)):
+            continue
+        if years and year not in years or (len(compact) < 4 or compact in names) and year not in years:
+            continue
+        allowed = hits(VARIANTS, " ".join([title_text, *(" ".join(words(n)) for n in want["names"])]))
+        if hits(VARIANTS, text) - allowed or hits(VARIANTS_JA, plain(name)) - hits(VARIANTS_JA, plain(g["title"])) or \
+                hits(VARIANTS, title_text) - hits(VARIANTS, text) or VIDEO.search(text) and not VIDEO.search(title_text):
+            continue
+        fits.append((len(compact), g["id"]))
+    best = [rg for n, rg in fits if n == max(fits)[0]]
+    return best[0] if len(best) == 1 else None
+
+
+def covers(audio: list[dict], editions: list[dict], artist: str) -> bool:
+    """Whether the files' names cover every track of an edition: by title, or by disc and track number. Their
+    lengths are checked when they are imported."""
+    def number(name):
+        found, disc = number_of(name), DISC.match(PurePosixPath(name).parent.name)
+        return (int(disc[1]), found[1]) if found and disc else found
+    files = [{"path": f["name"], "key": key(title_of(f["name"], artist)), "number": number(f["name"]), "length": None} for f in audio]
+    return any(r.get("status") != "Pseudo-Release" and (tracks := [(m, t) for m in r.get("media") or [] for t in m.get("tracks") or []])
+               and len(tracks) <= len(files) and match(files, tracks) is not None for r in editions)
+
+
+def targets(files: list[dict], want: dict, groups: list[dict], wanted: set[str], editions) -> dict[str, list[str]]:
+    """The wanted albums a bundle's file list ({name, size}) holds, by release group, each with its files to fetch:
+    one album folder's music (its discs' folders too) and images. A folder must cover a whole edition by its file
+    names; lossless folders are tried first. groups: the artist's release groups; wanted: those missing.
+    editions(rg): the release group's editions with their tracks."""
+    folders = {}
+    for f in files:
+        if f["name"].rsplit(".", 1)[-1].lower() in AUDIO:
+            parent = PurePosixPath(f["name"]).parent
+            folders.setdefault(parent.parent if DISC.match(parent.name) else parent, []).append(f)
+    lossless = lambda audio: sum(f["name"].rsplit(".", 1)[-1].lower() in LOSSLESS_FILES for f in audio)
+    found = {}
+    for folder, audio in sorted(folders.items(), key=lambda item: (lossless(item[1]), len(item[1])), reverse=True):
+        rg = folder_album(folder.name, want, groups)
+        if rg not in wanted or rg in found:
+            continue
+        try:
+            fits = covers(audio, editions(rg), want["artist"])
+        except (OSError, LookupError) as e:
+            log.info("editions of %s: %s", rg, e)
+            continue
+        if fits:
+            images = [f["name"] for f in files if f["name"].rsplit(".", 1)[-1].lower() in IMAGES and PurePosixPath(f["name"]).is_relative_to(folder)]
+            found[rg] = [f["name"] for f in audio] + images
+        else:
+            log.info("%s holds only part of %s", folder, rg)
+    return found
+
+
+def bundles(prowlarr, want: dict, groups: list[dict], wanted: set[str], blocked: set, cached_files, editions) -> list[tuple[dict, dict]]:
+    """The artist's bundles TorBox has cached that hold wanted albums, with their targets: most albums first, then
+    quality and seeders. Uncached ones are left out, as they would download everything and hold a slot for long."""
+    found = unique([r for q in bundle_queries(want) for r in prowlarr.search(q)], hash_of)
+    candidates = sorted((r for r in found if hash_of(r) and not {hash_of(r), r.get("guid")} & blocked and is_bundle(r, want)),
+                        key=lambda r: r.get("seeders") or 0, reverse=True)[:100]
+    listed = cached_files([hash_of(r) for r in candidates]) if candidates else {}
+    picks = [(r, t) for r in candidates if hash_of(r) in listed and (t := targets(listed[hash_of(r)], want, groups, wanted, editions))]
+    log.info("bundles of %s: %d results, %d bundles, %d cached, %d with wanted albums", want["artist"], len(found), len(candidates), len(listed), len(picks))
+    return sorted(picks, key=lambda p: (len(p[1]), quality(p[0]["title"]), p[0].get("seeders") or 0), reverse=True)

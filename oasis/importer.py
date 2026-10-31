@@ -72,10 +72,12 @@ def close(length: float, ms) -> bool:
 
 def match(files: list[dict], tracks: list[tuple[dict, dict]]) -> dict | None:
     """Maps every (medium, track) of an edition to a distinct file whose length fits: by title, then by one title
-    holding the other, then by disc and track number. None when some track has no file."""
+    holding the other, then by disc and track number. None when some track has no file. A length of None isn't
+    checked: a bundle's files are matched by name before they are downloaded."""
     mapping, used = {}, set()
     for medium, track in tracks:
-        fits = [f for f in files if f["path"] not in used and close(f["length"], track.get("length") or track["recording"].get("length"))]
+        length = track.get("length") or track["recording"].get("length")
+        fits = [f for f in files if f["path"] not in used and (f["length"] is None or close(f["length"], length))]
         want = key(track["title"])
         found = [f for f in fits if f["key"] == want] or [f for f in fits if want and f["key"] and (want in f["key"] or f["key"] in want)] or \
                 [f for f in fits if f["number"] == (medium["position"], track["position"])]

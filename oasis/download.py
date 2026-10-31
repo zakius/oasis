@@ -2,9 +2,12 @@
 fetches the files over HTTP into its staging folder and imports them. rdtclient isn't involved, so
 TorBox's slots and queue are read directly, files keep their paths inside the torrent, and oasis keeps its own record
 of which hash is which album. oasis places the files itself (importer.py), or with import = "lidarr" has Lidarr
-import them. Nothing seeds from here."""
+import them. A cached bundle serves several albums: only their files are fetched, each album into
+<hash>/<release group>/, and each is imported on its own (download_target). Nothing seeds from here."""
 import hashlib
+import json
 import logging
+import posixpath
 import re
 import shutil
 import threading
@@ -16,7 +19,7 @@ from pathlib import Path, PurePosixPath
 
 from . import releases
 from .doctor import CACHE_IGNORES
-from .importer import AUDIO
+from .importer import AUDIO, editions
 from .lidarr import GRAB_TRIES, unparsed_match
 from .releases import hash_of
 from .torbox import RateLimited
@@ -152,7 +155,8 @@ class Downloads:
         return {r[0] for r in db.execute("select album_id from download where state not in ('done', 'failed')")}
 
     def groups(self, db) -> set[str]:
-        return {r[0] for r in db.execute("select album_mbid from download where state not in ('done', 'failed') and album_mbid is not null")}
+        return {r[0] for r in db.execute("select album_mbid from download where state not in ('done', 'failed') and album_mbid is not null union "
+                                         "select t.rg from download_target t join download d on d.hash = t.hash where d.state not in ('done', 'failed')")}
 
     def search(self, db, album_id: int) -> bool | None:
         """Searches the indexers (through Prowlarr, else Lidarr) for Lidarr's album and sends the best pick to TorBox;
@@ -168,13 +172,23 @@ class Downloads:
         return self.send(db, releases.find(self.prowlarr, want, blocked, self.torbox().cached), blocked, 0, group,
                          f"{want['artist']} - {want['title']}")
 
+    def bundle(self, db, want: dict, groups: list[dict], wanted: set[str]) -> bool | None:
+        """Sends the cached bundle of the artist that holds the most wanted albums (release group ids) to TorBox, to
+        fetch only theirs; see releases.bundles and send."""
+        blocked = self.blocked(db)
+        picks = releases.bundles(self.prowlarr, want, groups, wanted, blocked, self.torbox().cached_files, lambda rg: editions(db, rg))
+        for release, targets in picks[:GRAB_TRIES]:
+            if (sent := self.send(db, [release], blocked, 0, None, f"{want['artist']}: {len(targets)} albums", targets)) is not None:
+                return sent
+        return None
+
     def blocked(self, db) -> set[str]:
         return {r[0] for r in db.execute("select hash from release_block")}
 
-    def send(self, db, picks: list[dict], blocked: set, album_id: int, group: str | None, label: str) -> bool | None:
+    def send(self, db, picks: list[dict], blocked: set, album_id: int, group: str | None, label: str, targets: dict | None = None) -> bool | None:
         """Sends the first pick TorBox takes. True when one went, None when none would, False when TorBox had no free
         slot and queued it: the queued copy goes, the release isn't at fault, and the album is due again soon.
-        album_id: Lidarr's, 0 for albums only oasis's catalogue has."""
+        album_id: Lidarr's, 0 for albums only oasis's catalogue has. targets: a bundle's albums, {group: files}."""
         tb = self.torbox()
         for release in picks[:GRAB_TRIES]:
             try:
@@ -200,6 +214,9 @@ class Downloads:
             db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated) "
                        "values (?, ?, ?, ?, ?, ?, 'added', ?, ?)", (added["hash"].lower(), release.get("guid"), album_id,
                                                                     group, release["title"], added["torrent_id"], now, now))
+            db.execute("delete from download_target where hash = ?", (added["hash"].lower(),))
+            db.executemany("insert into download_target(hash, rg, files, state) values (?, ?, ?, 'pending')",
+                           [(added["hash"].lower(), rg, json.dumps(files)) for rg, files in (targets or {}).items()])
             log.info("sent %s to TorBox for %s", release["title"], label)
             return True
         return None
@@ -248,17 +265,34 @@ class Downloads:
         if state == "importing":
             self.finish(db, row)
 
+    def chosen(self, db, row, torrent) -> list[tuple[dict, Path]] | None:
+        """The files to fetch and where to: the torrent's music, cue sheets and cover art to <hash>/<path inside the
+        torrent>, so same-named files in different folders both arrive; a bundle's targets only, to <hash>/<release
+        group>/<path inside the album's folder>. None when TorBox doesn't list a target's file."""
+        files = [f for f in torrent.get("files") or [] if f["name"].rsplit(".", 1)[-1].lower() in KEEP]
+        targets = db.execute("select rg, files from download_target where hash = ?", (row["hash"],)).fetchall()
+        if not targets:
+            return [(f, self.folder / row["hash"] / inside(f["name"])) for f in files]
+        listed, todo = {f["name"]: f for f in files}, []
+        for rg, names in targets:
+            names = json.loads(names)
+            top = posixpath.commonpath([posixpath.dirname(n) for n in names])
+            if not all(n in listed for n in names):
+                return None
+            todo += [(listed[n], self.folder / row["hash"] / rg / inside(posixpath.relpath(n, top))) for n in names]
+        return todo
+
     def fetch(self, db, row, torrent) -> bool:
-        """Fetches the torrent's music, cue sheets and cover art to <downloads>/<hash>/<path inside the torrent>, so
-        same-named files in different folders both arrive. Files already there at full size are kept; others are
-        fetched again. True once all are there."""
+        """Fetches the chosen files. Files already there at full size are kept; others are fetched again. True once
+        all are there."""
         if time.time() < self.paused_until:
             return False
-        files = [f for f in torrent.get("files") or [] if f["name"].rsplit(".", 1)[-1].lower() in KEEP]
-        if not any(f["name"].rsplit(".", 1)[-1].lower() in AUDIO for f in files):
+        if (todo := self.chosen(db, row, torrent)) is None:
+            self.fail(db, row, "a bundle's files differ from what TorBox had cached")
+            return False
+        if not any(f["name"].rsplit(".", 1)[-1].lower() in AUDIO for f, _ in todo):
             self.fail(db, row, "no audio files in the torrent")
             return False
-        todo = [(f, self.folder / row["hash"] / inside(f["name"])) for f in files]
         todo = [(f, path) for f, path in todo if not (path.exists() and path.stat().st_size == f["size"])]
         with ThreadPoolExecutor(PARALLEL) as pool:
             errors = [e for e in pool.map(lambda job: self.fetch_file(torrent["id"], *job), todo) if e]
@@ -300,6 +334,8 @@ class Downloads:
             return e
 
     def finish(self, db, row):
+        if db.execute("select 1 from download_target where hash = ?", (row["hash"],)).fetchone():
+            return self.place_targets(db, row)
         if self.own:
             return self.place(db, row)
         self.lidarr_import(db, row)
@@ -317,6 +353,27 @@ class Downloads:
             self.lidarr.rescan([str(album)])
         except OSError as e:
             log.warning("Lidarr rescan of %s failed: %s", album, e)
+
+    def place_targets(self, db, row):
+        """A bundle's albums, each imported on its own. One no edition matches is left out; the bundle fails, and is
+        blocked, only when none matched."""
+        folder = self.folder / row["hash"]
+        for (rg,) in db.execute("select rg from download_target where hash = ? and state = 'pending'", (row["hash"],)).fetchall():
+            try:
+                album = self.own.place(folder / rg, rg)
+            except LookupError as e:
+                log.info("bundle %s: %s isn't there: %s", row["title"], rg, e)
+                db.execute("update download_target set state = 'failed' where hash = ? and rg = ?", (row["hash"], rg))
+                continue
+            db.execute("update download_target set state = 'done' where hash = ? and rg = ?", (row["hash"], rg))
+            try:
+                self.lidarr.rescan([str(album)])
+            except OSError as e:
+                log.warning("Lidarr rescan of %s failed: %s", album, e)
+        if db.execute("select 1 from download_target where hash = ? and state = 'done'", (row["hash"],)).fetchone():
+            self.done(db, row, folder)
+        else:
+            self.fail(db, row, "import failed: no album of the bundle matched")
 
     def lidarr_import(self, db, row):
         """Imports the folder with the doctor's matcher, moving the files into the library. Lidarr can fail an import

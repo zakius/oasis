@@ -65,6 +65,10 @@ class FakeDownloads:
         self.wants = getattr(self, "wants", []) + [want]
         return self.result
 
+    def bundle(self, db, want, groups, wanted):
+        self.found.append(("bundle", want["artist"], sorted(wanted)))
+        return self.result
+
 
 class FakeLidarr:
     def __init__(self):
@@ -207,6 +211,23 @@ def test_missing_albums_are_searched_in_order_and_again_ever_further_apart(clien
     assert wants(client)[db.execute("select title from want_album where rg = ?", (sent,)).fetchone()[0]][0] == "downloading"
     want = acq.downloads.wants[-1]
     assert want["artist"] == "Beta" and want["names"] == ["Beta"] and "Greatest Hits" in want["others"] and want["upgrade"] is False
+
+
+def test_an_artist_with_gaps_gets_a_weekly_bundle_search_in_an_album_searchs_place(client, mb, monkeypatch):
+    follow_beta(client, mb)
+    acq, now = client.app.state.api.library, [time.time()]
+    acq.bundles, acq.downloads.found = True, []
+    acq.downloads.active.add("g-second")  # downloading on its own
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    now[0] += acquire.SEARCH_GAP
+    sync(client)
+    assert acq.downloads.found == [("bundle", "Beta", ["g-new", "g-ost"])]  # Film was searched, for nothing yet
+    now[0] += acquire.SEARCH_GAP
+    sync(client)
+    assert len(acq.downloads.found) == 2 and acq.downloads.found[1][0] != "bundle"  # an album search: the bundle one is weekly
+    now[0] += acquire.BUNDLE_AGAIN
+    sync(client)
+    assert acq.downloads.found[2][0] == "bundle"
 
 
 def test_a_new_star_resolves_through_musicbrainz_search_exact_matches_only(client, mb):

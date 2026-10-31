@@ -330,7 +330,8 @@ class Api:
             if torbox and torbox.get("downloads") else None
         # oasis's own catalogue needs oasis's search, download and import; else, or with catalogue = "lidarr", Lidarr's.
         own = self.downloads and self.downloads.prowlarr and self.downloads.own and config.acquire.get("catalogue", "oasis") == "oasis"
-        self.library = Acquire(self._db, self.downloads, lidarr, config.acquire.get("secondary_types", SECONDARY)) if own else \
+        self.library = Acquire(self._db, self.downloads, lidarr, config.acquire.get("secondary_types", SECONDARY),
+                               config.acquire.get("bundles", True)) if own else \
             Library(self._db, lidarr, self.downloads) if lidarr else None
         self.scanning = self.scan_again = False
         self.scan_lock = threading.Lock()

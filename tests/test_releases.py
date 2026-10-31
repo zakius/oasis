@@ -8,7 +8,7 @@ from oasis import download, releases
 from oasis.db import connect
 from oasis.download import info_hash, source
 from oasis.releases import find, queries, rank, reject, target
-from test_download import db, downloads, lidarr, torbox  # noqa: F401 (fixtures)
+from test_download import db, downloads, files, lidarr, tb, torbox  # noqa: F401 (fixtures)
 
 
 def want(title, *names, year="", others=(), discs=1, upgrade=False, native=()):
@@ -189,3 +189,108 @@ def test_a_release_listed_without_its_hash_is_skipped_when_it_failed_before(down
                                                     result("Artist - Album [MP3]", "ef01", magnetUrl="magnet:?xt=urn:btih:ef01")]})
     assert downloads.search(db, 5)
     assert torbox.added == [("Artist - Album [MP3]", "magnet:?xt=urn:btih:ef01", None)]
+
+
+LP = {"artist": "Linkin Park", "names": ["Linkin Park"], "native": [], "albums": ["Hybrid Theory", "Hybrid Theory", "Meteora", "Minutes to Midnight", "One More Light"]}
+LP_GROUPS = [{"id": "g-ht-ep", "title": "Hybrid Theory", "first-release-date": "1999"}, {"id": "g-ht", "title": "Hybrid Theory", "first-release-date": "2000"},
+             {"id": "g-met", "title": "Meteora", "first-release-date": "2003"}, {"id": "g-mtm", "title": "Minutes to Midnight", "first-release-date": "2007"},
+             {"id": "g-oml", "title": "One More Light", "first-release-date": "2017"}, {"id": "g-one", "title": "One", "first-release-date": "2017"}]
+SONGS = {"g-ht-ep": ["Carousel", "Technique"], "g-ht": ["Papercut", "One Step Closer", "In the End"], "g-met": ["Foreword", "Don't Stay"],
+         "g-mtm": ["Wake", "Given Up", "Leave Out All the Rest"], "g-oml": ["Nobody Can Save Me", "Heavy"], "g-one": ["One"]}
+
+
+def editions(rg):
+    return [{"status": "Official", "media": [{"position": 1, "tracks": [{"id": f"{rg}-{n}", "position": n + 1, "title": t, "length": 200000, "recording": {}}
+                                                                        for n, t in enumerate(SONGS[rg])]}]}]
+
+
+def listing(folders: dict) -> list[dict]:
+    return [{"name": f"LP Discography/{folder}/{name}", "size": 1} for folder, names in folders.items() for name in names]
+
+
+DISCOGRAPHY = listing({
+    "Linkin Park - Hybrid Theory (2000) [FLAC]": ["01. Papercut.flac", "02. One Step Closer.flac", "03. In the End.flac", "cover.jpg", "rip.log"],
+    "Linkin Park - Hybrid Theory (2000) [MP3]": ["01. Papercut.mp3", "02. One Step Closer.mp3", "03. In the End.mp3"],
+    "2003 - Meteora": ["01 Foreword.flac"],  # a track short
+    "2003 - Meteora (Live)": ["01 Foreword.flac", "02 Don't Stay.flac"],
+    "Minutes to Midnight (2007)/CD1": ["01 Wake.flac", "02 Given Up.flac"],
+    "Minutes to Midnight (2007)/CD2": ["01 Leave Out All the Rest.flac"],
+    "Minutes to Midnight (2007)": ["folder.jpg"],
+    "One More Light (2017)": ["01 Nobody Can Save Me.flac", "02 Heavy.flac"],
+    "Hybrid Theory (image+cue)": ["Hybrid Theory.flac", "Hybrid Theory.cue"],
+})
+
+
+def test_a_bundles_file_list_gives_the_wanted_albums_each_folder_wholly_holds():
+    wanted = {"g-ht", "g-ht-ep", "g-met", "g-mtm", "g-one"}  # One More Light is here already
+    found = releases.targets(DISCOGRAPHY, LP, LP_GROUPS, wanted, editions)
+    assert set(found) == {"g-ht", "g-mtm"}  # not the EP (another year), the partial or live Meteora, or One (inside One More Light)
+    assert found["g-ht"] == [f"LP Discography/Linkin Park - Hybrid Theory (2000) [FLAC]/{n}" for n in ("01. Papercut.flac", "02. One Step Closer.flac",
+                                                                                                       "03. In the End.flac", "cover.jpg")]
+    assert sorted(found["g-mtm"]) == sorted(f"LP Discography/Minutes to Midnight (2007)/{n}" for n in ("CD1/01 Wake.flac", "CD1/02 Given Up.flac",
+                                                                                                        "CD2/01 Leave Out All the Rest.flac", "folder.jpg"))
+    # Without a year, one title of two release groups is neither.
+    assert releases.targets(listing({"Hybrid Theory": ["01 Papercut.flac", "02 One Step Closer.flac", "03 In the End.flac"]}),
+                            LP, LP_GROUPS, wanted, editions) == {}
+
+
+def test_a_bundle_is_the_artists_and_says_so_or_holds_two_albums():
+    assert releases.is_bundle(result("Linkin Park - Discography (2000-2017) [FLAC]"), LP)
+    assert releases.is_bundle(result("Linkin Park - Hybrid Theory + Meteora [FLAC]"), LP)
+    assert not releases.is_bundle(result("Linkin Park - Meteora [FLAC]"), LP)
+    assert not releases.is_bundle(result("Pink Floyd - Discography [FLAC]"), LP)
+    assert not releases.is_bundle(result("Linkin Park - Discography [DVD] 1080p"), LP)
+
+
+def test_only_cached_bundles_with_wanted_albums_are_picked_most_albums_first():
+    prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "aa"), result("Linkin Park - Discography [MP3]", "bb"),
+                                                     result("Linkin Park - Complete [FLAC]", "cc", seeders=900), result("Linkin Park - Meteora", "dd")],
+                         "Linkin Park": [result("Linkin Park - Discography [FLAC]", "aa"), result("Linkin Park - Box Set", "ee")]})
+    listed = {"aa": DISCOGRAPHY, "bb": listing({"Hybrid Theory (2000)": ["01 Papercut.mp3", "02 One Step Closer.mp3", "03 In the End.mp3"]}),
+              "ee": listing({"Live (2005)": ["01 Papercut.flac"]})}
+    asked = []
+    cached = lambda hashes: asked.append(hashes) or {h: listed[h] for h in hashes if h in listed}
+    picks = releases.bundles(prowlarr, LP, LP_GROUPS, {"g-ht", "g-mtm"}, {"bb"}, cached, editions)
+    assert [(r["infoHash"], sorted(t)) for r, t in picks] == [("aa", ["g-ht", "g-mtm"])]  # cc isn't cached; bb is blocked; ee holds nothing wanted
+    assert prowlarr.asked == ["Linkin Park discography", "Linkin Park"] and sorted(asked[0]) == ["aa", "cc", "ee"]  # dd isn't a bundle
+
+
+def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloads, lidarr, torbox, db, tmp_path, monkeypatch):
+    class Own:
+        def place(self, folder, group):
+            placed[group] = sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file())
+            if group in failing:
+                raise LookupError("no edition matches")
+            return tmp_path / "music" / group
+
+    placed, failing, downloads.own = {}, {"g-mtm"}, Own()
+    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
+    torbox.cached_files = lambda hashes: {"abcd": DISCOGRAPHY} if "abcd" in hashes else {}
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm", "g-met"})
+    row = db.execute("select * from download").fetchone()
+    assert (row["hash"], row["album_mbid"], row["state"]) == ("abcd", None, "added") and downloads.groups(db) == {"g-ht", "g-mtm"}
+
+    listed = files(tmp_path, *(f["name"] for f in DISCOGRAPHY))
+    torbox.list = [{**tb(71, "abcd", progress=1, active=False), "download_state": "completed", "download_finished": True, "download_present": True,
+                    "files": listed}]
+    downloads.cycle()
+    ids = {f["name"].split("/", 1)[1]: f["id"] for f in listed}
+    fetched = [*(f"Linkin Park - Hybrid Theory (2000) [FLAC]/{n}" for n in ("01. Papercut.flac", "02. One Step Closer.flac", "03. In the End.flac", "cover.jpg")),
+               *(f"Minutes to Midnight (2007)/{n}" for n in ("CD1/01 Wake.flac", "CD1/02 Given Up.flac", "CD2/01 Leave Out All the Rest.flac", "folder.jpg"))]
+    assert sorted(torbox.links) == sorted(ids[n] for n in fetched)  # not the MP3 copy, the partial album or the log
+    assert placed == {"g-ht": ["01. Papercut.flac", "02. One Step Closer.flac", "03. In the End.flac", "cover.jpg"],
+                      "g-mtm": ["CD1/01 Wake.flac", "CD1/02 Given Up.flac", "CD2/01 Leave Out All the Rest.flac", "folder.jpg"]}
+    assert dict(db.execute("select rg, state from download_target").fetchall()) == {"g-ht": "done", "g-mtm": "failed"}
+    assert db.execute("select state from download").fetchone()[0] == "done" and torbox.deleted == [71] and not (tmp_path / "dl/abcd").exists()
+    assert lidarr.rescanned == [str(tmp_path / "music/g-ht")] and downloads.groups(db) == set() and downloads.scans == [1]
+
+    # None of a bundle's albums imports: it fails and is blocked.
+    failing.add("g-ht")
+    downloads.prowlarr.results["Linkin Park discography"][0].update(infoHash="bcde", magnetUrl="magnet:?xt=urn:btih:bcde")
+    torbox.cached_files = lambda hashes: {"bcde": DISCOGRAPHY}
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm"})
+    torbox.list = [{**torbox.list[0], "id": 72, "hash": "bcde"}]
+    downloads.cycle()
+    assert db.execute("select state, error from download where hash = 'bcde'").fetchone()[:] == ("failed", "import failed: no album of the bundle matched")
+    assert "bcde" in downloads.blocked(db)
