@@ -73,6 +73,15 @@ rdt_db = "/rdt/rdtclient.db"   # rdtclient's database, read from a copy for the 
 # max_active = 8               # TorBox torrents active at which no download starts: Pro has 10, two stay free for anime
 ```
 
+With a `[prowlarr]` section as well, oasis searches Prowlarr's music indexers itself instead of Lidarr's search (see `oasis/releases.py`), so Lidarr's parser no longer decides which names are the album. It asks for "artist album", then the album alone when the title is distinctive, then the album with the artist's names in other scripts (MusicBrainz aliases), with brackets and quotes dropped, and stops at the first query that finds a usable release. A name must hold the artist (under any of their names) and the album title as whole words, case, accents, punctuation and full-width forms aside; kana, kanji and Hangul count character by character, so `[2022.09.07] Creepy Nuts 3rdアルバム「アンサンブル・プレイ」[FLAC]` matches. Names with variant words the title lacks (live, instrumentals, acapellas, karaoke, remixes, deluxe, anniversary…), bundles (discographies, or the titles of two of the artist's albums), videos, and sizes outside 20 MB–5 GB per disc are left out; a self-titled album or a title under 4 characters also needs the year, the title right after the artist, or the title in quotes. Lossless comes first, then what TorBox has cached (whatever its seeders), then MP3 320, V0, then seeders; a release TorBox hasn't cached needs a seeder. An album already here lossy only takes lossless. Removing `[prowlarr]` goes back to Lidarr's search.
+
+```toml
+[prowlarr]
+url = "http://prowlarr:9696"
+api_key = "…"                  # Prowlarr's config.xml
+# tag = 2                      # the music indexers' tag
+```
+
 Never point a Lidarr SABnzbd download client at rdtclient's categories: rdtclient's SABnzbd emulation deletes torrents it doesn't own. Usenet isn't supported.
 
 ## Run

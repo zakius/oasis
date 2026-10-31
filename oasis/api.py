@@ -28,6 +28,7 @@ from .download import Downloads
 from .importer import Importer
 from .forward import Forwarder, LastFm
 from .lidarr import Library, Lidarr
+from .prowlarr import Prowlarr
 from .recommend import Recommender, set_entries
 from .ytm import YouTubeMusic
 
@@ -323,7 +324,8 @@ class Api:
         # Its own importer: the doctor's dry run mustn't stop downloads.
         self.downloads = Downloads(self._db, lidarr, Doctor(self._db, lidarr, torbox["rdt_db"]), torbox["downloads"], torbox.get("max_active", 8),
                                    torbox.get("stall_hours", 1), self._start_scan,
-                                   Importer(self._db, config.library[0]) if torbox.get("import", "oasis") == "oasis" else None) \
+                                   Importer(self._db, config.library[0]) if torbox.get("import", "oasis") == "oasis" else None,
+                                   Prowlarr(**config.prowlarr) if config.prowlarr else None) \
             if torbox and torbox.get("downloads") else None
         self.library = Library(self._db, lidarr, self.downloads) if lidarr else None
         self.scanning = self.scan_again = False

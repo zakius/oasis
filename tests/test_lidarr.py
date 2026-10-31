@@ -271,21 +271,18 @@ def test_releases_lidarr_cant_read_are_matched_by_artist_and_album_title():
     assert lidarr_module.unparsed_match([release("SawanoHiroyuki[nZk] V [FLAC]")], "SawanoHiroyuki[nZk]", "V") is None  # too short to tell
 
 
-def test_search_grabs_lidarrs_pick_or_an_unparsed_match_and_remembers_the_latter(client):
+def test_search_grabs_lidarrs_pick_and_leaves_names_it_cant_read_to_oasiss_own_search(client):
     calls = []
     lidarr = Lidarr("http://lidarr", "key")
     results = {"release?albumId=5": [release("Creepy Nuts 3rdアルバム「アンサンブル・プレイ」[FLAC]")],
-               "album/5": {"title": "アンサンブル・プレイ", "artistId": 9, "artist": {"artistName": "Creepy Nuts"}},
                "release?albumId=6": [release("Rammstein - Mutter (2001) [FLAC]", rejections=[]), release("Rammstein - Mutter [MP3]", rejections=[])]}
     lidarr.call = lambda method, path, body=None: calls.append((method, path, body)) or results.get(path)
-    assert lidarr.search_album(6) is None and calls[-1][2] == {"guid": "Rammstein - Mutter (2001) [FLAC]", "indexerId": 1}
-    library = client.app.state.api.library or lidarr_module.Library(client.app.state.api._db, lidarr)
-    library.lidarr = lidarr
+    lidarr.search_album(6)
+    assert calls[-1][2] == {"guid": "Rammstein - Mutter (2001) [FLAC]", "indexerId": 1}
+    library = lidarr_module.Library(client.app.state.api._db, lidarr)
     db = client.app.state.api._db()
     library.search(db, 5)
-    assert calls[-1][2] == {"guid": "Creepy Nuts 3rdアルバム「アンサンブル・プレイ」[FLAC]", "indexerId": 1, "albumId": 5, "artistId": 9}
-    grabbed = results["release?albumId=5"][0]["infoHash"].lower()
-    assert [tuple(r) for r in db.execute("select hash, album_id from lidarr_rescue")] == [(grabbed, 5)]
+    assert calls[-1][:2] == ("GET", "release?albumId=5") and not db.execute("select * from lidarr_rescue").fetchall()
 
 
 def test_a_release_that_fails_to_grab_gives_way_to_the_next_and_a_failed_search_still_counts(client):
@@ -302,6 +299,7 @@ def test_a_release_that_fails_to_grab_gives_way_to_the_next_and_a_failed_search_
             return [release("dead", rejections=[]), release("alive", rejections=[])]
         raise OSError("Lidarr GET release: 500")
     lidarr.call = call
-    assert lidarr.search_album(6) is None and grabs == ["dead", "alive"]
+    lidarr.search_album(6)
+    assert grabs == ["dead", "alive"]
     library = lidarr_module.Library(client.app.state.api._db, lidarr)
     library.search(client.app.state.api._db(), 7)  # the search itself fails: logged, not raised

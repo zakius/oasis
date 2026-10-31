@@ -12,9 +12,11 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 
+from . import releases
 from .doctor import CACHE_IGNORES
 from .importer import AUDIO
 from .lidarr import GRAB_TRIES, unparsed_match
+from .releases import hash_of
 from .torbox import RateLimited
 
 log = logging.getLogger(__name__)
@@ -28,15 +30,11 @@ FETCH_TRIES = 5          # polls in a row a file may fail to download before the
 KEEP_FAILED = 7 * 86400  # seconds a failed download's files stay for inspection
 
 
-def hash_of(release: dict) -> str:
-    return (release.get("infoHash") or "").lower()
-
-
-def choose(releases: list[dict], artist: str, title: str, blocked: set, cached) -> list[dict]:
+def choose(offers: list[dict], artist: str, title: str, blocked: set, cached) -> list[dict]:
     """The releases to try for an album, in turn: those TorBox has cached (it downloads them at once, seeders or not)
     at least as good as the best eligible one, then those Lidarr accepts, best first, then one it can't read by name.
     A release whose only faults are few seeders or a copy in Lidarr's queue is eligible only when cached."""
-    fresh = [r for r in releases if r.get("protocol") != "usenet" and not {hash_of(r), r.get("guid")} & blocked]
+    fresh = [r for r in offers if r.get("protocol") != "usenet" and not {hash_of(r), r.get("guid")} & blocked]
     accepted = [r for r in fresh if not r.get("rejections")]
     seedless = [r for r in fresh if r.get("rejections") and all(x.startswith(CACHE_IGNORES) for x in r["rejections"])]
     have = cached(list(dict.fromkeys(h for r in accepted + seedless if (h := hash_of(r))))[:100])
@@ -56,10 +54,11 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def source(release: dict) -> dict:
     """What TorBox gets: the magnet link, else the .torrent through Prowlarr (which may answer with a magnet link
-    instead), else a magnet link of the bare hash. Proxy URLs carry Prowlarr's key: errors name only the path."""
-    if release.get("magnetUrl"):
+    instead), else a magnet link of the bare hash. Prowlarr's own search gives its proxy for the magnet link too.
+    Proxy URLs carry Prowlarr's key: errors name only the path."""
+    if (release.get("magnetUrl") or "").startswith("magnet:"):
         return {"magnet": release["magnetUrl"]}
-    if url := release.get("downloadUrl"):
+    if url := release.get("magnetUrl") or release.get("downloadUrl"):
         try:
             with urllib.request.build_opener(NoRedirect).open(url, timeout=60) as response:
                 return {"torrent": response.read()}
@@ -83,10 +82,13 @@ class Downloads:
     """Sends searches' picks to TorBox and walks each download through added -> downloading -> fetching ->
     importing -> done, or failed. The state is in the download table, so a restart resumes where it was."""
 
-    def __init__(self, connect, lidarr, importer, downloads: str, max_active: int = 8, stall_hours: float = 1, imported=lambda: None, own=None):
+    def __init__(self, connect, lidarr, importer, downloads: str, max_active: int = 8, stall_hours: float = 1, imported=lambda: None, own=None,
+                 prowlarr=None):
         """importer: the doctor, for the TorBox key and Lidarr's import. own: oasis's Importer, which imports instead.
-        imported: called after each import. Lidarr tells oasis to scan after its own imports, not after ManualImport."""
+        imported: called after each import. Lidarr tells oasis to scan after its own imports, not after ManualImport.
+        prowlarr: oasis searches the indexers itself; without, Lidarr's search lists the releases."""
         self.connect, self.lidarr, self.importer, self.folder, self.imported, self.own = connect, lidarr, importer, Path(downloads), imported, own
+        self.prowlarr = prowlarr
         self.max_active, self.stall = max_active, stall_hours * 3600
         self.client = None
         self.seen = {}       # hash -> (progress, since when)
@@ -117,11 +119,13 @@ class Downloads:
         return {r[0] for r in db.execute("select album_id from download where state not in ('done', 'failed')")}
 
     def search(self, db, album_id: int) -> bool:
-        """Has Lidarr search the indexers and sends the best pick to TorBox. False when TorBox had no free slot and
-        queued it: the queued copy goes, the release isn't at fault, and the album is due again soon."""
+        """Searches the indexers (through Prowlarr, else Lidarr) and sends the best pick to TorBox. False when TorBox had
+        no free slot and queued it: the queued copy goes, the release isn't at fault, and the album is due again soon."""
         album, tb = self.lidarr.album_by_id(album_id), self.torbox()
         blocked = {r[0] for r in db.execute("select hash from release_block")}
-        for release in choose(self.lidarr.releases(album_id), album["artist"]["artistName"], album["title"], blocked, tb.cached)[:GRAB_TRIES]:
+        picks = releases.find(self.prowlarr, releases.target(db, self.lidarr, album), blocked, tb.cached) if self.prowlarr else \
+            choose(self.lidarr.releases(album_id), album["artist"]["artistName"], album["title"], blocked, tb.cached)
+        for release in picks[:GRAB_TRIES]:
             try:
                 added = tb.add(release["title"], **source(release))
             except OSError as e:

@@ -100,25 +100,17 @@ class Lidarr:
         if album_ids:
             self.call("PUT", "album/monitor", {"albumIds": album_ids, "monitored": monitored})
 
-    def search_album(self, album_id: int) -> str | None:
-        """Searches and grabs the best release Lidarr accepts. When it accepts none only because it can't read the
-        names (most Japanese releases: '[2022.09.07] Creepy Nuts 3rdアルバム「アンサンブル・プレイ」[FLAC]'), grabs one
-        whose name has the artist and the album title; returns its hash, since Lidarr won't import it on its own."""
-        releases = self.releases(album_id)
+    def search_album(self, album_id: int):
+        """Searches and grabs the best release Lidarr accepts. Names it can't read are oasis's own search's job
+        (releases.py), with downloads through TorBox."""
         # Lidarr lists best first. A release whose torrent the download client can't fetch fails to grab: the next one.
-        for release in [r for r in releases if not r.get("rejections")][:GRAB_TRIES]:
+        for release in [r for r in self.releases(album_id) if not r.get("rejections")][:GRAB_TRIES]:
             if self.try_grab(release):
-                return None
-        album = self.album_by_id(album_id)
-        if (pick := unparsed_match(releases, album["artist"]["artistName"], album["title"])) \
-                and self.try_grab(pick, albumId=album_id, artistId=album["artistId"]):
-            log.info("grabbed %s for %s - %s, which Lidarr can't read", pick["title"], album["artist"]["artistName"], album["title"])
-            return (pick.get("infoHash") or "").lower() or None
-        return None
+                return
 
-    def try_grab(self, release: dict, **ids) -> bool:
+    def try_grab(self, release: dict) -> bool:
         try:
-            self.grab(release, **ids)
+            self.grab(release)
             return True
         except OSError as e:
             log.info("couldn't grab %s: %s", release["title"], e)
@@ -163,9 +155,8 @@ class Lidarr:
         """What the indexers have for the album, best first, with Lidarr's rejections."""
         return self.call("GET", f"release?albumId={album_id}") or []
 
-    def grab(self, release: dict, **ids):
-        """ids (albumId, artistId) tie a release Lidarr can't read by name to its album."""
-        self.call("POST", "release", {"guid": release["guid"], "indexerId": release["indexerId"], **ids})
+    def grab(self, release: dict):
+        self.call("POST", "release", {"guid": release["guid"], "indexerId": release["indexerId"]})
 
     def album_by_id(self, album_id: int) -> dict:
         return self.call("GET", f"album/{album_id}")
@@ -392,12 +383,9 @@ class Library:
         try:
             if self.downloads:
                 return now if self.downloads.search(db, album_id) else now - RESEARCH + RETRY_FULL
-            hash = self.lidarr.search_album(album_id)
+            self.lidarr.search_album(album_id)
         except OSError as e:
             log.warning("search for Lidarr album %d failed: %s", album_id, e)
-            return now
-        if hash:  # the doctor imports it into this album
-            db.execute("insert or replace into lidarr_rescue values (?, ?, ?)", (hash, album_id, now))
         return now
 
     def search_catalogue(self, db, queued_albums: set):
