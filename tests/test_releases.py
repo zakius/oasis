@@ -69,6 +69,8 @@ def test_variants_bundles_videos_and_sizes_are_not_the_album():
     assert reject(result("Linkin Park - The Hunting Party (2014) [FLAC 16-44] remastered"), party) is None
     assert reject(result("Linkin Park - The Hunting Party (Live in Texas) 2014"), party) == "variant: live"
     assert reject(result("Rammstein - Feuer Frei! [2002, Tanz-Metal, Industrial, DVD5]"), want("Feuer Frei!", "Rammstein")) == "video"
+    assert reject(result("Linkin Park - Meteora - 2003, FLAC (image+.cue), lossless"), meteora) == "disc image"
+    assert reject(result("Linkin Park - Meteora - 2003, FLAC (tracks+.cue), lossless"), meteora) is None
     assert reject(result("Jeris Johnson   Dragonborn (2024) Mp3 320kbps [PMEDIA] ⭐️", size=100e6), want("Dragonborn", "Jeris Johnson")) is None
     assert reject(result("Metallica - Hardwired To Self Destruct (2016)"), want("Hardwired…To Self-Destruct", "Metallica")) is None
     assert reject(result("Hunters - Arachne (2019)"), want("Arachne", "Hunter")) == "no artist"  # whole words only
