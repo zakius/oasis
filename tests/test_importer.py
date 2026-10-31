@@ -68,7 +68,8 @@ def test_the_edition_the_files_cover_is_picked_and_placed_with_its_tags(make, tm
     standard = edition("standard", [("One", 2), ("Two", 3), ("Three", 4)])
     deluxe = edition("deluxe", [("One", 2), ("Two", 3), ("Three", 4), ("Four", 5), ("Five", 6)])
     translated = edition("pseudo", [("One", 2), ("Two", 3), ("Three", 4), ("Not on any edition", 9)], status="Pseudo-Release")
-    album = make(single, deluxe, standard, translated).place(staging, "rg-1")
+    unknown = edition("unknown", [("One", 0), ("Two", 0), ("Three", 0)])  # MusicBrainz has no lengths
+    album = make(unknown, single, deluxe, standard, translated).place(staging, "rg-1")
     assert album == root / "Beta/First (2001)"
     assert sorted(p.name for p in album.iterdir()) == ["01 - One.flac", "02 - Two.flac", "03 - Three.flac", "cover.jpg"]
 

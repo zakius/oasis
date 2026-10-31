@@ -96,7 +96,8 @@ def pick(releases: list[dict], files: list[dict]) -> tuple[dict, dict]:
         if release.get("status") == "Pseudo-Release" or not tracks or len(tracks) > len(files) or (mapping := match(files, tracks)) is None:
             continue
         lengths = {t["id"]: t.get("length") or t["recording"].get("length") for _, t in tracks}
-        score = (len(tracks), -sum(abs(f["length"] - (lengths[i] or 0) / 1000) for i, f in mapping.items() if lengths[i]))
+        # A track without a length in MusicBrainz counts as off by the most: an edition that has them is surer.
+        score = (len(tracks), -sum(abs(f["length"] - lengths[i] / 1000) if lengths[i] else SLACK[0] for i, f in mapping.items()))
         if best is None or score > best[0]:
             best = score, release, mapping
     if best is None:
