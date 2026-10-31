@@ -5,6 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from itertools import chain, zip_longest
 
+from .artists import linked
 from .db import remember
 
 log = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ class Recommender:
             ("YouTube Music radio", lambda: self.from_youtube(db, seed, count)),
             ("Last.fm similar tracks", lambda: self.from_lastfm(db, seed, min(count, 15 if deep else 10)) if self.lastfm else []),
             ("Last.fm similar artists", lambda: self.from_similar_artists(db, seed, count) if self.lastfm else []),
+            ("linked artists", lambda: self.from_linked(db, seed, count)),
             ("same artist", lambda: self.from_artist(db, seed, count)),
             ("played together", lambda: self.from_plays(db, seed, count)),
             ("same genre", lambda: self.from_tags(db, seed, count)),
@@ -57,6 +59,12 @@ class Recommender:
         per_artist = [[r[0] for r in db.execute(
             "select id from track where library = 1 and (album_artist = ? collate nocase or artist = ? collate nocase) "
             "order by random() limit 3", (name, name))] for name in self.similar_artists[artist]]
+        return [id for id in chain.from_iterable(zip_longest(*per_artist)) if id][:count]
+
+    def from_linked(self, db, seed, count: int) -> list[str]:
+        """Library songs by the seed artist's personas, related artists and band members, closest first, a few each in turn."""
+        per_artist = [[r[0] for r in db.execute("select id from track where library = 1 and artist_id = ? order by random() limit 3", (other,))]
+                      for other, _ in linked(db, seed["artist_id"])]
         return [id for id in chain.from_iterable(zip_longest(*per_artist)) if id][:count]
 
     def from_artist(self, db, seed, count: int) -> list[str]:

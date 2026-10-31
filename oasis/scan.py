@@ -7,7 +7,7 @@ from pathlib import Path
 import mutagen
 
 from .credits import store, tag_credits
-from .db import adopt_local_copies, make_id
+from .db import adopt_local_copies, artist_id, make_id
 
 log = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ def read(path: Path, root: Path, covers: dict[Path, str | None]) -> dict | None:
         "mb_release": first(tags, "musicbrainz_albumid"), "mb_track": first(tags, "musicbrainz_releasetrackid"),
         "mb_recording": first(tags, "musicbrainz_trackid"), "isrc": joined("isrc"), "label": joined("label") or joined("organization"),
         "release_types": joined("releasetype"), "original_date": first(tags, "originaldate"),
-        "_credits": tag_credits(tags),
+        "_credits": tag_credits(tags), "_albumartist_mbids": tags.get("musicbrainz_albumartistid") if tags else None,
     }
 
 
@@ -96,7 +96,8 @@ def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
                     log.warning("skipping %s: %s", path, e)
                     continue
                 if row:
-                    credits = row.pop("_credits")
+                    credits, mbids = row.pop("_credits"), row.pop("_albumartist_mbids") or []
+                    row["artist_id"] = artist_id(db, row["album_artist"], mbids[0] if len(mbids) == 1 else None)
                     columns = ", ".join(row)
                     updates = ", ".join(f"{k} = excluded.{k}" for k in row if k not in ("id", "created"))
                     # MusicBrainz credits stay while the file is still the same release track.

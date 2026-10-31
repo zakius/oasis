@@ -14,13 +14,15 @@ import urllib.request
 import mutagen
 from mutagen._vorbis import VCommentDict
 
-from .db import make_id
+from . import artists
+from .db import artist_id
 from .dedupe import retagged, same_audio
 
 log = logging.getLogger(__name__)
 
 MUSICBRAINZ = "https://musicbrainz.org/ws/2/release/{}?fmt=json&inc=artist-credits+recordings+isrcs+labels+genres+" \
               "release-groups+artist-rels+recording-level-rels+work-rels+work-level-rels"
+MUSICBRAINZ_ARTIST = "https://musicbrainz.org/ws/2/artist/{}?fmt=json&inc=aliases+artist-rels"
 USER_AGENT = "oasis/0.1 ( https://github.com/zakius/oasis )"
 GAP = 1.1             # seconds between MusicBrainz requests
 RETRY = 30, 600       # seconds before retrying after MusicBrainz errors (503 when busy): first, doubling up to the last
@@ -43,7 +45,7 @@ def credit(role, name, artist, position=0, sub_role=None, joinphrase=None) -> di
     artist = artist or {}
     canonical = artist.get("name") or name
     return {"role": role, "sub_role": sub_role, "name": name or canonical, "artist_name": canonical, "mbid": artist.get("id"),
-            "artist_type": artist.get("type"), "artist_id": make_id("ar-", canonical), "position": position, "joinphrase": joinphrase}
+            "artist_type": artist.get("type"), "position": position, "joinphrase": joinphrase}
 
 
 def artist_credits(role: str, credits: list) -> list[dict]:
@@ -95,7 +97,7 @@ def release_metadata(data: dict) -> tuple[dict, dict]:
 def dedupe_credits(credits: list[dict]) -> list[dict]:
     seen, out = set(), []
     for c in credits:
-        key = (c["role"], c["sub_role"], c["artist_id"])
+        key = (c["role"], c["sub_role"], c["mbid"] or c["artist_name"].casefold())
         if key not in seen:
             seen.add(key)
             out.append(c)
@@ -153,8 +155,8 @@ def write_tags(path: str, fields: dict, credits: list[dict]) -> bool:
 class Credits:
     """Fills credits for releases that arrived in the library, one MusicBrainz request at a time."""
 
-    def __init__(self, connect, fetch=None):
-        self.connect, self.fetch = connect, fetch or fetch_release
+    def __init__(self, connect, fetch=None, fetch_artist=None):
+        self.connect, self.fetch, self.fetch_artist = connect, fetch or fetch_release, fetch_artist or fetch_artist_data
         self.wake = threading.Event()
         self.retry = RETRY[0]
 
@@ -176,13 +178,13 @@ class Credits:
             self.wake.clear()
 
     def step(self) -> bool:
-        """Fills one release; whether there may be more to do."""
+        """Fills one release, or when all are, one credited artist's names and links; whether there may be more to do."""
         db = self.connect()
         try:
             row = db.execute("select mb_release from track where source = 'local' and mb_release is not null "
                              "and credits_at is null limit 1").fetchone()
             if row is None:
-                return False
+                return self.artist_step(db)
             release = row["mb_release"]
             try:
                 data = self.fetch(release)
@@ -196,6 +198,19 @@ class Credits:
             return True
         finally:
             db.close()
+
+    def artist_step(self, db) -> bool:
+        row = db.execute("select mbid from mb_artist where fetched is null and mbid in (select mbid from credit) limit 1").fetchone()
+        if row is None:
+            return False
+        try:
+            artists.learn(db, self.fetch_artist(row["mbid"]))
+        except LookupError:
+            db.execute("update mb_artist set fetched = ? where mbid = ?", (NOT_FOUND, row["mbid"]))
+        artists.merge(db)
+        self.retry = RETRY[0]
+        db.commit()
+        return True
 
 
 def apply(db, data: dict):
@@ -250,16 +265,24 @@ def store(db, track_id: str, credits: list[dict], source: str):
     db.execute("delete from credit where track_id = ? and source = ?", (track_id, source))
     db.executemany("insert into credit(track_id, role, sub_role, name, artist_name, artist_id, mbid, artist_type, position, "
                    "joinphrase, source) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                   [(track_id, c["role"], c["sub_role"], c["name"], c["artist_name"], c["artist_id"], c["mbid"], c["artist_type"],
+                   [(track_id, c["role"], c["sub_role"], c["name"], c["artist_name"], artist_id(db, c["artist_name"], c["mbid"]), c["mbid"], c["artist_type"],
                      c["position"], c["joinphrase"], source) for c in credits])
 
 
 def fetch_release(mbid: str) -> dict:
-    request = urllib.request.Request(MUSICBRAINZ.format(mbid), headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    return fetch(MUSICBRAINZ.format(mbid))
+
+
+def fetch_artist_data(mbid: str) -> dict:
+    return fetch(MUSICBRAINZ_ARTIST.format(mbid))
+
+
+def fetch(url: str) -> dict:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             return json.loads(response.read())
     except urllib.error.HTTPError as e:
-        if e.code == 404:
-            raise LookupError(mbid) from e
-        raise OSError(f"release {mbid}: {e.code}") from e
+        if e.code in (400, 404):  # 400: not a valid id
+            raise LookupError(url) from e
+        raise OSError(f"{url}: {e.code}") from e

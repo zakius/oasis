@@ -8,6 +8,13 @@ paths = ["~/Music"]
 dedupe = false    # store each audio stream once: copies of a song in several editions become reflinks of the best one,
                   # each keeping its own tags. Needs the library writable and on btrfs or XFS.
 
+[artists]
+# One MusicBrainz artist is one artist whatever the spelling; these settle what MusicBrainz can't.
+# merge = [["米津玄師", "Kenshi Yonezu"]]              # the later names become the first
+# separate = ["Phoenix"]                              # never merged into an artist that goes by it too
+# related = [["Mori Calliope", "DEMONDICE"]]          # separate artists that belong together: shown first among
+                                                      # similar artists and mixed into each other's radios
+
 [ytmusic]
 enabled = false   # search YouTube Music and stream from it
 cache = "cache"   # downloaded audio; tracks you star or add to a playlist download right away

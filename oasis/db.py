@@ -33,6 +33,20 @@ create table if not exists credit(  -- who made each track, as credited
 );
 create index if not exists credit_track on credit(track_id);
 create index if not exists credit_artist on credit(artist_id);
+create table if not exists mb_artist(  -- MusicBrainz artists and the oasis artist each one is
+    mbid text primary key, artist_id text not null, name text not null, type text,
+    fetched real                    -- when its other names and links were read; -1 when MusicBrainz lacks it
+);
+create table if not exists artist_alias(  -- another name's id -> the artist it belongs to
+    id text primary key, artist_id text not null,
+    source text not null            -- musicbrainz, or config (the user's merges; a name mapped to itself stays separate)
+);
+create table if not exists artist_link(  -- separate artists close to each other, either way round
+    artist_id text not null, other_id text not null,
+    kind text not null,             -- persona (one person's projects), related (the user's groups), member (bands)
+    source text not null, primary key(artist_id, other_id, kind)
+);
+create index if not exists artist_link_other on artist_link(other_id);
 create table if not exists stat(
     id text primary key,            -- any track, album or artist id
     starred real, rating int, play_count int not null default 0, played real
@@ -95,6 +109,26 @@ def make_id(prefix: str, *parts: str) -> str:
     return prefix + hashlib.sha1("\0".join(p.casefold() for p in parts).encode()).hexdigest()[:16]
 
 
+def artist_id(db, name: str, mbid: str | None = None) -> str:
+    """The artist's oasis id. A MusicBrainz artist keeps the id it first got, so its spellings share one and two
+    artists of the same name get two; a name alone follows the merges in artist_alias."""
+    id = make_id("ar-", name)
+    if not mbid:
+        return resolve(db, id)
+    if row := db.execute("select artist_id from mb_artist where mbid = ?", (mbid,)).fetchone():
+        return resolve(db, row[0], config_only=True)
+    if db.execute("select 1 from mb_artist where artist_id = ?", (id,)).fetchone():
+        id = make_id("ar-", name, mbid)  # another artist of this name came first
+    db.execute("insert into mb_artist(mbid, artist_id, name) values (?, ?, ?)", (mbid, id, name))
+    db.execute("delete from artist_alias where id = ? and source = 'musicbrainz'", (id,))  # the name is its own now
+    return resolve(db, id, config_only=True)
+
+
+def resolve(db, id: str, config_only=False) -> str:
+    row = db.execute("select artist_id from artist_alias where id = ? and (? or source = 'config')", (id, not config_only)).fetchone()
+    return row[0] if row else id
+
+
 migrated: set[Path] = set()
 
 
@@ -130,6 +164,7 @@ def migrate(db: sqlite3.Connection):
 def remember(db, row: dict) -> str:
     """Caches a streaming track's metadata and returns its id. The same song already known (same artist and title,
     length within 5 s), local or under another YouTube upload, keeps its id; a local copy wins."""
+    row["artist_id"] = resolve(db, row["artist_id"])
     known = db.execute("select id, source from track where artist_id = ? and title = ? collate nocase and abs(duration - ?) <= 5 "
                        "and id != ? order by source != 'local' limit 1",
                        (row["artist_id"], row["title"], row["duration"] or 0, row["id"])).fetchone()
@@ -152,14 +187,20 @@ def move_track(db, old: str, new: str):
     keeps working as an alias, since clients keep ids in queues and caches."""
     for table in ("playlist_entry", "play", "outbox"):
         db.execute(f"update {table} set track_id = ? where track_id = ?", (new, old))
+    move_stat(db, old, new)
+    for table, column in (("lyrics", "track_id"), ("track", "id")):
+        db.execute(f"delete from {table} where {column} = ?", (old,))
+    db.execute("update moved set new_id = ? where new_id = ?", (new, old))
+    db.execute("insert or replace into moved values (?, ?)", (old, new))
+
+
+def move_stat(db, old: str, new: str):
+    """Stars, ratings and plays of one id added to another's."""
     db.execute("insert into stat(id, starred, rating, play_count, played) select ?, starred, rating, play_count, played "
                "from stat where id = ? on conflict(id) do update set starred = coalesce(stat.starred, excluded.starred), "
                "rating = coalesce(stat.rating, excluded.rating), play_count = stat.play_count + excluded.play_count, "
                "played = max(coalesce(stat.played, 0), coalesce(excluded.played, 0))", (new, old))
-    for table, column in (("stat", "id"), ("lyrics", "track_id"), ("track", "id")):
-        db.execute(f"delete from {table} where {column} = ?", (old,))
-    db.execute("update moved set new_id = ? where new_id = ?", (new, old))
-    db.execute("insert or replace into moved values (?, ?)", (old, new))
+    db.execute("delete from stat where id = ?", (old,))
 
 
 def adopt_local_copies(db):

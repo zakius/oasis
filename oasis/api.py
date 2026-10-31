@@ -19,10 +19,10 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import accounts, cover, dedupe, forward, lyrics, scan, web, ytm
+from . import accounts, artists, cover, dedupe, forward, lyrics, scan, web, ytm
 from .config import Config
 from .credits import PERFORMANCE_ROLES, Credits
-from .db import connect, make_id, move_track, remember
+from .db import connect, make_id, move_track, remember, resolve
 from .forward import Forwarder, LastFm
 from .lidarr import Library, Lidarr
 from .recommend import Recommender, set_entries
@@ -89,6 +89,7 @@ def to_xml(tag: str, value: dict) -> Element:
 
 
 SONG_ID_PARAMS = ("id", "songId", "songIdToAdd")
+ARTIST_ID_PARAMS = ("id", "artistId")
 
 
 class Params:
@@ -113,11 +114,13 @@ class Params:
         return value
 
     def follow_moves(self, db):
-        """Song ids a client still holds for streams that became local files point at the local track."""
+        """Song ids a client still holds for streams that became local files point at the local track, and artist ids
+        of another name of an artist at the artist."""
         ids = {v for k, v in self.multi if k in SONG_ID_PARAMS and v.startswith("yt-")}
         if ids:
             moved = dict(db.execute(f"select old_id, new_id from moved where old_id in ({','.join('?' * len(ids))})", list(ids)))
             self.multi = [(k, moved.get(v, v) if k in SONG_ID_PARAMS else v) for k, v in self.multi]
+        self.multi = [(k, resolve(db, v) if k in ARTIST_ID_PARAMS and v.startswith("ar-") else v) for k, v in self.multi]
 
 
 SONG_COLUMNS = """t.*, s.starred, s.rating, s.play_count, s.played"""
@@ -298,6 +301,8 @@ class Api:
         self.ytm = ytm or (YouTubeMusic(config.ytm_cache) if config.ytm_cache else None)
         db = self._db()
         accounts.sync_config_users(db, config.users)
+        artists.reidentify(db)
+        artists.configure(db, config.artists)
         db.close()
         services_for = (lambda db, user: services) if services is not None else \
             (lambda db, user: forward.user_services(config, self.ytm, accounts.get(db, user)))
@@ -787,24 +792,39 @@ class Api:
         return {"nowPlaying": {}}
 
     def _artist_info(self, db, p):
-        r = self._one(db, ARTISTS + " where t.artist_id = ? group by t.artist_id", p.need("id"))
+        r = db.execute(ARTISTS + " where t.artist_id = ? group by t.artist_id", (p.need("id"),)).fetchone()
+        if r is None:  # only credited on others' songs
+            self._one(db, "select 1 from credit where artist_id = ? limit 1", p.need("id"))
+            return clean({"similarArtist": self._linked_artists(db, p.need("id")) or None})
         self._artist_page(db, r["id"], r["name"])
         page = db.execute("select description, image from ytm_artist where artist_id = ?", (r["id"],)).fetchone()
         youtube = clean({"biography": page["description"], "smallImageUrl": page["image"], "mediumImageUrl": page["image"],
                          "largeImageUrl": page["image"]}) if page else {}
+        linked = self._linked_artists(db, r["id"])
         if not self.recommender.lastfm:
-            return youtube
+            return {**youtube, **clean({"similarArtist": linked or None})}
         try:
             info = self.recommender.lastfm.artist_info(r["name"])
         except Exception as e:
             log.info("Last.fm artist info failed: %s", e)
-            return youtube
+            return {**youtube, **clean({"similarArtist": linked or None})}
         names = [a["name"] for a in info.get("similar", {}).get("artist", [])][:p.int("count", 20)]
         similar = [artist(a) for name in names for a in db.execute(
             ARTISTS + " where t.library = 1 and t.album_artist = ? collate nocase group by t.artist_id", (name,))]
+        similar = linked + [a for a in similar if a["id"] not in {x["id"] for x in linked}]
         bio = info.get("bio", {}).get("summary", "")
         return {**youtube, **clean({"biography": bio.split("<a href")[0].strip() or None, "lastFmUrl": info.get("url"),
-                                    "musicBrainzId": info.get("mbid") or None, "similarArtist": similar})}
+                                    "musicBrainzId": info.get("mbid") or None, "similarArtist": similar or None})}
+
+    def _linked_artists(self, db, artist_id):
+        """Personas, the user's related artists and band members that have songs here, closest first; oasisLink says how."""
+        found = []
+        for other, kind in artists.linked(db, artist_id):
+            if r := db.execute(ARTISTS + " where t.artist_id = ? group by t.artist_id", (other,)).fetchone():
+                found.append({**artist(r), "oasisLink": kind})
+            elif c := db.execute("select name from credit where artist_id = ? order by source = 'tags' limit 1", (other,)).fetchone():
+                found.append({"id": other, "name": c["name"], "oasisLink": kind})
+        return found
 
     def getArtistInfo2(self, db, p, user):
         return {"artistInfo2": self._artist_info(db, p)}

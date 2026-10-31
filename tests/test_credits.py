@@ -47,8 +47,10 @@ def client(library, tmp_path):
 
 
 def fill(client):
-    credits = Credits(client.app.state.api._db, fetch=lambda mbid: RELEASE)
-    assert credits.step() and not credits.step()
+    credits = Credits(client.app.state.api._db, fetch=lambda mbid: RELEASE, fetch_artist={}.__getitem__)
+    assert credits.step()
+    while credits.step():
+        pass
 
 
 def song_named(client, title):
@@ -102,7 +104,7 @@ def test_one_performance_entered_twice_in_musicbrainz_shares_its_credits_but_not
     first, second = str(library / "Songs/01.flac"), str(library / "Single/01.flac")
     db.execute("insert into audio_pair values (?, ?, 0, 0, 1)", tuple(sorted((first, second))))  # dedupe found one stream
     releases = {"rel-1": RELEASE, "rel-2": other_release}
-    credits = Credits(client.app.state.api._db, fetch=releases.__getitem__)
+    credits = Credits(client.app.state.api._db, fetch=releases.__getitem__, fetch_artist={}.__getitem__)
     while credits.step():
         pass
 

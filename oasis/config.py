@@ -1,3 +1,4 @@
+import dataclasses
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,7 @@ class Config:
     lastfm_key: str | None = None
     lastfm_secret: str | None = None
     lidarr: dict | None = None  # url, api_key, and optionally root_folder, quality_profile, metadata_profile
+    artists: dict = dataclasses.field(default_factory=dict)  # merge, separate and related names (see artists.py)
     dedupe: bool = False        # store each audio stream once (see dedupe.py); needs the library writable, on btrfs or XFS
 
 
@@ -30,6 +32,7 @@ def load(path: Path) -> Config:
         ytm_cache=base / Path(ytm.get("cache", "cache")).expanduser() if ytm.get("enabled") else None,
         lastfm_key=lastfm.get("api_key") or None,
         lastfm_secret=lastfm.get("secret") or None,
+        artists=data.get("artists", {}),
         dedupe=data.get("library", {}).get("dedupe", False),
         lidarr=data["lidarr"] if data.get("lidarr", {}).get("url") and data["lidarr"].get("api_key") else None,
     )
