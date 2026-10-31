@@ -442,6 +442,11 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     client.app.state.api._db().execute("insert into mb_artist(mbid, artist_id, name) values ('mb-beta', ?, 'Beta')", (artist_id(client, "Beta"),))
     found = call(client, "search3", query="Kenshi Yonezu")["searchResult3"]
     assert [a["id"] for a in found["artist"]] == ["ar-mb-" + KENSHI] and [a["id"] for a in found["album"]] == ["al-mb-" + STRAY]
+    db = client.app.state.api._db()
+    db.execute("update track set album_artist = 'Kenshi Yonezu' where album = 'Second'")  # by another name: left out
+    assert call(client, "search3", query="Kenshi Yonezu")["searchResult3"]["artist"][0]["name"] == "Kenshi Yonezu"
+    assert len(call(client, "search3", query="Kenshi Yonezu")["searchResult3"]["artist"]) == 1
+    db.execute("update track set album_artist = 'The Alpha' where album = 'Second'")
     assert found["album"][0]["artistId"] == "ar-mb-" + KENSHI and found["album"][0]["year"] == 2020
     asked = len(mb.asked)
     assert call(client, "search3", query="Ke")["searchResult3"]["artist"] == [] and len(mb.asked) == asked  # too short to ask
@@ -455,7 +460,7 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     assert album["song"] == [] and album["oasisWanted"] == "wanted" and album["starred"]
     assert wants(client)["STRAY SHEEP"][:2] == ("missing", "starred") and wants(client)["BOOTLEG"][1] == "followed"
 
-    db = client.app.state.api._db()  # it arrives
+    # it arrives
     db.execute("update track set mb_release_group = ? where album = 'First'", (STRAY,))
     beta = artist_id(client, "Beta")
     db.execute("insert into mb_artist(mbid, artist_id, name) values (?, ?, '米津玄師')", (KENSHI, beta))

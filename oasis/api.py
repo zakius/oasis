@@ -724,7 +724,8 @@ class Api:
             titles = {ytm.fold(x) for x in [*(a["name"] for a in albums), *(s.get("album") for s in songs)] if x}
             if p.int("artistOffset", 0) == 0 and (room := p.int("artistCount", 20) - len(artists)) > 0:
                 artists += [self._mb_artist(db, a) for a in self._find(db, "artist", text)
-                            if ytm.fold(a["name"]) not in names and not acquire.library_id(db, MB_IDS["artist"] + a["id"])][:room]
+                            if not {ytm.fold(n) for n in [a["name"], *(x["name"] for x in a.get("aliases") or [])]} & names
+                            and not acquire.library_id(db, MB_IDS["artist"] + a["id"])][:room]
             if p.int("albumOffset", 0) == 0 and (room := p.int("albumCount", 20) - len(albums)) > 0:
                 albums += [self._mb_album(db, g) for g in self._find(db, "album", text)
                            if ytm.fold(g["title"]) not in titles and not acquire.library_id(db, MB_IDS["album"] + g["id"])][:room]
