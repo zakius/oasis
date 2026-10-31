@@ -57,6 +57,9 @@ class FakeLidarr(Lidarr):
     def track_files(self, album_id):
         return self.files.get(album_id, [])
 
+    def rescan(self, folders):
+        self.rescanned = folders
+
 
 class FakeTorBox:
     def __init__(self):

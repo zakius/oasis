@@ -5,17 +5,29 @@ import time
 from pathlib import Path
 
 import mutagen
+from mutagen.easyid3 import EasyID3
+from mutagen.easymp4 import EasyMP4Tags
 
 from .credits import store, tag_credits
 from .db import adopt_local_copies, artist_id, make_id
 
 log = logging.getLogger(__name__)
 
+# Picard's frames for the tags read below that mutagen's MP3 and M4A interfaces lack, so those files carry what FLAC does.
+for key, name in {"artists": "ARTISTS", "releasetype": "MusicBrainz Album Type", "releasestatus": "MusicBrainz Album Status"}.items():
+    EasyID3.RegisterTXXXKey(key, name)
+EasyID3.RegisterTextKey("label", "TPUB")
+for key, name in {"artists": "ARTISTS", "originaldate": "ORIGINALDATE", "media": "MEDIA", "label": "LABEL", "catalognumber": "CATALOGNUMBER",
+                  "barcode": "BARCODE", "isrc": "ISRC", "releasetype": "MusicBrainz Album Type", "releasestatus": "MusicBrainz Album Status",
+                  "musicbrainz_releasetrackid": "MusicBrainz Release Track Id", "musicbrainz_releasegroupid": "MusicBrainz Release Group Id"}.items():
+    EasyMP4Tags.RegisterFreeformKey(key, name)
+
 CONTENT_TYPES = {
     "mp3": "audio/mpeg", "flac": "audio/flac", "ogg": "audio/ogg", "oga": "audio/ogg", "opus": "audio/ogg",
     "m4a": "audio/mp4", "aac": "audio/aac", "wav": "audio/wav", "wv": "audio/x-wavpack",
     "ape": "audio/x-ape", "mpc": "audio/x-musepack", "aiff": "audio/aiff", "aif": "audio/aiff",
 }
+REPLACED = ".replaced"  # library files a better copy replaced, moved aside (see importer.py)
 COVER_NAMES = ("cover", "folder", "front", "album")
 COVER_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 
@@ -72,7 +84,7 @@ def read(path: Path, root: Path, covers: dict[Path, str | None]) -> dict | None:
         "cover": "embedded" if has_embedded_cover(audio) else covers[path.parent],
         "mtime": stat.st_mtime, "created": time.time(),
         "mb_release": first(tags, "musicbrainz_albumid"), "mb_track": first(tags, "musicbrainz_releasetrackid"),
-        "mb_recording": first(tags, "musicbrainz_trackid"), "isrc": joined("isrc"), "label": joined("label") or joined("organization"),
+        "mb_recording": first(tags, "musicbrainz_trackid"), "mb_release_group": first(tags, "musicbrainz_releasegroupid"), "isrc": joined("isrc"), "label": joined("label") or joined("organization"),
         "release_types": joined("releasetype"), "original_date": first(tags, "originaldate"),
         "_credits": tag_credits(tags), "_albumartist_mbids": tags.get("musicbrainz_albumartistid") if tags else None,
     }
@@ -82,7 +94,8 @@ def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
     known = {r["ref"]: r["mtime"] for r in db.execute("select ref, mtime from track where source = 'local'")}
     seen, covers, changed = set(), {}, 0
     for root in roots:
-        for directory, _, files in os.walk(root):
+        for directory, folders, files in os.walk(root):
+            folders[:] = [f for f in folders if f != REPLACED]
             for name in files:
                 path = Path(directory, name)
                 if path.suffix.lower().lstrip(".") not in CONTENT_TYPES:

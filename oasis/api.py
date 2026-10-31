@@ -25,6 +25,7 @@ from .credits import PERFORMANCE_ROLES, Credits
 from .db import connect, make_id, move_track, remember, resolve
 from .doctor import Doctor
 from .download import Downloads
+from .importer import Importer
 from .forward import Forwarder, LastFm
 from .lidarr import Library, Lidarr
 from .recommend import Recommender, set_entries
@@ -321,9 +322,11 @@ class Api:
         self.doctor = Doctor(self._db, lidarr, **{k: v for k, v in torbox.items() if k in DOCTOR_KEYS}) if torbox else None
         # Its own importer: the doctor's dry run mustn't stop downloads.
         self.downloads = Downloads(self._db, lidarr, Doctor(self._db, lidarr, torbox["rdt_db"]), torbox["downloads"], torbox.get("max_active", 8),
-                                   torbox.get("stall_hours", 1), self._start_scan) if torbox and torbox.get("downloads") else None
+                                   torbox.get("stall_hours", 1), self._start_scan,
+                                   Importer(self._db, config.library[0]) if torbox.get("import", "oasis") == "oasis" else None) \
+            if torbox and torbox.get("downloads") else None
         self.library = Library(self._db, lidarr, self.downloads) if lidarr else None
-        self.scanning = False
+        self.scanning = self.scan_again = False
         self.scan_lock = threading.Lock()
         self.credits = Credits(self._db)
 
@@ -347,17 +350,23 @@ class Api:
         self.recommender.lastfm = LastFm(key, secret, None)
 
     def _start_scan(self):
+        """A scan asked for while one runs follows it: files an import placed meanwhile may be past it."""
         if not self.scan_lock.acquire(blocking=False):
+            self.scan_again = True
             return
         self.scanning = True
 
         def run():
             db = self._db()
             try:
-                scan.scan(db, self.config.library)
-                if self.config.dedupe:
-                    self._dedupe(db)
-                self.credits.wake.set()
+                while True:
+                    self.scan_again = False
+                    scan.scan(db, self.config.library)
+                    if self.config.dedupe:
+                        self._dedupe(db)
+                    self.credits.wake.set()
+                    if not self.scan_again:
+                        break
             finally:
                 db.close()
                 self.scanning = False

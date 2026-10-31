@@ -196,3 +196,30 @@ def test_with_downloads_the_library_searches_through_them_and_shows_them_downloa
     assert len(torbox.added) == 1 and ("search", 1) not in fake.calls  # not through Lidarr's grab
     library.reconcile()
     assert db.execute("select state from lidarr_item").fetchone()[0] == "downloading"
+
+
+def test_with_its_own_importer_oasis_places_the_files_and_lidarr_rescans_the_album(downloads, lidarr, torbox, db, tmp_path):
+    class Own:
+        def place(self, folder, group):
+            placed.append((folder, group))
+            if group == "mb-other":
+                raise LookupError("no edition matches")
+            return tmp_path / "music/Artist/Album (2001)"
+
+    placed, downloads.own = [], Own()
+    lidarr.offers[5] = [offer("a", "abcd", 10)]
+    downloads.search(db, 5)
+    torbox.list = [{**tb(71, "abcd", progress=1, active=False), "download_state": "completed", "download_finished": True,
+                    "download_present": True, "files": files(tmp_path, "Album/01.flac")}]
+    downloads.cycle()
+    folder = tmp_path / "dl" / "abcd"
+    assert placed == [(folder, "mb-album")] and lidarr.imported == [] and lidarr.rescanned == [str(tmp_path / "music/Artist/Album (2001)")]
+    assert db.execute("select state from download").fetchone()[0] == "done" and not folder.exists() and downloads.scans == [1]
+
+    lidarr.albums[5]["foreignAlbumId"], lidarr.offers[5] = "mb-other", [offer("b", "bcde", 10)]
+    downloads.search(db, 5)
+    torbox.list = [{**torbox.list[0], "id": 72, "hash": "bcde"}]
+    downloads.cycle()
+    row = db.execute("select state, error from download where hash = 'bcde'").fetchone()
+    assert tuple(row) == ("failed", "import failed: no edition matches") and (tmp_path / "dl/bcde/Album/01.flac").exists()
+    assert {r[0] for r in db.execute("select hash from release_block")} == {"b", "bcde"}

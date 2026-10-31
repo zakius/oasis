@@ -8,13 +8,11 @@ import json
 import logging
 import threading
 import time
-import urllib.error
-import urllib.request
 
 import mutagen
 from mutagen._vorbis import VCommentDict
 
-from . import artists
+from . import artists, musicbrainz
 from .db import artist_id
 from .dedupe import retagged, same_audio
 
@@ -23,8 +21,6 @@ log = logging.getLogger(__name__)
 MUSICBRAINZ = "https://musicbrainz.org/ws/2/release/{}?fmt=json&inc=artist-credits+recordings+isrcs+labels+genres+" \
               "release-groups+artist-rels+recording-level-rels+work-rels+work-level-rels"
 MUSICBRAINZ_ARTIST = "https://musicbrainz.org/ws/2/artist/{}?fmt=json&inc=aliases+artist-rels"
-USER_AGENT = "oasis/0.1 ( https://github.com/zakius/oasis )"
-GAP = 1.1             # seconds between MusicBrainz requests
 RETRY = 30, 600       # seconds before retrying after MusicBrainz errors (503 when busy): first, doubling up to the last
 IDLE = 300            # seconds between looks for new releases when nothing woke the worker
 NOT_FOUND = -1        # credits_at for releases MusicBrainz doesn't have
@@ -168,7 +164,7 @@ class Credits:
             wait = IDLE
             try:
                 while self.step():
-                    time.sleep(GAP)
+                    pass
             except OSError as e:
                 log.warning("MusicBrainz: %s; again in %d s", e, self.retry)
                 wait, self.retry = self.retry, min(self.retry * 2, RETRY[1])
@@ -270,19 +266,8 @@ def store(db, track_id: str, credits: list[dict], source: str):
 
 
 def fetch_release(mbid: str) -> dict:
-    return fetch(MUSICBRAINZ.format(mbid))
+    return musicbrainz.get(MUSICBRAINZ.format(mbid))
 
 
 def fetch_artist_data(mbid: str) -> dict:
-    return fetch(MUSICBRAINZ_ARTIST.format(mbid))
-
-
-def fetch(url: str) -> dict:
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return json.loads(response.read())
-    except urllib.error.HTTPError as e:
-        if e.code in (400, 404):  # 400: not a valid id
-            raise LookupError(url) from e
-        raise OSError(f"{url}: {e.code}") from e
+    return musicbrainz.get(MUSICBRAINZ_ARTIST.format(mbid))

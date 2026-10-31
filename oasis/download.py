@@ -1,7 +1,8 @@
 """oasis's own downloads: the release a search picks goes to TorBox, which downloads the torrent on its servers; oasis
-fetches the files over HTTP into its staging folder and has Lidarr import that folder. rdtclient isn't involved, so
+fetches the files over HTTP into its staging folder and imports them. rdtclient isn't involved, so
 TorBox's slots and queue are read directly, files keep their paths inside the torrent, and oasis keeps its own record
-of which hash is which album. Nothing seeds from here."""
+of which hash is which album. oasis places the files itself (importer.py), or with import = "lidarr" has Lidarr
+import them. Nothing seeds from here."""
 import logging
 import shutil
 import threading
@@ -11,7 +12,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 
-from .doctor import AUDIO, CACHE_IGNORES
+from .doctor import CACHE_IGNORES
+from .importer import AUDIO
 from .lidarr import GRAB_TRIES, unparsed_match
 from .torbox import RateLimited
 
@@ -81,9 +83,10 @@ class Downloads:
     """Sends searches' picks to TorBox and walks each download through added -> downloading -> fetching ->
     importing -> done, or failed. The state is in the download table, so a restart resumes where it was."""
 
-    def __init__(self, connect, lidarr, importer, downloads: str, max_active: int = 8, stall_hours: float = 1, imported=lambda: None):
-        """imported: called after each import. Lidarr tells oasis to scan after its own imports, not after ManualImport."""
-        self.connect, self.lidarr, self.importer, self.folder, self.imported = connect, lidarr, importer, Path(downloads), imported
+    def __init__(self, connect, lidarr, importer, downloads: str, max_active: int = 8, stall_hours: float = 1, imported=lambda: None, own=None):
+        """importer: the doctor, for the TorBox key and Lidarr's import. own: oasis's Importer, which imports instead.
+        imported: called after each import. Lidarr tells oasis to scan after its own imports, not after ManualImport."""
+        self.connect, self.lidarr, self.importer, self.folder, self.imported, self.own = connect, lidarr, importer, Path(downloads), imported, own
         self.max_active, self.stall = max_active, stall_hours * 3600
         self.client = None
         self.seen = {}       # hash -> (progress, since when)
@@ -234,18 +237,40 @@ class Downloads:
             return e
 
     def finish(self, db, row):
+        if self.own:
+            return self.place(db, row)
+        self.lidarr_import(db, row)
+
+    def place(self, db, row):
+        """oasis's own import. A download no edition matches fails; Lidarr rescans the album folder so it counts the
+        album present and doesn't search it again."""
+        folder = self.folder / row["hash"]
+        try:
+            album = self.own.place(folder, row["album_mbid"])
+        except LookupError as e:
+            return self.fail(db, row, f"import failed: {e}")
+        self.done(db, row, folder)
+        try:
+            self.lidarr.rescan([str(album)])
+        except OSError as e:
+            log.warning("Lidarr rescan of %s failed: %s", album, e)
+
+    def lidarr_import(self, db, row):
         """Imports the folder with the doctor's matcher, moving the files into the library. Lidarr can fail an import
         after moving the files, and a restart can come between: an album complete in Lidarr counts as imported."""
         folder = self.folder / row["hash"]
         item = {"downloadId": None, "albumId": row["album_id"], "title": row["title"]}
         if self.importer.try_import(item, str(folder), mode="move") or self.complete(row["album_id"]):
-            self.delete(row)
-            shutil.rmtree(folder, ignore_errors=True)
-            self.set(db, row, "done")
-            log.info("imported %s", row["title"])
-            self.imported()
+            self.done(db, row, folder)
         else:
             self.fail(db, row, "import failed: the files match no edition of the album")
+
+    def done(self, db, row, folder: Path):
+        self.delete(row)
+        shutil.rmtree(folder, ignore_errors=True)
+        self.set(db, row, "done")
+        log.info("imported %s", row["title"])
+        self.imported()
 
     def complete(self, album_id: int) -> bool:
         stats = self.lidarr.album_by_id(album_id).get("statistics") or {}

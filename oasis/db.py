@@ -18,6 +18,7 @@ create table if not exists track(
     library int not null default 1, -- 0 for streaming tracks only seen in search or radio
     mtime real, created real,
     mb_release text, mb_track text, mb_recording text,  -- MusicBrainz release, release track and recording ids
+    mb_release_group text,
     isrc text, label text, release_types text, original_date text, -- several values joined with '; '
     genres text,                    -- JSON list
     credits_at real                 -- when MusicBrainz credits were filled; -1 when it has none, null while pending
@@ -90,6 +91,7 @@ create table if not exists download(  -- releases oasis downloads through TorBox
     state text not null,                    -- added, downloading, fetching, importing, done, failed
     error text, created real not null, updated real not null
 );
+create table if not exists mb_cache(url text primary key, body text not null, fetched real not null);  -- see musicbrainz.py
 create table if not exists release_block(  -- releases that failed: never picked again. hash: info hash, or guid for those listed without one
     hash text primary key, reason text, at real not null
 );

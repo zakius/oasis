@@ -12,6 +12,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+from .importer import AUDIO, number_of, title_of
 from .lidarr import Lidarr
 from .torbox import TorBox
 from .ytm import fold
@@ -25,23 +26,7 @@ SWAP_RECHECK = timedelta(hours=1)
 CACHE_IGNORES = ("Not enough seeders", "Release in queue")
 ORPHAN_AFTER = timedelta(minutes=10)    # rdtclient tracks its adds by then
 STUCK_AFTER = timedelta(minutes=30)     # every audio file downloaded this long ago, but the torrent still "downloading"
-AUDIO = ("flac", "mp3", "m4a", "ogg", "opus", "wav", "ape", "wv", "aiff", "alac", "aac")
 EPOCH = datetime.min.replace(tzinfo=timezone.utc)
-
-
-def title_of(path: str, artist: str) -> str:
-    """'01. Artist - Title (Album Version).flac' -> 'Title'."""
-    name = re.sub(r"\.[^.]+$", "", os.path.basename(path))
-    name = re.sub(r"^\s*(?:\d+[-.]?)?\d+\s*[.\-_)]*\s*", "", name)
-    if name.casefold().startswith(artist.casefold()):
-        name = name[len(artist):].lstrip(" -_.")
-    return re.sub(r"\s*[(\[][^)\]]*[)\]]\s*$", "", name)
-
-
-def number_of(path: str):
-    """'2-05 Title.flac' -> (2, 5); '05 Title.flac' -> (1, 5)."""
-    m = re.match(r"\s*(?:(\d)[-.])?(\d+)", os.path.basename(path))
-    return (int(m[1] or 1), int(m[2])) if m else None
 
 
 def match(files: list, tracks: list, artist: str):
