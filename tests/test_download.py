@@ -54,7 +54,7 @@ class Importer:
             raise LookupError("no edition matches")
 
 
-WANT = {"artist": "Artist", "names": ["Artist"], "title": "Album", "year": "", "others": [], "discs": 1, "upgrade": False, "native": []}
+WANT = {"artist": "Artist", "names": ["Artist"], "title": "Album", "year": "", "others": [], "discs": 1, "upgrade": False, "native": [], "other_titles": []}
 
 
 def offer(hash, quality="FLAC", **extra):

@@ -21,7 +21,8 @@ from .ytm import fold
 log = logging.getLogger(__name__)
 
 MB = "https://musicbrainz.org/ws/2/"
-CATALOGUE = MB + "release-group?artist={}&type=album|ep|single&inc=artist-credits&limit=100&offset={}&fmt=json"
+CATALOGUE = MB + "release-group?artist={}&type=album|ep|single&inc=artist-credits+aliases&limit=100&offset={}&fmt=json"
+PSEUDO = MB + "release?artist={}&status=pseudo-release&inc=release-groups&limit=100&offset={}&fmt=json"  # transliterations, translations
 EDITIONS = MB + "release?release-group={}&status=official&inc=recordings&limit=100&fmt=json"
 GROUP = MB + "release-group/{}?inc=artist-credits&fmt=json"
 RELEASE = MB + "release/{}?inc=release-groups&fmt=json"
@@ -63,14 +64,31 @@ def find(db, kind: str, text: str) -> list[dict]:
     return musicbrainz.get(SEARCH.format(path, urllib.parse.quote(" ".join(words))), db, KEEP_FIND).get(path + "s") or []
 
 
-def release_groups(db, mbid: str) -> list[dict]:
-    """All the artist's release groups."""
+def pages(db, url: str, kind: str) -> list[dict]:
+    """All of a MusicBrainz browse's kind ('release-group'), page by page."""
     found = []
     while True:
-        page = musicbrainz.get(CATALOGUE.format(mbid, len(found)), db, KEEP_CATALOGUE)
-        found += page.get("release-groups") or []
-        if not page.get("release-groups") or len(found) >= page.get("release-group-count", 0):
+        page = musicbrainz.get(url.format(len(found)), db, KEEP_CATALOGUE)
+        found += page.get(kind + "s") or []
+        if not page.get(kind + "s") or len(found) >= page.get(kind + "-count", 0):
             return found
+
+
+def release_groups(db, mbid: str) -> list[dict]:
+    """All the artist's release groups, with their aliases."""
+    return pages(db, CATALOGUE.replace("{}", mbid, 1), "release-group")
+
+
+def other_titles(db, mbid: str) -> dict[str, list[str]]:
+    """Each of the artist's release groups' other whole titles in MusicBrainz, as releases.other_titles keeps them:
+    its aliases ('To Us Former Prodigies') and its pseudo-releases' titles ('Ensemble Play' for アンサンブル・プレイ).
+    Search hints aren't titles."""
+    groups = release_groups(db, mbid)
+    found = {g["id"]: [a["name"] for a in g.get("aliases") or [] if a.get("type") != "Search hint"] for g in groups}
+    for r in pages(db, PSEUDO.replace("{}", mbid, 1), "release"):
+        found.get((r.get("release-group") or {}).get("id"), []).append(r["title"])
+    titles = {g["id"]: g["title"] for g in groups}
+    return {rg: kept for rg, names in found.items() if (kept := releases.other_titles(titles[rg], names, [t for o, t in titles.items() if o != rg]))}
 
 
 def mbid_of(id: str) -> str | None:
@@ -375,7 +393,8 @@ class Acquire:
             return False
         mbid, sent = row["artist_mbid"], None
         try:
-            groups, queued = self.browse(db, mbid), self.downloads.groups(db)
+            alternatives, queued = other_titles(db, mbid), self.downloads.groups(db)
+            groups = [{**g, "other_titles": alternatives.get(g["id"], [])} for g in self.browse(db, mbid)]
             wanted = {rg for (rg,) in db.execute("select rg from want_album where artist_mbid = ? and state = 'missing'", (mbid,)) if rg not in queued}
             titles = [g["title"] for g in groups if g["primary-type"] != "Single"]
             names = releases.aliases(db, row["artist"], mbid, titles)
@@ -405,8 +424,9 @@ class Acquire:
                    (now, now + min(first * 2 ** row["tries"], most), None if sent else error, row["rg"]))
 
     def target(self, db, row) -> dict:
-        """What releases.find looks for: the artist under all its names, the title, year, discs, the artist's other
-        albums and EPs (a name holding one is a bundle), and whether the album is here lossy already (then only lossless will do)."""
+        """What releases.find looks for: the artist under all its names, the title and its other titles, year, discs, the
+        artist's other albums and EPs (a name holding one is a bundle), and whether the album is here lossy already
+        (then only lossless will do)."""
         try:
             others = [g["title"] for g in self.browse(db, row["artist_mbid"]) if g["primary-type"] != "Single" and g["id"] != row["rg"]]
         except (OSError, LookupError):
@@ -414,7 +434,12 @@ class Acquire:
                                                (row["artist_mbid"], row["rg"]))]
         names = releases.aliases(db, row["artist"], row["artist_mbid"], [row["title"], *others])
         discs = (db.execute("select discs from mb_group where rg = ?", (row["rg"],)).fetchone() or [1])[0]
-        return {"artist": row["artist"], "names": names, "title": row["title"], "year": (row["first_date"] or "")[:4],
+        try:
+            alternatives = other_titles(db, row["artist_mbid"]).get(row["rg"], [])
+        except (OSError, LookupError) as e:
+            log.info("other titles of %s: %s", row["title"], e)
+            alternatives = []
+        return {"artist": row["artist"], "names": names, "title": row["title"], "other_titles": alternatives, "year": (row["first_date"] or "")[:4],
                 "native": releases.native(names), "discs": discs, "others": others, "upgrade": row["state"] == "have"}
 
     def still_to_find(self, db) -> int:

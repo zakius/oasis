@@ -25,6 +25,7 @@ class MusicBrainz:
 
     def __init__(self):
         self.catalogues, self.songs, self.artists, self.found, self.releases, self.asked, self.info = {}, {}, [], [], {}, [], {}
+        self.pseudo = {}  # artist -> its pseudo-releases
 
     def __call__(self, url, db=None, keep=0):
         self.asked.append(url)
@@ -33,6 +34,9 @@ class MusicBrainz:
         if path == "release-group" and "artist" in q:
             groups = self.catalogues.get(q["artist"], [])
             return {"release-groups": groups[int(q["offset"]):][:100], "release-group-count": len(groups)}
+        if path == "release" and "artist" in q:
+            found = self.pseudo.get(q["artist"], [])
+            return {"releases": found[int(q["offset"]):][:100], "release-count": len(found)}
         if path == "release":
             songs = self.songs.get(q["release-group"])
             video = {"format": "DVD-Video", "tracks": [{"title": "Live"}]}  # the smallest edition, but not the album
@@ -185,6 +189,19 @@ def test_missing_albums_are_searched_in_order_and_again_ever_further_apart(clien
     assert wants(client)[db.execute("select title from want_album where rg = ?", (sent,)).fetchone()[0]][0] == "downloading"
     want = acq.downloads.wants[-1]
     assert want["artist"] == "Beta" and want["names"] == ["Beta"] and "Greatest Hits" in want["others"] and want["upgrade"] is False
+
+
+def test_a_search_knows_the_albums_other_titles_from_its_aliases_and_pseudo_releases(client, mb):
+    follow_beta(client, mb)
+    second = next(g for g in mb.catalogues["mb-beta"] if g["id"] == "g-second")
+    second["aliases"] = [{"name": "Zweite", "type": "Release group name"}, {"name": "2nd", "type": "Search hint"}]
+    mb.pseudo["mb-beta"] = [{"title": t, "release-group": {"id": rg}} for t, rg in
+                            [("Sekando", "g-second"), ("Second (Instrumental)", "g-second"), ("Film", "g-second"), ("Sekando", "g-second"),
+                             ("Fuirumu", "g-ost"), ("Elsewhere", "g-unknown")]]
+    db = client.app.state.api._db()
+    assert acquire.other_titles(db, "mb-beta") == {"g-second": ["Zweite", "Sekando"], "g-ost": ["Fuirumu"]}
+    row = db.execute("select * from want_album where rg = 'g-second'").fetchone()
+    assert client.app.state.api.library.target(db, row)["other_titles"] == ["Zweite", "Sekando"]
 
 
 def test_an_artist_with_gaps_gets_a_weekly_bundle_search_in_an_album_searchs_place(client, mb, monkeypatch):

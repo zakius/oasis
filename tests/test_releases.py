@@ -12,7 +12,7 @@ from test_download import WANT, Prowlarr, db, downloads, files, result, tb, torb
 
 def want(title, *names, year="", others=(), discs=1, upgrade=False, native=()):
     return {"artist": names[0], "names": list(names), "title": title, "year": year, "others": list(others), "discs": discs,
-            "upgrade": upgrade, "native": list(native)}
+            "upgrade": upgrade, "native": list(native), "other_titles": []}
 
 
 CREEPY = want("アンサンブル・プレイ", "Creepy Nuts", "クリーピーナッツ", year="2022", others=["クリープ・ショー", "Case", "LEGION"])
@@ -96,6 +96,17 @@ def test_queries_drop_brackets_and_try_the_album_alone_and_the_native_names():
     assert queries(RAMMSTEIN) == ["Rammstein Rammstein", "Rammstein"]  # 'Rammstein' is 9 characters: distinctive
     assert queries(want("Case", "Creepy Nuts", "クリーピーナッツ", native=["クリーピーナッツ"])) == ["Creepy Nuts Case", "クリーピーナッツ Case"]
     assert queries(want("Living Things", "Linkin Park")) == ["Linkin Park Living Things", "Living Things"]
+
+
+def test_an_album_is_also_found_and_matched_by_its_other_titles():
+    creepy = {**CREEPY, "other_titles": ["Ensemble Play"]}
+    assert queries(creepy)[-1] == "Creepy Nuts Ensemble Play"
+    assert reject(result("Creepy Nuts - Ensemble Play (2022) [FLAC 24bit]"), creepy) is None
+    assert reject(result("Creepy Nuts - Ensemble Play (2022) [FLAC 24bit]"), CREEPY) == "no title"
+    assert reject(result("Creepy Nuts - Creep Show (2022) [FLAC]"), creepy) == "no title"
+    assert reject(result("Creepy Nuts - Ensemble Play (Instrumentals) [FLAC]"), creepy) == "variant: instrumentals"
+    # Only whole titles of this album, as a variant of none and another album's title never
+    assert releases.other_titles("ビリケン", ["Biriken", "BIRIKEN (Instrumental)", "biriken", "Case", "ビリケン"], ["Case"]) == ["Biriken"]
 
 
 def test_find_stops_at_the_first_query_with_a_usable_release_and_skips_blocked_ones():
@@ -199,6 +210,14 @@ def test_a_bundles_file_list_gives_the_wanted_albums_each_folder_wholly_holds():
     # Without a year, one title of two release groups is neither.
     assert releases.targets(listing({"Hybrid Theory": ["01 Papercut.flac", "02 One Step Closer.flac", "03 In the End.flac"]}),
                             LP, LP_GROUPS, wanted, editions) == {}
+
+
+def test_a_bundles_album_folder_may_be_named_by_one_of_its_other_titles():
+    groups = [{"id": "g-ens", "title": "アンサンブル・プレイ", "first-release-date": "2022", "other_titles": ["Ensemble Play"]},
+              {"id": "g-cs", "title": "クリープ・ショー", "first-release-date": "2023"}]
+    assert releases.folder_album("Creepy Nuts - Ensemble Play (2022) [FLAC]", CREEPY, groups) == "g-ens"
+    assert releases.folder_album("2022 - アンサンブル・プレイ (Ensemble Play)", CREEPY, groups) == "g-ens"  # both its titles: still one album
+    assert releases.folder_album("Creepy Nuts - Creep Show (2023)", CREEPY, groups) is None
 
 
 def test_a_bundle_is_the_artists_and_says_so_or_holds_two_albums():
