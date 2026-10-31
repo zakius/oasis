@@ -13,7 +13,7 @@ create table if not exists track(
     track_no int, disc_no int, year int, genre text,
     duration int, bitrate int, size int, suffix text, content_type text,
     cover text,                     -- 'embedded', an image path or URL, or null
-    ytm_id text,                    -- YouTube Music videoId, also for local tracks matched to one
+    ytm_id text,                    -- YouTube Music videoId, also for local tracks matched to one; '' when none exists
     ytm_album text,                 -- YouTube Music album browse id
     library int not null default 1, -- 0 for streaming tracks only seen in search or radio
     mtime real, created real

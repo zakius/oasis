@@ -128,3 +128,18 @@ def test_unsatisfiable_range(client, ytm, monkeypatch):
     call(client, "search3", query="remote")
     response = client.get("/rest/stream", params={"u": "admin", "p": "secret", "id": "yt-vid1"}, headers={"Range": "bytes=50-"})
     assert response.status_code == 416 and response.headers["content-range"] == "bytes */10"
+
+
+def test_songs_carry_their_youtube_id(client, ytm, monkeypatch):
+    call(client, "search3", query="remote")
+    assert call(client, "getSong", id="yt-vid1")["song"]["youtubeId"] == "vid1"
+    local = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song A")
+    assert "youtubeId" not in local
+    asked = []
+    monkeypatch.setattr(ytm, "match", lambda track: asked.append(track["title"]) or "vidA", raising=False)
+    assert call(client, "getSong", id=local["id"])["song"]["youtubeId"] == "vidA"
+    monkeypatch.setattr(ytm, "match", lambda track: asked.append(track["title"]) or None, raising=False)
+    other = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song B")
+    assert "youtubeId" not in call(client, "getSong", id=other["id"])["song"]
+    call(client, "getSong", id=other["id"])
+    assert asked == ["Song A", "Song B"]  # a missing match is looked up once

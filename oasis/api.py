@@ -135,7 +135,7 @@ def song(r) -> dict:
         "bitRate": r["bitrate"], "path": str(Path(r["ref"]).relative_to(root)) if r["source"] == "local" else None,
         "albumId": r["album_id"], "artistId": r["artist_id"], "type": "music", "mediaType": "song",
         "created": iso(r["created"]), "starred": iso(r["starred"]), "userRating": r["rating"],
-        "playCount": r["play_count"] or 0, "played": iso(r["played"]),
+        "playCount": r["play_count"] or 0, "played": iso(r["played"]), "youtubeId": r["ytm_id"] or None,
     })
 
 
@@ -380,7 +380,15 @@ class Api:
         self.completed.add(album_id)
 
     def getSong(self, db, p, user):
-        return {"song": song(self._one(db, SONGS + " where t.id = ?", p.need("id")))}
+        r = self._one(db, SONGS + " where t.id = ?", p.need("id"))
+        if r["ytm_id"] is None and self.ytm:
+            # Finds the song on YouTube Music once, for share links; "" remembers that it isn't there.
+            try:
+                db.execute("update track set ytm_id = ? where id = ?", (self.ytm.match(r) or "", r["id"]))
+                r = self._one(db, SONGS + " where t.id = ?", r["id"])
+            except Exception as e:
+                log.info("YouTube Music match for %s failed: %s", r["id"], e)
+        return {"song": song(r)}
 
     def getMusicDirectory(self, db, p, user):
         id = p.need("id")
