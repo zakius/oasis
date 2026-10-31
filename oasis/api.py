@@ -21,6 +21,7 @@ from starlette.routing import Route
 
 from . import accounts, cover, dedupe, forward, lyrics, scan, web, ytm
 from .config import Config
+from .credits import Credits
 from .db import connect, make_id, move_track, remember
 from .forward import Forwarder, LastFm
 from .lidarr import Library, Lidarr
@@ -177,6 +178,93 @@ def artist(r) -> dict:
     })
 
 
+def describe(db, payload: dict) -> dict:
+    """Adds to every song and album in a response what OpenSubsonic clients show beyond the basics: each artist and
+    album artist with their own id, the other contributors by role, ISRCs, labels, release types and genres."""
+    songs, albums = [], []
+
+    def walk(value):
+        if isinstance(value, dict):
+            if value.get("mediaType") == "song":
+                songs.append(value)
+            elif value.get("isDir") and str(value.get("id", "")).startswith("al-"):
+                albums.append(value)
+            for v in value.values():
+                walk(v)
+        elif isinstance(value, list):
+            for v in value:
+                walk(v)
+    walk(payload)
+    if songs:
+        describe_songs(db, songs)
+    if albums:
+        describe_albums(db, albums)
+    return payload
+
+
+def credits_of(db, track_ids: list[str]) -> dict[str, list]:
+    """Each track's credits: MusicBrainz's when it has them, else the file's tags."""
+    rows = db.execute(f"select * from credit where track_id in ({','.join('?' * len(track_ids))}) order by position", track_ids).fetchall()
+    found = {}
+    for r in rows:
+        found.setdefault(r["track_id"], {}).setdefault(r["source"], []).append(r)
+    return {t: sources.get("musicbrainz") or sources.get("tags", []) for t, sources in found.items()}
+
+
+def people(credits, role: str) -> tuple[list[dict], str | None]:
+    """The artists of a role, and how they read together ('A feat. B')."""
+    rows = [c for c in credits if c["role"] == role]
+    if not rows:
+        return [], None
+    joined = "".join(c["name"] + (c["joinphrase"] or "") for c in rows) if any(c["joinphrase"] for c in rows) else ", ".join(c["name"] for c in rows)
+    return [{"id": c["artist_id"], "name": c["name"]} for c in rows], joined
+
+
+def genre_list(r) -> list[dict] | None:
+    names = json.loads(r["genres"]) if r["genres"] else ([r["genre"]] if r["genre"] else [])
+    return [{"name": g} for g in names] or None
+
+
+def describe_songs(db, songs: list[dict]):
+    ids = list({s["id"] for s in songs})
+    credits = credits_of(db, ids)
+    tracks = {r["id"]: r for r in db.execute(f"select id, isrc, genres, genre, mb_recording from track where id in ({','.join('?' * len(ids))})", ids)}
+    for s in songs:
+        mine, track = credits.get(s["id"], []), tracks.get(s["id"])
+        artists, display = people(mine, "artist")
+        album_artists, display_album = people(mine, "albumartist")
+        contributors = [clean({"role": c["role"], "subRole": c["sub_role"], "artist": {"id": c["artist_id"], "name": c["name"]}})
+                        for c in mine if c["role"] not in ("artist", "albumartist")]
+        composers = [c["name"] for c in mine if c["role"] == "composer"] or [c["name"] for c in mine if c["role"] == "writer"]
+        s.update(clean({"artists": artists or None, "displayArtist": display, "albumArtists": album_artists or None,
+                        "displayAlbumArtist": display_album, "contributors": contributors or None,
+                        "displayComposer": ", ".join(dict.fromkeys(composers)) or None}))
+        if track is not None:
+            s.update(clean({"isrc": track["isrc"].split("; ") if track["isrc"] else None, "musicBrainzId": track["mb_recording"],
+                            "genres": genre_list(track)}))
+
+
+def describe_albums(db, albums: list[dict]):
+    ids = list({a["id"] for a in albums})
+    tracks = {r["album_id"]: r for r in db.execute(
+        f"select album_id, min(id) as id, mb_release, label, release_types, original_date, genres, genre from track "
+        f"where album_id in ({','.join('?' * len(ids))}) group by album_id", ids)}
+    credits = credits_of(db, [t["id"] for t in tracks.values()]) if tracks else {}
+    for a in albums:
+        track = tracks.get(a["id"])
+        if track is None:
+            continue
+        artists, display = people(credits.get(track["id"], []), "albumartist")
+        types = [t.strip() for t in (track["release_types"] or "").split(";") if t.strip()]
+        date = [int(x) for x in (track["original_date"] or "").split("-") if x.isdigit()]
+        a.update(clean({"artists": artists or None, "displayArtist": display, "musicBrainzId": track["mb_release"],
+                        "isCompilation": "compilation" in types or None, "recordLabels": [{"name": l} for l in track["label"].split("; ")] if track["label"] else None,
+                        "genres": genre_list(track),
+                        "originalReleaseDate": dict(zip(("year", "month", "day"), date)) if date else None}))
+        if types and not a.get("releaseTypes"):
+            a["releaseTypes"] = [t.title() for t in types]
+
+
 def decode_password(value: str) -> str:
     return bytes.fromhex(value[4:]).decode() if value.startswith("enc:") else value
 
@@ -210,6 +298,7 @@ class Api:
         self.library = Library(self._db, Lidarr(**{k: v for k, v in config.lidarr.items() if k in LIDARR_KEYS})) if config.lidarr else None
         self.scanning = False
         self.scan_lock = threading.Lock()
+        self.credits = Credits(self._db)
 
     def _db(self):
         return connect(self.config.database)
@@ -225,6 +314,7 @@ class Api:
                 scan.scan(db, self.config.library)
                 if self.config.dedupe:
                     self._dedupe(db)
+                self.credits.wake.set()
             finally:
                 db.close()
                 self.scanning = False
@@ -393,7 +483,9 @@ class Api:
         return [song(r) for r in db.execute(SONGS + " where t.album_id = ? order by disc_no, track_no is null, track_no, title", (album_id,))]
 
     def getArtist(self, db, p, user):
-        r = self._one(db, ARTISTS + " where t.artist_id = ? group by t.artist_id", p.need("id"))
+        r = db.execute(ARTISTS + " where t.artist_id = ? group by t.artist_id", (p.need("id"),)).fetchone()
+        if r is None:
+            return self._credited_artist(db, p.need("id"))
         albums = self._artist_albums(db, r["id"])
         known = {a["id"] for a in albums}
         self._artist_page(db, r["id"], r["name"])
@@ -404,6 +496,13 @@ class Api:
                    for x in db.execute("select * from ytm_release where artist_id = ? order by coalesce(year, 0) desc, title", (r["id"],))
                    if x["album_id"] not in known]
         return {"artist": {**artist(r), "albumCount": len(albums), "album": albums}}
+
+    def _credited_artist(self, db, artist_id):
+        """An artist only credited on others' songs (a guest singer, a band member, a composer): the albums they're on."""
+        name = self._one(db, "select name from credit where artist_id = ? order by source = 'tags', role != 'artist' limit 1", artist_id)["name"]
+        albums = [album(r) for r in db.execute(ALBUMS + " where t.id in (select track_id from credit where artist_id = ?) "
+                                               "group by t.album_id order by year, name", (artist_id,))]
+        return {"artist": {"id": artist_id, "name": name, "albumCount": len(albums), "album": albums}}
 
     def _artist_page(self, db, artist_id, name):
         """Fetches the artist's YouTube Music page into ytm_artist and ytm_release, at most once a day."""
@@ -1000,7 +1099,7 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
                 user = api._authenticate(db, p)
                 p.follow_moves(db)
                 result = handler(api, db, p, user)
-                return result if isinstance(result, Response) else respond(fmt, result)
+                return result if isinstance(result, Response) else respond(fmt, describe(db, result))
             except Fail as e:
                 return respond(fmt, {}, e)
             finally:
@@ -1020,6 +1119,7 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
             threading.Thread(target=api._mix_loop, daemon=True).start()
         api.recommender.start()
         api.recommender.wake.set()
+        api.credits.start()
         yield
 
     app = Starlette(routes=[Route("/rest/{method}", endpoint, methods=["GET", "POST"]), *web.routes(api)], lifespan=lifespan)

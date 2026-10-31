@@ -6,6 +6,7 @@ from pathlib import Path
 
 import mutagen
 
+from .credits import store, tag_credits
 from .db import adopt_local_copies, make_id
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ def read(path: Path, root: Path, covers: dict[Path, str | None]) -> dict | None:
     length = getattr(audio.info, "length", 0) or 0
     bitrate = getattr(audio.info, "bitrate", 0) or (stat.st_size * 8 / length if length else 0)
     suffix = path.suffix.lower().lstrip(".")
+    joined = lambda key: "; ".join(str(v) for v in tags.get(key) or []) or None if tags is not None and key in tags else None
     return {
         "id": make_id("tr-", str(path)), "source": "local", "ref": str(path), "root": str(root),
         "title": title, "artist": artist, "album_artist": album_artist, "album": album,
@@ -69,6 +71,10 @@ def read(path: Path, root: Path, covers: dict[Path, str | None]) -> dict | None:
         "suffix": suffix, "content_type": CONTENT_TYPES.get(suffix, "application/octet-stream"),
         "cover": "embedded" if has_embedded_cover(audio) else covers[path.parent],
         "mtime": stat.st_mtime, "created": time.time(),
+        "mb_release": first(tags, "musicbrainz_albumid"), "mb_track": first(tags, "musicbrainz_releasetrackid"),
+        "mb_recording": first(tags, "musicbrainz_trackid"), "isrc": joined("isrc"), "label": joined("label") or joined("organization"),
+        "release_types": joined("releasetype"), "original_date": first(tags, "originaldate"),
+        "_credits": tag_credits(tags),
     }
 
 
@@ -90,10 +96,14 @@ def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
                     log.warning("skipping %s: %s", path, e)
                     continue
                 if row:
+                    credits = row.pop("_credits")
                     columns = ", ".join(row)
                     updates = ", ".join(f"{k} = excluded.{k}" for k in row if k not in ("id", "created"))
+                    # MusicBrainz credits stay while the file is still the same release track.
                     db.execute(f"insert into track({columns}) values ({', '.join('?' * len(row))}) "
-                               f"on conflict(id) do update set {updates}", list(row.values()))
+                               f"on conflict(id) do update set {updates}, credits_at = case when track.mb_track is excluded.mb_track "
+                               "and track.mb_release is excluded.mb_release then track.credits_at end", list(row.values()))
+                    store(db, row["id"], credits, "tags")
                     changed += 1
     gone = [ref for ref in known if ref not in seen]
     db.executemany("delete from track where ref = ?", [(ref,) for ref in gone])

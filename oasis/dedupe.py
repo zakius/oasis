@@ -286,7 +286,10 @@ def dedupe_song(db, rows) -> list[tuple[str, str]]:
     if not matched:
         return []
     changed, done = [], set()
-    for kept in sorted({p for pair in matched for p in pair}, key=lambda p: rank(info(p)), reverse=True):
+    # A copy already kept stays kept when the rest ties: its padding for the clones' tags mustn't make a clone look smaller.
+    already_kept = {r["kept"] for r in shared.values()}
+    key = lambda p: (*rank(info(p))[:-1], p in already_kept, rank(info(p))[-1])
+    for kept in sorted({p for pair in matched for p in pair}, key=key, reverse=True):
         if kept in done:
             continue
         copies = [p for p in {q for pair in matched if kept in pair for q in pair} - {kept} - done]

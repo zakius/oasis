@@ -16,10 +16,23 @@ create table if not exists track(
     ytm_id text,                    -- YouTube Music videoId, also for local tracks matched to one; '' when none exists
     ytm_album text,                 -- YouTube Music album browse id
     library int not null default 1, -- 0 for streaming tracks only seen in search or radio
-    mtime real, created real
+    mtime real, created real,
+    mb_release text, mb_track text, mb_recording text,  -- MusicBrainz release, release track and recording ids
+    isrc text, label text, release_types text, original_date text, -- several values joined with '; '
+    genres text,                    -- JSON list
+    credits_at real                 -- when MusicBrainz credits were filled; -1 when it has none, null while pending
 );
 create index if not exists track_album on track(album_id);
 create index if not exists track_artist on track(artist_id);
+create table if not exists credit(  -- who made each track, as credited
+    track_id text not null, role text not null,  -- artist, albumartist, performer, composer, lyricist, writer, arranger...
+    sub_role text,                  -- performers: instrument or voice
+    name text not null,             -- as credited: a persona or character stays one
+    artist_name text, artist_id text, mbid text, artist_type text, position int, joinphrase text,
+    source text not null            -- musicbrainz or tags
+);
+create index if not exists credit_track on credit(track_id);
+create index if not exists credit_artist on credit(artist_id);
 create table if not exists stat(
     id text primary key,            -- any track, album or artist id
     starred real, rating int, play_count int not null default 0, played real
@@ -93,6 +106,7 @@ def connect(path: Path) -> sqlite3.Connection:
     if path not in migrated:
         db.executescript(SCHEMA)
         migrate(db)
+        db.execute("create index if not exists track_release on track(mb_release)")  # on a column migrate may add
         migrated.add(path)
     return db
 
