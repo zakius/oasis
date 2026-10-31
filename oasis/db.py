@@ -83,6 +83,16 @@ create table if not exists lidarr_item(
 create table if not exists lidarr_rescue(  -- releases oasis grabbed that Lidarr can't tie to their album by name
     hash text primary key, album_id int not null, grabbed real not null
 );
+create table if not exists download(  -- releases oasis downloads through TorBox itself (see download.py)
+    hash text primary key, guid text,       -- info hash; the indexer's id of the release
+    album_id int not null, album_mbid text, -- Lidarr's album, and its MusicBrainz id
+    title text, torbox_id int,
+    state text not null,                    -- added, downloading, fetching, importing, done, failed
+    error text, created real not null, updated real not null
+);
+create table if not exists release_block(  -- releases that failed: never picked again. hash: info hash, or guid for those listed without one
+    hash text primary key, reason text, at real not null
+);
 create table if not exists audio_pair(  -- dedupe verdicts, valid while both files are unchanged
     a text not null, b text not null, a_mtime real not null, b_mtime real not null, level int not null, primary key(a, b)
 );

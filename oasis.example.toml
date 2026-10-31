@@ -32,6 +32,7 @@ secret = ""
 # api_key = ""
 # [torbox]                       # with [lidarr]: unstick Lidarr's downloads (README → Lidarr)
 # rdt_db = "/rdt/rdtclient.db"
+# downloads = "/downloads/oasis"  # oasis downloads through TorBox itself (README → Lidarr)
 
 # Admins. More users can be added on the account page (http://<host>:4533/admin) or with Subsonic's createUser.
 [[users]]

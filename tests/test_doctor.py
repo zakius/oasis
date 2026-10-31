@@ -43,8 +43,9 @@ class FakeLidarr(Lidarr):
     def proposals(self, **where):
         return self.proposed.get(where.get("downloadId") or where.get("folder"), [])
 
-    def manual_import(self, files):
+    def manual_import(self, files, mode="auto"):
         self.imported.append(files)
+        self.mode = mode
         if self.imports_land:
             for f in files:
                 self.files.setdefault(f["albumId"], []).append({"dateAdded": "2099-01-01T00:00:00Z"})
@@ -224,6 +225,13 @@ def test_rule8_unfinished_torrents_rdtclient_does_not_track_are_deleted(doctor, 
                    torrent(4, "finished", progress=1), torrent(5, "inactive", active=False)]
     doctor.cycle()
     assert torbox.deleted == [1]
+
+
+def test_rules8_and_9_leave_oasiss_own_downloads_alone(doctor, torbox, tmp_path):
+    connect(tmp_path / "oasis.db").execute("insert into download(hash, album_id, state, created, updated) values ('ours', 5, 'downloading', 0, 0)")
+    torbox.list = [torrent(1, "OURS", progress=0, seeds=0)]  # untracked by rdtclient, and dead
+    doctor.cycle()
+    assert torbox.deleted == []
 
 
 def test_rule9_dead_torrents_are_replaced_in_lidarr_or_deleted(doctor, lidarr, torbox, rdt):

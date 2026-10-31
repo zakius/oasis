@@ -53,18 +53,24 @@ api_key = "..."            # Lidarr → Settings → General
 
 oasis keeps who wants what, and a worker reconciles Lidarr with it after every star or unstar and every minute. A wanted album is looked up on MusicBrainz through Lidarr by artist and title (punctuation and case aside; collaboration credits are tried artist by artist), added with only that album monitored, and searched: one album search every 3 minutes, so a burst of stars doesn't trip a debrid service's rate limit, and again after 6 hours if nothing came. A wanted artist is followed: new releases get monitored, the back catalogue doesn't, and nothing is searched. Once no user wants an item, oasis only unmonitors it; downloaded files stay. Lookups with no match are retried after 30 minutes, errors and timeouts after 5. An album known only by a romanized YouTube Music title may not match MusicBrainz's original-script title. Lidarr downloads into the music folder, the scan picks the files up, and streams of the same songs move onto them.
 
-Albums and artists carry `oasisWanted`: `wanted`, `downloading` (only while Lidarr's queue holds it) or `failed`, with the reason in `oasisWantedError` (for example "searched, nothing grabbed yet"), and nothing once an album is complete, an artist is followed, or nobody wants it.
+Albums and artists carry `oasisWanted`: `wanted`, `downloading` (only while Lidarr's queue or oasis's own downloads hold it) or `failed`, with the reason in `oasisWantedError` (for example "searched, nothing grabbed yet"), and nothing once an album is complete, an artist is followed, or nobody wants it.
 
 `oasis adopt-lidarr --user NAME` makes NAME follow, as if starred, every artist followed in Lidarr itself that oasis doesn't follow yet, by MusicBrainz id; `--dry-run` only lists them. It first saves their Lidarr monitoring to `adopt-lidarr-<date>.json` next to the database, since the next reconcile monitors their albums and EPs. Unstarring one undoes it.
 
 With a `[torbox]` section as well, a worker fixes what Lidarr and rdtclient leave stuck, every 5 minutes (see `oasis/doctor.py`): failed imports go in against whichever edition of the album the files cover, or the release is blocklisted and searched again; downloads rdtclient finished but never completed get imported; TorBox's queued items, untracked and dead torrents are deleted so its active slots stay free; and slow downloads are swapped for a copy TorBox has cached. It needs the downloads folder at the same path Lidarr sees it.
+
+With `downloads` set, oasis downloads its searches' finds through TorBox itself instead of having Lidarr grab them through rdtclient (see `oasis/download.py`). Of the releases Lidarr's search lists, it picks one TorBox has cached, whatever its seeders, when that is as good as the best Lidarr accepts, else Lidarr's best; it adds it to TorBox with no seeding, fetches the music, cue sheets and cover art one file at a time (paced, two at once) into `downloads/<hash>/` at their paths inside the torrent, and has Lidarr import that folder, moving the files. It starts a download only while fewer than `max_active` torrents are active on the whole TorBox account, anime's included. A dead torrent, a TorBox error or a failed import blocks the release in oasis (not Lidarr's blocklist) and searches the album again; a failed import's files stay 7 days. These downloads don't show in Lidarr's queue. Lidarr's own RSS grabs still go through rdtclient, and the doctor's rules still cover them. Removing `downloads` and restarting goes back to Lidarr grabbing; downloads already running finish.
 
 ```toml
 [torbox]
 rdt_db = "/rdt/rdtclient.db"   # rdtclient's database, read from a copy for the TorBox key and its downloads
 # stall_hours = 1              # no progress this long: the download is dead
 # dry_run = true               # log what it would do, change nothing
+# downloads = "/downloads/oasis"  # oasis's own staging folder, at the same path Lidarr sees it
+# max_active = 8               # TorBox torrents active at which no download starts: Pro has 10, two stay free for anime
 ```
+
+Never point a Lidarr SABnzbd download client at rdtclient's categories: rdtclient's SABnzbd emulation deletes torrents it doesn't own. Usenet isn't supported.
 
 ## Run
 

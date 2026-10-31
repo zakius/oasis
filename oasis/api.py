@@ -24,6 +24,7 @@ from .config import Config
 from .credits import PERFORMANCE_ROLES, Credits
 from .db import connect, make_id, move_track, remember, resolve
 from .doctor import Doctor
+from .download import Downloads
 from .forward import Forwarder, LastFm
 from .lidarr import Library, Lidarr
 from .recommend import Recommender, set_entries
@@ -157,6 +158,7 @@ def song(r) -> dict:
 
 
 LIDARR_KEYS = ("url", "api_key", "root_folder", "quality_profile", "metadata_profile")
+DOCTOR_KEYS = ("rdt_db", "stall_hours", "dry_run")
 # Lidarr progress of starred albums and artists, for clients that show it; complete albums and followed artists need no badge.
 WANTED_STATES = {"wanted": "wanted", "sent": "wanted", "downloading": "downloading", "failed": "failed"}
 
@@ -314,8 +316,13 @@ class Api:
         lastfm = LastFm(config.lastfm_key, config.lastfm_secret or "", None) if config.lastfm_key else None
         self.recommender = Recommender(self._db, self.ytm, lastfm)
         self.completed: set[str] = set()
-        self.library = Library(self._db, Lidarr(**{k: v for k, v in config.lidarr.items() if k in LIDARR_KEYS})) if config.lidarr else None
-        self.doctor = Doctor(self._db, self.library.lidarr, **config.torbox) if self.library and config.torbox else None
+        lidarr = Lidarr(**{k: v for k, v in config.lidarr.items() if k in LIDARR_KEYS}) if config.lidarr else None
+        torbox = config.torbox if lidarr else None
+        self.doctor = Doctor(self._db, lidarr, **{k: v for k, v in torbox.items() if k in DOCTOR_KEYS}) if torbox else None
+        # Its own importer: the doctor's dry run mustn't stop downloads.
+        self.downloads = Downloads(self._db, lidarr, Doctor(self._db, lidarr, torbox["rdt_db"]), torbox["downloads"], torbox.get("max_active", 8),
+                                   torbox.get("stall_hours", 1)) if torbox and torbox.get("downloads") else None
+        self.library = Library(self._db, lidarr, self.downloads) if lidarr else None
         self.scanning = False
         self.scan_lock = threading.Lock()
         self.credits = Credits(self._db)
@@ -1168,6 +1175,8 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
             api.library.start()
         if api.doctor:
             api.doctor.start()
+        if api.downloads:
+            api.downloads.start()
         if api.ytm:
             threading.Thread(target=api._mix_loop, daemon=True).start()
         api.recommender.start()

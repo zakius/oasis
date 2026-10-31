@@ -22,6 +22,7 @@ RESEARCH = 6 * 3600     # seconds before searching again for an album that got n
 GRAB_WAIT = 600         # seconds after a search before "nothing grabbed" counts
 GRAB_TRIES = 5          # accepted releases tried in turn when grabbing fails
 MAX_ACTIVE = 8          # running downloads at which no new search starts: TorBox Pro has 10 slots, two stay free for anime
+RETRY_FULL = 600        # seconds before an album TorBox had no free slot for is searched again
 UPGRADE_AGAIN = 7 * 86400  # seconds between searches for a lossless copy of an album downloaded lossy
 CATALOGUE_TYPES = {"Album", "EP"}  # what of a followed artist's back catalogue gets downloaded; singles repeat album tracks
 RECHECK_CATALOGUE = 86400  # seconds between passes dropping repackages Lidarr monitored as new releases
@@ -176,8 +177,8 @@ class Lidarr:
         """How Lidarr would import a download's files: where is downloadId, or folder (ignored when an id is given)."""
         return self.call("GET", "manualimport?" + urllib.parse.urlencode({**where, "filterExistingFiles": "false"})) or []
 
-    def manual_import(self, files: list[dict]) -> dict:
-        return self.call("POST", "command", {"name": "ManualImport", "importMode": "auto", "replaceExistingFiles": False, "files": files})
+    def manual_import(self, files: list[dict], mode: str = "auto") -> dict:
+        return self.call("POST", "command", {"name": "ManualImport", "importMode": mode, "replaceExistingFiles": False, "files": files})
 
     def command(self, command_id: int) -> dict:
         return self.call("GET", f"command/{command_id}")
@@ -228,10 +229,11 @@ def artist_names(credit: str) -> list[str]:
 
 class Library:
     """Reconciles Lidarr with what users starred: wanted albums get added and searched (paced), wanted artists
-    followed for new releases, and items nobody wants any more unmonitored."""
+    followed for new releases, and items nobody wants any more unmonitored. With downloads (download.py), oasis
+    downloads what the searches find through TorBox itself; without, Lidarr grabs it through its download client."""
 
-    def __init__(self, connect, lidarr: Lidarr):
-        self.connect, self.lidarr = connect, lidarr
+    def __init__(self, connect, lidarr: Lidarr, downloads=None):
+        self.connect, self.lidarr, self.downloads = connect, lidarr, downloads
         self.wake = threading.Event()
         self.last_search = 0.0
 
@@ -253,6 +255,8 @@ class Library:
             for kind, ref in db.execute("select distinct kind, ref from wanted").fetchall():
                 db.execute("insert or ignore into lidarr_item(kind, ref, state, updated) values (?, ?, 'wanted', ?)", (kind, ref, time.time()))
             queued_albums, queued_artists, running = self.lidarr.queued()
+            if self.downloads:
+                queued_albums |= self.downloads.albums(db)
             for item in db.execute("select * from lidarr_item").fetchall():
                 wanted = db.execute("select 1 from wanted where kind = ? and ref = ?", (item["kind"], item["ref"])).fetchone()
                 if wanted and (item["retry_at"] or 0) > time.time():
@@ -269,10 +273,21 @@ class Library:
                 except Exception as e:  # Lidarr or MusicBrainz down, timeouts: soon again
                     log.warning("Lidarr: %s %s: %s", item["kind"], item["ref"], e)
                     set_state(db, item, "wanted" if not item["mbid"] else item["state"], str(e)[:300], retry=RETRY_ERROR)
-            if running < MAX_ACTIVE:
+            if self.room(running):
                 self.search_next(db, queued_albums)
         finally:
             db.close()
+
+    def room(self, running: int) -> bool:
+        """Whether a search may start: few enough downloads in Lidarr's queue, or with oasis's own downloads, few
+        enough active TorBox torrents."""
+        if not self.downloads:
+            return running < MAX_ACTIVE
+        try:
+            return self.downloads.room()
+        except OSError as e:
+            log.warning("TorBox: %s", e)
+            return False
 
     def names(self, db, item) -> tuple[str, str | None]:
         column = "album_id" if item["kind"] == "album" else "artist_id"
@@ -324,8 +339,13 @@ class Library:
             return "downloading", None
         db.execute("update lidarr_item set lidarr_id = ? where kind = ? and ref = ?", (album["id"], item["kind"], item["ref"]))
         if item["searched"] and time.time() - item["searched"] > GRAB_WAIT:
-            return "sent", self.lidarr.why_nothing(album["id"])
+            return "sent", self.why_nothing(db, album["id"])
         return "sent", "waiting for its search" if not item["searched"] else "searching"
+
+    def why_nothing(self, db, album_id: int) -> str:
+        failed = db.execute("select error from download where album_id = ? and state = 'failed' order by updated desc limit 1",
+                            (album_id,)).fetchone() if self.downloads else None
+        return f"download failed: {failed[0]}" if failed else self.lidarr.why_nothing(album_id)
 
     def monitor_catalogue(self, db, item, artist, first: bool):
         """Monitors the artist's albums and EPs so the paced search downloads them, except repackages: best-ofs,
@@ -358,22 +378,27 @@ class Library:
                           "and (searched is null or searched < ?) and exists (select 1 from wanted w where w.kind = 'album' "
                           "and w.ref = lidarr_item.ref) order by searched is not null, searched, rowid limit 1", (time.time() - RESEARCH,)).fetchone()
         if item is not None and item["lidarr_id"] not in queued_albums:
-            self.search(db, item["lidarr_id"])
+            searched = self.search(db, item["lidarr_id"])
             self.last_search = time.time()
             db.execute("update lidarr_item set searched = ?, error = 'searching' where kind = ? and ref = ?",
-                       (self.last_search, item["kind"], item["ref"]))
+                       (searched, item["kind"], item["ref"]))
         elif item is None:
             self.search_catalogue(db, queued_albums)
 
-    def search(self, db, album_id: int):
-        """Never raises: a search that fails still counts, so the next search moves on to another album."""
+    def search(self, db, album_id: int) -> float:
+        """Never raises: a search that fails still counts, so the next search moves on to another album. Returns the
+        time to record as the album's last search: one TorBox had no free slot for is due again after RETRY_FULL."""
+        now = time.time()
         try:
+            if self.downloads:
+                return now if self.downloads.search(db, album_id) else now - RESEARCH + RETRY_FULL
             hash = self.lidarr.search_album(album_id)
         except OSError as e:
             log.warning("search for Lidarr album %d failed: %s", album_id, e)
-            return
+            return now
         if hash:  # the doctor imports it into this album
-            db.execute("insert or replace into lidarr_rescue values (?, ?, ?)", (hash, album_id, time.time()))
+            db.execute("insert or replace into lidarr_rescue values (?, ?, ?)", (hash, album_id, now))
+        return now
 
     def search_catalogue(self, db, queued_albums: set):
         followed = {r[0] for r in db.execute("select lidarr_id from lidarr_item where kind = 'artist' and lidarr_id is not null "
@@ -388,9 +413,9 @@ class Library:
             return
         # Never searched first, then albums and EPs before singles; stable, so Lidarr's newest-first order otherwise.
         album = min(due, key=lambda a: (a["id"] in searched, a.get("albumType") == "Single"))
-        self.search(db, album["id"])
+        searched = self.search(db, album["id"])
         self.last_search = time.time()
-        db.execute("insert or replace into catalogue_search values (?, ?)", (album["id"], self.last_search))
+        db.execute("insert or replace into catalogue_search values (?, ?)", (album["id"], searched))
 
     def release(self, db, item):
         """Nobody wants it any more: stop Lidarr looking for it, and for an artist's albums not downloaded yet. Files stay."""

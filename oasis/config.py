@@ -15,7 +15,8 @@ class Config:
     lastfm_key: str | None = None
     lastfm_secret: str | None = None
     lidarr: dict | None = None  # url, api_key, and optionally root_folder, quality_profile, metadata_profile
-    torbox: dict | None = None  # rdt_db (rdtclient's database, which holds the TorBox key), stall_hours, dry_run (see doctor.py)
+    torbox: dict | None = None  # rdt_db (rdtclient's database, which holds the TorBox key), stall_hours, dry_run (see doctor.py),
+                                # downloads, max_active (see download.py)
     artists: dict = dataclasses.field(default_factory=dict)  # merge, separate and related names (see artists.py)
     dedupe: bool = False        # store each audio stream once (see dedupe.py); needs the library writable, on btrfs or XFS
 

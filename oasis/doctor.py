@@ -115,6 +115,7 @@ class Doctor:
         db = self.connect()
         try:
             rescued = dict(db.execute("select hash, album_id from lidarr_rescue").fetchall())
+            ours = {h for (h,) in db.execute("select hash from download")}  # oasis's own TorBox downloads (download.py)
         finally:
             db.close()
         for item in queue:
@@ -150,11 +151,12 @@ class Doctor:
                     self.remove(item)
                 elif error or stalled:
                     self.replace(item, item.get("errorMessage") or "stalled", queue, searched)
-        torrents = self.sweep(torbox, queue, searched, now) if torbox else []
+        torrents = self.sweep(torbox, queue, searched, now, ours) if torbox else []
         log.info("doctor: %d downloads in Lidarr's queue, %d TorBox torrents", len(queue), len(torrents))
 
-    def try_import(self, item, folder=None) -> bool:
-        """folder: where the files are, for downloads Lidarr still thinks are running (it proposes nothing by id then)."""
+    def try_import(self, item, folder=None, mode="auto") -> bool:
+        """folder: where the files are, for downloads Lidarr still thinks are running (it proposes nothing by id then),
+        or doesn't know (oasis's own, with downloadId None). mode: Lidarr's importMode."""
         where = {"folder": folder} if folder else {"downloadId": item["downloadId"]}
         proposals = self.lidarr.proposals(**where)
         if not proposals:
@@ -164,11 +166,11 @@ class Doctor:
             proposals = self.lidarr.proposals(**where)
 
         # Lidarr's own match is clean: import it as proposed.
-        if all(p.get("tracks") and not p.get("rejections") for p in proposals):
+        if all(p.get("tracks") and not p.get("rejections") and (p.get("album") or {}).get("id") == item["albumId"] for p in proposals):
             files = [{"path": p["path"], "artistId": p["artist"]["id"], "albumId": p["album"]["id"], "albumReleaseId": p["albumReleaseId"],
                       "trackIds": [t["id"] for t in p["tracks"]], "quality": p["quality"], "downloadId": item["downloadId"],
                       "indexerFlags": 0, "disableReleaseSwitching": False} for p in proposals]
-            return self.import_files(item, files, proposals[0]["albumReleaseId"])
+            return self.import_files(item, files, proposals[0]["albumReleaseId"], mode)
 
         # Otherwise find an edition the files cover completely; prefer the one with the most tracks.
         album = self.lidarr.album_by_id(item["albumId"])
@@ -182,7 +184,7 @@ class Doctor:
                           "disableReleaseSwitching": False} for track_id, f in mapping.items()]
                 self.say("matched", item["title"][:70], "to", release["trackCount"], "track edition",
                          release.get("format"), release.get("country"), release.get("disambiguation") or "")
-                return self.import_files(item, files, release["id"])
+                return self.import_files(item, files, release["id"], mode)
         return False
 
     def fix_extensions(self, folder: str):
@@ -196,11 +198,11 @@ class Doctor:
                             os.link(os.path.join(root, name), target)
                         self.say("renamed", name, "->", os.path.basename(target))
 
-    def import_files(self, item, files, release_id) -> bool:
+    def import_files(self, item, files, release_id, mode="auto") -> bool:
         if self.dry:
             self.say("import", item["title"][:70], f"({len(files)} files) as release", release_id)
             return True
-        cmd = self.lidarr.manual_import(files)
+        cmd = self.lidarr.manual_import(files, mode)
         for _ in range(150):
             status = self.lidarr.command(cmd["id"])
             if status["status"] in ("completed", "failed", "aborted"):
@@ -258,11 +260,12 @@ class Doctor:
             self.lidarr.grab(best)
             self.remove(item)
 
-    def sweep(self, torbox, queue, searched, now) -> list[dict]:
+    def sweep(self, torbox, queue, searched, now, ours=frozenset()) -> list[dict]:
         """TorBox queues adds beyond the plan's active slots, and rdtclient reports those as failed: queued ones are orphans
         that would take the slots later, and so are active ones rdtclient no longer tracks (TorBox started them after the
         add was reported failed). Dead torrents (no seeds, no progress for stall_hours, at any percentage) hold slots
-        forever: Lidarr's get replaced, others (Sonarr's) are deleted, which rdtclient reports to their owner as failed."""
+        forever: Lidarr's get replaced, others (Sonarr's) are deleted, which rdtclient reports to their owner as failed.
+        oasis's own downloads (ours) are left to download.py."""
         for q in torbox.queued():
             self.say("drop queued orphan", (q.get("name") or q.get("hash") or "")[:70])
             if not self.dry:
@@ -271,6 +274,8 @@ class Doctor:
         tracked = {h.lower() for (h,) in read_copy(self.rdt_db, "select Hash from Torrents where Completed is null and Hash is not null")}
         torrents = torbox.torrents()
         for t in torrents:
+            if t["hash"].lower() in ours:
+                continue
             age = now - datetime.fromisoformat(t["created_at"].replace("Z", "+00:00"))
             item = mine.get(t["hash"].lower())
             running = t["active"] and t["progress"] < 1
