@@ -382,8 +382,13 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     api.library.downloads.active.add(BOOTLEG)
     sync(client)
     page = client.get("/music/wanted").text
-    assert page.index("BOOTLEG") < page.index("Lemon") < page.index("STRAY SHEEP")  # downloading, starred, followed
-    assert "downloading 42%" in page and "download failed: dead torrent" in page and "not found yet, searched 0 min ago" in page
+    assert page.index("Needs a look") < page.index("Lemon") < page.index("Downloading") < page.index("BOOTLEG") \
+        < page.index("Not found yet") < page.index("STRAY SHEEP")  # what needs a look first
+    assert "42%" in page and "download failed: dead torrent" in page and "searched 0 min ago" in page
+    filtered = client.get("/music/wanted", params={"type": "Single", "q": "stray"}).text
+    assert "STRAY SHEEP" not in filtered or "Lemon" not in filtered
+    library = client.get("/music/library").text
+    assert "米津玄師" in library and "Lemon" in library and "wanted" in library and "downloading" in library
 
     assert "searched next" in client.post(f"/music/wanted/{STRAY}/search").text
     monkeypatch.setattr(api.library, "search", lambda db, row: setattr(api.library, "searched", row["rg"]))
@@ -398,6 +403,8 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
 
     assert "Gave up on 米津玄師 – BOOTLEG" in client.post(f"/music/wanted/{BOOTLEG}/give-up").text
     client.post(f"/music/wanted/{LEMON}/give-up")
+    assert "Gave up on 1 album" in client.post("/music/wanted/give-up", data={"rgs": STRAY}).text
+    db.execute("delete from given_up where rg = ?", (STRAY,))  # wanted again
     db.execute("update lidarr_item set catalogued = 0")
     sync(client)
     sync(client)

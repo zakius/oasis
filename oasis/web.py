@@ -5,14 +5,14 @@ import re
 import time
 import urllib.request
 from html import escape
-from urllib.parse import parse_qsl, quote
+from urllib.parse import parse_qsl, quote, urlencode
 
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
 from starlette.routing import Route
 
-from . import accounts, acquire, musicbrainz, releases
+from . import accounts, acquire, importer, musicbrainz, releases
 from .acquire import MB_IDS, TYPES
 from .forward import LastFm
 
@@ -36,12 +36,52 @@ button { padding: .4rem 1rem; border-radius: 8px; border: 1px solid #888; cursor
 .ok { color: #1a7f37; } .error { color: #c62828; } .muted { opacity: .7; font-size: .9rem; }
 ol { padding-left: 1.2rem; } form.inline { display: inline; } td { padding: .2rem .6rem .2rem 0; vertical-align: top; }
 li { margin: .25rem 0; } form.inline button { padding: .1rem .6rem; font-size: .85rem; }
+body.wide { max-width: 72rem; } a { color: #2f6fd0; } @media (prefers-color-scheme: dark) { a { color: #7fb0ff; } }
+table.grid { width: 100%; border-collapse: collapse; font-size: .93rem; }
+table.grid th { text-align: left; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; opacity: .65; padding: .35rem .5rem;
+                border-bottom: 1px solid #8885; font-weight: 600; }
+table.grid td { padding: .4rem .5rem; border-bottom: 1px solid #8882; vertical-align: middle; }
+table.grid tr:hover td { background: #8881; } table.grid tr.dim td { opacity: .55; }
+.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; } .actions { text-align: right; white-space: nowrap; }
+.actions form { display: inline; } .actions button, .bulk button { padding: .15rem .6rem; font-size: .8rem; }
+.pill { display: inline-block; padding: 0 .55rem; border-radius: 999px; font-size: .78rem; font-weight: 500; background: #8882; white-space: nowrap; }
+.pill.bad { background: #c628282e; } .pill.good { background: #1a7f372e; } .pill.busy { background: #1565c02e; }
+details > summary { cursor: pointer; list-style: none; } details > summary::-webkit-details-marker { display: none; }
+details > summary::before { content: "▸"; display: inline-block; width: 1em; transition: transform .15s; opacity: .6; }
+details[open] > summary::before { transform: rotate(90deg); }
+details.group { margin: .8rem 0; } details.group > summary { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; font-weight: 600; padding: .3rem 0; }
+details.group > summary .bulk { margin-left: auto; font-weight: normal; }
+details.artist { border-bottom: 1px solid #8883; padding: .35rem 0; } details.artist > summary, details.album > summary {
+  display: flex; flex-wrap: wrap; gap: .25rem .75rem; align-items: baseline; }
+details.artist > summary b { font-size: 1.05rem; } details.album { margin: .2rem 0 .2rem 1.2rem; }
+.dim-row { opacity: .6; display: flex; flex-wrap: wrap; gap: .25rem .75rem; align-items: baseline; padding-left: 1em; }
+details.album > table { margin: .3rem 0 .6rem 1em; width: calc(100% - 1em); } .right { margin-left: auto; }
+.filters { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; } .filters input[type=text] { width: auto; flex: 1 1 12rem; margin: 0; }
+.filters select { font: inherit; padding: .35rem; }
+@media (max-width: 640px) {
+  body { margin: 1rem auto; } section { padding: .8rem .9rem; }
+  table.grid thead { display: none; } table.grid, table.grid tbody, table.grid tr, table.grid td { display: block; width: 100%; box-sizing: border-box; }
+  table.grid tr { border-bottom: 1px solid #8884; padding: .45rem 0; } table.grid td { border: 0; padding: .05rem .2rem; }
+  table.grid td.lead { font-weight: 600; } table.grid td[data-label]::before { content: attr(data-label) " "; opacity: .55; font-size: .78rem; }
+  .num, .actions { text-align: left; } .actions { padding-top: .3rem !important; } details.album { margin-left: .4rem; }
+  details.album > table { margin-left: 0; width: 100%; } details.group > summary .bulk { margin-left: 0; width: 100%; }
+}
 """
 
 
 STATES = {"added": "waiting for TorBox", "downloading": "TorBox downloading", "fetching": "copying here", "importing": "importing"}
 MBID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-MUSIC_NAV = '<p><a href="/account">Your account</a> · <a href="/music">Find music</a> · <a href="/music/wanted">Wanted</a></p>'
+MUSIC_NAV = ('<p><a href="/account">Your account</a> · <a href="/music/library">Library</a> · <a href="/music">Find music</a> · '
+             '<a href="/music/wanted">Wanted</a></p>')
+
+
+def length(seconds) -> str:
+    seconds = int(seconds or 0)
+    return f"{seconds // 3600}:{seconds // 60 % 60:02}:{seconds % 60:02}" if seconds >= 3600 else f"{seconds // 60}:{seconds % 60:02}"
+
+
+def size(n) -> str:
+    return f"{(n or 0) / 1e9:.1f} GB" if (n or 0) >= 1e9 else f"{(n or 0) / 1e6:.0f} MB"
 
 
 def ago(ts: float) -> str:
@@ -53,11 +93,11 @@ async def read_form(request: Request) -> dict:
     return dict(parse_qsl((await request.body()).decode()))
 
 
-def page(title: str, body: str, message: str = "", error: str = "") -> HTMLResponse:
+def page(title: str, body: str, message: str = "", error: str = "", wide: bool = False) -> HTMLResponse:
     notice = f'<p class="ok">{escape(message)}</p>' if message else ""
     notice += f'<p class="error">{escape(error)}</p>' if error else ""
     return HTMLResponse(f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
-                        f'<title>{escape(title)} · oasis</title><style>{STYLE}</style></head><body><h1>{escape(title)}</h1>'
+                        f'<title>{escape(title)} · oasis</title><style>{STYLE}</style></head><body{' class="wide"' if wide else ""}><h1>{escape(title)}</h1>'
                         f'{notice}{body}</body></html>')
 
 
@@ -392,35 +432,80 @@ def routes(api) -> list[Route]:
 
     def wanted(db, request, user, form):
         q, acq = request.query_params, api.library
+        artist_f, type_f, text = q.get("artist", ""), q.get("type", ""), q.get("q", "").strip()
+        here = "/music/wanted" + ("?" + urlencode({k: v for k, v in (("artist", artist_f), ("type", type_f), ("q", text)) if v})
+                                  if artist_f or type_f or text else "")
         active = {r["rg"]: r for r in db.execute("select d.hash, d.state, coalesce(t.rg, d.album_mbid) rg from download d left join download_target t "
                                                  "on t.hash = d.hash where d.state not in ('done', 'failed') and coalesce(t.rg, d.album_mbid) is not null")}
 
-        def state(r) -> str:
+        def place(r) -> tuple[str, str]:
+            """The group a wanted album goes in, and what to say about it."""
             if d := active.get(r["rg"]):
                 seen = api.downloads.seen.get(d["hash"]) if api.downloads else None
-                return f"downloading {seen[0]:.0%}" if d["state"] == "downloading" and seen else STATES.get(d["state"], d["state"])
+                return "downloading", (f'<span class="pill busy">{seen[0]:.0%}</span>' if d["state"] == "downloading" and seen
+                                       else f'<span class="pill busy">{STATES.get(d["state"], d["state"])}</span>')
             if r["state"] == "downloading":
-                return "downloading"
-            if r["rg"] in acq.soon:
-                return "searched next"
+                return "downloading", '<span class="pill busy">downloading</span>'
             if (r["error"] or "").startswith(("download failed", "search failed")):
-                return f'<span class="error">{escape(r["error"])}</span>'
-            return f'not found yet, searched {ago(r["searched"])}' if r["searched"] else "waiting for its first search"
+                return "attention", f'<span class="error">{escape(r["error"])}</span>'
+            if r["rg"] in acq.soon:
+                return "next", '<span class="pill">in a minute or two</span>'
+            return ("notfound", f'searched {ago(r["searched"])}') if r["searched"] else ("waiting", "")
 
-        action = lambda rg, name, label: (f'<form class="inline" method="post" action="/music/wanted/{escape(rg)}/{name}">'
-                                          f'<button>{label}</button></form>')
-        rows = db.execute("select * from want_album where state in ('missing', 'downloading') order by state != 'downloading', "
-                          "reason != 'starred', artist collate nocase, first_date").fetchall()
-        lines = "".join(
-            f'<tr><td><a href="/music/artist/{escape(r["artist_mbid"])}">{escape(r["artist"] or "")}</a> – {escape(r["title"])} '
-            f'{details(r["primary_type"], (r["first_date"] or "")[:4], "starred" if r["reason"] == "starred" else "")}</td><td>{state(r)}</td><td>'
-            + (action(r["rg"], "search", "Search now") if r["state"] == "missing" else action(r["rg"], "block", "Block, try another"))
-            + action(r["rg"], "give-up", "Give up") + '</td></tr>' for r in rows)
+        def action(rg: str, name: str, label: str) -> str:
+            return (f'<form method="post" action="/music/wanted/{escape(rg)}/{name}"><input type="hidden" name="next" value="{escape(here)}">'
+                    f'<button>{label}</button></form>')
+
+        where, params = ["state in ('missing', 'downloading')"], []
+        if artist_f:
+            where.append("artist_mbid = ?"), params.append(artist_f)
+        if type_f:
+            where.append("primary_type = ?"), params.append(type_f)
+        if text:
+            where.append("(title like ? or artist like ?)"), params.extend([f"%{text}%"] * 2)
+        rows = db.execute(f"select * from want_album where {' and '.join(where)} order by reason != 'starred', artist collate nocase, "
+                          "primary_type != 'Album', primary_type != 'EP', first_date", params).fetchall()
+        groups: dict[str, list] = {}
+        for r in rows:
+            name, note = place(r)
+            groups.setdefault(name, []).append((r, note))
+        artists = db.execute("select artist_mbid, artist, count(*) n from want_album where state in ('missing', 'downloading') "
+                             "group by artist_mbid order by artist collate nocase").fetchall()
+        option = lambda value, label, chosen: f'<option value="{escape(value)}"{" selected" if value == chosen else ""}>{escape(label)}</option>'
         counts = dict(db.execute("select state, count(*) from want_album group by state").fetchall())
-        body = (f'{MUSIC_NAV}<section><p>{counts.get("missing", 0)} albums to find, {counts.get("downloading", 0)} downloading; '
-                f'{counts.get("have", 0)} wanted ones are here, {counts.get("skipped", 0)} of followed artists are left out.</p>'
-                f'<p class="muted">Giving up stops the search; files already here stay.</p>'
-                f'<table>{lines}</table></section>')
+        body = (f'{MUSIC_NAV}<section><p>{counts.get("missing", 0)} albums to find, {counts.get("downloading", 0)} downloading · '
+                f'{counts.get("have", 0)} wanted ones are here · {counts.get("skipped", 0)} of followed artists left out.</p>'
+                f'<form class="filters"><select name="artist">{option("", "All artists", artist_f)}'
+                + "".join(option(a["artist_mbid"], f'{a["artist"]} ({a["n"]})', artist_f) for a in artists)
+                + f'</select><select name="type">{option("", "Any type", type_f)}'
+                + "".join(option(t, t, type_f) for t in ("Album", "EP", "Single"))
+                + f'</select><input type="text" name="q" value="{escape(text)}" placeholder="Title or artist"><button>Filter</button>'
+                + (' <a href="/music/wanted">Clear</a>' if here != "/music/wanted" else "") + '</form>'
+                + '<p class="muted">Giving up stops the search; files already here stay, and wanting it again brings it back.</p>')
+        titles = [("attention", "Needs a look"), ("downloading", "Downloading"), ("next", "Searched next"),
+                  ("notfound", "Not found yet"), ("waiting", "Waiting for a first search")]
+        for key, title in titles:
+            items = groups.get(key, [])
+            if not items:
+                continue
+            bulk = (f'<form class="bulk" method="post" action="/music/wanted/give-up"><input type="hidden" name="rgs" '
+                    f'value="{",".join(r["rg"] for r, _ in items)}"><input type="hidden" name="next" value="{escape(here)}">'
+                    f'<button>Give up on {"these " + str(len(items)) if len(items) > 1 else "it"}</button></form>')
+            table = "".join(
+                f'<tr><td class="lead"><a href="/music/artist/{escape(r["artist_mbid"])}">{escape(r["artist"] or "")}</a> – '
+                f'{escape(r["title"])}</td><td>{escape(r["primary_type"] or "")}'
+                f'{" · " + escape(r["secondary_types"]) if r["secondary_types"] else ""}</td>'
+                f'<td class="num">{escape((r["first_date"] or "")[:4])}</td>'
+                f'<td>{"★ starred" if r["reason"] == "starred" else "followed"}</td><td>{note}</td>'
+                f'<td class="actions">{action(r["rg"], "block", "Try another") if key == "downloading" else action(r["rg"], "search", "Search now")}'
+                f'{action(r["rg"], "give-up", "Give up")}</td></tr>' for r, note in items)
+            opened = " open" if key in ("attention", "downloading", "next") or len(items) <= 30 else ""
+            body += (f'<details class="group"{opened}><summary>{title} <span class="pill">{len(items)}</span>{bulk}</summary>'
+                     f'<table class="grid"><thead><tr><th>Album</th><th>Type</th><th class="num">Year</th><th>Why</th><th>State</th><th></th>'
+                     f'</tr></thead><tbody>{table}</tbody></table></details>')
+        if not rows:
+            body += '<p class="muted">Nothing wanted matches.</p>' if here != "/music/wanted" else '<p class="muted">Nothing left to find.</p>'
+        body += '</section>'
         lost = db.execute("select li.*, exists (select 1 from wanted w where w.kind = li.kind and w.ref = li.ref and w.user = ?) mine "
                           "from lidarr_item li where li.state = 'failed' and exists (select 1 from wanted w where w.kind = li.kind "
                           "and w.ref = li.ref)", (user["name"],)).fetchall()
@@ -430,30 +515,110 @@ def routes(api) -> list[Route]:
                      "artist": ("select album_artist from track where artist_id = ?", "select name from ytm_artist where artist_id = ?")}
             name = lambda r: next((row[0] for sql in names[r["kind"]] if (row := db.execute(sql, (r["ref"],)).fetchone())), r["ref"])
             body += ('<section><h2>Not found on MusicBrainz</h2><p class="muted">Starred, but oasis can\'t tell which MusicBrainz '
-                     'artist or album it is; it asks again later. Find it above and want it from there instead.</p><ul>' + "".join(
-                         f'<li>{escape(name(r))} {details(r["kind"])} <span class="error">{escape(r["error"] or "")}</span> ' + (
-                             f'<form class="inline" method="post" action="/music/unwant"><input type="hidden" name="kind" value="{r["kind"]}">'
+                     'artist or album it is; it asks again later. Find it and want it from there instead.</p><table class="grid"><tbody>' + "".join(
+                         f'<tr><td class="lead">{escape(name(r))}</td><td>{escape(r["kind"])}</td><td><span class="error">{escape(r["error"] or "")}</span></td>'
+                         f'<td class="actions">' + (
+                             f'<form method="post" action="/music/unwant"><input type="hidden" name="kind" value="{r["kind"]}">'
                              f'<input type="hidden" name="ref" value="{escape(r["ref"])}"><button>Give up</button></form>' if r["mine"] else "")
-                         + '</li>' for r in lost) + '</ul></section>')
-        return page("Wanted", body, q.get("message", ""), q.get("error", ""))
+                         + '</td></tr>' for r in lost) + '</tbody></table></section>')
+        return page("Wanted", body, q.get("message", ""), q.get("error", ""), wide=True)
 
-    def wanted_action(db, request, user, form):
-        rg, action = request.path_params["rg"], request.path_params["action"]
-        row = db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
-        if row is None or action not in ("search", "block", "give-up"):
-            return back("/music/wanted", error="That album isn't wanted any more.")
-        name = f'{row["artist"]} – {row["title"]}'
-        if action == "block" and not (api.downloads and api.downloads.block(db, rg)):
-            return back("/music/wanted", error=f"Nothing is downloading for {name} that can still be stopped.")
-        if action in ("search", "block"):
-            api.library.soon.add(rg)
-            api.library.wake.set()
-            return back("/music/wanted", message=f"{name} is searched next, in a minute or two." if action == "search" else
-                        f"Blocked that release of {name}; the next search picks another.")
+    def music_library(db, request, user, form):
+        """Every artist with music here or wanted: its albums, here or not yet, and an album's songs."""
+        q = request.query_params
+        text, show = q.get("q", "").strip(), q.get("show", "")
+        tracks = db.execute("select t.*, s.play_count plays, s.starred from track t left join stat s on s.id = t.id where t.source = 'local' "
+                            "order by t.year, t.album collate nocase, t.disc_no, t.track_no, t.title").fetchall()
+        mbid_of = dict(db.execute("select artist_id, mbid from mb_artist").fetchall())
+        followed = {r[0] for r in db.execute("select ref from wanted where kind = 'artist'")}
+        artists: dict[str, dict] = {}
+        for t in tracks:
+            a = artists.setdefault(mbid_of.get(t["artist_id"]) or t["artist_id"], {"name": t["album_artist"], "ids": set(), "albums": {}, "wanted": []})
+            a["ids"].add(t["artist_id"])
+            a["albums"].setdefault(t["album_id"], []).append(t)
+        for w in db.execute("select * from want_album where state in ('missing', 'downloading') order by first_date").fetchall():
+            artists.setdefault(w["artist_mbid"], {"name": w["artist"], "ids": set(), "albums": {}, "wanted": []})["wanted"].append(w)
+        downloading = {r[0] for r in db.execute("select coalesce(t.rg, d.album_mbid) from download d left join download_target t on t.hash = d.hash "
+                                                "where d.state not in ('done', 'failed')")}
+
+        def fmt(rows) -> str:
+            kinds = sorted({r["suffix"] for r in rows if r["suffix"]})
+            lossy = [r["bitrate"] for r in rows if (r["suffix"] or "") not in importer.LOSSLESS and r["bitrate"]]
+            return " / ".join(k.upper() for k in kinds) + (f" {round(sum(lossy) / len(lossy))}k" if lossy else "")
+
+        def song(t, album_artist: str) -> str:
+            number = f'{t["disc_no"]}-{t["track_no"]}' if (t["disc_no"] or 1) > 1 else str(t["track_no"] or "")
+            by = f' <span class="muted">{escape(t["artist"])}</span>' if t["artist"] and t["artist"] != album_artist else ""
+            return (f'<tr><td class="num">{number}</td><td class="lead">{"★ " if t["starred"] else ""}{escape(t["title"])}{by}</td>'
+                    f'<td class="num">{length(t["duration"])}</td><td>{escape(fmt([t]))}</td><td class="num">{size(t["size"])}</td>'
+                    f'<td class="num">{t["plays"] or 0} plays</td></tr>')
+
+        def album(rows) -> str:
+            t = rows[0]
+            kind = (t["release_types"] or "").split(";")[0].strip().title()
+            info = " · ".join(filter(None, [str(t["year"] or ""), kind, f"{len(rows)} songs", length(sum(r["duration"] or 0 for r in rows)),
+                                            fmt(rows), size(sum(r["size"] or 0 for r in rows)), f'{sum(r["plays"] or 0 for r in rows)} plays']))
+            return (f'<details class="album"><summary><span>{escape(t["album"])}</span><span class="pill good">here</span>'
+                    f'<span class="muted">{escape(info)}</span></summary><table class="grid"><tbody>'
+                    + "".join(song(r, t["album_artist"]) for r in rows) + '</tbody></table></details>')
+
+        def missing(w) -> str:
+            state = ('<span class="pill busy">downloading</span>' if w["state"] == "downloading" or w["rg"] in downloading else
+                     f'<span class="pill">wanted · not found yet, searched {ago(w["searched"])}</span>' if w["searched"] else
+                     '<span class="pill">wanted · waiting for a first search</span>')
+            info = " · ".join(filter(None, [(w["first_date"] or "")[:4], w["primary_type"], "starred" if w["reason"] == "starred" else ""]))
+            return (f'<div class="album dim-row"><span>{escape(w["title"])}</span> {state} <span class="muted">{escape(info)}</span></div>')
+
+        body = (f'{MUSIC_NAV}<section><form class="filters"><input type="text" name="q" value="{escape(text)}" placeholder="Artist">'
+                f'<select name="show">' + "".join(f'<option value="{v}"{" selected" if v == show else ""}>{label}</option>' for v, label in
+                                                    (("", "Everything"), ("here", "Only what's here"), ("wanted", "Only artists with wanted albums")))
+                + '</select><button>Show</button></form></section><section>')
+        shown = 0
+        for key, a in sorted(artists.items(), key=lambda kv: (kv[1]["name"] or "").casefold()):
+            if text and text.casefold() not in (a["name"] or "").casefold() or show == "here" and not a["albums"] or show == "wanted" and not a["wanted"]:
+                continue
+            shown += 1
+            rows = [t for album_rows in a["albums"].values() for t in album_rows]
+            pills = (('<span class="pill">followed</span>' if a["ids"] & followed or MBID.fullmatch(key) and acquire.refs(db, "artist", key) & followed else "")
+                     + (f'<span class="pill good">{len(a["albums"])} here</span>' if a["albums"] else "")
+                     + (f'<span class="pill">{len(a["wanted"])} wanted</span>' if a["wanted"] else ""))
+            info = " · ".join(filter(None, [f"{len(rows)} songs" if rows else "", length(sum(r["duration"] or 0 for r in rows)) if rows else "",
+                                            size(sum(r["size"] or 0 for r in rows)) if rows else ""]))
+            link = f' <a class="muted" href="/music/artist/{escape(key)}">discography</a>' if MBID.fullmatch(key) else ""
+            body += (f'<details class="artist"{" open" if text else ""}><summary><b>{escape(a["name"] or "")}</b>{pills}'
+                     f'<span class="muted">{escape(info)}</span>{link}</summary>'
+                     + "".join(album(r) for r in a["albums"].values()) + "".join(missing(w) for w in a["wanted"]) + '</details>')
+        body += ('' if shown else '<p class="muted">Nothing matches.</p>') + '</section>'
+        return page("Library", body, q.get("message", ""), q.get("error", ""), wide=True)
+
+    def give_up(db, user, rg: str):
         api._want(db, user["name"], "album", mine(db, user, "album", rg), None)
         db.execute("insert or replace into given_up values (?, ?)", (rg, time.time()))
         db.execute("update want_album set state = 'skipped', error = 'given up' where rg = ? and reason = 'followed'", (rg,))
-        return back("/music/wanted", message=f"Gave up on {name}. Files already here stay.")
+
+    def wanted_action(db, request, user, form):
+        rg, action = request.path_params["rg"], request.path_params["action"]
+        here = form.get("next", "") if form.get("next", "").startswith("/music/wanted") else "/music/wanted"
+        row = db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
+        if row is None or action not in ("search", "block", "give-up"):
+            return back(here, error="That album isn't wanted any more.")
+        name = f'{row["artist"]} – {row["title"]}'
+        if action == "block" and not (api.downloads and api.downloads.block(db, rg)):
+            return back(here, error=f"Nothing is downloading for {name} that can still be stopped.")
+        if action in ("search", "block"):
+            api.library.soon.add(rg)
+            api.library.wake.set()
+            return back(here, message=f"{name} is searched next, in a minute or two." if action == "search" else
+                        f"Blocked that release of {name}; the next search picks another.")
+        give_up(db, user, rg)
+        return back(here, message=f"Gave up on {name}. Files already here stay.")
+
+    def wanted_give_up(db, request, user, form):
+        here = form.get("next", "") if form.get("next", "").startswith("/music/wanted") else "/music/wanted"
+        rgs = [rg for rg in form.get("rgs", "").split(",") if MBID.fullmatch(rg)]
+        for rg in rgs:
+            give_up(db, user, rg)
+        return back(here, message=f"Gave up on {len(rgs)} album{'s' if len(rgs) != 1 else ''}. Files already here stay.")
 
     def unwant(db, request, user, form):
         if form.get("kind") in MB_IDS:
@@ -484,6 +649,8 @@ def routes(api) -> list[Route]:
         Route("/music/want", catalogue(set_want), methods=["POST"]),
         Route("/music/unwant", catalogue(unwant), methods=["POST"]),
         Route("/music/wanted", catalogue(wanted)),
+        Route("/music/library", catalogue(music_library)),
+        Route("/music/wanted/give-up", catalogue(wanted_give_up), methods=["POST"]),
         Route("/music/wanted/{rg}/{action:str}", catalogue(wanted_action), methods=["POST"]),
         Route("/admin/users", signed_in(create_user, admin=True), methods=["POST"]),
         Route("/admin/users/{name}/delete", signed_in(delete_user, admin=True), methods=["POST"]),
