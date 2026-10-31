@@ -22,7 +22,7 @@ from .ytm import fold
 
 log = logging.getLogger(__name__)
 
-AUDIO = ("flac", "mp3", "m4a", "ogg", "opus", "wav", "ape", "wv", "aiff", "alac", "aac")
+AUDIO = ("flac", "mp3", "m4a", "ogg", "opus", "wav", "ape", "wv", "aiff", "alac", "aac", "mpc")
 LOSSLESS = ("flac", "wav", "ape", "wv", "aiff", "alac")
 EDITIONS = "https://musicbrainz.org/ws/2/release?release-group={}&inc=media+recordings+artist-credits+labels+release-groups+isrcs" \
            "&limit=100&offset={}&fmt=json"
@@ -88,7 +88,8 @@ def match(files: list[dict], tracks: list[tuple[dict, dict]]) -> dict | None:
 
 
 def pick(releases: list[dict], files: list[dict]) -> tuple[dict, dict]:
-    """The edition the files cover: every track has its file. The most tracks wins, then the closest lengths.
+    """The edition the files cover: every track has its file. The most tracks wins, then the closest lengths, then
+    the official earliest.
     Pseudo-releases (transliterations) are left out: the release they translate has the same tracks."""
     best = None
     for release in releases:
@@ -97,7 +98,9 @@ def pick(releases: list[dict], files: list[dict]) -> tuple[dict, dict]:
             continue
         lengths = {t["id"]: t.get("length") or t["recording"].get("length") for _, t in tracks}
         # A track without a length in MusicBrainz counts as off by the most: an edition that has them is surer.
-        score = (len(tracks), -sum(abs(f["length"] - lengths[i] / 1000) if lengths[i] else SLACK[0] for i, f in mapping.items()))
+        # Identical editions (the same digital release in many countries) fall to the official, earliest one: the original.
+        score = (len(tracks), -sum(abs(f["length"] - lengths[i] / 1000) if lengths[i] else SLACK[0] for i, f in mapping.items()),
+                 release.get("status") == "Official", -int(re.sub(r"\D", "", release.get("date") or "").ljust(8, "9")[:8]))
         if best is None or score > best[0]:
             best = score, release, mapping
     if best is None:

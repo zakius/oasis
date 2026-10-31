@@ -160,3 +160,11 @@ def test_credits_and_imports_share_one_musicbrainz_pace(tmp_path, monkeypatch):
     assert len(sent) == 6 and min(gaps) >= 1.0 and max(gaps) >= 2
     importer.editions(db, "g0")  # cached
     assert len(sent) == 6
+
+
+def test_identical_editions_fall_to_the_official_original():
+    tracks = [("One", 100), ("Two", 200)]
+    files = [{"key": importer.key(t), "number": (1, n + 1), "length": s, "path": f"{n}.flac"} for n, (t, s) in enumerate(tracks)]
+    later, original, bootleg = edition("af", tracks), edition("jp", tracks), edition("bt", tracks, status="Bootleg")
+    later["date"], original["date"], bootleg["date"] = "2023-05-01", "2023-03-15", "2022"
+    assert importer.pick([later, bootleg, original], files)[0]["id"] == "jp"
