@@ -193,9 +193,12 @@ class Library:
             artist = self.lidarr.artist(mbid)
             if artist is None:
                 self.lidarr.add_artist(found or lookup())
-            elif not artist["monitored"] or artist.get("monitorNewItems") != "all":
+                return "followed", None
+            if not artist["monitored"] or artist.get("monitorNewItems") != "all":
                 self.lidarr.follow_artist(artist, True)
-            return ("downloading" if artist and artist["id"] in queued_artists else "followed"), None
+            if not item["searched"]:
+                self.clear_back_catalogue(db, item, artist)
+            return ("downloading" if artist["id"] in queued_artists else "followed"), None
 
         album = self.lidarr.album(mbid)
         if album is None:
@@ -211,6 +214,19 @@ class Library:
         if item["searched"] and time.time() - item["searched"] > GRAB_WAIT:
             return "sent", self.lidarr.why_nothing(album["id"])
         return "sent", "waiting for its search" if not item["searched"] else "searching"
+
+    def clear_back_catalogue(self, db, item, artist):
+        """Once Lidarr has the artist's albums, unmonitors those released before it was followed (Lidarr's first
+        refresh counts them as new), except albums users starred on their own. Done once per artist."""
+        albums = self.lidarr.albums_of(artist["id"])
+        if not albums:
+            return  # first refresh still pending
+        starred = {r[0] for r in db.execute("select mbid from lidarr_item where kind = 'album' and mbid is not null")}
+        followed = artist.get("added") or ""
+        old = [a["id"] for a in albums if a["monitored"] and a["foreignAlbumId"] not in starred
+               and (a.get("releaseDate") or "") <= followed]
+        self.lidarr.set_albums(old, False)
+        db.execute("update lidarr_item set searched = ? where kind = ? and ref = ?", (time.time(), item["kind"], item["ref"]))
 
     def search_next(self, db, queued_albums: set):
         """Searches one album at a time, SEARCH_GAP apart: first those never searched, then ones that got nothing."""

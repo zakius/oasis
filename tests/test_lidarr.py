@@ -9,7 +9,7 @@ from oasis.lidarr import Library, Lidarr, artist_names
 
 class FakeLidarr(Lidarr):
     def __init__(self):
-        self.albums, self.artists, self.queue_albums, self.calls = {}, {}, set(), []
+        self.albums, self.artists, self.queue_albums, self.calls, self.artist_albums = {}, {}, set(), [], {}
 
     def find_album(self, artist, title):
         self.calls.append(("find_album", artist, title))
@@ -44,6 +44,9 @@ class FakeLidarr(Lidarr):
 
     def search_album(self, album_id):
         self.calls.append(("search", album_id))
+
+    def albums_of(self, artist_id):
+        return self.artist_albums.get(artist_id, [])
 
     def follow_artist(self, artist, follow):
         self.calls.append(("follow", artist["id"], follow))
@@ -125,6 +128,13 @@ def test_starred_artist_is_followed_for_new_releases_only(client, lidarr):
     assert ("add_artist", "mb-The Alpha") in lidarr.calls and not any(c[0] == "search" for c in lidarr.calls)
     shown = next(a for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"] if a["name"] == "The Alpha")
     assert "oasisWanted" not in shown  # followed: nothing to show
+    # After Lidarr's first refresh, the back catalogue it monitored is unmonitored once; newer releases stay.
+    lidarr.artists["mb-The Alpha"]["added"] = "2026-01-01T00:00:00Z"
+    lidarr.artist_albums[100] = [{"id": 50, "monitored": True, "foreignAlbumId": "mb-old", "releaseDate": "2010-05-01T00:00:00Z"},
+                                 {"id": 51, "monitored": True, "foreignAlbumId": "mb-new", "releaseDate": "2026-06-01T00:00:00Z"}]
+    sync(client)
+    sync(client)
+    assert [c for c in lidarr.calls if c[0] == "set_albums"] == [("set_albums", (50,), False)]
     call(client, "unstar", artistId=artist["id"])
     sync(client)
     assert ("follow", 100, False) in lidarr.calls
