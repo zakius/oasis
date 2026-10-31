@@ -162,7 +162,8 @@ class Downloads:
                 return self.fail(db, row, "gone from TorBox", block=False)
             if "error" in torrent["download_state"].lower():
                 return self.fail(db, row, f"TorBox: {torrent['download_state']}")
-            if not (torrent["download_finished"] and torrent["download_present"]):
+            # TorBox lists a torrent it is checking (one re-added, say) with no files, even when it calls it finished.
+            if not (torrent["download_finished"] and torrent["download_present"] and torrent.get("files")):
                 progress, since = self.seen.get(row["hash"], (None, 0))
                 if progress != torrent["progress"]:  # a torrent still at 0% has made no progress since it was added, restart or not
                     since = row["created"] if progress is None and not torrent["progress"] else time.time()

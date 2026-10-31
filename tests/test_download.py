@@ -100,6 +100,9 @@ def test_a_search_sends_the_pick_to_torbox_and_the_files_are_fetched_and_importe
     torbox.list = [tb(71, "abcd", progress=0.5)]
     downloads.cycle()
     assert db.execute("select state from download").fetchone()[0] == "downloading"
+    torbox.list = [{**tb(71, "abcd", progress=1), "download_state": "checking", "download_finished": True, "download_present": True, "files": []}]
+    downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "downloading"
 
     folder = tmp_path / "dl" / "abcd"
     lidarr.proposed[str(folder)] = [proposal(str(folder / "Album/01.flac"), tracks=[1]), proposal(str(folder / "Album/02.flac"), tracks=[2])]
