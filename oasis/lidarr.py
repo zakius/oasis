@@ -2,6 +2,7 @@
 takes over. oasis keeps the desired state (who wants what) and reconciles Lidarr with it."""
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
@@ -12,7 +13,11 @@ from .ytm import fold
 
 log = logging.getLogger(__name__)
 
-RETRY = 1800  # seconds between attempts for items that failed
+RETRY_NO_MATCH = 1800   # seconds before looking an unmatched name up again
+RETRY_ERROR = 300       # seconds before retrying after Lidarr or MusicBrainz errors
+SEARCH_GAP = 180        # seconds between album searches, so a burst of stars doesn't trip the debrid service's rate limit
+RESEARCH = 6 * 3600     # seconds before searching again for an album that got nothing
+GRAB_WAIT = 600         # seconds after a search before "nothing grabbed" counts
 
 
 class Lidarr:
@@ -41,14 +46,20 @@ class Lidarr:
                 "metadataProfileId": self.metadata_profile or root["defaultMetadataProfileId"]}
 
     def find_artist(self, name: str) -> dict | None:
-        found = self.call("GET", "artist/lookup?" + urllib.parse.urlencode({"term": name}))
-        return next((a for a in found if fold(a["artistName"]) == fold(name)), None)
+        for candidate in artist_names(name):
+            found = self.call("GET", "artist/lookup?" + urllib.parse.urlencode({"term": candidate}))
+            if match := next((a for a in found if fold(a["artistName"]) == fold(candidate)), None):
+                return match
+        return None
 
     def find_album(self, artist: str, title: str) -> dict | None:
-        found = self.call("GET", "album/lookup?" + urllib.parse.urlencode({"term": f"{artist} {title}"}))
-        mine = [a for a in found if fold(a["artist"]["artistName"]) == fold(artist)]
-        return next((a for a in mine if fold(a["title"]) == fold(title)), None) or \
-            next((a for a in mine if fold(title) and (fold(title) in fold(a["title"]) or fold(a["title"]) in fold(title))), None)
+        for candidate in artist_names(artist):
+            found = self.call("GET", "album/lookup?" + urllib.parse.urlencode({"term": f"{candidate} {title}"}))
+            mine = [a for a in found if fold(a["artist"]["artistName"]) == fold(candidate)]
+            if match := next((a for a in mine if fold(a["title"]) == fold(title)), None) or \
+                    next((a for a in mine if fold(title) and (fold(title) in fold(a["title"]) or fold(a["title"]) in fold(title))), None):
+                return match
+        return None
 
     def artist(self, mbid: str) -> dict | None:
         return next(iter(self.call("GET", f"artist?mbId={mbid}") or []), None)
@@ -56,38 +67,67 @@ class Lidarr:
     def album(self, mbid: str) -> dict | None:
         return next(iter(self.call("GET", f"album?foreignAlbumId={mbid}") or []), None)
 
-    def add_artist(self, found: dict, monitor_all: bool) -> dict:
-        body = {**found, **self.defaults(), "monitored": True, "monitorNewItems": "all" if monitor_all else "none",
-                "addOptions": {"monitor": "all" if monitor_all else "none", "searchForMissingAlbums": monitor_all}}
+    def albums_of(self, artist_id: int) -> list[dict]:
+        return self.call("GET", f"album?artistId={artist_id}") or []
+
+    def add_artist(self, found: dict) -> dict:
+        """Follows the artist: new releases get monitored, the back catalogue doesn't, and nothing is searched."""
+        body = {**found, **self.defaults(), "monitored": True, "monitorNewItems": "all",
+                "addOptions": {"monitor": "none", "searchForMissingAlbums": False}}
         return self.call("POST", "artist", body)
 
     def add_album(self, found: dict) -> dict:
+        """Adds the album monitored, under its artist with nothing else monitored; searching is paced separately."""
         artist = {**found["artist"], **self.defaults(), "monitored": True, "monitorNewItems": "none",
                   "addOptions": {"monitor": "none", "searchForMissingAlbums": False}}
-        return self.call("POST", "album", {**found, "artist": artist, "monitored": True, "addOptions": {"searchForNewAlbum": True}})
+        return self.call("POST", "album", {**found, "artist": artist, "monitored": True, "addOptions": {"searchForNewAlbum": False}})
 
-    def set_album(self, album_id: int, monitored: bool, search: bool = False):
-        self.call("PUT", "album/monitor", {"albumIds": [album_id], "monitored": monitored})
-        if search:
-            self.call("POST", "command", {"name": "AlbumSearch", "albumIds": [album_id]})
+    def set_albums(self, album_ids: list[int], monitored: bool):
+        if album_ids:
+            self.call("PUT", "album/monitor", {"albumIds": album_ids, "monitored": monitored})
 
-    def set_artist(self, artist: dict, monitored: bool):
-        artist = {**artist, "monitored": monitored, "monitorNewItems": "all" if monitored else "none"}
-        self.call("PUT", f"artist/{artist['id']}", artist)
-        if monitored:
-            self.call("POST", "command", {"name": "ArtistSearch", "artistId": artist["id"]})
+    def search_album(self, album_id: int):
+        self.call("POST", "command", {"name": "AlbumSearch", "albumIds": [album_id]})
+
+    def follow_artist(self, artist: dict, follow: bool):
+        """Following monitors the artist for new releases; unfollowing unmonitors it. Albums keep their own monitoring."""
+        self.call("PUT", f"artist/{artist['id']}", {**artist, "monitored": follow, "monitorNewItems": "all" if follow else "none"})
 
     def queued(self) -> tuple[set[int], set[int]]:
         records = self.call("GET", "queue?pageSize=1000")["records"]
         return {r["albumId"] for r in records if r.get("albumId")}, {r["artistId"] for r in records if r.get("artistId")}
 
+    def why_nothing(self, album_id: int) -> str:
+        """The reason an album searched for isn't downloading, from Lidarr's history."""
+        events = self.call("GET", f"history?albumId={album_id}&page=1&pageSize=5&sortKey=date&sortDirection=descending")
+        for event in (events or {}).get("records", []):
+            kind, data = event.get("eventType"), event.get("data") or {}
+            if kind == "downloadFailed":
+                return f"download failed: {data.get('message') or event.get('sourceTitle')}"
+            if kind in ("albumImportIncomplete", "trackFileImportFailed", "downloadImportFailed"):
+                return f"import failed: {data.get('statusMessages') or event.get('sourceTitle')}"
+            if kind == "grabbed":
+                return f"grabbed {event.get('sourceTitle')}, then it left the queue"
+        return "searched, nothing grabbed yet: no release found, or the download client refused it"
+
+
+def artist_names(credit: str) -> list[str]:
+    """Names to look a credit up by: the credit itself, then each artist of a collaboration, with and without
+    a bracketed suffix: 'SawanoHiroyuki[nZk]:mizuki' -> SawanoHiroyuki[nZk]:mizuki, SawanoHiroyuki[nZk], SawanoHiroyuki, mizuki."""
+    names = [credit]
+    for part in re.split(r"\s*(?:,|&|:|×|/|\bfeat\.?|\bft\.?|\bwith\b)\s*", credit, flags=re.I):
+        names += [part, re.sub(r"\s*[\[(][^\])]*[\])]\s*$", "", part)]
+    return [n for n in dict.fromkeys(n.strip() for n in names) if n]
+
 
 class Library:
-    """Reconciles Lidarr with what users starred: wanted items get added and monitored, unwanted ones unmonitored."""
+    """Reconciles Lidarr with what users starred: wanted albums get added and searched (paced), wanted artists
+    followed for new releases, and items nobody wants any more unmonitored."""
 
     def __init__(self, connect, lidarr: Lidarr):
         self.connect, self.lidarr = connect, lidarr
         self.wake = threading.Event()
+        self.last_search = 0.0
 
     def start(self):
         threading.Thread(target=self.run, daemon=True).start()
@@ -98,7 +138,7 @@ class Library:
                 self.reconcile()
             except Exception:
                 log.exception("Lidarr sync failed")
-            self.wake.wait(300)
+            self.wake.wait(60)
             self.wake.clear()
 
     def reconcile(self):
@@ -109,31 +149,34 @@ class Library:
             queued_albums, queued_artists = self.lidarr.queued()
             for item in db.execute("select * from lidarr_item").fetchall():
                 wanted = db.execute("select 1 from wanted where kind = ? and ref = ?", (item["kind"], item["ref"])).fetchone()
-                if wanted and item["state"] == "failed" and item["updated"] > time.time() - RETRY:
-                    continue  # failed recently; try again later instead of hammering Lidarr
+                if wanted and (item["retry_at"] or 0) > time.time():
+                    continue
                 try:
                     if wanted:
-                        state = self.want(db, item, queued_albums, queued_artists)
-                        db.execute("update lidarr_item set state = ?, error = null, updated = ? where kind = ? and ref = ?",
-                                   (state, time.time(), item["kind"], item["ref"]))
+                        state, error = self.want(db, item, queued_albums, queued_artists)
+                        set_state(db, item, state, error)
                     else:
                         self.release(item)
                         db.execute("delete from lidarr_item where kind = ? and ref = ?", (item["kind"], item["ref"]))
-                except Exception as e:
+                except LookupError as e:
+                    set_state(db, item, "failed", str(e), retry=RETRY_NO_MATCH)
+                except Exception as e:  # Lidarr or MusicBrainz down, timeouts: soon again
                     log.warning("Lidarr: %s %s: %s", item["kind"], item["ref"], e)
-                    db.execute("update lidarr_item set state = 'failed', error = ?, updated = ? where kind = ? and ref = ?",
-                               (str(e)[:300], time.time(), item["kind"], item["ref"]))
+                    set_state(db, item, "wanted" if not item["mbid"] else item["state"], str(e)[:300], retry=RETRY_ERROR)
+            self.search_next(db, queued_albums)
         finally:
             db.close()
 
     def names(self, db, item) -> tuple[str, str | None]:
         column = "album_id" if item["kind"] == "album" else "artist_id"
-        row = db.execute(f"select album_artist, album from track where {column} = ? limit 1", (item["ref"],)).fetchone()
+        row = db.execute(f"select album_artist, album from track where {column} = ? limit 1", (item["ref"],)).fetchone() or \
+            (db.execute("select a.name album_artist, r.title album from ytm_release r join ytm_artist a on a.artist_id = r.artist_id "
+                        "where r.album_id = ?", (item["ref"],)).fetchone() if item["kind"] == "album" else None)
         if row is None:
             raise LookupError("not in oasis any more")
         return row["album_artist"], row["album"] if item["kind"] == "album" else None
 
-    def want(self, db, item, queued_albums: set, queued_artists: set) -> str:
+    def want(self, db, item, queued_albums: set, queued_artists: set) -> tuple[str, str | None]:
         artist_name, album_title = self.names(db, item)
         is_album = item["kind"] == "album"
         lookup = (lambda: self.lidarr.find_album(artist_name, album_title)) if is_album else (lambda: self.lidarr.find_artist(artist_name))
@@ -146,26 +189,42 @@ class Library:
             mbid = found["foreignAlbumId" if is_album else "foreignArtistId"]
             db.execute("update lidarr_item set mbid = ? where kind = ? and ref = ?", (mbid, item["kind"], item["ref"]))
 
-        if is_album:
-            album = self.lidarr.album(mbid)
-            if album is None:
-                album = self.lidarr.add_album(found or lookup())
-            elif not album["monitored"]:
-                self.lidarr.set_album(album["id"], True, search=True)
-            if album["id"] in queued_albums:
-                return "downloading"
-            stats = album.get("statistics") or {}
-            return "have" if stats.get("trackCount") and stats.get("trackFileCount", 0) >= stats["trackCount"] else "sent"
+        if not is_album:
+            artist = self.lidarr.artist(mbid)
+            if artist is None:
+                self.lidarr.add_artist(found or lookup())
+            elif not artist["monitored"] or artist.get("monitorNewItems") != "all":
+                self.lidarr.follow_artist(artist, True)
+            return ("downloading" if artist and artist["id"] in queued_artists else "followed"), None
 
-        artist = self.lidarr.artist(mbid)
-        if artist is None:
-            artist = self.lidarr.add_artist(found or lookup(), monitor_all=True)
-        elif not artist["monitored"] or artist.get("monitorNewItems") != "all":
-            self.lidarr.set_artist(artist, True)
-        if artist["id"] in queued_artists:
-            return "downloading"
-        stats = artist.get("statistics") or {}
-        return "have" if stats.get("trackCount") and stats.get("trackFileCount", 0) >= stats["trackCount"] else "sent"
+        album = self.lidarr.album(mbid)
+        if album is None:
+            album = self.lidarr.add_album(found or lookup())
+        elif not album["monitored"]:
+            self.lidarr.set_albums([album["id"]], True)
+        stats = album.get("statistics") or {}
+        if stats.get("trackCount") and stats.get("trackFileCount", 0) >= stats["trackCount"]:
+            return "have", None
+        if album["id"] in queued_albums:
+            return "downloading", None
+        db.execute("update lidarr_item set lidarr_id = ? where kind = ? and ref = ?", (album["id"], item["kind"], item["ref"]))
+        if item["searched"] and time.time() - item["searched"] > GRAB_WAIT:
+            return "sent", self.lidarr.why_nothing(album["id"])
+        return "sent", "waiting for its search" if not item["searched"] else "searching"
+
+    def search_next(self, db, queued_albums: set):
+        """Searches one album at a time, SEARCH_GAP apart: first those never searched, then ones that got nothing."""
+        if time.time() - self.last_search < SEARCH_GAP:
+            return
+        item = db.execute("select * from lidarr_item where kind = 'album' and state = 'sent' and lidarr_id is not null "
+                          "and (searched is null or searched < ?) and exists (select 1 from wanted w where w.kind = 'album' "
+                          "and w.ref = lidarr_item.ref) order by searched is not null, searched, rowid limit 1", (time.time() - RESEARCH,)).fetchone()
+        if item is None or item["lidarr_id"] in queued_albums:
+            return
+        self.lidarr.search_album(item["lidarr_id"])
+        self.last_search = time.time()
+        db.execute("update lidarr_item set searched = ?, error = 'searching' where kind = ? and ref = ?",
+                   (self.last_search, item["kind"], item["ref"]))
 
     def release(self, item):
         """Nobody wants it any more: stop Lidarr looking for it. Files already downloaded stay."""
@@ -173,6 +232,11 @@ class Library:
             return
         if item["kind"] == "album":
             if album := self.lidarr.album(item["mbid"]):
-                self.lidarr.set_album(album["id"], False)
+                self.lidarr.set_albums([album["id"]], False)
         elif artist := self.lidarr.artist(item["mbid"]):
-            self.lidarr.set_artist(artist, False)
+            self.lidarr.follow_artist(artist, False)
+
+
+def set_state(db, item, state: str, error: str | None, retry: float | None = None):
+    db.execute("update lidarr_item set state = ?, error = ?, retry_at = ?, updated = ? where kind = ? and ref = ?",
+               (state, error, time.time() + retry if retry else None, time.time(), item["kind"], item["ref"]))

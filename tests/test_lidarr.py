@@ -1,7 +1,10 @@
+import time
+
 import pytest
 
 from conftest import call, make_client
-from oasis.lidarr import Library, Lidarr
+from oasis import lidarr as lidarr_module
+from oasis.lidarr import Library, Lidarr, artist_names
 
 
 class FakeLidarr(Lidarr):
@@ -10,8 +13,6 @@ class FakeLidarr(Lidarr):
 
     def find_album(self, artist, title):
         self.calls.append(("find_album", artist, title))
-        if title == "Unknown":
-            return None
         return {"foreignAlbumId": f"mb-{title}", "title": title, "artist": {"artistName": artist, "foreignArtistId": f"mb-{artist}"}}
 
     def find_artist(self, name):
@@ -29,24 +30,30 @@ class FakeLidarr(Lidarr):
         self.albums[found["foreignAlbumId"]] = album
         return album
 
-    def add_artist(self, found, monitor_all):
-        self.calls.append(("add_artist", found["foreignArtistId"], monitor_all))
+    def add_artist(self, found):
+        self.calls.append(("add_artist", found["foreignArtistId"]))
         artist = {"id": 100 + len(self.artists), "monitored": True, "monitorNewItems": "all"}
         self.artists[found["foreignArtistId"]] = artist
         return artist
 
-    def set_album(self, album_id, monitored, search=False):
-        self.calls.append(("set_album", album_id, monitored, search))
+    def set_albums(self, album_ids, monitored):
+        self.calls.append(("set_albums", tuple(album_ids), monitored))
         for album in self.albums.values():
-            if album["id"] == album_id:
+            if album["id"] in album_ids:
                 album["monitored"] = monitored
 
-    def set_artist(self, artist, monitored):
-        self.calls.append(("set_artist", artist["id"], monitored))
-        artist["monitored"] = monitored
+    def search_album(self, album_id):
+        self.calls.append(("search", album_id))
+
+    def follow_artist(self, artist, follow):
+        self.calls.append(("follow", artist["id"], follow))
+        artist["monitored"] = follow
 
     def queued(self):
         return self.queue_albums, set()
+
+    def why_nothing(self, album_id):
+        return "searched, nothing grabbed yet"
 
 
 @pytest.fixture
@@ -69,21 +76,31 @@ def sync(client):
     client.app.state.api.library.reconcile()
 
 
-def test_starred_album_goes_to_lidarr_and_tracks_progress(client, lidarr):
-    first = album_of(client, "First")
+def test_starred_album_is_added_then_searched_paced_and_tracked_honestly(client, lidarr, monkeypatch):
+    first, second = album_of(client, "First"), album_of(client, "Second")
     call(client, "star", albumId=first["id"])
+    call(client, "star", albumId=second["id"])
     call(client, "star", albumId=first["id"])  # starring twice changes nothing
     sync(client)
-    assert lidarr.calls.count(("add_album", "mb-First")) == 1
+    assert sorted(c for c in lidarr.calls if c[0] == "add_album") == [("add_album", "mb-First"), ("add_album", "mb-Second")]
+    sync(client)
+    assert [c for c in lidarr.calls if c[0] == "search"] == [("search", 1)]  # one search per gap
     assert album_of(client, "First")["oasisWanted"] == "wanted"
+    library = client.app.state.api.library
+    library.last_search -= lidarr_module.SEARCH_GAP
+    sync(client)
+    assert [c for c in lidarr.calls if c[0] == "search"] == [("search", 1), ("search", 2)]
     lidarr.queue_albums.add(1)
     sync(client)
     assert album_of(client, "First")["oasisWanted"] == "downloading"
     lidarr.queue_albums.clear()
+    monkeypatch.setattr(time, "time", lambda real=time.time: real() + lidarr_module.GRAB_WAIT + 1)
+    sync(client)
+    first_now = album_of(client, "First")
+    assert first_now["oasisWanted"] == "wanted" and first_now["oasisWantedError"] == "searched, nothing grabbed yet"
     lidarr.albums["mb-First"]["statistics"] = {"trackCount": 2, "trackFileCount": 2}
     sync(client)
-    assert "oasisWanted" not in album_of(client, "First")
-    assert ("find_album", "Beta", "First") in lidarr.calls and lidarr.calls.count(("find_album", "Beta", "First")) == 1  # mbid kept
+    assert "oasisWanted" not in album_of(client, "First") and "oasisWantedError" not in album_of(client, "First")
 
 
 def test_unstarred_album_is_only_unmonitored_once_nobody_wants_it(client, lidarr):
@@ -94,36 +111,51 @@ def test_unstarred_album_is_only_unmonitored_once_nobody_wants_it(client, lidarr
     sync(client)
     call(client, "unstar", albumId=first["id"])
     sync(client)
-    assert not any(c[0] == "set_album" and c[2] is False for c in lidarr.calls)  # bob still wants it
+    assert ("set_albums", (1,), False) not in lidarr.calls  # bob still wants it
     call(client, "unstar", albumId=first["id"], u="bob", p="pw")
     sync(client)
-    assert ("set_album", 1, False, False) in lidarr.calls
+    assert ("set_albums", (1,), False) in lidarr.calls
     assert "oasisWanted" not in album_of(client, "First")
 
 
-def test_unmonitored_album_is_monitored_and_searched_again(client, lidarr):
-    first = album_of(client, "First")
-    lidarr.albums["mb-First"] = {"id": 7, "monitored": False, "foreignAlbumId": "mb-First"}
-    call(client, "star", albumId=first["id"])
-    sync(client)
-    assert ("set_album", 7, True, True) in lidarr.calls and not any(c[0] == "add_album" for c in lidarr.calls)
-
-
-def test_starred_artist_is_added_with_everything_monitored(client, lidarr):
+def test_starred_artist_is_followed_for_new_releases_only(client, lidarr):
     artist = next(a for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"] if a["name"] == "The Alpha")
     call(client, "star", artistId=artist["id"])
     sync(client)
-    assert ("add_artist", "mb-The Alpha", True) in lidarr.calls
-    assert next(a for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"] if a["name"] == "The Alpha")["oasisWanted"] == "wanted"
+    assert ("add_artist", "mb-The Alpha") in lidarr.calls and not any(c[0] == "search" for c in lidarr.calls)
+    shown = next(a for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"] if a["name"] == "The Alpha")
+    assert "oasisWanted" not in shown  # followed: nothing to show
+    call(client, "unstar", artistId=artist["id"])
+    sync(client)
+    assert ("follow", 100, False) in lidarr.calls
 
 
-def test_album_without_musicbrainz_match_fails_and_waits_before_retrying(client, lidarr, monkeypatch):
+def test_no_match_fails_with_reason_and_waits_while_errors_retry_soon(client, lidarr, monkeypatch):
     first = album_of(client, "First")
     monkeypatch.setattr(lidarr, "find_album", lambda artist, title: None)
     call(client, "star", albumId=first["id"])
     sync(client)
-    assert album_of(client, "First")["oasisWanted"] == "failed"
+    shown = album_of(client, "First")
+    assert shown["oasisWanted"] == "failed" and "no MusicBrainz album" in shown["oasisWantedError"]
     asked = []
     monkeypatch.setattr(lidarr, "find_album", lambda artist, title: asked.append(title))
     sync(client)
-    assert asked == []  # retried only after a while
+    assert asked == []
+    db = client.app.state.api._db()
+    retry = db.execute("select retry_at - updated from lidarr_item").fetchone()[0]
+    assert abs(retry - lidarr_module.RETRY_NO_MATCH) < 5
+
+    def down(artist, title):
+        raise OSError("Lidarr GET album/lookup: 503")
+    monkeypatch.setattr(lidarr, "find_album", down)
+    db.execute("update lidarr_item set retry_at = null")
+    sync(client)
+    shown = album_of(client, "First")
+    assert shown["oasisWanted"] == "wanted" and "503" in shown["oasisWantedError"]
+    assert abs(db.execute("select retry_at - updated from lidarr_item").fetchone()[0] - lidarr_module.RETRY_ERROR) < 5
+
+
+def test_collaboration_credits_split_into_artist_names():
+    assert artist_names("SawanoHiroyuki[nZk]:mizuki") == ["SawanoHiroyuki[nZk]:mizuki", "SawanoHiroyuki[nZk]", "SawanoHiroyuki", "mizuki"]
+    assert artist_names("Falling In Reverse, Corey Taylor, Serj Tankian")[:2] == ["Falling In Reverse, Corey Taylor, Serj Tankian", "Falling In Reverse"]
+    assert artist_names("A feat. B")[1:] == ["A", "B"] and artist_names("X × Y")[1:] == ["X", "Y"]

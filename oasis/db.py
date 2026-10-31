@@ -46,8 +46,9 @@ create table if not exists user(
 create table if not exists wanted(user text not null, kind text not null, ref text not null, primary key(user, kind, ref));
 create table if not exists lidarr_item(
     kind text not null, ref text not null,  -- 'album' or 'artist', and its oasis id
-    state text not null,                    -- wanted, sent, downloading, have, failed
-    mbid text, error text, updated real not null,
+    state text not null,                    -- wanted, sent, downloading, have, followed (artists), failed
+    mbid text, lidarr_id int, error text,   -- error: why it isn't downloading, for clients to show
+    searched real, retry_at real, updated real not null,
     primary key(kind, ref)
 );
 create table if not exists ytm_artist(  -- an artist's YouTube Music page, kept for a day

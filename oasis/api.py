@@ -126,13 +126,13 @@ select t.album_id as id, t.album as name, t.album_artist as artist, t.artist_id,
        count(*) as song_count, sum(t.duration) as duration, min(t.created) as created,
        max(t.year) as year, max(t.genre) as genre, max(t.cover is not null) as has_cover,
        s.starred as album_starred, s.rating as album_rating,
-       coalesce(sum(ps.play_count), 0) as plays, max(ps.played) as last_played, li.state as lidarr_state
+       coalesce(sum(ps.play_count), 0) as plays, max(ps.played) as last_played, li.state as lidarr_state, li.error as lidarr_error
 from track t left join stat s on s.id = t.album_id left join stat ps on ps.id = t.id
 left join lidarr_item li on li.kind = 'album' and li.ref = t.album_id
 """
 ARTISTS = """
 select t.artist_id as id, t.album_artist as name, count(distinct t.album_id) as album_count,
-       max(t.cover is not null) as has_cover, s.starred, s.rating, li.state as lidarr_state
+       max(t.cover is not null) as has_cover, s.starred, s.rating, li.state as lidarr_state, li.error as lidarr_error
 from track t left join stat s on s.id = t.artist_id left join lidarr_item li on li.kind = 'artist' and li.ref = t.artist_id
 """
 
@@ -152,7 +152,7 @@ def song(r) -> dict:
 
 
 LIDARR_KEYS = ("url", "api_key", "root_folder", "quality_profile", "metadata_profile")
-# Lidarr progress of starred albums and artists, for clients that show it; complete ones need no badge.
+# Lidarr progress of starred albums and artists, for clients that show it; complete albums and followed artists need no badge.
 WANTED_STATES = {"wanted": "wanted", "sent": "wanted", "downloading": "downloading", "failed": "failed"}
 
 
@@ -164,6 +164,7 @@ def album(r) -> dict:
         "created": iso(r["created"]), "year": r["year"], "genre": r["genre"], "starred": iso(r["album_starred"]),
         "userRating": r["album_rating"], "playCount": r["plays"], "played": iso(r["last_played"]),
         "oasisWanted": WANTED_STATES.get(r["lidarr_state"]),
+        "oasisWantedError": r["lidarr_error"] if WANTED_STATES.get(r["lidarr_state"]) else None,
     })
 
 
@@ -172,6 +173,7 @@ def artist(r) -> dict:
         "id": r["id"], "name": r["name"], "albumCount": r["album_count"],
         "coverArt": r["id"] if r["has_cover"] else None, "starred": iso(r["starred"]), "userRating": r["rating"],
         "oasisWanted": WANTED_STATES.get(r["lidarr_state"]),
+        "oasisWantedError": r["lidarr_error"] if WANTED_STATES.get(r["lidarr_state"]) else None,
     })
 
 

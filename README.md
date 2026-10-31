@@ -51,9 +51,9 @@ api_key = "..."            # Lidarr → Settings → General
 # metadata_profile = 1
 ```
 
-oasis keeps who wants what, and a worker reconciles Lidarr with it after every star or unstar and every 5 minutes. A wanted album is looked up on MusicBrainz through Lidarr by artist and title (punctuation and case aside), added with only that album monitored, and searched; a wanted artist is added with everything monitored. Once no user wants an item, oasis only unmonitors it; downloaded files stay. Items that fail (no MusicBrainz match, Lidarr down) are retried after 30 minutes. An album known only by a romanized YouTube Music title may not match MusicBrainz's original-script title. Lidarr downloads into the music folder, the scan picks the files up, and streams of the same songs move onto them.
+oasis keeps who wants what, and a worker reconciles Lidarr with it after every star or unstar and every minute. A wanted album is looked up on MusicBrainz through Lidarr by artist and title (punctuation and case aside; collaboration credits are tried artist by artist), added with only that album monitored, and searched: one album search every 3 minutes, so a burst of stars doesn't trip a debrid service's rate limit, and again after 6 hours if nothing came. A wanted artist is followed: new releases get monitored, the back catalogue doesn't, and nothing is searched. Once no user wants an item, oasis only unmonitors it; downloaded files stay. Lookups with no match are retried after 30 minutes, errors and timeouts after 5. An album known only by a romanized YouTube Music title may not match MusicBrainz's original-script title. Lidarr downloads into the music folder, the scan picks the files up, and streams of the same songs move onto them.
 
-Albums and artists carry `oasisWanted`: `wanted`, `downloading` or `failed` while Lidarr works on them, and nothing once they're complete or nobody wants them.
+Albums and artists carry `oasisWanted`: `wanted`, `downloading` (only while Lidarr's queue holds it) or `failed`, with the reason in `oasisWantedError` (for example "searched, nothing grabbed yet"), and nothing once an album is complete, an artist is followed, or nobody wants it.
 
 ## Run
 
