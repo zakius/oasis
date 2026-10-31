@@ -181,6 +181,8 @@ class Downloads:
             db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated) "
                        "values (?, ?, 0, ?, ?, ?, 'added', ?, ?)", (added["hash"].lower(), release.get("guid"),
                                                                     group, release["title"], added["torrent_id"], now, now))
+            self.seen.pop(added["hash"].lower(), None)  # added again after a failure: its stall timer starts anew
+            self.failures.pop(added["hash"].lower(), None)
             db.execute("delete from download_target where hash = ?", (added["hash"].lower(),))
             db.executemany("insert into download_target(hash, rg, files, state) values (?, ?, ?, 'pending')",
                            [(added["hash"].lower(), rg, json.dumps(files)) for rg, files in (targets or {}).items()])

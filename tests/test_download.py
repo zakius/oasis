@@ -156,6 +156,25 @@ def test_a_torrent_still_moving_or_seeded_is_not_dead(downloads, torbox, db):
     assert torbox.deleted == [] and db.execute("select state from download").fetchone()[0] == "downloading"
 
 
+def test_a_torrent_added_again_after_a_failure_gets_a_new_stall_timer(downloads, torbox, db, monkeypatch):
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
+    downloads.find(db, WANT, "mb-album")
+    torbox.list = [tb(71, "abcd", progress=0.3, seeds=0)]
+    downloads.cycle()
+    torbox.list = []
+    downloads.cycle()  # gone from TorBox: not blocked
+    now[0] += 7200
+    downloads.find(db, WANT, "mb-album")
+    torbox.list = [tb(72, "abcd", progress=0.3, seeds=0)]
+    downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "downloading"
+    now[0] += 3601
+    downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "failed"
+
+
 def test_a_queued_add_is_dropped_without_blocking(downloads, torbox, db):
     downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
     torbox.full = True
