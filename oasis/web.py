@@ -101,7 +101,7 @@ NO_COVER = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect
 confirm = lambda question: f' onsubmit="return confirm({escape(json.dumps(question, ensure_ascii=False))})"'  # for buttons that drop things
 HIDE_BROKEN = 'onerror="this.removeAttribute(\'src\')"'  # a cover that fails shows the empty frame, not a broken image
 MBID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-MUSIC_NAV = ('<p><a href="/account">Your account</a> · <a href="/music/library">Library</a> · <a href="/music">Find music</a> · '
+MUSIC_NAV = ('<p><a href="/account">Dashboard</a> · <a href="/music/library">Library</a> · <a href="/music">Find music</a> · '
              '<a href="/music/wanted">Wanted</a></p>')
 
 
@@ -228,7 +228,7 @@ def routes(api) -> list[Route]:
                     '<p class="muted">Set in oasis.toml.</p>' if user["name"] in api.config.users else
                     '<form method="post" action="/account/password"><label>New password<input type="password" name="password">'
                     '</label><button>Change</button></form>') + '</section>')
-        return page("Your oasis account", body, q.get("message", ""), q.get("error", ""))
+        return page("Dashboard", body, q.get("message", ""), q.get("error", ""))
 
     def link_youtube(db, request, user, form):
         try:
