@@ -533,7 +533,7 @@ class Api:
 
     def _album_songs(self, db, album_id):
         """The album's own songs, and the songs its YouTube Music listing shares with another album, in its order."""
-        return [song(r) for r in db.execute(
+        return [clean(song(r) | {"track": r["no"], "discNumber": r["disc"]}) for r in db.execute(
             f"select {SONG_COLUMNS}, coalesce(at.disc_no, t.disc_no) as disc, coalesce(at.track_no, t.track_no) as no "
             "from track t left join stat s on s.id = t.id left join album_track at on at.track_id = t.id and at.album_id = ? "
             "where t.album_id = ? or at.album_id is not null order by disc, no is null, no, title", (album_id, album_id))]
@@ -624,8 +624,8 @@ class Api:
             log.info("album %s unavailable: %s", browse_id, e)
             return
         ids = [remember(db, row) for row in rows]
-        db.executemany("insert or replace into album_track values (?, ?, ?, ?)",
-                       [(album_id, id, row.get("disc_no"), row.get("track_no")) for id, row in zip(ids, rows)])
+        db.executemany("insert or replace into album_track select ?, id, ?, ? from track where id = ? and source = 'ytm'",
+                       [(album_id, row.get("disc_no"), row.get("track_no"), id) for id, row in zip(ids, rows)])
         if release:  # file this album's own songs under the artist page's album, whatever spelling YouTube credits them with
             db.executemany("update track set album_id = ?, artist_id = ? where id = ? and source = 'ytm' and ytm_album = ?",
                            [(album_id, release["artist_id"], id, browse_id) for id in ids])
@@ -725,12 +725,13 @@ class Api:
             known = {s["id"] for s in songs}
             try:
                 # Capped: a client asking for 500 songs would otherwise wait on YouTube Music's paging for many seconds.
-                found = [remember(db, row) for row in self.ytm.search(" ".join(terms), min(p.int("songCount", 20), YTM_SEARCH))]
+                # At least 20, for the artists and albums of a client asking for those alone (songCount=0).
+                found = [remember(db, row) for row in self.ytm.search(" ".join(terms), max(min(p.int("songCount", 20), YTM_SEARCH), 20))]
             except Exception as e:
                 log.warning("YouTube Music search failed: %s", e)
                 found = []
             found = [song(self._one(db, SONGS + " where t.id = ?", id)) for id in dict.fromkeys(found) if id not in known]
-            songs += found
+            songs += found[:p.int("songCount", 20)]
             # The artists and albums of YouTube Music's songs that the query names, as the library's are matched, after
             # the library's: opening one fetches the rest of it.
             folded = [ytm.fold(t) for t in terms]
@@ -1163,6 +1164,14 @@ class Api:
         return {}
 
     def getCoverArt(self, db, p, user):
+        try:
+            return self._cover_art(db, p)
+        except Fail as e:
+            if e.code != NOT_FOUND:
+                raise
+            return Response(status_code=404)  # a status clients see, not an error document they would draw as an image
+
+    def _cover_art(self, db, p):
         id = p.need("id")
         id = acquire.mbid_of(id) and acquire.library_id(db, id) or id
         if id.startswith(MB_IDS["album"]):  # a MusicBrainz-only album until it arrives
@@ -1179,8 +1188,8 @@ class Api:
         except OSError as e:
             log.warning("cover %s unavailable: %s", r["cover"], e)
             image = None
-        if image is None:  # a status clients see, not an error document they would try to show as an image
-            return Response(status_code=404)
+        if image is None:
+            raise Fail(NOT_FOUND, "Cover art not found")
         return Response(image[0], media_type=image[1], headers={"Cache-Control": "public, max-age=86400"})
 
     def stream(self, db, p, user):

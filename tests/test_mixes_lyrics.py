@@ -86,6 +86,9 @@ def test_mixes_are_read_only_playlists_in_the_library(client, ytm):
     cover = mixes["My Supermix"]["coverArt"]
     assert cover.startswith("pl-")
     assert mixes["My Mix 1"]["readonly"] is True
+    uncovered = call(client, "createPlaylist", name="Bare")["playlist"]["id"]
+    assert client.get("/rest/getCoverArt", params={"u": "admin", "p": "secret", "id": f"pl-{uncovered}"}).status_code == 404
+    call(client, "deletePlaylist", id=uncovered)
     assert call(client, "updatePlaylist", playlistId=mixes["My Mix 1"]["id"], name="mine")["error"]["code"] == 50  # not authorized
     call(client, "oasisUnlinkYouTubeMusic")
     assert playlists(client) == {}
