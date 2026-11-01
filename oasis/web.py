@@ -98,6 +98,7 @@ details.album > table { margin: .3rem 0 .6rem 1em; width: calc(100% - 1em); } .r
 STATES = {"added": "waiting for TorBox", "downloading": "TorBox downloading", "fetching": "copying here", "importing": "importing"}
 NO_COVER = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#8883"/>'
             '<text x="50" y="64" font-size="42" text-anchor="middle" fill="#8889">♪</text></svg>')
+confirm = lambda question: f' onsubmit="return confirm({escape(json.dumps(question, ensure_ascii=False))})"'  # for buttons that drop things
 HIDE_BROKEN = 'onerror="this.removeAttribute(\'src\')"'  # a cover that fails shows the empty frame, not a broken image
 MBID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 MUSIC_NAV = ('<p><a href="/account">Your account</a> · <a href="/music/library">Library</a> · <a href="/music">Find music</a> · '
@@ -481,8 +482,8 @@ def routes(api) -> list[Route]:
                 return "next", '<span class="pill">in a minute or two</span>'
             return ("notfound", f'searched {ago(r["searched"])}') if r["searched"] else ("waiting", "")
 
-        def action(rg: str, name: str, label: str) -> str:
-            return (f'<form method="post" action="/music/wanted/{escape(rg)}/{name}"><input type="hidden" name="next" value="{escape(here)}">'
+        def action(rg: str, name: str, label: str, ask: str = "") -> str:
+            return (f'<form method="post" action="/music/wanted/{escape(rg)}/{name}"{ask and confirm(ask)}><input type="hidden" name="next" value="{escape(here)}">'
                     f'<button>{label}</button></form>')
 
         where, params = ["state in ('missing', 'downloading')"], []
@@ -518,7 +519,7 @@ def routes(api) -> list[Route]:
             if not items:
                 continue
             bulk = (f'<form class="bulk" method="post" action="/music/wanted/give-up" '
-                    f'onsubmit="return confirm(\'Give up on all {len(items)} in {title}?\')"><input type="hidden" name="rgs" '
+                    f'{confirm(f"Give up on all {len(items)} in {title}?")}><input type="hidden" name="rgs" '
                     f'value="{",".join(r["rg"] for r, _ in items)}"><input type="hidden" name="next" value="{escape(here)}">'
                     f'<button>Give up on {"all " + str(len(items)) if len(items) > 1 else "it"}…</button></form>')
             table = "".join(
@@ -528,7 +529,7 @@ def routes(api) -> list[Route]:
                 f'<td class="num">{escape((r["first_date"] or "")[:4])}</td>'
                 f'<td>{"★ starred" if r["reason"] == "starred" else "followed"}</td><td>{note}</td>'
                 f'<td class="actions">{action(r["rg"], "block", "Try another") if key == "downloading" else action(r["rg"], "search", "Search now")}'
-                f'{action(r["rg"], "give-up", "Give up")}</td></tr>' for r, note in items)
+                f'{action(r["rg"], "give-up", "Give up", f"Give up on {r['artist']} – {r['title']}?")}</td></tr>' for r, note in items)
             opened = " open" if key in ("attention", "downloading", "next") or len(items) <= 30 else ""
             body += (f'<details class="group"{opened}><summary>{title} <span class="pill">{len(items)}</span></summary>'
                      f'<table class="grid"><thead><tr><th>Album</th><th>Type</th><th class="num">Year</th><th>Why</th><th>State</th><th></th>'
@@ -548,7 +549,7 @@ def routes(api) -> list[Route]:
                      'artist or album it is; it asks again later. Find it and want it from there instead.</p><table class="grid"><tbody>' + "".join(
                          f'<tr><td class="lead">{escape(name(r))}</td><td>{escape(r["kind"])}</td><td><span class="error">{escape(r["error"] or "")}</span></td>'
                          f'<td class="actions">' + (
-                             f'<form method="post" action="/music/unwant"><input type="hidden" name="kind" value="{r["kind"]}">'
+                             f'<form method="post" action="/music/unwant"{confirm(f"Give up on {name(r)}?")}><input type="hidden" name="kind" value="{r["kind"]}">'
                              f'<input type="hidden" name="ref" value="{escape(r["ref"])}"><button>Give up</button></form>' if r["mine"] else "")
                          + '</td></tr>' for r in lost) + '</tbody></table></section>')
         return page("Wanted", body, q.get("message", ""), q.get("error", ""), wide=True)
