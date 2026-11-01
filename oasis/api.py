@@ -136,7 +136,8 @@ SONGS = f"select {SONG_COLUMNS} from track t left join stat s on s.id = t.id"
 ALBUMS = """
 select t.album_id as id, t.album as name, t.album_artist as artist, t.artist_id,
        count(*) as song_count, sum(t.duration) as duration, min(t.created) as created,
-       max(t.year) as year, max(t.genre) as genre, max(t.cover is not null) as has_cover,
+       coalesce(max(t.year), (select x.year from ytm_release x where x.album_id = t.album_id)) as year,
+       max(t.genre) as genre, max(t.cover is not null) as has_cover,
        s.starred as album_starred, s.rating as album_rating,
        coalesce(sum(ps.play_count), 0) as plays, max(ps.played) as last_played, wi.state as want_state, wi.error as want_error
 from track t left join stat s on s.id = t.album_id left join stat ps on ps.id = t.id
