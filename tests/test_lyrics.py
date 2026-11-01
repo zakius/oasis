@@ -62,6 +62,7 @@ def test_netease_word_timing(monkeypatch):
         "https://music.163.com/api/song/lyric": json.dumps({"yrc": {"lyric": "[1000,2000](1000,500,0)Hel(1500,500,0)lo (world)"}}).encode()})
     found = lyrics.netease(QUERY)
     assert found.word_level and found.lines == [(1000, "Hello (world)")]
+    assert found.words == [[[1000, 1500, "Hel"], [1500, 2000, "lo (world)"]]]
 
 
 def test_kugou_decrypts_krc(monkeypatch):
@@ -72,7 +73,8 @@ def test_kugou_decrypts_krc(monkeypatch):
         "https://mobileservice.kugou.com": json.dumps({"data": {"info": [{"songname": "Song", "duration": 200, "hash": "h"}]}}).encode(),
         "https://krcs.kugou.com/search": json.dumps({"candidates": [{"id": 1, "accesskey": "k"}]}).encode(),
         "https://krcs.kugou.com/download": json.dumps({"content": encrypted}).encode()})
-    assert lyrics.kugou(QUERY).lines == [(1000, "Hi there")]
+    found = lyrics.kugou(QUERY)
+    assert found.lines == [(1000, "Hi there")] and found.words == [[[1000, 1500, "Hi"], [1500, 2000, " there"]]]  # starts relative to the line
 
 
 def test_lyricsplus_rejects_timing_that_does_not_fit(monkeypatch):
@@ -81,7 +83,7 @@ def test_lyricsplus_rejects_timing_that_does_not_fit(monkeypatch):
             {"time": 1000, "duration": end - 1000, "syllabus": [{"text": "Hey"}]}]}).encode()
     respond(monkeypatch, {"https://lyricsplus": body(190_000)})
     found = lyrics.lyricsplus(QUERY)
-    assert found.source == "LyricsPlus · Apple" and found.word_level
+    assert found.source == "LyricsPlus · Apple" and found.word_level and found.words == [[[0, 0, "Hey"]]]
     respond(monkeypatch, {"https://lyricsplus": body(30_000)})
     assert lyrics.lyricsplus(QUERY) is None
 
@@ -102,3 +104,11 @@ def test_cleaning_drops_credits_and_heading_and_unescapes():
 def test_lrc_offset_is_applied_positive_sooner():
     assert lyrics.parse("[offset:+500]\n[00:01.00]a\n[00:00.20]b").lines == [(0, "b"), (500, "a")]
     assert lyrics.parse("[offset:-250]\n[00:01.00]a").lines == [(1250, "a")]
+
+
+def test_enhanced_lrc_keeps_word_timing():
+    found = lyrics.parse("[offset:100]\n[00:02.00]<00:02.00>b<00:02.50>c\n[00:01.00]<00:01.00>a\n[00:03.00]d")
+    assert found.lines == [(900, "a"), (1900, "bc"), (2900, "d")]
+    assert found.words == [[[900, 1900, "a"]], [[1900, 2400, "b"], [2400, 2900, "c"]], []]  # an open word runs to the next line
+    cut = lyrics.cleaned(found, Query("x", "y", None, 0)).subset([1])
+    assert cut.lines == [(1900, "bc")] and cut.words == [[[1900, 2400, "b"], [2400, 2900, "c"]]]

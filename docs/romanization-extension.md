@@ -76,8 +76,10 @@ Servers that don't know `kinds` ignore it and send everything, which clients mus
 
 - oasis: implements and advertises the extension; romanizes names and lyrics with a port of roma's romanizer
   (`oasis/romanize.py`), kept identical by the golden cases in `tests/romanization-cases.tsv`, which roma's own
-  romanizer generates. oasis keeps line timing only and has no translations, so it sends no `cueLine` and no
-  `translation` entries yet.
+  romanizer generates. It sends `cueLine` on `main` and `pronunciation` for lines with karaoke words (enhanced LRC,
+  NetEase, KuGou, LyricsPlus): a pronunciation line is its words' romaji joined, each word keeping the main word's
+  timing, as roma's romanizeLyrics does. A romaji word that went to the word before is left out, so a pronunciation
+  line can have fewer cues than its main line. No `translation` entries yet.
 - roma (Subsonic app): with the extension, never downloads or asks for the Japanese dictionary; syncs its index
   with `romanization=both` so switching the display is instant; asks lyrics with `enhanced=true` and `kinds`
   matching the display. Without it, on-device romanization with the dictionary, as today.
@@ -91,7 +93,7 @@ Servers that don't know `kinds` ignore it and send everything, which clients mus
 2. `kinds` applies with `enhanced=true` only. Without `enhanced`, the response stays songLyrics v1, unchanged.
 3. Lyrics already in Latin script have no `pronunciation` entry, and `main` stands in for it when `kinds` asks for
    `pronunciation`.
-4. `cueLine` comes "when the server has word timing", not "when synced": oasis has line timing only.
+4. `cueLine` comes "when the server has word timing", not "when synced": lyrics with line timing only stay line-level.
 5. The `pronunciation` entry's `lang` values are listed.
 6. With `latin`, albums' `title` and `album` fields change with `name`, and `getArtists` and `getIndexes` regroup
    their index by the romanized names.

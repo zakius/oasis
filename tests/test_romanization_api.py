@@ -122,3 +122,30 @@ def test_lyrics_kinds(client):
     # Lyrics already in Latin script have no pronunciation: main stands in for it.
     assert [l["kind"] for l in lyrics(one, enhanced="true")] == ["main"]
     assert [l["kind"] for l in lyrics(one, enhanced="true", kinds="pronunciation")] == ["main"]
+
+
+@pytest.fixture
+def karaoke(tmp_path):
+    root = tmp_path / "lib"
+    make_track(root / "a/1.flac", title="忙しい", artist="テスト", album="テスト", tracknumber="1")
+    (root / "a/1.lrc").write_text("[00:01.00]<00:01.00>忙<00:01.40>し<00:01.60>い <00:02.00>夜に\n[00:04.00]ここ\n")
+    with make_client(root, tmp_path / "oasis.db") as c:
+        yield c
+
+
+def test_lyrics_cue_lines(karaoke):
+    id = songs(karaoke)["忙しい"]["id"]
+    lyrics = lambda **params: call(karaoke, "getLyricsBySongId", id=id, **params)["lyricsList"]["structuredLyrics"]
+    assert all("cueLine" not in l for l in lyrics())
+    main, pronunciation = lyrics(enhanced="true")
+    def cues(entry):
+        return [[(c["start"], c["end"], c["value"], c["byteStart"], c["byteEnd"]) for c in l["cue"]] for l in entry["cueLine"]]
+    assert [l["index"] for l in main["cueLine"]] == [0]  # ここ has no word timing: line-level only
+    assert cues(main) == [[(1000, 1400, "忙", 0, 2), (1400, 1600, "し", 3, 5), (1600, 2000, "い ", 6, 9), (2000, 4000, "夜に", 10, 15)]]
+    assert [l["value"] for l in pronunciation["line"]] == ["Isogashii yoru ni", "Koko"]
+    assert pronunciation["cueLine"][0]["value"] == "Isogashii yoru ni"
+    assert cues(pronunciation) == [[(1000, 1400, "Isoga", 0, 4), (1400, 1600, "shi", 5, 7), (1600, 2000, "i ", 8, 9), (2000, 4000, "yoru ni", 10, 16)]]
+    for entry in (main, pronunciation):  # each cue's bytes are its own text
+        for l in entry["cueLine"]:
+            assert all(l["value"].encode()[c["byteStart"]:c["byteEnd"] + 1].decode() == c["value"] for c in l["cue"])
+    assert "cueLine" in lyrics(enhanced="true", kinds="pronunciation")[0]

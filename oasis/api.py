@@ -360,6 +360,28 @@ def latin_index(db):
         folded(r["album"], r["title"], r["artist"], title_of=True), folded(r["album_artist"], r["title"], r["album"])) for r in rows])
 
 
+def cue_lines(values: list[str], words: list[list]) -> dict:
+    """songLyrics v2 cueLine for each line with karaoke words: each word found in the line's text in order, with
+    inclusive UTF-8 byte offsets; a word the text doesn't hold (romaji that went to the word before) is left out."""
+    found = []
+    for index, (value, line_words) in enumerate(zip(values, words)):
+        cues, at = [], 0
+        for start, end, text in line_words:
+            i = value.find(text, at) if text else -1
+            if i < 0 and (text := text.strip()):
+                i = value.find(text, at)
+            if i < 0 or not text:
+                continue
+            byte = len(value[:i].encode())
+            cues.append({"start": start, "end": end, "value": text, "byteStart": byte, "byteEnd": byte + len(text.encode()) - 1})
+            at = i + len(text)
+        for cue, after in zip(cues, cues[1:]):
+            cue["end"] = max(cue["start"], min(cue["end"], after["start"]))
+        if cues:
+            found.append({"index": index, "start": cues[0]["start"], "end": cues[-1]["end"], "value": value, "cue": cues})
+    return {"cueLine": found} if found else {}
+
+
 def decode_password(value: str) -> str:
     return bytes.fromhex(value[4:]).decode() if value.startswith("enc:") else value
 
@@ -1007,7 +1029,8 @@ class Api:
         if r["source"] == "local" and (found := lyrics.local(r["ref"])):
             return found
         cached = db.execute("select found, fetched from lyrics where track_id = ?", (r["id"],)).fetchone()
-        if cached and (cached["found"] or cached["fetched"] > time.time() - 86400):
+        old = cached and cached["found"] and '"word_level": true' in cached["found"] and '"words"' not in cached["found"]  # cached without its words
+        if cached and not old and (cached["found"] or cached["fetched"] > time.time() - 86400):
             return lyrics.Lyrics(**json.loads(cached["found"])) if cached["found"] else None
         youtube = None
         if self.ytm:
@@ -1034,11 +1057,16 @@ class Api:
         # translations; lyrics already in Latin script have no pronunciation, and main stands in for one.
         kinds = (p.get("kinds") or "main,pronunciation,translation").split(",")
         texts, siblings = [text for _, text in found.lines], [x for x in (r["artist"], r["album"]) if x]
+        words = found.words if found.synced and found.words else [[] for _ in texts]
         latin = romanize.lyrics(texts, siblings) if any(map(romanize.has_non_latin, texts)) else None
-        entries = [{**main, "kind": "main"}] if "main" in kinds or "pronunciation" in kinds and latin is None else []
+        entries = [{**main, "kind": "main", **cue_lines(texts, words)}] if "main" in kinds or "pronunciation" in kinds and latin is None else []
         if latin and "pronunciation" in kinds:
+            # A line with karaoke words reads as its words' romaji, each word keeping its timing (roma's romanizeLyrics).
+            word_latin = romanize.lyric_words(texts, [[w[2] for w in ws] for ws in words], siblings)
+            latin = ["".join(wl).strip() if wl else l for l, wl in zip(latin, word_latin)]
+            words = [[[a, b, t] for (a, b, _), t in zip(ws, wl)] for ws, wl in zip(words, word_latin)]
             entries.append({**main, "kind": "pronunciation", "lang": romanize.language(texts, siblings) + "-Latn",
-                            "line": [clean({"start": start, "value": l}) for (start, _), l in zip(found.lines, latin)]})
+                            "line": [clean({"start": start, "value": l}) for (start, _), l in zip(found.lines, latin)], **cue_lines(latin, words)})
         return {"lyricsList": clean({"structuredLyrics": entries or None})}
 
     def getLyrics(self, db, p, user):

@@ -1,5 +1,6 @@
 """Lyrics from the track's own files and from the providers roma uses, chosen by roma's rules (YouTube Music's text is
-the reference). Lines are (start ms or None, text)."""
+the reference). Lines are (start ms or None, text); words, when the source has karaoke timing, are each line's
+[start ms, end ms, text] words, which join into the line's text."""
 import base64
 import html
 import json
@@ -32,9 +33,25 @@ class Lyrics:
     lines: list[tuple[int | None, str]]
     synced: bool
     word_level: bool = False
+    words: list[list[list]] | None = None
 
     def text(self) -> str:
         return "\n".join(text for _, text in self.lines)
+
+    def subset(self, keep: list[int]) -> "Lyrics":
+        return Lyrics(self.source, [self.lines[i] for i in keep], self.synced, self.word_level, [self.words[i] for i in keep] if self.words else None)
+
+
+def timed(source: str, rows: list, word_level: bool) -> Lyrics:
+    """Synced lyrics from (start, text, words) rows, in time order. A word without an end runs to the next line (roma's
+    closeWords)."""
+    rows = sorted(rows, key=lambda row: row[0])
+    for i, (start, _, words) in enumerate(rows):
+        for w in words:
+            if w[1] is None:
+                w[1] = rows[i + 1][0] if i + 1 < len(rows) else words[-1][0] + 1000
+    words = [words for _, _, words in rows]
+    return Lyrics(source, [(start, text) for start, text, _ in rows], True, word_level, words if any(words) else None)
 
 
 @dataclass
@@ -52,27 +69,34 @@ def ms(minutes: str, seconds: str) -> int:
 def parse(text: str, source: str = "file") -> Lyrics:
     """LRC (also with <mm:ss.xx> word stamps) or plain text. A line with several timestamps repeats. An [offset:ms]
     tag is applied to the times (positive shows lines sooner), so oasis always sends offset 0."""
-    lines, word_level = [], False
+    lines, rows, word_level = [], [], False
     offset = int(m.group(1)) if (m := re.search(r"^\[offset:\s*([+-]?\d+)\s*\]", text, re.M | re.I)) else 0
     for raw in text.splitlines():
         rest, stamps = raw.strip(), []
         while m := LRC_TIME.match(rest):
             stamps.append(max(0, ms(*m.groups()) - offset))
             rest = rest[m.end():]
-        if WORD_TIME.search(rest):
+        words, marks = [], list(WORD_TIME.finditer(rest))
+        if marks:
             word_level = True
+            if stamps and rest[:marks[0].start()].strip():  # text before the first word stamp starts with the line
+                words.append([stamps[0], None, rest[:marks[0].start()]])
+            for i, m in enumerate(marks):
+                start = max(0, ms(*m.groups()) - offset)
+                if words:
+                    words[-1][1] = start
+                if w := rest[m.end():marks[i + 1].start() if i + 1 < len(marks) else len(rest)]:
+                    words.append([start, None, w])
             rest = WORD_TIME.sub("", rest)
         if stamps:
-            lines += [(start, rest.strip()) for start in stamps]
+            rows += [(start, rest.strip(), words if len(stamps) == 1 and stamps else []) for start in stamps]
         elif not re.fullmatch(r"\[\w+:.*\]", raw.strip()):  # LRC headers like [ar:...]
             lines.append((None, raw.strip()))
-    synced = any(start is not None for start, _ in lines)
-    if synced:
-        lines = sorted((line for line in lines if line[0] is not None), key=lambda line: line[0])
-    else:
-        while lines and not lines[-1][1]:
-            lines.pop()
-    return Lyrics(source, lines, synced, word_level and synced)
+    if rows:
+        return timed(source, rows, word_level)
+    while lines and not lines[-1][1]:
+        lines.pop()
+    return Lyrics(source, lines, False)
 
 
 def local(path: str) -> Lyrics | None:
@@ -104,9 +128,11 @@ def cleaned(found: Lyrics, query: "Query") -> Lyrics:
     (KuGou starts with one): they aren't sung."""
     def unescape(text):
         return re.sub(r"\\(['\"])", r"\1", html.unescape(text))
-    lines = [(start, unescape(text)) for i, (start, text) in enumerate(found.lines)
-             if not CREDIT.search(text) and not (i < 3 and " - " in text and same_title(text.split(" - ", 1)[1], query.title))]
-    return Lyrics(found.source, lines, found.synced, found.word_level)
+    found = found.subset([i for i, (_, text) in enumerate(found.lines)
+                          if not CREDIT.search(text) and not (i < 3 and " - " in text and same_title(text.split(" - ", 1)[1], query.title))])
+    found.lines = [(start, unescape(text)) for start, text in found.lines]
+    found.words = found.words and [[[a, b, unescape(t)] for a, b, t in words] for words in found.words]
+    return found
 
 
 # Matching
@@ -186,15 +212,17 @@ def lrclib(query: Query) -> Lyrics | None:
     return parse(plain["plainLyrics"], "LRCLIB") if plain else None
 
 
-def parse_timed(text: str, word: re.Pattern, source: str) -> Lyrics | None:
-    """NetEase YRC "[start,dur](wordStart,dur,0)word" and KuGou KRC "[start,dur]<offset,dur,0>word"."""
-    lines = []
+def parse_timed(text: str, word: re.Pattern, source: str, relative=False) -> Lyrics | None:
+    """NetEase YRC "[start,dur](wordStart,dur,0)word" and KuGou KRC "[start,dur]<offset,dur,0>word" (relative: word
+    starts count from the line's)."""
+    rows = []
     for raw in text.splitlines():
         if not (head := re.match(r"\[(\d+),(\d+)\]", raw)):
             continue
-        words = "".join(m[3] for m in word.finditer(raw[head.end():]))
-        lines.append((int(head[1]), words.strip()))
-    return Lyrics(source, lines, True, True) if lines else None
+        base = int(head[1]) if relative else 0
+        words = [[base + int(m[1]), base + int(m[1]) + int(m[2]), m[3]] for m in word.finditer(raw[head.end():]) if m[3]]
+        rows.append((int(head[1]), "".join(w[2] for w in words).strip(), words))
+    return timed(source, rows, True) if rows else None
 
 
 YRC_WORD = re.compile(r"\((\d+),(\d+),\d+\)(.*?)(?=\(\d+,\d+,\d+\)|$)")
@@ -216,7 +244,7 @@ def netease(query: Query) -> Lyrics | None:
     if not lrc:
         return None
     result = parse(lrc, "NetEase")
-    result.lines = [line for line in result.lines if " : " not in line[1] and "：" not in line[1]]  # credits like "作词 : X"
+    result = result.subset([i for i, (_, text) in enumerate(result.lines) if " : " not in text and "：" not in text])  # credits like "作词 : X"
     return result if result.lines else None
 
 
@@ -243,7 +271,7 @@ def kugou(query: Query) -> Lyrics | None:
         return None
     c = candidates[0]
     download = json.loads(get(f"https://krcs.kugou.com/download?ver=1&man=yes&client=pc&fmt=krc&charset=utf8&id={c['id']}&accesskey={c['accesskey']}"))
-    return parse_timed(kugou_decrypt(download["content"]), KRC_WORD, "KuGou") if download.get("content") else None
+    return parse_timed(kugou_decrypt(download["content"]), KRC_WORD, "KuGou", relative=True) if download.get("content") else None
 
 
 def lyricsplus(query: Query) -> Lyrics | None:
@@ -259,10 +287,10 @@ def lyricsplus(query: Query) -> Lyrics | None:
     if meta.get("title") and not same_title(meta["title"], query.title):
         return None
     rows = body.get("lyrics") or []
-    lines, word_level, end = [], False, 0
+    lines, words, end = [], [], 0
     for row in rows:
         syllables = [s for s in row.get("syllabus") or [] if s.get("text")]
-        word_level |= bool(syllables)
+        words.append([[int(float(s.get("time") or 0)), int(float(s.get("time") or 0)) + int(float(s.get("duration") or 0)), s["text"]] for s in syllables])
         text = "".join(s["text"] for s in syllables).strip() if syllables else (row.get("text") or "").strip()
         start = int(float(row.get("time") or 0))
         end = max(end, start + int(float(row.get("duration") or 0)))
@@ -274,7 +302,8 @@ def lyricsplus(query: Query) -> Lyrics | None:
     if song >= 60_000 and end > 0 and not (min(song // 2, song - 90_000) <= end <= song + 45_000):
         return None
     source = f"LyricsPlus · {meta['source']}" if meta.get("source") else "LyricsPlus"
-    return Lyrics(source, lines, any(start > 0 for start, _ in lines), word_level)
+    synced = any(start > 0 for start, _ in lines)
+    return Lyrics(source, lines, synced, any(words), words if synced and any(words) else None)
 
 
 PROVIDERS = {"lrclib": lrclib, "netease": netease, "kugou": kugou, "lyricsplus": lyricsplus}

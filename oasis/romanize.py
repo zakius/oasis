@@ -639,10 +639,19 @@ def lyrics(lines: list[str], siblings=()) -> list[str]:
     """Lyric lines in sentence case. The language is decided once per song: kana in any line makes every line
     Japanese, else Chinese evidence in any line makes every Han line Chinese; the Cyrillic language comes from the whole
     lyrics, unless a line has a letter that language lacks."""
-    hint = next((t for t in lines if has_kana(t)), None) or next((t for t in lines if looks_chinese(t)), None)
-    sib = [*siblings, *([hint] if hint else [])]
-    song = cyrillic_language("\n".join(lines))
+    sib, song = song_context(lines, siblings)
     return ["".join(parts(pieces(line, sib), sib, cyrillic_language_of_line(line, song))).strip() for line in lines]
+
+
+def song_context(lines: list[str], siblings=()) -> tuple[list[str], str]:
+    hint = next((t for t in lines if has_kana(t)), None) or next((t for t in lines if looks_chinese(t)), None)
+    return [*siblings, *([hint] if hint else [])], cyrillic_language("\n".join(lines))
+
+
+def lyric_words(lines: list[str], words: list[list[str]], siblings=()) -> list[list[str]]:
+    """Each line's karaoke words romanized, one result per word (roma's wordLatin); [] for a line without words."""
+    sib, song = song_context(lines, siblings)
+    return [parts(w, sib, cyrillic_language_of_line(line, song)) if w else [] for line, w in zip(lines, words)]
 
 
 def language(lines: list[str], siblings=()) -> str:
