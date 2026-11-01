@@ -239,3 +239,11 @@ def test_a_song_on_an_album_and_its_single_stays_on_both(client, ytm, monkeypatc
     assert titles(single["song"]) == ["Track 2"] and single["songCount"] == 1 and single["song"][0]["id"] == first["song"][1]["id"]
     counts = {a["name"]: a["songCount"] for a in call(client, "getArtist", id=beta["id"])["artist"]["album"]}
     assert counts["Track 2"] == 1
+
+
+def test_search_lists_youtube_artists_and_albums_after_the_librarys(client):
+    found = call(client, "search3", query="gamma")["searchResult3"]
+    assert [a["name"] for a in found["artist"]] == ["Gamma"] and [a["name"] for a in found["album"]] == ["Far Away"]
+    album = call(client, "getAlbum", id=found["album"][0]["id"])["album"]
+    assert titles(album["song"]) == ["Track 1", "Track 2", "Track 3", "Gamma Hit"]  # opening it fetches the rest
+    assert call(client, "getArtist", id=found["artist"][0]["id"])["artist"]["album"][0]["name"] == "Far Away"

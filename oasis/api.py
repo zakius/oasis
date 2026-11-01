@@ -96,6 +96,7 @@ SONG_ID_PARAMS = ("id", "songId", "songIdToAdd")
 ARTIST_ID_PARAMS = ("id", "artistId")
 MOVED_PARAMS = (*SONG_ID_PARAMS, "albumId", "artistId")
 FIND_FROM = 3  # characters a search needs before MusicBrainz is asked too
+YTM_SEARCH = 50  # YouTube Music songs a search asks for at most
 
 
 class Params:
@@ -722,11 +723,25 @@ class Api:
         if self.ytm and terms and p.int("songOffset", 0) == 0:
             known = {s["id"] for s in songs}
             try:
-                found = [remember(db, row) for row in self.ytm.search(" ".join(terms), p.int("songCount", 20))]
+                # Capped: a client asking for 500 songs would otherwise wait on YouTube Music's paging for many seconds.
+                found = [remember(db, row) for row in self.ytm.search(" ".join(terms), min(p.int("songCount", 20), YTM_SEARCH))]
             except Exception as e:
                 log.warning("YouTube Music search failed: %s", e)
                 found = []
-            songs += [song(self._one(db, SONGS + " where t.id = ?", id)) for id in dict.fromkeys(found) if id not in known]
+            found = [song(self._one(db, SONGS + " where t.id = ?", id)) for id in dict.fromkeys(found) if id not in known]
+            songs += found
+            # The artists and albums of YouTube Music's songs that the query names, as the library's are matched, after
+            # the library's: opening one fetches the rest of it.
+            folded = [ytm.fold(t) for t in terms]
+            def named(*texts): return all(t in ytm.fold(" ".join(x or "" for x in texts)) for t in folded)
+            if p.int("artistOffset", 0) == 0 and (room := p.int("artistCount", 20) - len(artists)) > 0:
+                ids = [i for i in dict.fromkeys(s["artistId"] for s in found if s.get("artistId") and named(s["artist"]))
+                       if i not in {a["id"] for a in artists}]
+                artists += self._in_order(db, ARTISTS, "t.artist_id", ids[:room], artist)
+            if p.int("albumOffset", 0) == 0 and (room := p.int("albumCount", 20) - len(albums)) > 0:
+                ids = [i for i in dict.fromkeys(s["albumId"] for s in found if s.get("albumId") and named(s.get("album"), s["artist"]))
+                       if i not in {a["id"] for a in albums}]
+                albums += self._in_order(db, ALBUMS, "t.album_id", ids[:room], album)
         text = " ".join(terms)
         if self.library and len(text) >= FIND_FROM:
             # MusicBrainz last, for what neither the library nor YouTube Music has: these can be starred like any other.
@@ -740,6 +755,14 @@ class Api:
                 albums += [self._mb_album(db, g) for g in self._find(db, "album", text)
                            if ytm.fold(g["title"]) not in titles and not acquire.library_id(db, MB_IDS["album"] + g["id"])][:room]
         return {"artist": artists, "album": albums, "song": songs}
+
+    @staticmethod
+    def _in_order(db, query, column, ids, shape) -> list[dict]:
+        """query's rows grouped by column, for ids in their order."""
+        if not ids:
+            return []
+        rows = {r["id"]: r for r in db.execute(query + f" where {column} in ({','.join('?' * len(ids))}) group by {column}", ids)}
+        return [shape(rows[i]) for i in ids if i in rows]
 
     def _find(self, db, kind, text) -> list[dict]:
         try:
