@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 
 INTERVAL = 60            # seconds between polls of TorBox
 SLOWEST = 12 * 3600     # seconds a download may take at its pace so far
+EMPTY_SWARM = 10 * 60    # seconds a torrent may go without progress, seeders and a full copy among its peers
 DEAD_AFTER = 20 * 60     # seconds a torrent may sit at 0% without seeders
 UNRELIABLE = 5, 1 / 3    # an indexer with this many downloads, this share of them dead, is tried last
 KEEP = (*AUDIO, *ARCHIVES, "cue", "jpg", "jpeg", "png", "webp", "gif")  # music (perhaps packed), cue sheets and cover art; logs, nfo and the rest stay on TorBox
@@ -242,6 +243,12 @@ class Downloads:
                 if progress != torrent["progress"]:  # a torrent still at 0% has made no progress since it was added, restart or not
                     since = row["created"] if progress is None and not torrent["progress"] else time.time()
                     self.seen[row["hash"]] = (torrent["progress"], since)
+                # Nobody to get it from, or peers holding only part of it, for EMPTY_SWARM: its slot is freed.
+                if not torrent["seeds"] and time.time() - since > EMPTY_SWARM:
+                    if not torrent.get("peers"):
+                        return self.fail(db, row, "dead torrent: nobody shares it")
+                    if (have := torrent.get("availability") or 0) < 1:
+                        return self.fail(db, row, f"dead torrent: its peers have only {have:.0%} of it")
                 # Not a byte from no seeder: dead soon. Stalled part way: the usual wait, as seeders come and go.
                 if not torrent["seeds"] and time.time() - since > (DEAD_AFTER if not torrent["progress"] else self.stall):
                     return self.fail(db, row, "dead torrent: no seeds, no progress")

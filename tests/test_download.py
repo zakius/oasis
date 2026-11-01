@@ -26,8 +26,9 @@ class TorBox(FakeTorBox):
         return (self.tmp / "cdn" / str(file_id)).as_uri()
 
 
-def tb(id, hash, **extra):
-    return {"download_state": "downloading", "download_finished": False, "download_present": False, **torrent(id, hash, **extra)}
+def tb(id, hash, peers=1, availability=1.0, **extra):
+    return {"download_state": "downloading", "download_finished": False, "download_present": False, "peers": peers,
+            "availability": availability, **torrent(id, hash, **extra)}
 
 
 def result(title, hash="", seeders=5, size=400e6, **extra):
@@ -195,7 +196,7 @@ def test_a_torrent_without_seeders_at_0_percent_is_dead_after_20_minutes(downloa
     monkeypatch.setattr(time, "time", lambda: now[0])
     downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
     downloads.find(db, WANT, "mb-album")
-    torbox.list = [tb(71, "abcd", progress=0, seeds=0)]
+    torbox.list = [tb(71, "abcd", progress=0, seeds=0, peers=2, availability=1.5)]
     downloads.cycle()
     now[0] += 1000
     downloads.cycle()
@@ -248,3 +249,20 @@ def test_a_trickling_torrent_makes_way_when_slots_are_full_and_albums_wait_and_i
     assert "abcd" in downloads.slow(db) and "abcd" not in downloads.blocked(db)
     other = result("Artist - Album [FLAC]", "beef", seeders=1)
     assert [r["infoHash"] for r in releases.rank([offer("abcd", seeders=90), other], set(), slow=downloads.slow(db))] == ["beef", "abcd"]
+
+
+@pytest.mark.parametrize("swarm, why", [({"peers": 0}, "dead torrent: nobody shares it"),
+                                        ({"peers": 3, "availability": 0.6}, "dead torrent: its peers have only 60% of it")])
+def test_a_torrent_nobody_or_only_part_of_which_is_shared_goes_after_10_minutes(downloads, torbox, db, monkeypatch, swarm, why):
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
+    downloads.find(db, WANT, "mb-album")
+    torbox.list = [tb(71, "abcd", progress=0.1, seeds=0, **swarm)]
+    downloads.cycle()
+    now[0] += 500
+    downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "downloading"
+    now[0] += 200
+    downloads.cycle()
+    assert db.execute("select state, error from download").fetchone()[:] == ("failed", why)
