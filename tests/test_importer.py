@@ -70,7 +70,7 @@ def test_the_edition_the_files_cover_is_picked_and_placed_with_its_tags(make, tm
     translated = edition("pseudo", [("One", 2), ("Two", 3), ("Three", 4), ("Not on any edition", 9)], status="Pseudo-Release")
     unknown = edition("unknown", [("One", 0), ("Two", 0), ("Three", 0)])  # MusicBrainz has no lengths
     album = make(unknown, single, deluxe, standard, translated).place(staging, "rg-1")
-    assert album == root / "Beta/First (2001)"
+    assert album == root / "Beta/2001 - First"
     assert sorted(p.name for p in album.iterdir()) == ["01 - One.flac", "02 - Two.flac", "03 - Three.flac", "cover.jpg"]
 
     row = read(album / "03 - Three.flac", root, {})
@@ -89,28 +89,37 @@ def test_an_edition_whose_lengths_differ_is_rejected(make, tmp_path):
         make(edition("long", [("One", 60)])).place(tmp_path / "dl", "rg-1")
 
 
-def test_untitled_files_are_matched_by_their_numbers_into_an_existing_artist_folder(make, tmp_path, root):
+def test_untitled_files_are_matched_by_their_numbers_and_named_as_musicbrainz_names_the_edition(make, tmp_path, root):
     audio(tmp_path / "dl/01.flac", 2)
     audio(tmp_path / "dl/02.flac", 3)
-    audio(root / "beta (jp)/Old (1999)/01 - Old.flac", 2)
+    audio(root / "beta (jp)/Old (1999)/01 - Old.flac", 2)  # another spelling of the artist's folder doesn't count
     db = connect(tmp_path / "oasis.db")
     db.execute("insert into track(id, source, ref, artist_id) values ('t', 'local', ?, ?)",
                (str(root / "beta (jp)/Old (1999)/01 - Old.flac"), artist_id(db, "Beta", "mb-beta")))
-    album = make(edition("jp", [("いち", 2), ("に: 二", 3)])).place(tmp_path / "dl", "rg-1")
-    assert album == root / "beta (jp)/First (2001)"
+    jp = edition("jp", [("いち", 2), ("に: 二", 3)], title="Fürst?")  # the edition's title, the release group's year
+    jp["artist-credit"] = [{"name": "ベータ", "joinphrase": " & ", "artist": {"id": "mb-beta", "name": "Beta"}},
+                           {"name": "Gamma", "joinphrase": "", "artist": {"id": "mb-gamma", "name": "Gamma"}}]
+    album = make(jp).place(tmp_path / "dl", "rg-1")
+    assert album == root / "Beta/2001 - Fürst"
     assert sorted(p.name for p in album.glob("*.flac")) == ["01 - いち.flac", "02 - に - 二.flac"]
 
 
-def test_a_multi_disc_edition_gets_a_folder_per_disc(make, tmp_path, root):
+def test_a_multi_disc_edition_keeps_one_folder_with_the_disc_before_each_number(make, tmp_path, root):
     audio(tmp_path / "dl/CD1/01 One.flac", 2, title="One", discnumber="1", tracknumber="1")
     audio(tmp_path / "dl/CD2/01 One.flac", 3, title="One", discnumber="2", tracknumber="1")
     album = make(edition("two", [("One", 2)], [("One", 3)])).place(tmp_path / "dl", "rg-1")
-    assert sorted(str(p.relative_to(album)) for p in album.rglob("*.flac")) == ["CD 01/01 - One.flac", "CD 02/01 - One.flac"]
-    assert mutagen.File(album / "CD 02/01 - One.flac")["discnumber"] == ["2"]
+    assert sorted(str(p.relative_to(album)) for p in album.rglob("*.flac")) == ["1-01 - One.flac", "2-01 - One.flac"]
+    assert mutagen.File(album / "2-01 - One.flac")["discnumber"] == ["2"]
+
+
+def test_numbers_are_as_wide_as_the_albums_widest():
+    assert importer.track_file(1, 1, 7, 9, "A/B: C?", ".FLAC") == "07 - A+B - C.flac"
+    assert importer.track_file(2, 12, 7, 120, "T", ".mp3") == "02-007 - T.mp3"
+    assert importer.album_folder("O.N.A.", "1995", "Modlishka") == importer.Path("O.N.A/1995 - Modlishka")
 
 
 def test_library_files_are_never_overwritten_and_lossy_ones_move_aside_for_lossless(make, tmp_path, root):
-    album = root / "Beta/First (2001)"
+    album = root / "Beta/2001 - First"
     kept = audio(album / "01 - One.flac", 2)
     lossy = audio(album / "02 - Two.mp3", 3)
     before, lossy_bytes = kept.read_bytes(), lossy.read_bytes()
@@ -118,7 +127,7 @@ def test_library_files_are_never_overwritten_and_lossy_ones_move_aside_for_lossl
     audio(tmp_path / "dl/02 Two.flac", 3, title="Two")
     make(edition("standard", [("One", 2), ("Two", 3)])).place(tmp_path / "dl", "rg-1")
     assert kept.read_bytes() == before
-    assert not lossy.exists() and (root / ".replaced/Beta/First (2001)/02 - Two.mp3").read_bytes() == lossy_bytes
+    assert not lossy.exists() and (root / ".replaced/Beta/2001 - First/02 - Two.mp3").read_bytes() == lossy_bytes
     assert mutagen.File(album / "02 - Two.flac")["musicbrainz_albumid"] == ["standard"]
     # A lossy download doesn't replace anything either.
     audio(tmp_path / "dl2/01 One.mp3", 2, title="One")
@@ -167,7 +176,7 @@ def test_disc_images_of_a_multi_disc_lossy_album_are_cut_as_they_are(make, tmp_p
     sheet(tmp_path / "dl/CD2/image.cue", "image.mp3", "Три", "Четыре", encoding="utf-8-sig", starts=(0, 3))
     album = make(edition("two", [("Один", 2), ("Два", 3)], [("Три", 3), ("Четыре", 2)])).place(tmp_path / "dl", "rg-1")
     assert sorted(str(p.relative_to(album)) for p in album.rglob("*.mp3")) == \
-           ["CD 01/01 - Один.mp3", "CD 01/02 - Два.mp3", "CD 02/01 - Три.mp3", "CD 02/02 - Четыре.mp3"]
+           ["1-01 - Один.mp3", "1-02 - Два.mp3", "2-01 - Три.mp3", "2-02 - Четыре.mp3"]
 
 
 @pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "utf-16", "cp932", "cp1251"])

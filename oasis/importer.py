@@ -1,8 +1,8 @@
 """oasis's own import of a finished download: finds the MusicBrainz edition of the album the files are (by titles,
 numbers and durations), writes that edition's tags into them the way Picard does, and places them in the library as
-Lidarr names its files, "Artist/Album (Year)/NN - Title.ext", so they sit with what Lidarr imported before. Library
-files are never overwritten or deleted: a lossy file a lossless copy replaces moves to .replaced. A disc image (one
-audio file and a cue sheet) is split into a file per track first."""
+"Artist/Year - Album/NN - Title.ext" (see album_folder and track_file). Library files are never overwritten or
+deleted: a lossy file a lossless copy replaces moves to .replaced. A disc image (one audio file and a cue sheet) is
+split into a file per track first."""
 import fcntl
 import logging
 import os
@@ -284,6 +284,18 @@ def clean(name: str) -> str:
     return re.sub(r"[- ._]+$", "", re.sub(r"([- ._])\1+", r"\1", name)).lstrip(" .")
 
 
+def album_folder(artist: str, year: str, title: str) -> Path:
+    """An album's folder in the library: "<artist>/<year> - <album>", or "<artist>/<album>" without a year."""
+    return Path(clean(artist), clean(f"{year} - {title}" if year else title))
+
+
+def track_file(disc: int, discs: int, track: int, tracks: int, title: str, suffix: str) -> str:
+    """A track's file name, "07 - Title.flac"; on an album of several discs "1-07 - Title.flac", so one folder keeps
+    the discs in order. Each number is as wide as the album's widest one, a track's at least two digits."""
+    number = f"{track:0{max(2, len(str(tracks)))}}"
+    return clean(f"{disc:0{len(str(discs))}}-{number} - {title}" if discs > 1 else f"{number} - {title}") + suffix.lower()
+
+
 def lossless(path: Path) -> bool:
     suffix = path.suffix.lower().lstrip(".")
     return suffix in LOSSLESS or suffix == "m4a" and getattr(getattr(mutagen.File(path), "info", None), "codec", "") == "alac"
@@ -320,32 +332,22 @@ class Importer:
             artist = releases[0]["artist-credit"][0]["name"] if releases else ""
             files = [read(p, artist) for p in sorted(folder.rglob("*")) if p.is_file() and p.suffix.lower().lstrip(".") in AUDIO and p not in images]
             release, mapping = pick(releases, files)
-            album = self.album_folder(db, release)
         finally:
             db.close()
-        multi = len(release["media"]) > 1
+        group = release.get("release-group") or {}
+        album = self.root / album_folder(release["artist-credit"][0]["artist"]["name"], (group.get("first-release-date") or release.get("date") or "")[:4],
+                                         release["title"])
+        discs, tracks = len(release["media"]), max(t["position"] for m in release["media"] for t in m["tracks"])
         placed = 0
         for medium in release["media"]:
             for track in medium["tracks"]:
                 source = mapping[track["id"]]["path"]
                 write(source, tags_for(release, medium, track))
-                where = album / clean(f"{medium.get('format') or 'Unknown'} {medium['position']:02}") if multi else album
-                placed += self.put(source, where / (clean(f"{track['position']:02} - {track['title']}") + source.suffix.lower()))
+                placed += self.put(source, album / track_file(medium["position"], discs, track["position"], tracks, track["title"], source.suffix))
         self.cover(release, {f["path"].parent for f in mapping.values()} | {i.parent for i in images}, album)
         log.info("imported %d of %d tracks as %s (%s %s, %s) into %s", placed, len(mapping), release["title"], release.get("country"),
                  release.get("date"), release["id"], album)
         return album
-
-    def album_folder(self, db, release: dict) -> Path:
-        """<album artist>/<album> (<year>): the artist's folder where the library already has their files, else their name."""
-        group = release.get("release-group") or {}
-        artist = release["artist-credit"][0]["artist"]
-        row = db.execute("select t.ref from track t join mb_artist m on m.artist_id = t.artist_id where m.mbid = ? and t.source = 'local' "
-                         "and t.ref like ? limit 1", (artist["id"], f"{self.root}/%")).fetchone()
-        home = Path(row[0]).relative_to(self.root).parts[0] if row else clean(artist["name"])
-        year = (group.get("first-release-date") or release.get("date") or "")[:4]
-        title = group.get("title") or release["title"]
-        return self.root / home / clean(f"{title} ({year})" if year else title)
 
     def put(self, source: Path, target: Path) -> int:
         """Places one file unless the library has that track already (any format): a lossless file replaces a lossy
