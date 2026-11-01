@@ -6,6 +6,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +27,10 @@ class Prowlarr:
             raise OSError(f"Prowlarr {path.split('?')[0]}: {e.code} {e.read()[:200].decode(errors='replace')}") from e
 
     def indexers(self) -> list[int]:
-        return [i["id"] for i in self.call("indexer") if i["enable"] and self.tag in i["tags"] and i["protocol"] == "torrent"]
+        """The enabled music indexers Prowlarr hasn't paused after failures."""
+        now = datetime.now(timezone.utc).isoformat()
+        paused = {s["indexerId"] for s in self.call("indexerstatus") if (s.get("disabledTill") or "") > now}
+        return [i["id"] for i in self.call("indexer") if i["enable"] and self.tag in i["tags"] and i["protocol"] == "torrent" and i["id"] not in paused]
 
     def search(self, query: str) -> list[dict]:
         """Torrents in the audio categories: title, size, seeders, infoHash, magnetUrl/downloadUrl (Prowlarr's proxy), guid, indexerId.
@@ -39,7 +43,7 @@ class Prowlarr:
                 try:
                     found += [r for r in job.result() if r.get("protocol") == "torrent"]
                 except OSError as e:
-                    log.info("Prowlarr indexer %s on %r: %s", i, query, e)
+                    log.info("Prowlarr indexer %s on %r: %s", i, query, " ".join(str(e).split())[:160])
                     errors.append(e)
         if ids and len(errors) == len(ids):
             raise errors[0]
