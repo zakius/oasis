@@ -132,8 +132,9 @@ class YouTubeMusic:
         with self.api_lock:
             home = client.get_home(limit=50)
             library = client.get_library_playlists(limit=None)
-        mixes = [c for section in home for c in section.get("contents", []) if (c.get("playlistId") or "").startswith("RDTMAK")]
-        saved = [p for p in library if p.get("playlistId") and p["playlistId"] != "SE"]  # SE: podcast episodes
+        # ytmusicapi gives None for home items it can't parse (new kinds YouTube adds): those are skipped.
+        mixes = [c for section in home if section for c in section.get("contents") or [] if c and (c.get("playlistId") or "").startswith("RDTMAK")]
+        saved = [p for p in library if p and p.get("playlistId") and p["playlistId"] != "SE"]  # SE: podcast episodes
         return list({p["playlistId"]: {"id": p["playlistId"], "title": p.get("title") or p["playlistId"],
                                        "description": p.get("description"), "cover": big_cover(p.get("thumbnails"))}
                      for p in mixes + saved}.values())

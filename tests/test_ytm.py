@@ -156,3 +156,14 @@ def test_songs_carry_their_youtube_id(client, ytm, monkeypatch):
     assert "youtubeId" not in call(client, "getSong", id=other["id"])["song"]
     call(client, "getSong", id=other["id"])
     assert asked == ["Song A", "Song B"]  # a missing match is looked up once
+
+
+def test_home_items_ytmusicapi_cant_parse_are_skipped(tmp_path):
+    class Client:
+        def get_home(self, limit):
+            return [{"contents": [None, {"playlistId": "RDTMAK1", "title": "My Supermix"}]}, None, {"contents": None}]
+
+        def get_library_playlists(self, limit):
+            return [None, {"playlistId": "LM", "title": "Liked Music"}]
+    found = ytm_module.YouTubeMusic(tmp_path).playlists(Client())
+    assert [p["title"] for p in found] == ["My Supermix", "Liked Music"]
