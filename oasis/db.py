@@ -110,6 +110,18 @@ create table if not exists audio_pair(  -- dedupe verdicts, valid while both fil
 create table if not exists audio_shared(  -- files dedupe made reflinks of a kept copy
     path text primary key, kept text not null, mtime real not null, kept_mtime real not null
 );
+create table if not exists audio_quality(  -- what each library FLAC really holds, as of mtime (see quality.py)
+    path text primary key, mtime real not null, checked real not null,
+    rate int, bits int,                     -- the file as it is now
+    bits_used int, low_share real,          -- bits its samples use; the share of samples using the low 8 of 24
+    cutoff int, drop_db real, sustained int, -- the spectrum's hard cutoff (Hz), its drop (dB), whether every loud stretch shows it
+    verdict text,                           -- padded, upsampled, lossy, or null
+    borderline text,                        -- the same kinds near the thresholds: recorded, never acted on
+    source_rate int,                        -- upsampled: the rate the cutoff implies
+    action text,                            -- resampled, converted, recompressed, kept, shared (left: dedupe shares it), failed
+    was text,                               -- before a conversion: '24-bit 96 kHz'
+    saved int not null default 0            -- bytes the action saved
+);
 create table if not exists catalogue_search(  -- the albums Lidarr searched and looked for, by Lidarr id: carried over, read only
     album_id int primary key, searched real not null,
     mbid text                               -- the release group, for oasis's own catalogue to carry the search over

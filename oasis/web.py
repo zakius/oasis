@@ -288,6 +288,21 @@ def pill(text: str, tone: str = "") -> str:
     return f'<span class="pill{" " + tone if tone else ""}">{escape(text)}</span>'
 
 
+def quality_pills(db, refs: list[str]) -> str:
+    """What the files really hold where it isn't what they claim (see quality.py), and what oasis made of fake hi-res."""
+    notes = Counter()
+    for q in db.execute(f"select * from audio_quality where path in ({','.join('?' * len(refs))})", refs):
+        if q["verdict"] == "lossy":
+            notes["from a lossy source", "bad"] += 1
+        elif q["verdict"] == "upsampled" and q["action"] != "resampled":
+            notes[f"upsampled from {q['source_rate'] / 1000:g} kHz", "busy"] += 1
+        elif q["verdict"] == "padded" and q["action"] != "converted":
+            notes["16-bit padded to 24", "busy"] += 1
+        elif q["action"] in ("resampled", "converted"):
+            notes[f"was fake {q['was']}", ""] += 1
+    return "".join(" " + pill(text + (f" · {n} of {len(refs)}" if n < len(refs) else ""), tone) for (text, tone), n in notes.items())
+
+
 def cover_of(rg: str) -> str:
     """A MusicBrainz release group's cover, from the Cover Art Archive until the album is here."""
     return f'<img class="cover small" loading="lazy" alt="" src="/music/cover/al-mb-{escape(rg)}" {HIDE_BROKEN}>'
@@ -880,7 +895,8 @@ def routes(api) -> list[Route]:
         facts = [("Released", escape(t["original_date"] or str(t["year"] or ""))),
                  ("Label", escape(t["label"] or "")), ("Genres", escape(", ".join(g for g, _ in genres.most_common(5)))),
                  ("Discs", max((r["disc_no"] or 1) for r in tracks) if max((r["disc_no"] or 1) for r in tracks) > 1 else None),
-                 ("Format", escape(fmt)), ("Size", size(sum(r["size"] or 0 for r in tracks))),
+                 ("Format", escape(fmt) + quality_pills(db, [r["ref"] for r in tracks if r["source"] == "local"])),
+                 ("Size", size(sum(r["size"] or 0 for r in tracks))),
                  ("Plays", sum(r["plays"] or 0 for r in tracks) or None),
                  ("MusicBrainz", f'<a href="https://musicbrainz.org/release/{escape(t["mb_release"])}">release</a>' if t["mb_release"] else None),
                  ("Folder", f'<code>{escape(str(Path(t["ref"]).parent))}</code>' if t["source"] == "local" else None)]
@@ -923,7 +939,7 @@ def routes(api) -> list[Route]:
         facts = [*credit_facts, ("Genres", escape(", ".join(json.loads(r["genres"]) if r["genres"] else [r["genre"] or ""]))),
                  ("ISRC", escape(r["isrc"] or "")),
                  ("MusicBrainz", f'<a href="https://musicbrainz.org/recording/{escape(r["mb_recording"])}">recording</a>' if r["mb_recording"] else None),
-                 ("Format", escape(f'{(r["suffix"] or "").upper()} · {r["bitrate"]} kbps · {size(r["size"])}')),
+                 ("Format", escape(f'{(r["suffix"] or "").upper()} · {r["bitrate"]} kbps · {size(r["size"])}') + quality_pills(db, [r["ref"]])),
                  ("Plays", f'{r["plays"] or 0}' + (f' · last {ago(r["played"])}' if r["played"] else "")),
                  ("Lyrics", ("found" if lyrics[0] else "none found") if lyrics else None),
                  ("Shares audio with", f'<code>{escape(shared[0])}</code>' if shared else None),
