@@ -141,10 +141,13 @@ class YouTubeMusic:
 
     def playlist_tracks(self, client, playlist_id: str) -> list[dict]:
         with self.api_lock:
-            if playlist_id.startswith("RDTMAK"):  # mixes only open as a watch playlist
+            try:
+                tracks = client.get_playlist(playlist_id, limit=100 if playlist_id.startswith("RDTMAK") else None)["tracks"]
+            except Exception:
+                if not playlist_id.startswith("RDTMAK"):
+                    raise
+                # A mix's watch playlist is the fallback only: for the themed My Mixes it holds another mix's songs.
                 tracks = client.get_watch_playlist(playlistId=playlist_id, limit=100)["tracks"]
-            else:
-                tracks = client.get_playlist(playlist_id, limit=None)["tracks"]
         return [row for t in tracks if (row := track_row(t))]
 
     def lyrics(self, video_id: str):

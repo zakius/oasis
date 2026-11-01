@@ -167,3 +167,27 @@ def test_home_items_ytmusicapi_cant_parse_are_skipped(tmp_path):
             return [None, {"playlistId": "LM", "title": "Liked Music"}]
     found = ytm_module.YouTubeMusic(tmp_path).playlists(Client())
     assert [p["title"] for p in found] == ["My Supermix", "Liked Music"]
+
+
+def test_mix_tracks_come_from_the_playlist_not_its_watch_queue(tmp_path):
+    # YouTube's watch queue of a themed My Mix holds another mix's songs; the playlist itself holds the right ones.
+    def track(video_id):
+        return {**SEARCH_ITEM, "videoId": video_id}
+
+    class Client:
+        fails = False
+
+        def get_playlist(self, playlist_id, limit=None):
+            if self.fails:
+                raise KeyError("contents")
+            return {"tracks": [track("right")]}
+
+        def get_watch_playlist(self, playlistId, limit):
+            return {"tracks": [track("wrong")]}
+
+    music, client = ytm_module.YouTubeMusic(tmp_path), Client()
+    assert [r["ref"] for r in music.playlist_tracks(client, "RDTMAK5uy_mix")] == ["right"]
+    client.fails = True
+    assert [r["ref"] for r in music.playlist_tracks(client, "RDTMAK5uy_mix")] == ["wrong"]  # still better than nothing
+    with pytest.raises(KeyError):
+        music.playlist_tracks(client, "PLsaved")
