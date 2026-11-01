@@ -6,8 +6,9 @@ MusicBrainz ('Ensemble Play'), which count as its own. A wrong album is worse th
 instrumentals, deluxe...), bundles and videos are left out, and so are short or self-titled names that don't pin the
 album down. Disc images are tried after a file per track. The importer's edition match comes after, as a second check.
 Discographies, singles collections and other bundles are read by their file lists: each folder that is one wanted
-album, EP or single becomes a target, and only its files are fetched. A folder of disc images is taken by its name and
-size alone. TorBox lists the files of bundles it has cached; of others, once it has downloaded them (download.py)."""
+album, EP or single becomes a target, and only its files are fetched; a single may be loose tracks too (see loose). A
+folder of disc images is taken by its name and size alone. TorBox lists the files of bundles it has cached; of others,
+once it has downloaded them (download.py)."""
 import logging
 import re
 import unicodedata
@@ -261,7 +262,8 @@ def folder_album(name: str, want: dict, groups: list[dict]) -> str | None:
     """The release group an album folder inside a bundle is: its name holds the title (or one of the group's
     other_titles) apart from the artist's name, and the year when it has one; variants and videos aren't the album. Of
     titles inside one another the longest wins ('One More Light' over 'One'); two groups of one title that the year
-    doesn't tell apart are neither."""
+    doesn't tell apart are neither, but a single loses to the album or EP unless the name says single: a title track's
+    single doesn't take its album's folder."""
     tokens = words(name)
     text, years = " ".join(tokens), {t for t in tokens if YEAR.match(t)}
     artists = [s for n in want["names"] for s in spans(tokens, words(n))]
@@ -280,6 +282,9 @@ def folder_album(name: str, want: dict, groups: list[dict]) -> str | None:
             continue
         fits.append((len(compact), g["id"]))
     best = {rg for n, rg in fits if n == max(fits)[0]}
+    if len(best) > 1:
+        kinds, single = {g["id"]: g.get("primary-type") for g in groups}, any(TYPES.get(t) == "Single" for t in tokens)
+        best = {rg for rg in best if (kinds[rg] == "Single") == single}
     return best.pop() if len(best) == 1 else None
 
 
@@ -313,8 +318,8 @@ def targets(files: list[dict], want: dict, groups: list[dict], wanted: set[str],
     """The wanted albums, EPs and singles a bundle's file list ({name, size}) holds, by release group, each with its files to fetch:
     one album folder's music (its discs' folders too), cue sheets and images. A folder must cover a whole edition by
     its file names, or be disc images of an edition's size; lossless folders are tried first, a file per track before
-    images. groups: the artist's release groups; wanted: those missing. editions(rg): the release group's editions
-    with their tracks."""
+    images; then singles in loose tracks. groups: the artist's release groups; wanted: those missing. editions(rg): the
+    release group's editions with their tracks."""
     folders, sheets = {}, {PurePosixPath(f["name"]).parent for f in files if f["name"].lower().endswith(".cue")}
     for f in files:
         if f["name"].rsplit(".", 1)[-1].lower() in AUDIO:
@@ -337,6 +342,35 @@ def targets(files: list[dict], want: dict, groups: list[dict], wanted: set[str],
             found[rg] = [f["name"] for f in audio] + extras
         else:
             log.info("%s holds only part of %s", folder, rg)
+    singles = [g["id"] for g in groups if g.get("primary-type") == "Single" and g["id"] in wanted and g["id"] not in found]
+    return found | loose([f for a in folders.values() if not disc_images(a, sheets) for f in a], want, singles, editions)
+
+
+def loose(audio: list[dict], want: dict, singles: list[str], editions) -> dict[str, list[str]]:
+    """The singles a bundle holds as loose tracks, in any folder: each track of one of a single's editions has a file
+    named exactly as it, lossless first. Exactly: brackets aside, as the importer reads a file's name, but neither a
+    title holding the other nor track numbers, which count within other releases; nor a variant (live, remix...) the
+    track isn't. A file may serve an album's target and a single's both: each gets its own copy, so a single never
+    takes an album's files. The importer's edition match, by length too, is the real check."""
+    named = {}
+    for f in sorted(audio, key=lambda f: f["name"].rsplit(".", 1)[-1].lower() not in LOSSLESS_FILES):
+        if title := key(title_of(f["name"], want["artist"])):
+            named.setdefault(title, []).append((f["name"], hits(VARIANTS, " ".join(words(PurePosixPath(f["name"]).stem)))))
+    found = {}
+    for rg in singles:
+        try:
+            official = [r for r in editions(rg) if r.get("status") != "Pseudo-Release"]
+        except (OSError, LookupError) as e:
+            log.info("editions of %s: %s", rg, e)
+            continue
+        for r in sorted(official, key=lambda r: sum(len(m.get("tracks") or []) for m in r.get("media") or []), reverse=True):
+            picked = []
+            for t in (t for m in r.get("media") or [] for t in m.get("tracks") or []):
+                allowed = hits(VARIANTS, " ".join(words(" ".join([t["title"], *want["names"]]))))
+                picked.append(next((n for n, v in named.get(key(t["title"]), []) if v <= allowed and n not in picked), None))
+            if picked and None not in picked:
+                found[rg] = picked
+                break
     return found
 
 

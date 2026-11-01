@@ -213,6 +213,31 @@ def test_a_bundles_file_list_gives_the_wanted_albums_each_folder_wholly_holds():
                             LP, LP_GROUPS, wanted, editions) == {}
 
 
+def test_a_wanted_single_is_also_found_as_loose_tracks_by_their_exact_titles():
+    groups = [*LP_GROUPS, {"id": "g-nd", "title": "New Divide", "first-release-date": "2009", "primary-type": "Single"},
+              {"id": "g-qw", "title": "QWERTY", "first-release-date": "2006", "primary-type": "Single"}]
+    songs = {**SONGS, "g-nd": ["New Divide"], "g-qw": ["QWERTY", "Behind My Eyes"]}
+    tracks = lambda rg: [{"status": "Official", "media": [{"position": 1, "tracks": [{"id": t, "position": n + 1, "title": t, "recording": {}} for n, t in enumerate(songs[rg])]}]}]
+    bundle = listing({"Singles": ["Linkin Park - New Divide (Live).flac", "Linkin Park - New Divide.mp3", "Linkin Park - New Divide.flac", "05 QWERTY.flac",
+                                  "Linkin Park - Divide.flac"],
+                      "Transformers OST (2009)": ["03 Behind My Eyes Again.flac"]})
+    assert releases.targets(bundle, LP, groups, {"g-nd", "g-qw"}, tracks) == {"g-nd": ["LP Discography/Singles/Linkin Park - New Divide.flac"]}  # not the live one
+    bundle += listing({"Misc": ["Behind My Eyes.mp3"]})  # QWERTY's two tracks, wherever they are
+    assert releases.targets(bundle, LP, groups, {"g-qw"}, tracks) == {"g-qw": ["LP Discography/Singles/05 QWERTY.flac", "LP Discography/Misc/Behind My Eyes.mp3"]}
+
+
+def test_a_title_tracks_single_neither_takes_its_albums_folder_nor_keeps_it_from_the_album():
+    groups = [{"id": "g-oml", "title": "One More Light", "first-release-date": "2017", "primary-type": "Album"},
+              {"id": "g-oml-s", "title": "One More Light", "first-release-date": "2017", "primary-type": "Single"}]
+    songs = {"g-oml": ["Nobody Can Save Me", "One More Light"], "g-oml-s": ["One More Light"]}
+    tracks = lambda rg: [{"status": "Official", "media": [{"position": 1, "tracks": [{"id": t, "position": n + 1, "title": t, "recording": {}} for n, t in enumerate(songs[rg])]}]}]
+    album = listing({"One More Light (2017)": ["01 Nobody Can Save Me.flac", "02 One More Light.flac"]})
+    assert releases.folder_album("One More Light (2017)", LP, groups) == "g-oml"
+    assert releases.folder_album("One More Light (2017) [Single]", LP, groups) == "g-oml-s"
+    found = releases.targets(album, LP, groups, {"g-oml", "g-oml-s"}, tracks)
+    assert found == {"g-oml": [f["name"] for f in album], "g-oml-s": [album[1]["name"]]}  # one file, a copy for each
+
+
 def test_a_bundles_folder_of_disc_images_is_taken_by_its_name_and_size():
     """Meteora's two tracks last 400 s: a lossless image of them is some 40 MB."""
     image = lambda folder, size, *more: [{"name": f"LP/{folder}/{n}", "size": size if n.endswith(".flac") else 1} for n in ("Meteora.flac", "Meteora.cue", *more)]
