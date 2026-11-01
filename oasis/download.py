@@ -36,7 +36,7 @@ PACE = 3                 # seconds between file download requests: bursts of the
 PARALLEL = 2             # files fetched at once
 PAUSE = 300              # seconds without file downloads after a 429
 FETCH_TRIES = 5          # polls in a row a file may fail to download before the release counts as broken
-KEEP_FAILED = 7 * 86400  # seconds a failed download's files stay for inspection
+KEEP_FAILED = 2 * 86400  # seconds a failed download's files stay for inspection
 GRAB_TRIES = 5           # picks tried in turn when TorBox won't take one
 
 
