@@ -253,7 +253,15 @@ def test_only_cached_bundles_with_wanted_albums_are_picked_most_albums_first():
     cached = lambda hashes: asked.append(hashes) or {h: listed[h] for h in hashes if h in listed}
     picks = releases.bundles(prowlarr, LP, LP_GROUPS, {"g-ht", "g-mtm"}, {"bb"}, cached, editions)
     assert [(r["infoHash"], sorted(t)) for r, t in picks] == [("aa", ["g-ht", "g-mtm"])]  # cc isn't cached; bb is blocked; ee holds nothing wanted
-    assert prowlarr.asked == ["Linkin Park discography", "Linkin Park"] and sorted(asked[0]) == ["aa", "cc", "ee"]  # dd isn't a bundle
+    assert prowlarr.asked == ["Linkin Park discography", "Linkin Park", "Linkin Park singles", "Linkin Park complete singles"]
+    assert sorted(asked[0]) == ["aa", "cc", "ee"]  # dd isn't a bundle
+
+
+def test_a_singles_collection_is_a_bundle_whose_singles_folders_are_targets():
+    prowlarr = Prowlarr({"Linkin Park singles": [result("Linkin Park - Singles [FLAC]", "ss")]})
+    listed = {"ss": listing({"2017 - One [Single]": ["01 One.flac"], "2003 - Meteora": ["01 Foreword.flac", "02 Don't Stay.flac"]})}
+    picks = releases.bundles(prowlarr, LP, LP_GROUPS, {"g-one"}, set(), lambda hashes: {h: listed[h] for h in hashes if h in listed}, editions)
+    assert [(r["infoHash"], t) for r, t in picks] == [("ss", {"g-one": ["LP Discography/2017 - One [Single]/01 One.flac"]})]
 
 
 def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloads, torbox, db, tmp_path, monkeypatch):

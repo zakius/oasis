@@ -269,6 +269,19 @@ def test_guest_appearances_are_skipped_unless_starred_and_joint_credits_count(cl
     assert db.execute("select state, reason, error from want_album where rg = 'g-feat'").fetchone()[:] == ("missing", "starred", None)
 
 
+def test_an_artist_missing_only_singles_gets_a_bundle_search_too(client, mb, monkeypatch):
+    follow_beta(client, mb)
+    acq, now = client.app.state.api.library, [time.time()]
+    acq.bundles, acq.downloads.found = True, []
+    db = client.app.state.api._db()
+    db.execute("update want_album set state = 'skipped' where primary_type != 'Single'")  # no album or EP missing
+    db.execute("insert into want_album(rg, artist_mbid, artist, title, primary_type, reason, state) values ('g-b', 'mb-beta', 'Beta', 'B-Side', 'Single', 'followed', 'missing')")
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    now[0] += acquire.SEARCH_GAP
+    sync(client)
+    assert acq.downloads.found == [("bundle", "Beta", ["g-b", "g-new"])]
+
+
 def test_collaboration_credits_split_into_artist_names():
     assert artist_names("SawanoHiroyuki[nZk]:mizuki") == ["SawanoHiroyuki[nZk]:mizuki", "SawanoHiroyuki[nZk]", "SawanoHiroyuki", "mizuki"]
     assert artist_names("Falling In Reverse, Corey Taylor, Serj Tankian")[:2] == ["Falling In Reverse, Corey Taylor, Serj Tankian", "Falling In Reverse"]

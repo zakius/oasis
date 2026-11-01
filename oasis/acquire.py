@@ -3,9 +3,9 @@ artist's albums, EPs and singles are read daily, and guest appearances, repackag
 albums left out.
 An album is here when the library holds as many of its tracks as its smallest edition has. Missing albums are searched
 (Prowlarr, then TorBox: download.py) one a minute, or 15 s after a search that found nothing, again and again, ever
-further apart; an artist with gaps gets a weekly search for cached discographies and bundles, which can fill many at
-once. Anything MusicBrainz has can be wanted, under ids of its own until it arrives (see adopt). want_album holds
-the albums; want_item the stars and follows."""
+further apart; an artist with gaps gets a weekly search for cached discographies, singles collections and bundles,
+which can fill many at once. Anything MusicBrainz has can be wanted, under ids of its own until it arrives (see
+adopt). want_album holds the albums; want_item the stars and follows."""
 import itertools
 import json
 import logging
@@ -389,9 +389,9 @@ class Acquire:
             self.search(db, row)
 
     def bundle_next(self, db) -> bool:
-        """A bundle search instead of an album search, for an artist with two albums or EPs missing or one a search
-        found nothing for, weekly at most. True when one ran."""
-        row = db.execute("select artist_mbid, artist from want_album where state = 'missing' and primary_type != 'Single' and artist is not null "
+        """A bundle search instead of an album search, for an artist with two albums, EPs or singles missing or one a
+        search found nothing for, weekly at most. True when one ran."""
+        row = db.execute("select artist_mbid, artist from want_album where state = 'missing' and artist is not null "
                          "and artist_mbid not in (select artist_mbid from bundle_search where searched > ?) group by artist_mbid "
                          "having count(*) >= 2 or max(searched) is not null order by min(reason != 'starred') limit 1",
                          (time.time() - BUNDLE_AGAIN,)).fetchone()

@@ -5,8 +5,9 @@ is a word of its own, as those scripts don't space words. Uploads may name the a
 MusicBrainz ('Ensemble Play'), which count as its own. A wrong album is worse than none: variants (live,
 instrumentals, deluxe...), bundles and videos are left out, and so are short or self-titled names that don't pin the
 album down. Disc images are tried after a file per track. The importer's edition match comes after, as a second check.
-Discographies and other bundles TorBox has cached are read by their file lists: each folder that is one wanted album
-becomes a target, and only its files are fetched. A folder of disc images is taken by its name and size alone."""
+Discographies, singles collections and other bundles TorBox has cached are read by their file lists: each folder that
+is one wanted album, EP or single becomes a target, and only its files are fetched. A folder of disc images is taken
+by its name and size alone."""
 import logging
 import re
 import unicodedata
@@ -29,7 +30,7 @@ VARIANTS = re.compile(r"\b(best of|greatest hits|very best|the essential|antholo
                       r"acoustic|demos?|tribute|orchestral|symphonic|piano|lullaby|8 ?bit|sped up|slowed|nightcore|tv size)\b")
 CREDITED_AS_SOURCE = re.compile(r"\b(based on (the )?music of|music of|tribute to|covers? of|in the style of|songs of|plays|presents?)( the)?$")  # "Funk Daddy Present Jay-Z": a mixtape of theirs
 VARIANTS_JA = re.compile(r"インスト|カラオケ|ライ[ブヴ]|リミックス|オフボーカル")
-BUNDLES = re.compile(r"discograph|collection|complete|box ?set|anthology|全集|ディスコグラフィ", re.I)
+BUNDLES = re.compile(r"discograph|collection|complete|box ?set|anthology|\bsingles\b|全集|ディスコグラフィ", re.I)
 VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|hdtv|web ?rip|\d{3,4}[pi]|x26[45]|h ?26[45]|hevc|xvid|divx|mkv|avi|video)\b")
 TYPES = {"single": "Single", "maxi": "Single", "ep": "EP"}  # words naming a release's type
 IMAGE = re.compile(r"\b(image|img) cue\b")  # one file for the whole disc, which the importer splits: a file per track is surer
@@ -252,7 +253,8 @@ def is_bundle(release: dict, want: dict) -> bool:
 
 
 def bundle_queries(want: dict) -> list[str]:
-    return list(dict.fromkeys([f"{clean(want['artist'])} discography", clean(want["artist"]), *map(clean, want["native"])]))
+    artist = clean(want["artist"])
+    return list(dict.fromkeys([f"{artist} discography", artist, f"{artist} singles", f"{artist} complete singles", *map(clean, want["native"])]))
 
 
 def folder_album(name: str, want: dict, groups: list[dict]) -> str | None:
@@ -308,7 +310,7 @@ def sized(audio: list[dict], editions: list[dict]) -> bool:
 
 
 def targets(files: list[dict], want: dict, groups: list[dict], wanted: set[str], editions) -> dict[str, list[str]]:
-    """The wanted albums a bundle's file list ({name, size}) holds, by release group, each with its files to fetch:
+    """The wanted albums, EPs and singles a bundle's file list ({name, size}) holds, by release group, each with its files to fetch:
     one album folder's music (its discs' folders too), cue sheets and images. A folder must cover a whole edition by
     its file names, or be disc images of an edition's size; lossless folders are tried first, a file per track before
     images. groups: the artist's release groups; wanted: those missing. editions(rg): the release group's editions
