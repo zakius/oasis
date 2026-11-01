@@ -37,6 +37,16 @@ def has_han(s: str) -> bool:
     return any(script(c) == U.HAN for c in s)
 
 
+def opening(s: str) -> bool:
+    """Opening punctuation by Unicode's classes (「 （ “)."""
+    return bool(s) and all(unicodedata.category(c) in ("Ps", "Pi") for c in s)
+
+
+def closing(s: str) -> bool:
+    """Closing punctuation (」 ）”); ’ is the apostrophe too, so it doesn't close."""
+    return bool(s) and all(c != "’" and unicodedata.category(c) in ("Pe", "Pf") for c in s)
+
+
 def has_non_latin(s: str) -> bool:
     return any(script(c) not in LATINISH for c in s)
 
@@ -232,6 +242,7 @@ def japanese(s: str, title: bool) -> list[tuple[str, str, str | None]]:
     capitalized."""
     result, found = [], tokens(s)
     prev_word, prev, sokuon, stray = False, None, False, False
+    prev_close = False  # the previous token was closing punctuation (」, ）, ”): a word after it starts a new one
     for i, t in enumerate(found):
         surface, pos, nxt = t.surface, t.pos[0], found[i + 1] if i + 1 < len(found) else None
         prev_pos = prev.pos[0] if prev else None
@@ -264,8 +275,10 @@ def japanese(s: str, title: bool) -> list[tuple[str, str, str | None]]:
         is_word = bool(romaji) and alnum(romaji[0])
         if title and japanese_text and is_word and not (prev_word and glue) and not particle:
             romaji = capitalize(romaji)
-        result.append((surface, (" " if prev_word and is_word and not glue else "") + romaji, reading))
-        prev_word, prev = bool(romaji) and alnum(romaji[-1]), t
+        # Paired punctuation sits against what it encloses, with a space on its outer side: "Itai" to "itai".
+        space = prev_word and is_word and not glue or prev_close and (is_word or opening(surface)) or prev_word and opening(surface)
+        result.append((surface, (" " if space else "") + romaji, reading))
+        prev_word, prev, prev_close = bool(romaji) and alnum(romaji[-1]), t, closing(surface)
     return result
 
 
@@ -620,18 +633,19 @@ def _split_reading(surface, at, reading, romaji, starts, first, last) -> list[st
 
 def pieces(line: str, siblings=()) -> list[str]:
     """A line split into the words its romanization shows: in Japanese a word with its glued endings and the particles
-    apart (食べます|君|に、), elsewhere at spaces. The pieces join back into the line."""
+    apart (食べます|君|に、), opening punctuation with the word it opens (と|「居たい」), elsewhere at spaces. The pieces join back into the line."""
     if not is_japanese(normalize(line), siblings):
         return re.findall(f"^[{WS}]*[^{WS}]+[{WS}]*|[^{WS}]+[{WS}]*", line) or [line]
     out, cur, has_word, ends_loose = [], "", False, False
     for surface, romaji, _ in japanese(line, False):
         trimmed = romaji.lstrip()
         is_word = bool(trimmed) and alnum(trimmed[0]) or has_non_latin(surface)
-        if cur and is_word and has_word and (romaji.startswith(" ") or ends_loose):
+        opens = opening(surface)
+        if cur and has_word and (is_word and (romaji.startswith(" ") or ends_loose) or opens):
             out.append(cur)
             cur, has_word = "", False
         cur += surface
-        has_word, ends_loose = has_word or is_word, not is_word
+        has_word, ends_loose = has_word or is_word, not is_word and not opens
     return out + [cur] if cur else out
 
 

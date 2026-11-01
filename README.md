@@ -2,7 +2,7 @@
 
 An OpenSubsonic music server that merges your local library with streaming services into one library. Clients see ordinary tracks and never learn where a track comes from.
 
-It pairs with **mirage**, a fooyin fork that shows the server's library as if it were on your machine, and **roma**, an Android client.
+It pairs with **mirage**, a fooyin fork that shows the server's library as if it were on your machine, and **caravan** (com.zakius.caravan), an Android Subsonic client romanized by roma. roma ytm, the YouTube Music app, stays roma.
 
 ## Status
 
@@ -14,7 +14,7 @@ With `[ytmusic] enabled = true`, searches also return YouTube Music songs after 
 
 Open `http://<host>:4533/` and sign in with a Subsonic user and password. The account page links each user's own services:
 
-- **YouTube Music**: paste the "Copy as cURL" of a `browse` request (or its request headers, or the `Cookie` value) from a signed-in music.youtube.com tab, as the page explains step by step. oasis checks the sign-in and shows the account name. Clients can also link it themselves: `oasisLinkYouTubeMusic` takes `cookie` (the Cookie header) and optional `authUser`, which is how roma reuses its own Google sign-in. `oasisUnlinkYouTubeMusic` removes it.
+- **YouTube Music**: paste the "Copy as cURL" of a `browse` request (or its request headers, or the `Cookie` value) from a signed-in music.youtube.com tab, as the page explains step by step. oasis checks the sign-in and shows the account name. Clients can also link it themselves: `oasisLinkYouTubeMusic` takes `cookie` (the Cookie header) and optional `authUser`, which roma used to hand over its own Google sign-in until 2026-11-01; caravan has no YouTube code, so accounts are linked on this page. `oasisUnlinkYouTubeMusic` removes it.
 - **Last.fm**: "Sign in with Last.fm" goes through Last.fm's own page. The server needs `[lastfm] api_key` and `secret`.
 - **ListenBrainz**: paste the user token. oasis checks it.
 
