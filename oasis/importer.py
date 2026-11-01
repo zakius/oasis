@@ -1,15 +1,16 @@
 """oasis's own import of a finished download: finds the MusicBrainz edition of the album the files are (by titles,
 numbers and durations), writes that edition's tags into them the way Picard does, and places them in the library as
-"Artist/Year - Album/NN - Title.ext" (see album_folder and track_file). Library files are never overwritten or
-deleted: a lossy file a lossless copy replaces moves to .replaced. A disc image (one audio file and a cue sheet) is
-split into a file per track first."""
+"Artist/Year - Album/NN - Title.ext" (see album_folder and track_file). Library files are never overwritten: a
+lossless copy of a track the library has only lossy replaces it, the lossy file deleted once the new one is in place.
+A disc image (one audio file and a cue sheet) is split into a file per track first. The download's FLACs are checked
+before anything is placed (see quality.py): fake hi-res becomes what it is, outliers are recompressed, and a FLAC made
+from a lossy file fails the import (LossySource), so another release is picked."""
 import fcntl
 import logging
 import os
 import re
 import shutil
 import subprocess
-import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -18,9 +19,9 @@ from pathlib import Path
 import mutagen
 from mutagen._vorbis import VCommentDict
 
-from . import musicbrainz
+from . import musicbrainz, quality
 from .dedupe import FICLONE
-from .scan import COVER_NAMES, COVER_SUFFIXES, REPLACED
+from .scan import COVER_NAMES, COVER_SUFFIXES
 from .ytm import fold
 
 log = logging.getLogger(__name__)
@@ -301,8 +302,8 @@ def lossless(path: Path) -> bool:
     return suffix in LOSSLESS or suffix == "m4a" and getattr(getattr(mutagen.File(path), "info", None), "codec", "") == "alac"
 
 
-def copy(source: Path, target: Path):
-    """A reflink when the filesystem can, else a copy; synced, and never over an existing file."""
+def copy(source: Path, target: Path, over: bool = False):
+    """A reflink when the filesystem can, else a copy; synced, and never over an existing file unless over."""
     part = target.with_name(f".{target.name}.oasis-part")
     try:
         with open(source, "rb") as src, open(part, "wb") as out:
@@ -312,7 +313,7 @@ def copy(source: Path, target: Path):
                 shutil.copyfileobj(src, out, 1 << 20)
             out.flush()
             os.fsync(out.fileno())
-        os.link(part, target)
+        os.replace(part, target) if over else os.link(part, target)
     finally:
         part.unlink(missing_ok=True)
 
@@ -323,7 +324,7 @@ class Importer:
 
     def place(self, folder: Path, group: str) -> Path:
         """Imports the download in folder as an edition of the release group; returns the album folder.
-        LookupError when no edition matches."""
+        LookupError when no edition matches, LossySource (one) when a FLAC of it was made from a lossy file."""
         unpack(folder)
         images = split(folder)
         db = self.connect()
@@ -334,16 +335,25 @@ class Importer:
             release, mapping = pick(releases, files)
         finally:
             db.close()
+        checked = quality.import_check(sorted({f["path"] for f in mapping.values() if f["path"].suffix.lower() == ".flac"}))
         group = release.get("release-group") or {}
         album = self.root / album_folder(release["artist-credit"][0]["artist"]["name"], (group.get("first-release-date") or release.get("date") or "")[:4],
                                          release["title"])
         discs, tracks = len(release["media"]), max(t["position"] for m in release["media"] for t in m["tracks"])
         placed = 0
-        for medium in release["media"]:
-            for track in medium["tracks"]:
-                source = mapping[track["id"]]["path"]
-                write(source, tags_for(release, medium, track))
-                placed += self.put(source, album / track_file(medium["position"], discs, track["position"], tracks, track["title"], source.suffix))
+        db = self.connect()
+        try:
+            for medium in release["media"]:
+                for track in medium["tracks"]:
+                    source = mapping[track["id"]]["path"]
+                    write(source, tags_for(release, medium, track))
+                    target = album / track_file(medium["position"], discs, track["position"], tracks, track["title"], source.suffix)
+                    if self.put(source, target):
+                        placed += 1
+                        if source in checked:
+                            quality.store(db, target, checked[source])
+        finally:
+            db.close()
         self.cover(release, {f["path"].parent for f in mapping.values()} | {i.parent for i in images}, album)
         log.info("imported %d of %d tracks as %s (%s %s, %s) into %s", placed, len(mapping), release["title"], release.get("country"),
                  release.get("date"), release["id"], album)
@@ -351,19 +361,18 @@ class Importer:
 
     def put(self, source: Path, target: Path) -> int:
         """Places one file unless the library has that track already (any format): a lossless file replaces a lossy
-        one, which moves to .replaced; anything else stays as it is. 1 if placed."""
+        one, which is deleted once the new file is in place; anything else stays as it is. 1 if placed."""
         target.parent.mkdir(parents=True, exist_ok=True)
         have = [p for p in target.parent.iterdir() if p.stem == target.stem and p.suffix.lower().lstrip(".") in AUDIO]
         if have and not (lossless(source) and not any(lossless(p) for p in have)):
             return 0
+        copy(source, target, over=target in have)  # an ALAC .m4a over a lossy one
+        if target.stat().st_size != source.stat().st_size:
+            raise OSError(f"{target} isn't the {source.name} it was copied from")
         for old in have:
-            aside = self.root / REPLACED / old.relative_to(self.root)
-            aside.parent.mkdir(parents=True, exist_ok=True)
-            if aside.exists():
-                aside = aside.with_name(f"{aside.stem}.{int(time.time())}{aside.suffix}")
-            os.rename(old, aside)
-            log.info("replaced %s; the old file is in %s", old, aside)
-        copy(source, target)
+            if old != target:
+                old.unlink()
+            log.info("replaced %s with %s", old, target.name)
         return 1
 
     def cover(self, release: dict, folders: set[Path], album: Path):

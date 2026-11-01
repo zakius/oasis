@@ -27,7 +27,6 @@ CONTENT_TYPES = {
     "m4a": "audio/mp4", "aac": "audio/aac", "wav": "audio/wav", "wv": "audio/x-wavpack",
     "ape": "audio/x-ape", "mpc": "audio/x-musepack", "aiff": "audio/aiff", "aif": "audio/aiff",
 }
-REPLACED = ".replaced"  # library files a better copy replaced, moved aside (see importer.py)
 COVER_NAMES = ("cover", "folder", "front", "album")
 COVER_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 
@@ -96,7 +95,6 @@ def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
     seen, covers, changed = set(), {}, 0
     for root in roots:
         for directory, folders, files in os.walk(root):
-            folders[:] = [f for f in folders if f != REPLACED]
             for name in files:
                 path = Path(directory, name)
                 if path.suffix.lower().lstrip(".") not in CONTENT_TYPES:

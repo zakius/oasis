@@ -11,7 +11,9 @@ import pytest
 from oasis import credits, importer, musicbrainz
 from oasis.db import artist_id, connect
 from oasis.importer import Importer
+from oasis.quality import LossySource
 from oasis.scan import read
+from test_quality import lossy, music
 
 
 def audio(path, seconds, **tags):
@@ -118,16 +120,16 @@ def test_numbers_are_as_wide_as_the_albums_widest():
     assert importer.album_folder("O.N.A.", "1995", "Modlishka") == importer.Path("O.N.A/1995 - Modlishka")
 
 
-def test_library_files_are_never_overwritten_and_lossy_ones_move_aside_for_lossless(make, tmp_path, root):
+def test_library_files_are_never_overwritten_and_lossy_ones_give_way_to_lossless(make, tmp_path, root):
     album = root / "Beta/2001 - First"
     kept = audio(album / "01 - One.flac", 2)
     lossy = audio(album / "02 - Two.mp3", 3)
-    before, lossy_bytes = kept.read_bytes(), lossy.read_bytes()
+    before = kept.read_bytes()
     audio(tmp_path / "dl/01 One.flac", 2, title="One")
     audio(tmp_path / "dl/02 Two.flac", 3, title="Two")
     make(edition("standard", [("One", 2), ("Two", 3)])).place(tmp_path / "dl", "rg-1")
     assert kept.read_bytes() == before
-    assert not lossy.exists() and (root / ".replaced/Beta/2001 - First/02 - Two.mp3").read_bytes() == lossy_bytes
+    assert not lossy.exists() and sorted(p.name for p in album.iterdir()) == ["01 - One.flac", "02 - Two.flac"]
     assert mutagen.File(album / "02 - Two.flac")["musicbrainz_albumid"] == ["standard"]
     # A lossy download doesn't replace anything either.
     audio(tmp_path / "dl2/01 One.mp3", 2, title="One")
@@ -244,3 +246,30 @@ def test_an_album_packed_in_a_zip_is_unpacked_and_imported(make, tmp_path, root)
     album = make(edition("e", [("One", 2), ("Two", 3)])).place(tmp_path / "dl", "rg-1")
     assert sorted(p.name for p in album.iterdir() if p.suffix == ".flac") == ["01 - One.flac", "02 - Two.flac"]
     assert importer.LATER_PART.search("a.part2.rar") and not importer.LATER_PART.search("a.part01.rar")
+
+
+def test_a_flac_made_from_a_lossy_file_fails_the_import_before_anything_is_placed(make, tmp_path, root):
+    audio(tmp_path / "dl/01 One.flac", 10, title="One")
+    lossy(tmp_path / "dl/02 Two.flac", tmp_path / "work")
+    FLAC_tags(tmp_path / "dl/02 Two.flac", title="Two")
+    with pytest.raises(LossySource, match="lossy source in a FLAC: 02 Two.flac is cut off at 1[5-7]"):
+        make(edition("standard", [("One", 10), ("Two", 10)])).place(tmp_path / "dl", "rg-1")
+    assert not root.exists()
+
+
+def test_fake_hi_res_arrives_as_what_it_is_with_its_verdict(make, tmp_path, root):
+    music(tmp_path / "dl/01 One.flac", 44100, 10, "s32", "-af", "aresample=96000:resampler=soxr")
+    FLAC_tags(tmp_path / "dl/01 One.flac", title="One")
+    album = make(edition("standard", [("One", 10)])).place(tmp_path / "dl", "rg-1")
+    info = mutagen.File(album / "01 - One.flac").info
+    assert (info.sample_rate, info.bits_per_sample) == (44100, 16)
+    row = connect(tmp_path / "oasis.db").execute("select * from audio_quality").fetchone()
+    assert (row["path"], row["verdict"], row["action"], row["was"], row["rate"]) == (str(album / "01 - One.flac"), "upsampled", "resampled",
+                                                                                    "24-bit 96 kHz", 44100)
+
+
+def FLAC_tags(path, **tags):
+    file = mutagen.File(path)
+    for key, value in tags.items():
+        file[key] = value
+    file.save()

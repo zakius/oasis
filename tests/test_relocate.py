@@ -29,7 +29,6 @@ def library(tmp_path, monkeypatch):
     (root / "Beta/Loose/cover.jpg").write_bytes(b"jpg")
     taken = tagged(root / "Beta/Taken (2003)/01 - One.flac", b, "Taken", "One", "1", date="2003", release="rel-3")
     tagged(root / "Beta/2003 - Taken/01 - One.flac", b, "Taken", "One", "1", date="2003", release="rel-3")  # already in place
-    tagged(root / ".replaced/o.n.a/Modlishka (1995)/02 - Niepotrzebny.mp3", a, "Modlishka", "Niepotrzebny", "2")
     db = connect(tmp_path / "oasis.db")
     scan.scan(db, [root])
     return root, db, taken
@@ -65,7 +64,6 @@ def test_files_move_to_their_musicbrainz_names_and_keep_their_ids_and_stats(libr
     assert not (root / "o.n.a").exists() and not (root / "Beta/Two (2000)").exists()  # emptied folders go
     assert (root / "Beta/Loose/untagged.flac").exists() and (root / "Beta/Loose/cover.jpg").exists()
     assert taken.exists() and "collision" in result.left[taken] and "no artist" in result.left[root / "Beta/Loose/untagged.flac"]
-    assert (root / ".replaced/o.n.a/Modlishka (1995)/02 - Niepotrzebny.mp3").exists()
 
     assert db.execute("select ref, cover from track where id = ?", (one,)).fetchone()[0] == str(album / "01 - Kiedy powiem sobie dość.flac")
     assert db.execute("select starred, play_count from stat where id = ?", (one,)).fetchone()[:] == (1, 3)

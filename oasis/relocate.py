@@ -15,7 +15,7 @@ import mutagen
 
 from . import musicbrainz
 from .importer import album_folder, track_file
-from .scan import CONTENT_TYPES, REPLACED
+from .scan import CONTENT_TYPES
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +63,6 @@ def album_of(path: Path, root: Path) -> Path:
 def plan(db, root: Path) -> Plan:
     result, found, names, files = Plan(), {}, {}, []
     for directory, folders, names_here in os.walk(root):
-        folders[:] = [f for f in folders if f != REPLACED]
         files += [Path(directory, f) for f in names_here if not f.startswith(".")]  # hidden: half-written files, this tool's mapping
     files.sort()
     audio = [p for p in files if p.suffix.lower().lstrip(".") in CONTENT_TYPES]
@@ -129,6 +128,7 @@ def repoint(db, old: str, new: str):
     db.execute("update track set cover = ? where cover = ?", (new, old))
     db.execute("update audio_shared set path = ? where path = ?", (new, old))
     db.execute("update audio_shared set kept = ? where kept = ?", (new, old))
+    db.execute("update audio_quality set path = ? where path = ?", (new, old))
     for r in db.execute("select * from audio_pair where ? in (a, b)", (old,)).fetchall():
         (a, a_mtime), (b, b_mtime) = sorted([(new if r["a"] == old else r["a"], r["a_mtime"]), (new if r["b"] == old else r["b"], r["b_mtime"])])
         db.execute("delete from audio_pair where a = ? and b = ?", (r["a"], r["b"]))

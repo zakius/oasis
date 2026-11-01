@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 
 from . import releases
 from .importer import ARCHIVES, AUDIO, editions
+from .quality import LossySource
 from .releases import hash_of
 from .torbox import RateLimited
 
@@ -388,17 +389,20 @@ class Downloads:
 
     def place_targets(self, db, row):
         """A bundle's albums, each imported on its own. One no edition matches is left out; the bundle fails, and is
-        blocked, only when none matched."""
-        folder = self.folder / row["hash"]
+        blocked, only when none matched. One made from lossy files blocks it too, so that album's next search finds another."""
+        folder, lossy = self.folder / row["hash"], None
         for (rg,) in db.execute("select rg from download_target where hash = ? and state = 'pending'", (row["hash"],)).fetchall():
             try:
                 self.own.place(folder / rg, rg)
             except LookupError as e:
                 log.info("bundle %s: %s isn't there: %s", row["title"], rg, e)
                 db.execute("update download_target set state = 'failed' where hash = ? and rg = ?", (row["hash"], rg))
+                lossy = lossy or (e if isinstance(e, LossySource) else None)
                 continue
             db.execute("update download_target set state = 'done' where hash = ? and rg = ?", (row["hash"], rg))
         if db.execute("select 1 from download_target where hash = ? and state = 'done'", (row["hash"],)).fetchone():
+            if lossy:  # the albums it holds lossy-sourced are searched again: not in this bundle
+                self.block_release(db, row, f"import failed: {lossy}")
             self.done(db, row, folder)
         else:
             self.fail(db, row, "import failed: no album of the bundle matched")
@@ -414,12 +418,14 @@ class Downloads:
         """Deletes the torrent and makes the album due for another search. A blocked release is never picked again.
         The files stay KEEP_FAILED for inspection."""
         self.delete(row)
-        now = time.time()
         if block:
-            db.executemany("insert or replace into release_block values (?, ?, ?)", [(k, why, now) for k in (row["hash"], row["guid"]) if k])
+            self.block_release(db, row, why)
         self.set(db, row, "failed", why)
         db.execute("update want_album set next_search = null, error = ? where rg = ?", (f"download failed: {why}", row["album_mbid"]))
         log.info("download %s failed: %s", row["title"], why)
+
+    def block_release(self, db, row, why: str):
+        db.executemany("insert or replace into release_block values (?, ?, ?)", [(k, why, time.time()) for k in (row["hash"], row["guid"]) if k])
 
     def block(self, db, rg: str) -> bool:
         """Blocks the release TorBox is downloading for the album, so its next search picks another; a bundle's albums

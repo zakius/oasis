@@ -6,6 +6,7 @@ import pytest
 
 from oasis import download, releases
 from oasis.download import info_hash, source
+from oasis.quality import LossySource
 from oasis.releases import find, queries, rank, reject
 from test_download import WANT, Prowlarr, db, downloads, files, finished, result, tb, torbox  # noqa: F401 (fixtures)
 
@@ -289,12 +290,14 @@ def test_a_singles_collection_is_a_bundle_whose_singles_folders_are_targets():
     assert [(r["infoHash"], t) for r, t in picks] == [("ss", {"g-one": ["LP Discography/2017 - One [Single]/01 One.flac"]})]
 
 
-def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloads, torbox, db, tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure, blocked", [(LookupError("no edition matches"), False), (LossySource("lossy source in a FLAC"), True)])
+def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloads, torbox, db, tmp_path, monkeypatch, failure, blocked):
+    """An album of it made from lossy files blocks the bundle: its next search finds another."""
     class Own:
         def place(self, folder, group):
             placed[group] = sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file())
             if group in failing:
-                raise LookupError("no edition matches")
+                raise failure
 
     placed, failing, downloads.own = {}, {"g-mtm"}, Own()
     monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
@@ -317,6 +320,9 @@ def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloa
     assert dict(db.execute("select rg, state from download_target").fetchall()) == {"g-ht": "done", "g-mtm": "failed"}
     assert db.execute("select state from download").fetchone()[0] == "done" and torbox.deleted == [71] and not (tmp_path / "dl/abcd").exists()
     assert downloads.groups(db) == set() and downloads.scans == [1]
+    assert bool(db.execute("select 1 from release_block where hash = 'abcd'").fetchone()) == blocked
+    if blocked:
+        return  # the rest searches the same release again
 
     # None of a bundle's albums imports: it fails and is blocked.
     failing.add("g-ht")
