@@ -101,7 +101,7 @@ NO_COVER = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect
 confirm = lambda question: f' onsubmit="return confirm({escape(json.dumps(question, ensure_ascii=False))})"'  # for buttons that drop things
 HIDE_BROKEN = 'onerror="this.removeAttribute(\'src\')"'  # a cover that fails shows the empty frame, not a broken image
 MBID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-MUSIC_NAV = ('<p><a href="/account">Dashboard</a> · <a href="/music/library">Library</a> · <a href="/music">Find music</a> · '
+MUSIC_NAV = ('<p><a href="/">Dashboard</a> · <a href="/music/library">Library</a> · <a href="/music">Find music</a> · '
              '<a href="/music/wanted">Wanted</a></p>')
 
 
@@ -170,7 +170,7 @@ def routes(api) -> list[Route]:
                 if user is None:
                     return RedirectResponse("/login", status_code=303)
                 if admin and not user["admin"]:
-                    return back("/account", error="Only admins can manage users.")
+                    return back("/", error="Only admins can manage users.")
                 return handler(db, request, user, form)
             return await run_in_threadpool(with_db(run))
         return endpoint
@@ -187,7 +187,7 @@ def routes(api) -> list[Route]:
             user = accounts.get(db, form.get("name", ""))
             if user is None or user["password"] != form.get("password"):
                 return back("/login", error="Wrong user or password.")
-            response = RedirectResponse("/account", status_code=303)
+            response = RedirectResponse("/", status_code=303)
             response.set_cookie(COOKIE, accounts.new_session(db, user["name"]), max_age=accounts.SESSION_DAYS * 86400,
                                 httponly=True, samesite="lax")
             return response
@@ -234,15 +234,15 @@ def routes(api) -> list[Route]:
         try:
             name = api._link_youtube(db, user["name"], accounts.youtube_headers(form.get("headers", "")))
         except ValueError as e:
-            return back("/account", error=str(e))
+            return back("/", error=str(e))
         except Exception as e:  # Fail from the API
-            return back("/account", error=getattr(e, "message", str(e)))
-        return back("/account", message=f"YouTube Music linked as {name}. Your mixes are loading.")
+            return back("/", error=getattr(e, "message", str(e)))
+        return back("/", message=f"YouTube Music linked as {name}. Your mixes are loading.")
 
     def unlink_youtube(db, request, user, form):
         accounts.set_field(db, user["name"], ytm_auth=None, ytm_name=None)
         api._drop_mixes(db, user["name"])
-        return back("/account", message="YouTube Music unlinked.")
+        return back("/", message="YouTube Music unlinked.")
 
     def lastfm_service():
         return LastFm(api.config.lastfm_key, api.config.lastfm_secret, None)
@@ -254,21 +254,21 @@ def routes(api) -> list[Route]:
         try:
             key, name = lastfm_service().sign_in(request.query_params.get("token", ""))
         except Exception as e:
-            return back("/account", error=f"Last.fm sign-in failed: {e}")
+            return back("/", error=f"Last.fm sign-in failed: {e}")
         accounts.set_field(db, user["name"], lastfm_session=key, lastfm_name=name)
-        return back("/account", message=f"Last.fm linked as {name}.")
+        return back("/", message=f"Last.fm linked as {name}.")
 
     def lastfm_app(db, request, user, form):
         key, secret = form.get("key", "").strip(), form.get("secret", "").strip()
         try:
             api._set_lastfm_app(db, key, secret)
         except Exception as e:
-            return back("/account", error=f"Last.fm didn't accept these: {e}")
-        return back("/account", message="oasis is connected to Last.fm. Now sign in with your Last.fm account.")
+            return back("/", error=f"Last.fm didn't accept these: {e}")
+        return back("/", message="oasis is connected to Last.fm. Now sign in with your Last.fm account.")
 
     def unlink_lastfm(db, request, user, form):
         accounts.set_field(db, user["name"], lastfm_session=None, lastfm_name=None)
-        return back("/account", message="Last.fm unlinked.")
+        return back("/", message="Last.fm unlinked.")
 
     def link_listenbrainz(db, request, user, form):
         token = form.get("token", "").strip()
@@ -278,19 +278,19 @@ def routes(api) -> list[Route]:
                 with urllib.request.urlopen(request_, timeout=15) as response:
                     result = json.load(response)
             except Exception as e:
-                return back("/account", error=f"ListenBrainz didn't answer: {e}")
+                return back("/", error=f"ListenBrainz didn't answer: {e}")
             if not result.get("valid"):
-                return back("/account", error="ListenBrainz says that token isn't valid.")
+                return back("/", error="ListenBrainz says that token isn't valid.")
         accounts.set_field(db, user["name"], listenbrainz_token=token or None)
-        return back("/account", message="ListenBrainz linked." if token else "ListenBrainz unlinked.")
+        return back("/", message="ListenBrainz linked." if token else "ListenBrainz unlinked.")
 
     def change_password(db, request, user, form):
         if user["name"] in api.config.users:
-            return back("/account", error="This password is set in oasis.toml.")
+            return back("/", error="This password is set in oasis.toml.")
         if not form.get("password"):
-            return back("/account", error="A password is needed.")
+            return back("/", error="A password is needed.")
         accounts.set_field(db, user["name"], password=form["password"])
-        return back("/account", message="Password changed. Update it in your apps.")
+        return back("/", message="Password changed. Update it in your apps.")
 
     def status(db) -> str:
         """What oasis is busy with: downloads, the MusicBrainz fill and dedupe."""
@@ -323,7 +323,7 @@ def routes(api) -> list[Route]:
     def artist_settings(db, request, user, form):
         q, settings = request.query_params, api._artist_settings(db)
         lines = lambda key: escape("\n".join("; ".join(group) for group in settings.get(key, [])))
-        body = ('<p><a href="/account">Back to your account</a></p><form method="post" action="/admin/artists">'
+        body = ('<p><a href="/">Back to the dashboard</a></p><form method="post" action="/admin/artists">'
                 '<section><h2>Related artists</h2><p class="muted">One group per line, names separated by <code>;</code>. '
                 'Separate artists that belong together: they come first among each other\'s similar artists and mix into each '
                 f'other\'s radios. Clients only ever see them as related.</p><textarea name="related">{lines("related")}</textarea></section>'
@@ -352,7 +352,7 @@ def routes(api) -> list[Route]:
                 '<span class="muted">from oasis.toml</span>' if r["name"] in api.config.users else
                 f'<form class="inline" method="post" action="/admin/users/{quote(r["name"])}/delete"><button>Delete</button></form>') +
             '</td></tr>' for r in db.execute("select * from user order by name"))
-        body = (f'<p><a href="/account">Back to your account</a></p><section><h2>Users</h2><table>{rows}</table></section>'
+        body = (f'<p><a href="/">Back to the dashboard</a></p><section><h2>Users</h2><table>{rows}</table></section>'
                 '<section><h2>New user</h2><form method="post" action="/admin/users"><label>User<input type="text" name="name">'
                 '</label><label>Password<input type="password" name="password"></label><label><input type="checkbox" '
                 'name="admin"> Admin</label><p><button>Create</button></p></form></section>')
@@ -785,16 +785,12 @@ def routes(api) -> list[Route]:
             api._want(db, user["name"], form["kind"], [form.get("ref", "")], None)
         return back("/music/wanted", message="Given up.")
 
-    async def home(request: Request):
-        return RedirectResponse("/account")
-
     return [
-        Route("/", home),
+        Route("/", signed_in(account)),
         Route("/login", login, methods=["GET", "POST"]),
         Route("/admin/artists", signed_in(artist_settings, admin=True)),
         Route("/admin/artists", signed_in(save_artist_settings, admin=True), methods=["POST"]),
         Route("/logout", signed_in(logout), methods=["POST"]),
-        Route("/account", signed_in(account)),
         Route("/account/youtube", signed_in(link_youtube), methods=["POST"]),
         Route("/account/youtube/unlink", signed_in(unlink_youtube), methods=["POST"]),
         Route("/account/lastfm", signed_in(lastfm_start)),

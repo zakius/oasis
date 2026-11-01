@@ -43,17 +43,17 @@ def test_youtube_headers_from_any_copy():
 
 
 def test_web_sign_in_and_link_services(client):
-    assert client.get("/account", follow_redirects=False).headers["location"] == "/login"
+    assert client.get("/", follow_redirects=False).headers["location"] == "/login"
     assert "Wrong user" in client.post("/login", data={"name": "admin", "password": "x"}).text
     sign_in(client)
-    page = client.get("/account").text
+    page = client.get("/").text
     assert "Signed in as <b>admin</b>" in page and "Copy as cURL" in page
     linked = client.post("/account/youtube", data={"headers": "SID=a; __Secure-3PAPISID=b"}).text
     assert "YouTube Music linked as Tester" in linked
     assert "Wrong" not in client.post("/account/youtube", data={"headers": "nothing"}).text
     assert "no YouTube sign-in cookie" in client.post("/account/youtube", data={"headers": "nothing"}).text
     assert "unlinked" in client.post("/account/youtube/unlink").text
-    assert "last.fm/api/account/create" in client.get("/account").text
+    assert "last.fm/api/account/create" in client.get("/").text
 
 
 def test_an_admin_connects_oasis_to_lastfm_on_the_dashboard(client, monkeypatch):
@@ -118,6 +118,6 @@ def test_status_shows_oasis_downloads_and_what_arrived_lately(client):
             ("h3", "Mili - Hue [MPC]", "failed", "dead torrent: no seeds, no progress")]
     db.executemany("insert into download(hash, album_id, title, state, error, created, updated) values (?, 1, ?, ?, ?, strftime('%s'), strftime('%s'))", rows)
     sign_in(client)
-    page = client.get("/account").text
+    page = client.get("/").text
     assert "Downloading 1:" in page and "Mili - Hue [FLAC]" in page and "TorBox downloading" in page
     assert "✓ Rammstein - Mutter [FLAC]" in page and "dead torrent: no seeds, no progress" in page

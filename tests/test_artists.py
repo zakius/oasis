@@ -110,4 +110,4 @@ def test_artist_settings_on_the_dashboard_apply_at_once_and_merges_can_be_taken_
         client.post("/admin/artists", data={"related": "", "merge": "", "separate": ""})
         assert [a["name"] for a in call(client, "getArtist", id=make_id("ar-", "Beta"))["artist"]["album"]] == ["One"]
         assert [a["name"] for a in call(client, "getArtist", id=make_id("ar-", "Beta Band"))["artist"]["album"]] == ["Two"]
-        assert "Status" in client.get("/account").text and "artists in the library" in client.get("/account").text
+        assert "Status" in client.get("/").text and "artists in the library" in client.get("/").text
