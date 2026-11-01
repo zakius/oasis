@@ -7,7 +7,7 @@ import pytest
 from oasis import download, releases
 from oasis.download import info_hash, source
 from oasis.releases import find, queries, rank, reject
-from test_download import WANT, Prowlarr, db, downloads, files, result, tb, torbox  # noqa: F401 (fixtures)
+from test_download import WANT, Prowlarr, db, downloads, files, finished, result, tb, torbox  # noqa: F401 (fixtures)
 
 
 def want(title, *names, year="", others=(), discs=1, upgrade=False, native=()):
@@ -213,6 +213,20 @@ def test_a_bundles_file_list_gives_the_wanted_albums_each_folder_wholly_holds():
                             LP, LP_GROUPS, wanted, editions) == {}
 
 
+def test_a_bundles_folder_of_disc_images_is_taken_by_its_name_and_size():
+    """Meteora's two tracks last 400 s: a lossless image of them is some 40 MB."""
+    image = lambda folder, size, *more: [{"name": f"LP/{folder}/{n}", "size": size if n.endswith(".flac") else 1} for n in ("Meteora.flac", "Meteora.cue", *more)]
+    found = releases.targets(image("Meteora (2003) [FLAC image+cue]", 40e6, "cover.jpg", "rip.log"), LP, LP_GROUPS, {"g-met"}, editions)
+    assert found == {"g-met": [f"LP/Meteora (2003) [FLAC image+cue]/{n}" for n in ("Meteora.flac", "Meteora.cue", "cover.jpg")]}
+    assert releases.targets(image("Meteora (2003)", 1e6), LP, LP_GROUPS, {"g-met"}, editions) == {}  # too small to be the album
+    assert releases.targets(image("Meteora (2003)", 40e6)[:1], LP, LP_GROUPS, {"g-met"}, editions) == {}  # no cue sheet: one track
+    discs = [f for d in ("CD1", "CD2") for f in image(f"Meteora (2003)/{d}", 20e6)]
+    assert sorted(releases.targets(discs, LP, LP_GROUPS, {"g-met"}, editions)["g-met"]) == sorted(f["name"] for f in discs)
+    tracks = [{"name": f"LP/Meteora (2003) [tracks+cue]/{n}", "size": 20e6} for n in ("01 Foreword.flac", "02 Don't Stay.flac", "Meteora.cue")]
+    assert releases.targets(image("Meteora (2003) [image]", 40e6) + tracks, LP, LP_GROUPS, {"g-met"}, editions) == \
+        {"g-met": [f["name"] for f in tracks]}  # a file per track first
+
+
 def test_a_bundles_album_folder_may_be_named_by_one_of_its_other_titles():
     groups = [{"id": "g-ens", "title": "アンサンブル・プレイ", "first-release-date": "2022", "other_titles": ["Ensemble Play"]},
               {"id": "g-cs", "title": "クリープ・ショー", "first-release-date": "2023"}]
@@ -280,6 +294,22 @@ def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloa
     downloads.cycle()
     assert db.execute("select state, error from download where hash = 'bcde'").fetchone()[:] == ("failed", "import failed: no album of the bundle matched")
     assert "bcde" in downloads.blocked(db)
+
+
+def test_a_bundles_disc_image_arrives_with_its_cue_sheet_for_the_importer_to_split(downloads, torbox, db, tmp_path, monkeypatch):
+    class Own:
+        def place(self, folder, group):
+            placed[group] = sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file())
+
+    placed, downloads.own = {}, Own()
+    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    names = [f"LP/Meteora (2003) [image+cue]/{n}" for n in ("Meteora.ape", "Meteora.cue", "Meteora.log")]
+    downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
+    torbox.cached_files = lambda hashes: {"abcd": [{"name": n, "size": 40e6} for n in names]}
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met"})
+    torbox.list = [finished(71, "abcd", names, tmp_path)]
+    downloads.cycle()
+    assert placed == {"g-met": ["Meteora.ape", "Meteora.cue"]} and db.execute("select state from download").fetchone()[0] == "done"
 
 
 def test_another_album_holding_the_title_a_namesake_or_various_artists_are_not_the_album():
