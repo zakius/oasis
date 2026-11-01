@@ -26,76 +26,157 @@ LASTFM_APP_STEPS = """<p>First connect oasis itself to Last.fm (once, for every 
 <li>Fill in any application name, for example <i>oasis</i>; leave the callback URL empty.</li>
 <li>Copy the <b>API key</b> and <b>Shared secret</b> it shows here.</li></ol>
 <form method="post" action="/account/lastfm/app"><label>API key<input type="text" name="key"></label>
-<label>Shared secret<input type="password" name="secret"></label><button>Connect</button></form>"""
+<label>Shared secret<input type="password" name="secret"></label><button class="primary">Connect</button></form>"""
 
 STYLE = """
-body { font: 16px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; color: #1d1d1f; background: #fafafa; }
-@media (prefers-color-scheme: dark) { body { color: #e8e8e8; background: #161616; } section { background: #202020 !important; } }
-h1 { font-size: 1.6rem; } h2 { font-size: 1.15rem; margin: 0 0 .5rem; }
-section { background: #fff; border-radius: 12px; padding: 1rem 1.25rem; margin: 1rem 0; box-shadow: 0 1px 3px #0002; }
-input, textarea, button { font: inherit; } textarea { width: 100%; min-height: 6rem; box-sizing: border-box; }
-input[type=text], input[type=password] { width: 100%; box-sizing: border-box; margin: .2rem 0 .6rem; padding: .4rem; }
-button { padding: .4rem 1rem; border-radius: 8px; border: 1px solid #888; cursor: pointer; }
-.ok { color: #1a7f37; }
-.toast { position: fixed; z-index: 9; left: 50%; bottom: 1.25rem; transform: translateX(-50%); width: max-content; max-width: calc(100% - 2rem);
-         margin: 0; padding: .6rem 1rem; border-radius: 10px; background: #1a7f37; color: #fff; box-shadow: 0 4px 16px #0005; cursor: pointer;
-         animation: fade 1s 6s forwards; } .toast.bad { background: #c62828; animation: none; }
-@keyframes fade { to { opacity: 0; visibility: hidden; } }
-tr:target td { background: #2f6fd022 !important; } tr[id] { scroll-margin-top: 30vh; } .error { color: #c62828; } .muted { opacity: .7; font-size: .9rem; }
-ol { padding-left: 1.2rem; } form.inline { display: inline; } td { padding: .2rem .6rem .2rem 0; vertical-align: top; }
-li { margin: .25rem 0; } form.inline button { padding: .1rem .6rem; font-size: .85rem; }
-body.wide { max-width: 72rem; } a { color: #2f6fd0; } @media (prefers-color-scheme: dark) { a { color: #7fb0ff; } }
-table.grid { width: 100%; border-collapse: collapse; font-size: .93rem; }
-table.grid th { text-align: left; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; opacity: .65; padding: .35rem .5rem;
-                border-bottom: 1px solid #8885; font-weight: 600; }
-table.grid td { padding: .4rem .5rem; border-bottom: 1px solid #8882; vertical-align: middle; }
-table.grid tr:hover td { background: #8881; } table.grid tr.dim td { opacity: .55; }
-.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; } .actions { text-align: right; white-space: nowrap; }
-.actions form { display: inline; } .actions form + form { margin-left: 1.5rem; } .actions button, .bulk button { padding: .15rem .6rem; font-size: .8rem; }
-.pill { display: inline-block; padding: 0 .55rem; border-radius: 999px; font-size: .78rem; font-weight: 500; background: #8882; white-space: nowrap; }
-.pill.bad { background: #c628282e; } .pill.good { background: #1a7f372e; } .pill.busy { background: #1565c02e; }
+:root { color-scheme: light dark; --bg: #f4f5f7; --surface: #fff; --raised: #eceef2; --line: #e1e4ea; --text: #14171c; --muted: #5b6472;
+        --accent: #0d9488; --link: #0f766e; --on-accent: #fff; --good: #15803d; --busy: #4f46e5; --bad: #dc2626; --star: #d97706;
+        --shadow: 0 1px 2px #0000000d; --pad: 1.25rem; --radius: 14px; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f1115; --surface: #171a20; --raised: #22262e; --line: #2a2e37; --text: #e8eaee; --muted: #969eac; --accent: #2dd4bf;
+          --link: #5eead4; --on-accent: #042f2c; --good: #4ade80; --busy: #a5b4fc; --bad: #f87171; --star: #fbbf24; --shadow: none; } }
+* { box-sizing: border-box; }
+body { margin: 0; font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--text); background: var(--bg);
+       -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; }
+main { max-width: 48rem; margin: 0 auto; padding: 2rem 1.5rem 5rem; } .wide main { max-width: 76rem; }
+a { color: var(--link); text-decoration: none; } a:hover { text-decoration: underline; }
+h1 { font-size: 1.85rem; line-height: 1.2; letter-spacing: -.02em; margin: 0 0 1.5rem; overflow-wrap: anywhere; }
+h2 { font-size: 1.05rem; letter-spacing: -.01em; margin: 0 0 .75rem; } main > h2 { margin-top: 2rem; }
+p { margin: 0 0 .75rem; } :is(p, ul, ol, form):last-child { margin-bottom: 0; }
+ol { padding-left: 1.3rem; } li { margin: .3rem 0; } code { font-size: .85em; overflow-wrap: anywhere; }
+.bar { position: sticky; top: 0; z-index: 5; border-bottom: 1px solid var(--line); background: var(--bg); }
+.bar > div { max-width: 76rem; margin: 0 auto; padding: 0 1.5rem; height: 3.75rem; display: flex; align-items: center; gap: 2.5rem; }
+.brand { display: flex; align-items: center; gap: .55rem; margin: 0; font-size: 1.15rem; font-weight: 700; letter-spacing: -.02em; color: var(--text); }
+.brand:hover { text-decoration: none; } .brand svg { width: 1.65rem; height: 1.65rem; } .logo circle { fill: var(--accent); } .logo path { stroke: var(--on-accent); }
+.tabs { display: flex; gap: .25rem; }
+.tabs a { display: flex; align-items: center; gap: .5rem; padding: .45rem .85rem; border-radius: 999px; color: var(--muted); font-size: .95rem; font-weight: 600; }
+.tabs a:hover { color: var(--text); background: var(--raised); text-decoration: none; }
+.tabs a[aria-current] { color: var(--text); background: var(--raised); } .tabs a[aria-current] svg { color: var(--link); }
+.tabs svg { width: 1.2rem; height: 1.2rem; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+section { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: var(--pad); margin: 0 0 1rem; box-shadow: var(--shadow); }
+section.plain { background: none; border: 0; border-radius: 0; padding: 0; margin: 0 0 2.5rem; box-shadow: none; }
+.split { display: grid; grid-template-columns: minmax(0, 1fr) 22rem; gap: 0 1.5rem; align-items: start; }
+input, select, textarea, button { font: inherit; color: inherit; }
+input[type=text], input[type=password], select, textarea { display: block; width: 100%; min-height: 2.75rem; margin: .35rem 0 0; padding: .55rem .8rem;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--text); font-size: 1rem; font-weight: 400; }
+textarea { min-height: 8rem; resize: vertical; line-height: 1.45; }
+select { appearance: none; padding-right: 2.25rem; cursor: pointer; background: var(--bg) no-repeat right .8rem center / .75rem
+  url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%238a93a0' stroke-width='2'/%3E%3C/svg%3E"); }
+:is(input, select, textarea):focus { outline: 2px solid var(--accent); outline-offset: -2px; } ::placeholder { color: var(--muted); opacity: .8; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+label { display: block; margin: 0 0 1rem; font-size: .875rem; font-weight: 600; color: var(--muted); }
+label.check { display: flex; align-items: center; gap: .6rem; color: var(--text); font-size: 1rem; font-weight: 400; }
+input[type=checkbox], input[type=radio] { width: 1.15rem; height: 1.15rem; margin: 0; accent-color: var(--accent); }
+button, .button { display: inline-flex; align-items: center; justify-content: center; gap: .4rem; min-height: 2.25rem; padding: .35rem .95rem;
+  border: 1px solid var(--line); border-radius: 10px; background: var(--raised); color: var(--text); font-size: .9rem; font-weight: 600;
+  line-height: 1.2; white-space: nowrap; cursor: pointer; }
+button:hover, .button:hover { border-color: var(--muted); text-decoration: none; } button:disabled { opacity: .55; cursor: progress; }
+:is(button, .button).primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+:is(button, .button).primary:hover { filter: brightness(1.08); }
+button.danger { background: none; color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
+button.danger:hover { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, transparent); }
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; } .row > .right { margin-left: auto; } .row > p { margin: 0; }
+section > .row + .row { margin-top: 1rem; } form.inline { display: inline; }
+.pill { display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .78rem; font-weight: 600; line-height: 1.45; white-space: nowrap;
+        vertical-align: .08em; color: var(--muted); background: color-mix(in srgb, currentColor 14%, transparent); }
+.muted { color: var(--muted); font-size: .875rem; } .good, .ok { color: var(--good); } .busy { color: var(--busy); } .bad, .error { color: var(--bad); }
+.accent { color: var(--link); } .star { color: var(--star); } .ok::before { content: "✓ "; } a.pill:hover { text-decoration: none; filter: brightness(1.15); }
+.meter { display: inline-block; width: 4rem; height: .4rem; margin-right: .5rem; border-radius: 999px; overflow: hidden;
+  vertical-align: .1em; background: color-mix(in srgb, var(--busy) 20%, transparent); } .meter i { display: block; height: 100%; background: var(--busy); }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr)); gap: .75rem; margin: 0 0 1.25rem; }
+.stats > div { padding: .85rem 1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+.stats b { display: block; font-size: 1.6rem; line-height: 1.15; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.stats span { color: var(--muted); font-size: .85rem; }
+ul.rows { list-style: none; padding: 0; margin: 0 calc(-1 * var(--pad)); }
+ul.rows > li { display: flex; align-items: center; gap: .85rem; margin: 0; padding: .7rem var(--pad); }
+ul.rows > li + li { border-top: 1px solid var(--line); } section > :is(ul.rows, table.grid):first-child { margin-top: -.5rem; }
+section > ul.rows:last-child { margin-bottom: -.5rem; }
+.grow { flex: 1; min-width: 0; overflow-wrap: anywhere; } ul.rows .grow > a:first-child { font-weight: 600; }
+.mark { flex: none; width: 1.25rem; text-align: center; font-weight: 700; }
+table.grid { width: 100%; border-collapse: collapse; }
+section > table.grid { width: calc(100% + 2 * var(--pad)); margin: 0 calc(-1 * var(--pad)) -.5rem; }
+table.grid th { padding: .55rem .6rem; border-bottom: 1px solid var(--line); text-align: left; font-size: .72rem; font-weight: 600; text-transform: uppercase;
+                letter-spacing: .06em; color: var(--muted); white-space: nowrap; } table.grid th.num { text-align: right; }
+table.grid td { padding: .65rem .6rem; border-top: 1px solid var(--line); vertical-align: middle; } table.grid tbody tr:first-child td { border-top: 0; }
+table.grid :is(td, th):first-child { padding-left: var(--pad); } table.grid :is(td, th):last-child { padding-right: var(--pad); }
+table.grid tbody tr:hover { background: color-mix(in srgb, var(--raised) 50%, transparent); } td.lead b { font-weight: 600; }
+tr:target { background: color-mix(in srgb, var(--accent) 16%, transparent) !important; } tr[id] { scroll-margin-top: 30vh; }
+.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; } td.thumb { width: 1px; padding-right: .2rem !important; }
+td.meta { color: var(--muted); font-size: .9rem; white-space: nowrap; } a.stretch::after { content: ""; position: absolute; inset: 0; }
+a.stretch, table.tracks td.lead > a { color: var(--text); }
+table.thumbs tr { position: relative; } table.tracks td:first-child { width: 2.5rem; color: var(--muted); }
+.actions { text-align: right; white-space: nowrap; } .actions form { display: inline-block; } .actions form + form { margin-left: 1.25rem; }
+.actions button { min-height: 2rem; padding: .25rem .75rem; font-size: .85rem; }
 details > summary { cursor: pointer; list-style: none; } details > summary::-webkit-details-marker { display: none; }
-details > summary::before { content: "▸"; display: inline-block; width: 1em; transition: transform .15s; opacity: .6; }
-details[open] > summary::before { transform: rotate(90deg); }
-details.group { margin: 1.75rem 0; border: 1px solid #8883; border-radius: 10px; overflow: hidden; }
-details.group > summary { display: flex; gap: .5rem; align-items: center; font-weight: 600; padding: .55rem .75rem; background: #8881; }
-details.group[open] > summary { border-bottom: 1px solid #8883; } details.group table.grid tr:last-child td { border-bottom: 0; }
-details.group table.grid :is(td, th):first-child { padding-left: .75rem; } details.group table.grid :is(td, th):last-child { padding-right: .75rem; }
-details.group > .bulk { display: flex; justify-content: flex-end; padding: 1rem .75rem; border-top: 1px solid #8883; background: #8881; }
-details.group > .bulk button { background: none; border: 1px solid currentColor; padding: .25rem .8rem; font-size: .85rem; color: #c62828; }
-@media (prefers-color-scheme: dark) { details.group > .bulk button { color: #ef8a8a; } }
-details.artist { border-bottom: 1px solid #8883; padding: .35rem 0; } details.artist > summary, details.album > summary {
-  display: flex; flex-wrap: wrap; gap: .25rem .75rem; align-items: baseline; }
-details.artist > summary b { font-size: 1.05rem; } details.album { margin: .2rem 0 .2rem 1.2rem; }
-.hero { display: flex; gap: 1.25rem; align-items: flex-start; } .hero > div { flex: 1; min-width: 0; }
-.cover { width: 11rem; height: 11rem; object-fit: cover; border-radius: 8px; background: #8882; flex: none; }
-.cover.small { width: 2.6rem; height: 2.6rem; border-radius: 4px; } td.thumb { width: 2.6rem; padding-right: 0; }
-dl.meta { display: grid; grid-template-columns: max-content 1fr; gap: .2rem 1rem; margin: 0; } dl.meta dt { opacity: .6; }
-dl.meta dd { margin: 0; overflow-wrap: anywhere; } code { font-size: .85em; }
-.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr)); gap: 1rem; }
-.card { display: flex; flex-direction: column; gap: .15rem; color: inherit; text-decoration: none; min-width: 0; }
-.card .cover { width: 100%; height: auto; aspect-ratio: 1; } .card b { font-weight: 600; overflow-wrap: anywhere; }
-a.card:hover b { text-decoration: underline; } .card.dim { opacity: .55; } .card .pill { align-self: flex-start; }
-.dim-row { opacity: .6; display: flex; flex-wrap: wrap; gap: .25rem .75rem; align-items: baseline; padding-left: 1em; }
-details.album > table { margin: .3rem 0 .6rem 1em; width: calc(100% - 1em); } .right { margin-left: auto; }
-.filters { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; } .filters input[type=text] { width: auto; flex: 1 1 12rem; margin: 0; }
-.filters select { font: inherit; padding: .35rem; max-width: 100%; }
+details.group { margin: 0 0 1rem; overflow: hidden; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
+details.group > summary { display: flex; align-items: center; gap: .65rem; min-height: 3.25rem; padding: .7rem var(--pad); font-weight: 650; user-select: none; }
+details.group > summary::after { content: ""; width: .5rem; height: .5rem; margin: -.25rem .2rem 0 auto; border: solid var(--muted); border-width: 0 2px 2px 0;
+                                 transform: rotate(45deg); transition: transform .15s; }
+details.group[open] > summary::after { margin-top: .25rem; transform: rotate(225deg); } details.group[open] > summary { border-bottom: 1px solid var(--line); }
+details.group > .bulk { display: flex; justify-content: flex-end; padding: .85rem var(--pad); border-top: 1px solid var(--line); }
+.dot { flex: none; width: .55rem; height: .55rem; border-radius: 50%; background: currentColor; } .count { color: var(--muted); font-weight: 500; }
+.filters { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin: 0 0 1rem; } .filters > * { margin: 0 !important; }
+.filters :is(select, input) { width: auto; min-width: 0; flex: 1 1 10rem; }
+.filters select[name=artist] { flex: 2 1 14rem; } .filters select[name=type] { flex: 0 1 8.5rem; }
+.search { margin: 0 0 1.25rem; } .search > input { margin: 0 0 .75rem; } .facts > .row { margin: 0 0 1.1rem; }
+.seg { display: inline-flex; gap: 2px; padding: 3px; border-radius: 12px; background: var(--raised); }
+.seg label { margin: 0; font-size: .9rem; } .seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg span { display: block; padding: .4rem 1rem; border-radius: 9px; cursor: pointer; }
+.seg input:checked + span { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px #0003; }
+.seg input:focus-visible + span { outline: 2px solid var(--accent); }
+.cover { display: block; flex: none; width: 13rem; height: auto; aspect-ratio: 1; object-fit: cover; border-radius: 10px; background: var(--raised); }
+.cover.small { width: 2.75rem; border-radius: 6px; } .cover.round { border-radius: 50%; }
+.hero { display: grid; grid-template: "art head" auto "art facts" 1fr / 13rem minmax(0, 1fr); gap: .75rem 2rem; margin: 0 0 2.5rem; }
+.hero > .cover { grid-area: art; width: 100%; box-shadow: 0 8px 28px #0000003a; } .hero > header { grid-area: head; align-self: end; }
+.hero > .facts { grid-area: facts; } .hero h1 { margin: 0 0 .35rem; font-size: 2.25rem; } .hero .sub { margin: 0; color: var(--muted); }
+.kicker { margin: 0 0 .3rem; font-size: .75rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+dl.meta { display: grid; grid-template-columns: max-content 1fr; gap: .3rem 1.25rem; margin: 0 0 1rem; font-size: .925rem; }
+dl.meta dt { color: var(--muted); } dl.meta dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr)); gap: 1.5rem 1.1rem; }
+.card { display: flex; flex-direction: column; gap: .1rem; min-width: 0; color: inherit; } a.card:hover { text-decoration: none; }
+.card .cover { width: 100%; margin-bottom: .5rem; box-shadow: 0 2px 10px #00000024; transition: transform .15s; } a.card:hover .cover { transform: translateY(-2px); }
+.card b { display: -webkit-box; overflow: hidden; -webkit-line-clamp: 2; -webkit-box-orient: vertical; font-size: .95rem; font-weight: 600;
+          line-height: 1.3; overflow-wrap: anywhere; }
+a.card:hover b { text-decoration: underline; } .card .muted { font-size: .8rem; } .card .pill { align-self: flex-start; margin-top: .3rem; }
+.card.dim .cover { opacity: .4; filter: grayscale(.7); } .card.dim b { color: var(--muted); }
+.login { max-width: 23rem; margin: 10vh auto 0; padding: 2rem 1.75rem; } .login h1 { justify-content: center; margin-bottom: 1.75rem; font-size: 1.75rem; }
+.login button { width: 100%; min-height: 2.75rem; margin-bottom: 1rem; }
+.toast { position: fixed; z-index: 9; left: 50%; bottom: 1.5rem; width: max-content; max-width: min(34rem, calc(100% - 2rem)); margin: 0;
+         padding: .8rem 1.1rem .8rem 1rem; border-left: 4px solid var(--good); border-radius: 12px; background: var(--text); color: var(--bg);
+         box-shadow: 0 10px 30px #00000040; font-size: .95rem; cursor: pointer; transform: translateX(-50%); animation: rise .2s ease-out, fade 1s 6s forwards; }
+.toast.bad { border-left-color: var(--bad); animation: rise .2s ease-out; }
+@keyframes rise { from { opacity: 0; transform: translate(-50%, .75rem); } } @keyframes fade { to { opacity: 0; visibility: hidden; } }
+@media (max-width: 960px) { .split { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 640px) {
-  body { margin: 1rem auto; } section { padding: .8rem .9rem; }
-  table.grid thead { display: none; } table.grid, table.grid tbody, table.grid tr { display: block; width: 100%; box-sizing: border-box; }
-  table.grid tr { border-bottom: 1px solid #8884; padding: .45rem 0; } table.grid td { display: inline-block; border: 0; padding: .05rem .6rem .05rem 0; }
-  table.grid td:empty { display: none; } table.grid td.lead, table.grid td.actions, table.grid td.block { display: block; width: 100%; box-sizing: border-box; }
-  table.grid td.lead { font-weight: 600; } table.grid td[data-unit]::after { content: " " attr(data-unit); opacity: .6; }
-  table.tracks tr { display: grid; grid-template-columns: 2rem 1fr auto; column-gap: .4rem; }
-  table.tracks td:nth-child(1) { grid-column: 1; grid-row: 1; } table.tracks td.lead { grid-column: 2; grid-row: 1; }
-  table.tracks td:nth-child(4) { grid-column: 3; grid-row: 1; } table.tracks td:nth-child(3) { grid-column: 2; grid-row: 2; }
-  table.tracks td:nth-child(5) { grid-column: 3; grid-row: 2; } table.tracks td { padding-right: 0; }
-  details.group table.grid tr { padding: .7rem .75rem; } details.group table.grid td:first-child { padding-left: 0; } details.group table.grid tr:last-child { border-bottom: 0; }
-  .num, .actions { text-align: left; } .actions { padding-top: .5rem !important; } td.actions { display: flex !important; justify-content: space-between; }
-  details.album { margin-left: .4rem; }
-  details.album > table { margin-left: 0; width: 100%; }
-  .hero { flex-direction: column; } .hero > .cover { width: 100%; height: auto; aspect-ratio: 1; max-width: 22rem; }
-  .cards { grid-template-columns: repeat(2, 1fr); gap: .75rem; } td.thumb { display: none !important; }
+  :root { --pad: 1rem; } body { padding-bottom: calc(4.5rem + env(safe-area-inset-bottom)); } main { padding: 1.25rem 1rem 2rem; }
+  h1 { font-size: 1.6rem; margin-bottom: 1.1rem; }
+  .bar { position: fixed; top: auto; bottom: 0; left: 0; right: 0; padding-bottom: env(safe-area-inset-bottom); border-top: 1px solid var(--line);
+         border-bottom: 0; background: var(--surface); }
+  .bar > div { height: auto; padding: 0; } .bar .brand { display: none; } .tabs { flex: 1; gap: 0; }
+  .tabs a { flex: 1; flex-direction: column; gap: .2rem; padding: .5rem 0 .55rem; border-radius: 0; background: none !important; font-size: .72rem; }
+  .tabs svg { width: 3.6rem; height: 1.95rem; padding: .3rem 0; border-radius: 999px; }
+  .tabs a[aria-current] svg { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+  .toast { bottom: calc(5.5rem + env(safe-area-inset-bottom)); }
+  button, .button, .actions button { min-height: 2.75rem; padding: .5rem 1.1rem; font-size: .9rem; } .seg span { padding: .65rem 1rem; }
+  .stats { grid-template-columns: repeat(4, 1fr); gap: .5rem; } .stats > div { padding: .6rem .65rem; } .stats b { font-size: 1.2rem; }
+  .stats span { display: block; font-size: .72rem; line-height: 1.25; }
+  .filters select[name=artist] { flex-basis: 100%; } .filters input { flex-basis: 6rem; }
+  table.grid thead { display: none; } table.grid, table.grid tbody, table.grid tr { display: block; } table.grid { width: auto; }
+  table.grid tr { padding: .8rem var(--pad); border-top: 1px solid var(--line); } table.grid tr:first-child { border-top: 0; }
+  table.grid td { display: inline-block; margin-right: .75rem; padding: 0 !important; border: 0; } table.grid td:empty { display: none; }
+  table.grid :is(td.lead, td.state, td.actions) { display: block; margin-right: 0; } td.lead + td { margin-top: .1rem; }
+  table.grid td[data-unit]::after { content: " " attr(data-unit); color: var(--muted); } .num { text-align: left; }
+  table.thumbs td.num { margin-right: .55rem; font-size: .8125rem; }
+  table.thumbs tr { min-height: 4.4rem; padding-left: calc(var(--pad) + 3.6rem); } table.thumbs td.thumb { position: absolute; left: var(--pad); top: .8rem; }
+  td.actions { display: flex !important; justify-content: space-between; gap: 1rem; margin-top: .65rem; } table.thumbs td.actions { margin-left: -3.6rem; }
+  table.wanted td.lead { display: inline; } table.wanted td.lead b { display: block; } table.wanted td.lead div { display: inline; }
+  table.wanted td.meta { display: inline; margin: 0; font-size: .875rem; } table.wanted td.meta::before { content: " · "; } table.wanted td.state { margin-top: .3rem; }
+  table.tracks tr { display: grid; grid-template-columns: 1.75rem minmax(0, 1fr) auto; column-gap: .6rem; align-items: baseline; }
+  table.tracks td { margin: 0; } table.tracks td:nth-child(1) { grid-row: 1 / 3; } table.tracks td:nth-child(4) { grid-area: 1 / 3; }
+  table.tracks td:nth-child(3) { grid-area: 2 / 2; font-size: .8rem; } table.tracks td:nth-child(5) { grid-area: 2 / 3; font-size: .8rem; text-align: right; }
+  .hero { grid-template: "art head" auto "facts facts" auto / 7.5rem minmax(0, 1fr); gap: 1.25rem 1rem; margin-bottom: 2rem; }
+  .hero > header { align-self: center; } .hero h1 { font-size: 1.4rem; } .hero .sub { font-size: .9rem; }
+  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem .85rem; }
 }
 """
 
@@ -106,8 +187,14 @@ NO_COVER = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect
 confirm = lambda question: f' onsubmit="return confirm({escape(json.dumps(question, ensure_ascii=False))})"'  # for buttons that drop things
 HIDE_BROKEN = 'onerror="this.removeAttribute(\'src\')"'  # a cover that fails shows the empty frame, not a broken image
 MBID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-MUSIC_NAV = ('<p><a href="/">Dashboard</a> · <a href="/music/library">Library</a> · <a href="/music">Find music</a> · '
-             '<a href="/music/wanted">Wanted</a></p>')
+TABS = [("home", "/", "Dashboard", "M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"),
+        ("library", "/music/library", "Library", "M5 4v16M9.5 4v16M14 4.5l5.5 15"),
+        ("wanted", "/music/wanted", "Wanted", "M12 3v12m-5-5 5 5 5-5M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"),
+        ("find", "/music", "Find music", "M10.5 3.5a7 7 0 1 0 0 14 7 7 0 0 0 0-14zm5 12 5 5")]
+LOGO = ('<svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="15"/><path d="M8 13.5c2.7-2.2 5.3-2.2 8 0s5.3 2.2 '
+        '8 0M8 19.5c2.7-2.2 5.3-2.2 8 0s5.3 2.2 8 0" fill="none" stroke-width="2.4" stroke-linecap="round"/></svg>')
+FAVICON = "data:image/svg+xml," + quote(LOGO.replace("<svg", '<svg xmlns="http://www.w3.org/2000/svg"').replace("<circle", '<circle fill="#14b8a6"')
+                                        .replace('fill="none"', 'fill="none" stroke="#fff"'))
 
 
 def length(seconds) -> str:
@@ -174,18 +261,40 @@ SCRIPT = """(() => {
 })();"""
 
 
-def page(title: str, body: str, message: str = "", error: str = "", wide: bool = False, live: bool = False) -> HTMLResponse:
+def page(title: str, body: str, message: str = "", error: str = "", wide: bool = False, live: bool = False, tab: str | None = None,
+         heading: bool = True) -> HTMLResponse:
+    """tab: the navigation tab the page is under, None for no navigation (signing in); heading=False when body brings its own h1."""
     notice = f'<p class="toast" onclick="this.remove()">{escape(message)}</p>' if message else ""
     notice += f'<p class="toast bad" onclick="this.remove()">{escape(error)}</p>' if error else ""
-    return HTMLResponse(f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
-                        f'<title>{escape(title)} · oasis</title><style>{STYLE}</style></head><body{' class="wide"' if wide else ""}'
-                        f'{' data-live="1"' if live else ""}><h1>{escape(title)}</h1>{notice}<main id="main">{body}</main><script>{SCRIPT}</script></body></html>')
+    tabs = "".join(f'<a href="{href}"{' aria-current="page"' if key == tab else ""}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="{d}"/></svg>'
+                   f'{label}</a>' for key, href, label, d in TABS)
+    nav = f'<nav class="bar"><div><a class="brand" href="/">{LOGO}oasis</a><div class="tabs">{tabs}</div></div></nav>' if tab else ""
+    return HTMLResponse(f'<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, '
+                        f'viewport-fit=cover"><meta name="theme-color" content="#f4f5f7" media="(prefers-color-scheme: light)"><meta name="theme-color" '
+                        f'content="#0f1115" media="(prefers-color-scheme: dark)"><link rel="icon" href="{FAVICON}"><title>{escape(title)} · oasis</title>'
+                        f'<style>{STYLE}</style></head><body{' class="wide"' if wide else ""}{' data-live="1"' if live else ""}>{nav}<main id="main">'
+                        f'{f"<h1>{escape(title)}</h1>" if heading else ""}{body}</main>{notice}<script>{SCRIPT}</script></body></html>')
 
 
 def back(path: str, message: str = "", error: str = "", anchor: str = "") -> RedirectResponse:
     """anchor: the element to scroll back to, so a phone stays where the button was."""
     query = f"message={quote(message)}" if message else f"error={quote(error)}" if error else ""
     return RedirectResponse((path + ("&" if "?" in path else "?") + query if query else path) + (f"#{anchor}" if anchor else ""), status_code=303)
+
+
+def pill(text: str, tone: str = "") -> str:
+    return f'<span class="pill{" " + tone if tone else ""}">{escape(text)}</span>'
+
+
+def cover_of(rg: str) -> str:
+    """A MusicBrainz release group's cover, from the Cover Art Archive until the album is here."""
+    return f'<img class="cover small" loading="lazy" alt="" src="/music/cover/al-mb-{escape(rg)}" {HIDE_BROKEN}>'
+
+
+def hero(image: str, kicker: str, title: str, sub: str, facts: str) -> str:
+    """The head of an artist, album or song page: its picture beside what it is and its name, then the facts about it."""
+    return (f'<div class="hero">{image}<header><p class="kicker">{kicker}</p><h1>{escape(title)}</h1><p class="sub">{sub}</p></header>'
+            f'<div class="facts">{facts}</div></div>')
 
 
 def details(*parts) -> str:
@@ -229,10 +338,11 @@ def routes(api) -> list[Route]:
 
     async def login(request: Request):
         if request.method == "GET":
-            return page("Sign in", '<section><form method="post"><label>User<input type="text" name="name" autofocus></label>'
-                        '<label>Password<input type="password" name="password"></label><button>Sign in</button></form>'
+            return page("Sign in", f'<section class="login"><h1 class="brand">{LOGO}oasis</h1><form method="post"><label>User<input type="text" '
+                        'name="name" autocomplete="username" autofocus></label><label>Password<input type="password" name="password" '
+                        'autocomplete="current-password"></label><button class="primary">Sign in</button></form>'
                         '<p class="muted">The same user and password as in your Subsonic apps.</p></section>',
-                        error=request.query_params.get("error", ""))
+                        error=request.query_params.get("error", ""), heading=False)
         form = await read_form(request)
 
         def run(db):
@@ -254,24 +364,24 @@ def routes(api) -> list[Route]:
     def account(db, request, user, form):
         q = request.query_params
         youtube = (f'<p class="ok">Linked as <b>{escape(user["ytm_name"] or "")}</b>. Your mixes show up as playlists and your plays '
-                   f'go to its history.</p><form method="post" action="/account/youtube/unlink"{confirm("Unlink YouTube Music?")}><button>Unlink</button></form>'
+                   f'go to its history.</p><form method="post" action="/account/youtube/unlink"{confirm("Unlink YouTube Music?")}>'
+                   '<button class="danger">Unlink</button></form>'
                    if user["ytm_auth"] else YOUTUBE_STEPS)
         if not api.ytm:
             youtube = '<p class="muted">YouTube Music is off on this server (<code>[ytmusic] enabled</code>).</p>'
         lastfm = ((LASTFM_APP_STEPS if user["admin"] else '<p class="muted">An admin needs to connect oasis to Last.fm first.</p>')
                   if not (api.config.lastfm_key and api.config.lastfm_secret) else
                   f'<p class="ok">Linked as <b>{escape(user["lastfm_name"] or "")}</b>.</p><form method="post" '
-                  f'action="/account/lastfm/unlink"{confirm("Unlink Last.fm?")}><button>Unlink</button></form>' if user["lastfm_session"] else
-                  '<p><a href="/account/lastfm"><button type="button">Sign in with Last.fm</button></a></p>')
+                  f'action="/account/lastfm/unlink"{confirm("Unlink Last.fm?")}><button class="danger">Unlink</button></form>' if user["lastfm_session"] else
+                  '<a class="button primary" href="/account/lastfm">Sign in with Last.fm</a>')
         listenbrainz = (f'<p class="ok">Linked.</p><form method="post" action="/account/listenbrainz"{confirm("Unlink ListenBrainz?")}><input type="hidden" name="token">'
-                        f'<button>Unlink</button></form>' if user["listenbrainz_token"] else
+                        f'<button class="danger">Unlink</button></form>' if user["listenbrainz_token"] else
                         '<form method="post" action="/account/listenbrainz"><label>User token from '
                         '<a href="https://listenbrainz.org/settings/" target="_blank">listenbrainz.org/settings</a>'
-                        '<input type="text" name="token"></label><button>Link</button></form>')
-        admin = '<p><a href="/admin">Manage users</a> · <a href="/admin/artists">Artist settings</a></p>' if user["admin"] else ""
-        admin = '<p><a href="/music">Find music</a> · <a href="/music/wanted">Wanted</a></p>' + admin
-        body = (f'<div>Signed in as <b>{escape(user["name"])}</b>. <form class="inline" method="post" action="/logout">'
-                f'<button>Sign out</button></form></div>{admin}{status(db)}'
+                        '<input type="text" name="token"></label><button class="primary">Link</button></form>')
+        admin = '<a class="button" href="/admin">Users</a><a class="button" href="/admin/artists">Artist settings</a>' if user["admin"] else ""
+        body = (f'<div class="split"><div>{status(db)}</div><div><section><h2>Account</h2><div class="row"><p>Signed in as <b>{escape(user["name"])}</b>.</p>'
+                f'<form class="right" method="post" action="/logout"><button>Sign out</button></form></div>{f"<div class=row>{admin}</div>" if admin else ""}</section>'
                 f'<section><h2>YouTube Music</h2>{youtube}</section>'
                 f'<section><h2>Last.fm</h2><p class="muted">Your plays are scrobbled here. Turn off scrobbling in your apps, '
                 f'or plays count twice.</p>{lastfm}</section>'
@@ -279,8 +389,8 @@ def routes(api) -> list[Route]:
                 f'<section><h2>Password</h2>' + (
                     '<p class="muted">Set in oasis.toml.</p>' if user["name"] in api.config.users else
                     f'<form method="post" action="/account/password"{confirm("Change your password? Apps signed in with the old one stop working until you update them.")}><label>New password<input type="password" name="password">'
-                    '</label><button>Change</button></form>') + '</section>')
-        return page("Dashboard", body, q.get("message", ""), q.get("error", ""), live=True)
+                    '</label><button>Change</button></form>') + '</section></div></div>')
+        return page("Dashboard", body, q.get("message", ""), q.get("error", ""), wide=True, live=True, tab="home")
 
     def link_youtube(db, request, user, form):
         try:
@@ -344,38 +454,45 @@ def routes(api) -> list[Route]:
         accounts.set_field(db, user["name"], password=form["password"])
         return back("/", message="Password changed. Update it in your apps.")
 
+    def progress(hash: str, state: str) -> str:
+        """How far a download is: TorBox's share done while it downloads, else the step it is at."""
+        seen = api.downloads.seen.get(hash) if api.downloads and state == "downloading" else None
+        return (f'<span class="meter"><i style="width:{seen[0]:.0%}"></i></span><span class="busy">{seen[0]:.0%}</span>' if seen else
+                f'<span class="pill busy">{STATES.get(state, state)}</span>')
+
     def status(db) -> str:
         """What oasis is busy with: downloads, the MusicBrainz fill and dedupe."""
         count = lambda sql: db.execute(sql).fetchone()[0]
         songs, albums, artists = db.execute("select count(*), count(distinct album_id), count(distinct artist_id) from track "
                                             "where source = 'local'").fetchone()
-        lines = [f"{songs} songs, {albums} albums, {artists} artists in the library."]
-        active = db.execute("select title, state, created from download where state not in ('done', 'failed') order by created").fetchall()
-        lines.append(f'Downloading {len(active)}:<ul>' + "".join(
-            f'<li>{escape(r["title"])} <span class="muted">{STATES.get(r["state"], r["state"])}, {ago(r["created"])}</span></li>'
-            for r in active) + '</ul>' if active else "Nothing downloading.")
+        tiles = [(songs, "songs"), (albums, "albums"), (artists, "artists"), *([(api.library.still_to_find(db), "albums to find")] if api.library else [])]
+        html = '<div class="stats">' + "".join(f'<div><b>{n}</b><span>{label}</span></div>' for n, label in tiles) + '</div>'
+        active = db.execute("select hash, title, state, created from download where state not in ('done', 'failed') order by created").fetchall()
+        html += (f'<section><h2>Downloading <span class="count">{len(active)}</span></h2><ul class="rows">' + "".join(
+            f'<li><div class="grow">{escape(r["title"])}<div class="muted">{progress(r["hash"], r["state"])} {ago(r["created"])}</div></div></li>'
+            for r in active) + '</ul></section>' if active else '<section><h2>Downloading</h2><p class="muted">Nothing downloading.</p></section>')
         recent = db.execute("select title, state, error, updated from download where state in ('done', 'failed') "
                             "order by updated desc limit 5").fetchall()
         if recent:
-            lines.append('Lately:<ul>' + "".join(
-                f'<li>{"✓" if r["state"] == "done" else "✗"} {escape(r["title"])} <span class="muted">{ago(r["updated"])}'
-                f'{": " + escape(r["error"]) if r["error"] and r["state"] == "failed" else ""}</span></li>' for r in recent) + '</ul>')
-        if api.library:
-            lines.append(f'{api.library.still_to_find(db)} more albums still to find.')
+            html += '<section><h2>Lately</h2><ul class="rows">' + "".join(
+                f'<li>{"<span class=\"mark good\">✓</span>" if r["state"] == "done" else "<span class=\"mark bad\">✗</span>"}<div class="grow">'
+                f'{escape(r["title"])}<div class="muted">{ago(r["updated"])}{": " + escape(r["error"]) if r["error"] and r["state"] == "failed" else ""}'
+                f'</div></div></li>' for r in recent) + '</ul></section>'
         filled = count("select count(*) from track where source = 'local' and credits_at is not null")
         known = count("select count(*) from track where source = 'local' and mb_release is not null")
         artists_done = count("select count(*) from mb_artist where fetched is not null and mbid in (select mbid from credit)")
         artists_all = count("select count(*) from mb_artist where mbid in (select mbid from credit)")
-        lines.append(f'MusicBrainz: credits for {filled} of {known} songs, names and links for {artists_done} of {artists_all} artists.')
+        html += (f'<section><h2>Background</h2><p class="muted">MusicBrainz: credits for {filled} of {known} songs, names and links for '
+                 f'{artists_done} of {artists_all} artists.</p>')
         shared = db.execute("select count(*), coalesce(sum(t.size), 0) from audio_shared a join track t on t.ref = a.path").fetchone()
         if api.config.dedupe:
-            lines.append(f'Dedupe: {shared[0]} copies share another file\'s audio, saving {shared[1] / 1e9:.1f} GB.')
-        return '<section><h2>Status</h2>' + "".join(f'<p>{line}</p>' for line in lines) + '</section>'
+            html += f'<p class="muted">Dedupe: {shared[0]} copies share another file\'s audio, saving {shared[1] / 1e9:.1f} GB.</p>'
+        return html + '</section>'
 
     def artist_settings(db, request, user, form):
         q, settings = request.query_params, api._artist_settings(db)
         lines = lambda key: escape("\n".join("; ".join(group) for group in settings.get(key, [])))
-        body = ('<p><a href="/">Back to the dashboard</a></p><form method="post" action="/admin/artists">'
+        body = ('<form method="post" action="/admin/artists">'
                 '<section><h2>Related artists</h2><p class="muted">One group per line, names separated by <code>;</code>. '
                 'Separate artists that belong together: they come first among each other\'s similar artists and mix into each '
                 f'other\'s radios. Clients only ever see them as related.</p><textarea name="related">{lines("related")}</textarea></section>'
@@ -385,8 +502,8 @@ def routes(api) -> list[Route]:
                 '<section><h2>Keep separate</h2><p class="muted">One name per line. MusicBrainz lists it as another name of '
                 'some artist, but here it\'s someone else.</p>'
                 f'<textarea name="separate">{escape(chr(10).join(settings.get("separate", [])))}</textarea></section>'
-                '<button>Save</button></form>')
-        return page("Artist settings", body, q.get("message", ""), q.get("error", ""))
+                '<button class="primary">Save</button></form>')
+        return page("Artist settings", body, q.get("message", ""), q.get("error", ""), tab="home")
 
     def save_artist_settings(db, request, user, form):
         groups = lambda key: [names for line in form.get(key, "").splitlines() if len(names := [n.strip() for n in line.split(";") if n.strip()]) > 1]
@@ -398,17 +515,17 @@ def routes(api) -> list[Route]:
     def admin(db, request, user, form):
         q = request.query_params
         rows = "".join(
-            f'<tr><td><b>{escape(r["name"])}</b>{" (admin)" if r["admin"] else ""}</td>'
-            f'<td class="muted">{"YouTube Music " if r["ytm_auth"] else ""}{"Last.fm " if r["lastfm_session"] else ""}'
-            f'{"ListenBrainz" if r["listenbrainz_token"] else ""}</td><td>' + (
+            f'<tr><td class="lead"><b>{escape(r["name"])}</b>{" <span class=pill>admin</span>" if r["admin"] else ""}</td>'
+            f'<td class="muted">{" · ".join(name for name, on in (("YouTube Music", r["ytm_auth"]), ("Last.fm", r["lastfm_session"]),
+                                                                    ("ListenBrainz", r["listenbrainz_token"])) if on)}</td><td class="actions">' + (
                 '<span class="muted">from oasis.toml</span>' if r["name"] in api.config.users else
-                f'<form class="inline" method="post" action="/admin/users/{quote(r["name"])}/delete"{confirm(f"Delete the user {r['name']}?")}><button>Delete</button></form>') +
+                f'<form method="post" action="/admin/users/{quote(r["name"])}/delete"{confirm(f"Delete the user {r['name']}?")}><button class="danger">Delete</button></form>') +
             '</td></tr>' for r in db.execute("select * from user order by name"))
-        body = (f'<p><a href="/">Back to the dashboard</a></p><section><h2>Users</h2><table>{rows}</table></section>'
+        body = (f'<section><h2>Users</h2><table class="grid"><tbody>{rows}</tbody></table></section>'
                 '<section><h2>New user</h2><form method="post" action="/admin/users"><label>User<input type="text" name="name">'
-                '</label><label>Password<input type="password" name="password"></label><label><input type="checkbox" '
-                'name="admin"> Admin</label><p><button>Create</button></p></form></section>')
-        return page("Users", body, q.get("message", ""), q.get("error", ""))
+                '</label><label>Password<input type="password" name="password"></label><label class="check"><input type="checkbox" '
+                'name="admin"> Admin</label><button class="primary">Create</button></form></section>')
+        return page("Users", body, q.get("message", ""), q.get("error", ""), tab="home")
 
     def create_user(db, request, user, form):
         try:
@@ -428,7 +545,7 @@ def routes(api) -> list[Route]:
         """A music page, for any signed-in user: it needs oasis's own catalogue (acquire.py)."""
         def run(db, request, user, form):
             if not api.library:
-                return page("Find music", MUSIC_NAV, error="Acquisition is off: it needs [torbox] with downloads and [prowlarr] in oasis.toml.")
+                return page("Find music", "", error="Acquisition is off: it needs [torbox] with downloads and [prowlarr] in oasis.toml.", tab="find")
             return handler(db, request, user, form)
         return signed_in(run)
 
@@ -443,34 +560,36 @@ def routes(api) -> list[Route]:
         ask = "" if on else confirm(f"{label}? Its search stops; files already here stay.")
         return (f'<form class="inline" method="post" action="/music/want"{ask}><input type="hidden" name="kind" value="{kind}">'
                 f'<input type="hidden" name="mbid" value="{escape(mbid)}"><input type="hidden" name="on" value="{"1" if on else ""}">'
-                f'<input type="hidden" name="next" value="{escape(here)}"><button>{label}</button></form>')
+                f'<input type="hidden" name="next" value="{escape(here)}"><button{' class="danger"' if not on else ' class="primary"' if kind == "artist" else ""}>'
+                f'{label}</button></form>')
 
     def followed(db, mbid: str) -> bool:
         ids = acquire.refs(db, "artist", mbid)
         return bool(db.execute(f"select 1 from wanted where kind = 'artist' and ref in ({','.join('?' * len(ids))})", list(ids)).fetchone())
 
     def artist_state(db, mbid: str) -> str:
-        return " ".join(filter(None, ["in the library" if acquire.library_id(db, MB_IDS["artist"] + mbid) else "",
-                                      "followed" if followed(db, mbid) else ""]))
+        return (pill("in the library", "good") + " " if acquire.library_id(db, MB_IDS["artist"] + mbid) else ""
+                ) + (pill("followed", "accent") if followed(db, mbid) else "")
 
     def album_line(db, user, g: dict, here: str, by: bool = True) -> str:
         row = db.execute("select state, error from want_album where rg = ?", (g["id"],)).fetchone()
-        state = "in the library" if acquire.library_id(db, MB_IDS["album"] + g["id"]) or row and row["state"] == "have" else \
-            {"missing": "wanted", "downloading": "downloading", "skipped": f"left out: {row['error']}"}[row["state"]] if row else ""
+        state = pill("in the library", "good") if acquire.library_id(db, MB_IDS["album"] + g["id"]) or row and row["state"] == "have" else \
+            {"missing": pill("wanted", "accent"), "downloading": pill("downloading", "busy"),
+             "skipped": f'<span class="muted">left out: {escape(row["error"] or "")}</span>'}[row["state"]] if row else ""
         credit = g.get("artist-credit") or []
         artist = f' — <a href="/music/artist/{credit[0]["artist"]["id"]}">{escape(credited(g))}</a>' if by and credit else ""
         info = details(g.get("primary-type"), *(g.get("secondary-types") or []), (g.get("first-release-date") or "")[:4], g.get("disambiguation"))
-        return (f'<li>{escape(g["title"])}{artist} {info} <b>{escape(state)}</b> '
+        return (f'<li>{cover_of(g["id"])}<div class="grow"><b>{escape(g["title"])}</b>{artist}<div>{info} {state}</div></div>'
                 f'{want_button("album", g["id"], not mine(db, user, "album", g["id"]), here)}</li>')
 
     def find_music(db, request, user, form):
         q = request.query_params
         text, kind, error = q.get("q", "").strip(), "album" if q.get("kind") == "album" else "artist", q.get("error", "")
         checked = lambda k: " checked" if k == kind else ""
-        body = (f'{MUSIC_NAV}<section><form><input type="text" name="q" value="{escape(text)}" placeholder="An artist or album, in any '
-                f'script" autofocus><label><input type="radio" name="kind" value="artist"{checked("artist")}> Artists</label> '
-                f'<label><input type="radio" name="kind" value="album"{checked("album")}> Albums</label> <button>Search MusicBrainz</button>'
-                f'</form></section>')
+        body = (f'<form class="search"><input type="text" name="q" value="{escape(text)}" placeholder="An artist or album, in any script" '
+                f'aria-label="Artist or album"{"" if text else " autofocus"}><div class="row"><div class="seg"><label><input type="radio" name="kind" '
+                f'value="artist"{checked("artist")}><span>Artists</span></label><label><input type="radio" name="kind" value="album"{checked("album")}>'
+                f'<span>Albums</span></label></div><button class="primary right">Search MusicBrainz</button></div></form>')
         if text:
             try:
                 found = acquire.find(db, kind, text)
@@ -478,9 +597,10 @@ def routes(api) -> list[Route]:
                 found, error = [], f"MusicBrainz didn't answer: {e}"
             here = f"/music?q={quote(text)}&kind={kind}"
             lines = [album_line(db, user, g, here) for g in found] if kind == "album" else [
-                f'<li><a href="/music/artist/{a["id"]}">{escape(a["name"])}</a> {about(a)} <b>{artist_state(db, a["id"])}</b></li>' for a in found]
-            body += f'<section><ul>{"".join(lines)}</ul></section>' if lines else '<p class="muted">MusicBrainz knows nothing by that name.</p>'
-        return page("Find music", body, q.get("message", ""), error)
+                f'<li><div class="grow"><a href="/music/artist/{a["id"]}">{escape(a["name"])}</a><div>{about(a)}</div></div>{artist_state(db, a["id"])}</li>'
+                for a in found]
+            body += f'<section><ul class="rows">{"".join(lines)}</ul></section>' if lines else '<p class="muted">MusicBrainz knows nothing by that name.</p>'
+        return page("Find music", body, q.get("message", ""), error, tab="find")
 
     def music_artist(db, request, user, form):
         q, mbid = request.query_params, request.path_params["mbid"]
@@ -493,14 +613,14 @@ def routes(api) -> list[Route]:
         except OSError as e:
             return back("/music", error=f"MusicBrainz didn't answer: {e}")
         here = f"/music/artist/{mbid}"
-        body = (f'{MUSIC_NAV}<section><p>{about(info)}</p><p><b>{artist_state(db, mbid)}</b> '
-                f'{want_button("artist", mbid, not mine(db, user, "artist", mbid), here)}</p><p class="muted">Following wants its albums, EPs and '
+        body = (f'<section><div class="row"><div class="grow">{about(info)}<div>{artist_state(db, mbid)}</div></div>'
+                f'{want_button("artist", mbid, not mine(db, user, "artist", mbid), here)}</div><p class="muted">Following wants its albums, EPs and '
                 f'singles, new ones too, except repackages, singles whose songs are on its albums and what has no official release.</p></section>')
         for kind in TYPES:
             rows = sorted((g for g in groups if g.get("primary-type") == kind), key=lambda g: g.get("first-release-date") or "9999")
             if rows:
-                body += f'<section><h2>{kind}s</h2><ul>{"".join(album_line(db, user, g, here, by=False) for g in rows)}</ul></section>'
-        return page(info["name"], body, q.get("message", ""), q.get("error", ""))
+                body += f'<section><h2>{kind}s</h2><ul class="rows">{"".join(album_line(db, user, g, here, by=False) for g in rows)}</ul></section>'
+        return page(info["name"], body, q.get("message", ""), q.get("error", ""), tab="find")
 
     def set_want(db, request, user, form):
         kind, mbid, here = form.get("kind"), form.get("mbid", ""), form.get("next", "")
@@ -524,20 +644,18 @@ def routes(api) -> list[Route]:
         def place(r) -> tuple[str, str]:
             """The group a wanted album goes in, and what to say about it."""
             if d := active.get(r["rg"]):
-                seen = api.downloads.seen.get(d["hash"]) if api.downloads else None
-                return "downloading", (f'<span class="pill busy">{seen[0]:.0%}</span>' if d["state"] == "downloading" and seen
-                                       else f'<span class="pill busy">{STATES.get(d["state"], d["state"])}</span>')
+                return "downloading", progress(d["hash"], d["state"])
             if r["state"] == "downloading":
-                return "downloading", '<span class="pill busy">downloading</span>'
+                return "downloading", pill("downloading", "busy")
             if r["rg"] in acq.soon:
-                return "next", '<span class="pill">in a minute or two</span>'
+                return "next", pill("in a minute or two", "accent")
             if (r["error"] or "").startswith(("download failed", "search failed")):
                 return "attention", f'<span class="error">{escape(r["error"])}</span> <span class="muted">· tries again {until(r["next_search"])}</span>'
-            return ("notfound", f'searched {ago(r["searched"])}') if r["searched"] else ("waiting", "")
+            return ("notfound", f'<span class="muted">searched {ago(r["searched"])}</span>') if r["searched"] else ("waiting", "")
 
         def action(rg: str, name: str, label: str, ask: str = "") -> str:
             return (f'<form method="post" action="/music/wanted/{escape(rg)}/{name}"{ask and confirm(ask)}><input type="hidden" name="next" value="{escape(here)}">'
-                    f'<button>{label}</button></form>')
+                    f'<button{' class="danger"' if ask and name == "give-up" else ""}>{label}</button></form>')
 
         where, params = ["state in ('missing', 'downloading')"], []
         if artist_f:
@@ -556,14 +674,15 @@ def routes(api) -> list[Route]:
                              "group by artist_mbid order by artist collate nocase").fetchall()
         option = lambda value, label, chosen: f'<option value="{escape(value)}"{" selected" if value == chosen else ""}>{escape(label)}</option>'
         counts = dict(db.execute("select state, count(*) from want_album group by state").fetchall())
-        body = (f'{MUSIC_NAV}<section><p>{counts.get("missing", 0)} albums to find, {counts.get("downloading", 0)} downloading · '
-                f'{counts.get("have", 0)} wanted ones are here · {counts.get("skipped", 0)} of followed artists left out.</p>'
-                f'<form class="filters"><select name="artist">{option("", "All artists", artist_f)}'
+        tiles = [(counts.get("missing", 0), "albums to find"), (counts.get("downloading", 0), "downloading"), (counts.get("have", 0), "arrived"),
+                 (counts.get("skipped", 0), "left out")]
+        body = ('<div class="stats">' + "".join(f'<div><b>{n}</b><span>{label}</span></div>' for n, label in tiles) + '</div>'
+                f'<form class="filters"><select name="artist" aria-label="Artist">{option("", "All artists", artist_f)}'
                 + "".join(option(a["artist_mbid"], f'{a["artist"]} ({a["n"]})', artist_f) for a in artists)
-                + f'</select><select name="type">{option("", "Any type", type_f)}'
+                + f'</select><select name="type" aria-label="Type">{option("", "Any type", type_f)}'
                 + "".join(option(t, t, type_f) for t in ("Album", "EP", "Single"))
-                + f'</select><input type="text" name="q" value="{escape(text)}" placeholder="Title or artist"><button>Filter</button>'
-                + (' <a href="/music/wanted">Clear</a>' if here != "/music/wanted" else "") + '</form>'
+                + f'</select><input type="text" name="q" value="{escape(text)}" placeholder="Title or artist" aria-label="Title or artist"><button>Filter</button>'
+                + ('<a class="button" href="/music/wanted">Clear</a>' if here != "/music/wanted" else "") + '</form>'
                 + '<p class="muted">Giving up stops the search; files already here stay, and wanting it again brings it back.</p>')
         titles = [("attention", "Failed, trying again"), ("downloading", "Downloading"), ("next", "Searched next"),
                   ("notfound", "Not found yet"), ("waiting", "Waiting for a first search")]
@@ -574,22 +693,22 @@ def routes(api) -> list[Route]:
             bulk = (f'<form class="bulk" method="post" action="/music/wanted/give-up" '
                     f'{confirm(f"Give up on all {len(items)} in {title}?")}><input type="hidden" name="rgs" '
                     f'value="{",".join(r["rg"] for r, _ in items)}"><input type="hidden" name="next" value="{escape(here)}">'
-                    f'<button>Give up on {"all " + str(len(items)) if len(items) > 1 else "it"}…</button></form>')
+                    f'<button class="danger">Give up on {"all " + str(len(items)) if len(items) > 1 else "it"}…</button></form>')
             table = "".join(
-                f'<tr id="rg-{escape(r["rg"])}"><td class="lead"><a href="/music/artist/{escape(r["artist_mbid"])}">{escape(r["artist"] or "")}</a> – '
-                f'{escape(r["title"])}</td><td>{escape(r["primary_type"] or "")}'
+                f'<tr id="rg-{escape(r["rg"])}"><td class="thumb">{cover_of(r["rg"])}</td><td class="lead"><b>{escape(r["title"])}</b><div class="muted">'
+                f'<a href="/music/artist/{escape(r["artist_mbid"])}">{escape(r["artist"] or "")}</a></div></td><td class="meta">{escape(r["primary_type"] or "")}'
                 f'{" · " + escape(r["secondary_types"]) if r["secondary_types"] else ""}</td>'
-                f'<td class="num">{escape((r["first_date"] or "")[:4])}</td>'
-                f'<td>{"★ starred" if r["reason"] == "starred" else "followed"}</td><td>{note}</td>'
+                f'<td class="meta num">{escape((r["first_date"] or "")[:4])}</td>'
+                f'<td class="meta">{"<span class=star>★ starred</span>" if r["reason"] == "starred" else "followed"}</td><td class="state">{note}</td>'
                 f'<td class="actions">{action(r["rg"], "block", "Try another", f"Drop this download of {r['artist']} – {r['title']} and try another release?") if key == "downloading" else action(r["rg"], "search", "Search now")}'
                 f'{action(r["rg"], "give-up", "Give up", f"Give up on {r['artist']} – {r['title']}?")}</td></tr>' for r, note in items)
             opened = " open" if key in ("attention", "downloading", "next") or len(items) <= 30 else ""
-            body += (f'<details class="group" id="group-{key}"{opened}><summary>{title} <span class="pill">{len(items)}</span></summary>'
-                     f'<table class="grid"><thead><tr><th>Album</th><th>Type</th><th class="num">Year</th><th>Why</th><th>State</th><th></th>'
-                     f'</tr></thead><tbody>{table}</tbody></table>{bulk}</details>')
+            tone = {"attention": "bad", "downloading": "busy", "next": "accent"}.get(key, "muted")
+            body += (f'<details class="group" id="group-{key}"{opened}><summary><span class="dot {tone}"></span>{title}<span class="count">{len(items)}</span>'
+                     f'</summary><table class="grid thumbs wanted"><thead><tr><th></th><th>Album</th><th>Type</th><th class="num">Year</th><th>Why</th>'
+                     f'<th>State</th><th></th></tr></thead><tbody>{table}</tbody></table>{bulk}</details>')
         if not rows:
-            body += '<p class="muted">Nothing wanted matches.</p>' if here != "/music/wanted" else '<p class="muted">Nothing left to find.</p>'
-        body += '</section>'
+            body += f'<section><p class="muted">{"Nothing wanted matches." if here != "/music/wanted" else "Nothing left to find."}</p></section>'
         lost = db.execute("select wi.*, exists (select 1 from wanted w where w.kind = wi.kind and w.ref = wi.ref and w.user = ?) mine "
                           "from want_item wi where wi.state = 'failed' and exists (select 1 from wanted w where w.kind = wi.kind "
                           "and w.ref = wi.ref)", (user["name"],)).fetchall()
@@ -600,12 +719,12 @@ def routes(api) -> list[Route]:
             name = lambda r: next((row[0] for sql in names[r["kind"]] if (row := db.execute(sql, (r["ref"],)).fetchone())), r["ref"])
             body += ('<section><h2>Not found on MusicBrainz</h2><p class="muted">Starred, but oasis can\'t tell which MusicBrainz '
                      'artist or album it is; it asks again later. Find it and want it from there instead.</p><table class="grid"><tbody>' + "".join(
-                         f'<tr><td class="lead">{escape(name(r))}</td><td>{escape(r["kind"])}</td><td><span class="error">{escape(r["error"] or "")}</span></td>'
-                         f'<td class="actions">' + (
+                         f'<tr><td class="lead"><b>{escape(name(r))}</b></td><td class="meta">{escape(r["kind"])}</td><td class="state"><span class="error">'
+                         f'{escape(r["error"] or "")}</span></td><td class="actions">' + (
                              f'<form method="post" action="/music/unwant"{confirm(f"Give up on {name(r)}?")}><input type="hidden" name="kind" value="{r["kind"]}">'
-                             f'<input type="hidden" name="ref" value="{escape(r["ref"])}"><button>Give up</button></form>' if r["mine"] else "")
+                             f'<input type="hidden" name="ref" value="{escape(r["ref"])}"><button class="danger">Give up</button></form>' if r["mine"] else "")
                          + '</td></tr>' for r in lost) + '</tbody></table></section>')
-        return page("Wanted", body, q.get("message", ""), q.get("error", ""), wide=True, live=True)
+        return page("Wanted", body, q.get("message", ""), q.get("error", ""), wide=True, live=True, tab="wanted")
 
     def music_library(db, request, user, form):
         """Every artist with music here or wanted, one row each; their pages go deeper."""
@@ -617,20 +736,20 @@ def routes(api) -> list[Route]:
             if text and text.casefold() not in (a["name"] or "").casefold() or show == "here" and not a["albums"] or show == "wanted" and not a["wanted"]:
                 continue
             genres = ", ".join(a["genres"][:2])
-            rows += (f'<tr><td class="thumb">{picture(a["cover"], small=True)}</td><td class="lead"><a href="/music/library/artist/{quote(key)}">'
-                     f'{escape(a["name"] or "")}</a>{" <span class=pill>followed</span>" if a["followed"] else ""}'
+            rows += (f'<tr><td class="thumb">{picture(a["cover"], "small round")}</td><td class="lead"><a class="stretch" href="/music/library/artist/{quote(key)}">'
+                     f'<b>{escape(a["name"] or "")}</b></a>{" " + pill("followed", "accent") if a["followed"] else ""}'
                      f'<div class="muted">{escape(genres)}</div></td>'
                      f'<td class="num" data-unit="here">{a["albums"] or ""}</td><td class="num" data-unit="wanted">{a["wanted"] or ""}</td>'
                      f'<td class="num" data-unit="songs">{a["songs"] or ""}</td>'
                      f'<td class="num">{length(a["seconds"]) if a["seconds"] else ""}</td><td class="num">{size(a["bytes"]) if a["bytes"] else ""}</td></tr>')
         options = "".join(f'<option value="{v}"{" selected" if v == show else ""}>{label}</option>'
                           for v, label in (("", "Everything"), ("here", "With music here"), ("wanted", "With wanted albums")))
-        body = (f'{MUSIC_NAV}<section><form class="filters"><input type="text" name="q" value="{escape(text)}" placeholder="Artist">'
-                f'<select name="show">{options}</select><button>Show</button></form></section><section>'
-                + (f'<table class="grid"><thead><tr><th></th><th>Artist</th><th class="num">Albums here</th><th class="num">Wanted</th>'
-                   f'<th class="num">Songs</th><th class="num">Length</th><th class="num">Size</th></tr></thead><tbody>{rows}</tbody></table>'
-                   if rows else '<p class="muted">Nothing matches.</p>') + '</section>')
-        return page("Library", body, q.get("message", ""), q.get("error", ""), wide=True)
+        body = (f'<form class="filters"><input type="text" name="q" value="{escape(text)}" placeholder="Artist" aria-label="Artist">'
+                f'<select name="show" aria-label="Show">{options}</select><button>Show</button></form>'
+                + (f'<section><table class="grid thumbs"><thead><tr><th></th><th>Artist</th><th class="num">Albums here</th><th class="num">Wanted</th>'
+                   f'<th class="num">Songs</th><th class="num">Length</th><th class="num">Size</th></tr></thead><tbody>{rows}</tbody></table></section>'
+                   if rows else '<section><p class="muted">Nothing matches.</p></section>'))
+        return page("Library", body, q.get("message", ""), q.get("error", ""), wide=True, tab="library")
 
     def library_artists(db) -> dict[str, dict]:
         """Artists by their page key (MusicBrainz id when known, else oasis id) with what's here and what's wanted."""
@@ -656,8 +775,8 @@ def routes(api) -> list[Route]:
                 a["genres"] = [g for g, _ in counts.most_common(3)]
         return artists
 
-    def picture(album_id: str | None, small: bool = False) -> str:
-        cls = "cover small" if small else "cover"
+    def picture(album_id: str | None, look: str = "") -> str:
+        cls = f"cover {look}".strip()
         return (f'<img class="{cls}" loading="lazy" alt="" src="/music/cover/{quote(album_id)}" {HIDE_BROKEN}>' if album_id else f'<div class="{cls}"></div>')
 
     def music_cover(db, request, user, form):
@@ -667,7 +786,7 @@ def routes(api) -> list[Route]:
             return Response(NO_COVER, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=3600"})
 
     def library_artist(db, request, user, form):
-        key = request.path_params["key"]
+        q, key = request.query_params, request.path_params["key"]
         ids = [key] if key.startswith("ar-") else [r[0] for r in db.execute("select artist_id from mb_artist where mbid = ?", (key,))]
         mbid = key if MBID.fullmatch(key) else db.execute("select mbid from mb_artist where artist_id = ?", (key,)).fetchone()
         mbid = mbid if isinstance(mbid, str) or mbid is None else mbid[0]
@@ -687,8 +806,8 @@ def routes(api) -> list[Route]:
             kind = ((a["types"] or "album").split(";")[0].strip() or "album").title()
             groups.setdefault("EP" if kind == "Ep" else kind, []).append(card(a))
         for w in wanted:
-            state = ('<span class="pill busy">downloading</span>' if w["state"] == "downloading" or w["rg"] in downloading else
-                     f'<span class="pill">not found yet · {ago(w["searched"])}</span>' if w["searched"] else '<span class="pill">wanted</span>')
+            state = (pill("downloading", "busy") if w["state"] == "downloading" or w["rg"] in downloading else
+                     pill(f"not found yet · {ago(w['searched'])}") if w["searched"] else pill("wanted", "accent"))
             groups.setdefault(w["primary_type"] or "Album", []).append(
                 f'<div class="card dim"><img class="cover" loading="lazy" alt="" src="/music/cover/al-mb-{escape(w["rg"])}" '
                 f'{HIDE_BROKEN}>'
@@ -698,28 +817,26 @@ def routes(api) -> list[Route]:
         appears = db.execute(f"select distinct t.album_id, t.album, t.album_artist, group_concat(distinct c.role) roles from credit c "
                              f"join track t on t.id = c.track_id where c.artist_id in ({marks}) and t.artist_id not in ({marks}) "
                              f"and c.role != 'albumartist' group by t.album_id order by t.year", ids + ids).fetchall() if ids else []
-        facts = [("Type", about[0] if about and about[0] else None), ("Albums here", len(albums) or None), ("Wanted", len(wanted) or None),
-                 ("Songs", sum(a["songs"] for a in albums) or None), ("Length", length(sum(a["seconds"] or 0 for a in albums)) if albums else None),
-                 ("Size", size(sum(a["bytes"] or 0 for a in albums)) if albums else None),
-                 ("MusicBrainz", f'<a href="https://musicbrainz.org/artist/{mbid}">{mbid[:8]}…</a> · <a href="/music/artist/{mbid}">full discography</a>'
-                  if mbid else None), ("Related", links.rstrip(" · ") or None)]
-        image = (f'<img class="cover" loading="lazy" alt="" src="{escape(info["image"])}" {HIDE_BROKEN}>'
-                 if info and info["image"]
-                 else picture(albums[-1]["album_id"] if albums else None))
-        body = (f'{MUSIC_NAV}<section class="hero">{image}<div>'
-                f'<dl class="meta">{dl(facts)}</dl>'
-                f'{"<p class=muted>" + escape(info["description"][:600]) + "</p>" if info else ""}</div></section>')
+        counts = [f"{len(albums)} albums here" if albums else "", f"{len(wanted)} wanted" if wanted else "",
+                  f'{sum(a["songs"] for a in albums)} songs' if albums else "", length(sum(a["seconds"] or 0 for a in albums)) if albums else "",
+                  size(sum(a["bytes"] or 0 for a in albums)) if albums else ""]
+        facts = [("MusicBrainz", f'<a href="https://musicbrainz.org/artist/{mbid}">{mbid[:8]}…</a>' if mbid else None), ("Related", links.rstrip(" · ") or None)]
+        image = (f'<img class="cover round" loading="lazy" alt="" src="{escape(info["image"])}" {HIDE_BROKEN}>' if info and info["image"]
+                 else picture(albums[-1]["album_id"] if albums else None, "round"))
+        manage = f'<div class="row"><a class="button" href="/music/artist/{mbid}">Full discography</a></div>' if mbid else ""
+        body = hero(image, "Artist" + (f" · {escape(about[0])}" if about and about[0] else ""), name, escape(" · ".join(filter(None, counts))),
+                    f'{manage}<dl class="meta">{dl(facts)}</dl>{"<p class=muted>" + escape(info["description"][:600]) + "</p>" if info else ""}')
         for kind in ("Album", "EP", "Single", "Compilation", "Soundtrack", "Live", "Other"):
             if cards := groups.pop(kind, None):
-                body += f'<section><h2>{kind}s</h2><div class="cards">{"".join(cards)}</div></section>'
+                body += f'<section class="plain"><h2>{kind}s</h2><div class="cards">{"".join(cards)}</div></section>'
         for kind, cards in groups.items():
-            body += f'<section><h2>{escape(kind)}</h2><div class="cards">{"".join(cards)}</div></section>'
+            body += f'<section class="plain"><h2>{escape(kind)}</h2><div class="cards">{"".join(cards)}</div></section>'
         if appears:
-            body += ('<section><h2>Also appears on</h2><table class="grid"><tbody>' + "".join(
+            body += ('<h2>Also appears on</h2><section><table class="grid"><tbody>' + "".join(
                 f'<tr><td class="lead"><a href="/music/library/album/{quote(r["album_id"])}">{escape(r["album"])}</a> '
-                f'<span class="muted">{escape(r["album_artist"])}</span></td><td>{escape(r["roles"].replace(",", ", "))}</td></tr>'
+                f'<span class="muted">{escape(r["album_artist"])}</span></td><td class="meta">{escape(r["roles"].replace(",", ", "))}</td></tr>'
                 for r in appears) + '</tbody></table></section>')
-        return page(name, body, wide=True)
+        return page(name, body, q.get("message", ""), q.get("error", ""), wide=True, tab="library", heading=False)
 
     def link_name(db, artist_id: str) -> str | None:
         row = db.execute("select album_artist from track where artist_id = ? limit 1", (artist_id,)).fetchone() or \
@@ -750,11 +867,10 @@ def routes(api) -> list[Route]:
         bitrates = sorted({r["bitrate"] for r in tracks if r["bitrate"]})
         fmt = ", ".join(sorted({(r["suffix"] or "").upper() for r in tracks})) + ("" if lossless else f' {bitrates[0]}–{bitrates[-1]} kbps'
                                                                                    if len(bitrates) > 1 else f' {bitrates[0]} kbps' if bitrates else "")
-        facts = [("Artist", f'<a href="/music/library/artist/{quote(artist_key)}">{escape(t["album_artist"])}</a>'),
-                 ("Released", escape(t["original_date"] or str(t["year"] or ""))), ("Type", escape((t["release_types"] or "").replace(";", ","))),
+        facts = [("Released", escape(t["original_date"] or str(t["year"] or ""))),
                  ("Label", escape(t["label"] or "")), ("Genres", escape(", ".join(g for g, _ in genres.most_common(5)))),
-                 ("Songs", len(tracks)), ("Discs", max((r["disc_no"] or 1) for r in tracks) if max((r["disc_no"] or 1) for r in tracks) > 1 else None),
-                 ("Length", length(sum(r["duration"] or 0 for r in tracks))), ("Format", escape(fmt)), ("Size", size(sum(r["size"] or 0 for r in tracks))),
+                 ("Discs", max((r["disc_no"] or 1) for r in tracks) if max((r["disc_no"] or 1) for r in tracks) > 1 else None),
+                 ("Format", escape(fmt)), ("Size", size(sum(r["size"] or 0 for r in tracks))),
                  ("Plays", sum(r["plays"] or 0 for r in tracks) or None),
                  ("MusicBrainz", f'<a href="https://musicbrainz.org/release/{escape(t["mb_release"])}">release</a>' if t["mb_release"] else None),
                  ("Folder", f'<code>{escape(str(Path(t["ref"]).parent))}</code>' if t["source"] == "local" else None)]
@@ -766,13 +882,16 @@ def routes(api) -> list[Route]:
             writers = ", ".join(dict.fromkeys(c["name"] for c in mine if c["role"] in ("composer", "writer", "lyricist")))
             number = f'{r["disc_no"]}.{r["track_no"]}' if multi else str(r["track_no"] or "")
             rows += (f'<tr><td class="num">{number}</td><td class="lead"><a href="/music/library/song/{quote(r["id"])}">{escape(r["title"])}</a>'
-                     f'{" ★" if r["starred"] else ""}{f"<div class=muted>{escape(by)}</div>" if by and by != t["album_artist"] else ""}</td>'
+                     f'{" <span class=star>★</span>" if r["starred"] else ""}{f"<div class=muted>{escape(by)}</div>" if by and by != t["album_artist"] else ""}</td>'
                      f'<td class="muted">{escape(writers)}</td><td class="num">{length(r["duration"])}</td>'
                      f'<td class="num" data-unit="plays">{r["plays"] or ""}</td></tr>')
-        body = (f'{MUSIC_NAV}<section class="hero">{picture(album_id)}<dl class="meta">{dl(facts)}</dl></section>'
-                f'<section><table class="grid tracks"><thead><tr><th class="num">#</th><th>Title</th><th>Written by</th><th class="num">Length</th>'
+        kinds = [k.strip() for k in (t["release_types"] or "album").split(";") if k.strip()]
+        line = [f'by <a href="/music/library/artist/{quote(artist_key)}">{escape(t["album_artist"])}</a>', escape(str(t["year"] or "")),
+                f"{len(tracks)} songs", length(sum(r["duration"] or 0 for r in tracks))]
+        body = (hero(picture(album_id), escape(" · ".join(kinds)), t["album"], " · ".join(filter(None, line)), f'<dl class="meta">{dl(facts)}</dl>')
+                + f'<section><table class="grid tracks"><thead><tr><th class="num">#</th><th>Title</th><th>Written by</th><th class="num">Length</th>'
                 f'<th class="num">Plays</th></tr></thead><tbody>{rows}</tbody></table></section>')
-        return page(t["album"], body, wide=True)
+        return page(t["album"], body, wide=True, tab="library", heading=False)
 
     def library_song(db, request, user, form):
         r = db.execute("select t.*, s.play_count plays, s.played, s.starred, s.rating from track t left join stat s on s.id = t.id where t.id = ?",
@@ -791,18 +910,19 @@ def routes(api) -> list[Route]:
                         for role in sorted(roles, key=lambda x: order.index(x) if x in order else 99)]
         shared = db.execute("select kept from audio_shared where path = ?", (r["ref"],)).fetchone()
         lyrics = db.execute("select found is not null and found != '' from lyrics where track_id = ?", (r["id"],)).fetchone()
-        facts = [("Album", f'<a href="/music/library/album/{quote(r["album_id"])}">{escape(r["album"])}</a>'
-                 + (f' · disc {r["disc_no"]}' if (r["disc_no"] or 1) > 1 else "") + (f' · track {r["track_no"]}' if r["track_no"] else "")),
-                 *credit_facts, ("Length", length(r["duration"])), ("Genres", escape(", ".join(json.loads(r["genres"]) if r["genres"] else [r["genre"] or ""]))),
+        facts = [*credit_facts, ("Genres", escape(", ".join(json.loads(r["genres"]) if r["genres"] else [r["genre"] or ""]))),
                  ("ISRC", escape(r["isrc"] or "")),
                  ("MusicBrainz", f'<a href="https://musicbrainz.org/recording/{escape(r["mb_recording"])}">recording</a>' if r["mb_recording"] else None),
                  ("Format", escape(f'{(r["suffix"] or "").upper()} · {r["bitrate"]} kbps · {size(r["size"])}')),
                  ("Plays", f'{r["plays"] or 0}' + (f' · last {ago(r["played"])}' if r["played"] else "")),
-                 ("Starred", "★" if r["starred"] else None), ("Lyrics", ("found" if lyrics[0] else "none found") if lyrics else None),
+                 ("Lyrics", ("found" if lyrics[0] else "none found") if lyrics else None),
                  ("Shares audio with", f'<code>{escape(shared[0])}</code>' if shared else None),
                  ("File", f'<code>{escape(r["ref"])}</code>' if r["source"] == "local" else None)]
-        body = f'{MUSIC_NAV}<section class="hero">{picture(r["album_id"])}<dl class="meta">{dl(facts)}</dl></section>'
-        return page(r["title"], body, wide=True)
+        line = [f'from <a href="/music/library/album/{quote(r["album_id"])}">{escape(r["album"])}</a>', f'disc {r["disc_no"]}' if (r["disc_no"] or 1) > 1 else "",
+                f'track {r["track_no"]}' if r["track_no"] else "", length(r["duration"])]
+        body = hero(picture(r["album_id"]), "Song" + (' · <span class="star">★ starred</span>' if r["starred"] else ""), r["title"],
+                    " · ".join(filter(None, line)), f'<dl class="meta">{dl(facts)}</dl>')
+        return page(r["title"], body, wide=True, tab="library", heading=False)
 
     def give_up(db, user, rg: str):
         api._want(db, user["name"], "album", mine(db, user, "album", rg), None)
@@ -880,6 +1000,6 @@ YOUTUBE_STEPS = """
 <li>Paste it below, then close the private window <b>without signing out</b>: signing out ends the sign-in oasis uses.</li>
 </ol>
 <form method="post" action="/account/youtube"><textarea name="headers" placeholder="curl 'https://music.youtube.com/youtubei/v1/browse?...' -H 'cookie: ...'"></textarea>
-<p><button>Link YouTube Music</button></p></form>
+<p><button class="primary">Link YouTube Music</button></p></form>
 <p class="muted">The roma app can link it for you with its own Google sign-in.</p>
 """

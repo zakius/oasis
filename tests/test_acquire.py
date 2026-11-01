@@ -363,7 +363,7 @@ def test_the_dashboard_finds_follows_and_wants_any_artist_or_album(client, mb):
     page = client.get(f"/music/artist/{KENSHI}").text
     assert page.index("STRAY SHEEP") < page.index("<h2>Singles</h2>") < page.index("Lemon") and "Follow</button>" in page
     page = client.post("/music/want", data={"kind": "artist", "mbid": KENSHI, "on": "1", "next": f"/music/artist/{KENSHI}"}).text
-    assert "Followed" in page and "<b>followed</b>" in page and "Unfollow</button>" in page
+    assert "Followed" in page and '"pill accent">followed<' in page and "Unfollow</button>" in page
     sync(client)
     assert wants(client) == {"STRAY SHEEP": ("missing", "followed", "searched, no release found yet"), "Lemon": ("skipped", "followed",
                              "its songs are on the artist's albums"), "BOOTLEG": ("missing", "followed", None)}
@@ -375,7 +375,7 @@ def test_the_dashboard_finds_follows_and_wants_any_artist_or_album(client, mb):
     assert [tuple(r) for r in db.execute("select user, kind, ref from wanted order by kind")] == [("admin", "album", "al-mb-" + LEMON), ("admin", "artist", "ar-mb-" + KENSHI)]
     assert db.execute("select starred is not null from stat where id = ?", ("al-mb-" + LEMON,)).fetchone()[0] == 1  # as clients see it
     found = client.get("/music", params={"q": "stray sheep", "kind": "album"}).text
-    assert f'— <a href="/music/artist/{KENSHI}">米津玄師</a>' in found and "Album · 2020" in found and "<b>wanted</b>" in found
+    assert f'— <a href="/music/artist/{KENSHI}">米津玄師</a>' in found and "Album · 2020" in found and '"pill accent">wanted<' in found
     client.post("/music/want", data={"kind": "album", "mbid": LEMON, "next": "/music"})
     client.post("/music/want", data={"kind": "artist", "mbid": KENSHI, "next": "https://elsewhere"})
     sync(client)
