@@ -73,10 +73,10 @@ create table if not exists user(
     listenbrainz_token text
 );
 create table if not exists wanted(user text not null, kind text not null, ref text not null, primary key(user, kind, ref));
-create table if not exists lidarr_item(  -- stars and follows (see acquire.py); named from Lidarr, kept so a rollback finds them
+create table if not exists want_item(  -- stars and follows (see acquire.py)
     kind text not null, ref text not null,  -- 'album' or 'artist', and its oasis id
     state text not null,                    -- wanted, downloading, have, followed (artists), failed
-    mbid text, lidarr_id int, error text,   -- error: why it isn't downloading, for clients to show
+    mbid text, error text,                  -- error: why it isn't downloading, for clients to show
     searched real,                          -- albums: last search; artists: when the back catalogue was monitored
     retry_at real, updated real not null,
     catalogued real,                        -- artists: when oasis last read their catalogue from MusicBrainz (see acquire.py)
@@ -180,12 +180,21 @@ def connect(path: Path) -> sqlite3.Connection:
     db.execute("pragma journal_mode=wal")
     db.execute("pragma foreign_keys=on")
     if path not in migrated:
+        rename(db)
         db.executescript(SCHEMA)
         migrate(db)
         db.execute("create index if not exists track_release on track(mb_release)")  # on columns migrate may add
         db.execute("create index if not exists track_group on track(mb_release_group)")
         migrated.add(path)
     return db
+
+
+def rename(db: sqlite3.Connection):
+    """Gives tables of an older oasis their current names, rows and all, before SCHEMA creates them empty."""
+    tables = {row[0] for row in db.execute("select name from sqlite_master where type = 'table'")}
+    if "lidarr_item" in tables and "want_item" not in tables:  # named from when Lidarr kept the stars and follows
+        db.execute("alter table lidarr_item rename to want_item")
+        db.execute("alter table want_item drop column lidarr_id")
 
 
 def migrate(db: sqlite3.Connection):

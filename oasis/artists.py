@@ -67,7 +67,7 @@ def merge(db):
         db.execute("update credit set artist_id = ? where artist_id = ? and mbid is null", (new, old))
         db.execute("update ytm_release set artist_id = ? where artist_id = ?", (new, old))
         db.execute("delete from ytm_artist where artist_id = ?", (old,))
-        db.execute("update or ignore lidarr_item set ref = ? where kind = 'artist' and ref = ?", (new, old))
+        db.execute("update or ignore want_item set ref = ? where kind = 'artist' and ref = ?", (new, old))
         move_stat(db, old, new)
 
 

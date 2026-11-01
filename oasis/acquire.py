@@ -3,8 +3,7 @@ artist's albums, EPs and singles are read daily, and repackages and singles whos
 An album is here when the library holds as many of its tracks as its smallest edition has. Missing albums are searched
 (Prowlarr, then TorBox: download.py) one a minute, again and again, ever further apart; an artist with gaps gets a
 weekly search for cached discographies and bundles, which can fill many at once. Anything MusicBrainz has can be
-wanted, under ids of its own until it arrives (see adopt). want_album holds the albums; lidarr_item, named from when
-Lidarr kept them, the stars and follows, under that name still so the code before can come back."""
+wanted, under ids of its own until it arrives (see adopt). want_album holds the albums; want_item the stars and follows."""
 import itertools
 import json
 import logging
@@ -41,7 +40,7 @@ RESEARCH, RESEARCH_MOST = 6 * 3600, 7 * 86400       # a missing album is searche
 SINGLE_RESEARCH, SINGLE_MOST = 7 * 86400, 28 * 86400
 BUNDLE_AGAIN = 7 * 86400             # seconds between an artist's bundle searches
 MAP_RELEASES = 20                    # files tagged with a release but no release group, looked up per pass
-CLIENT_STATES = {"missing": "wanted", "downloading": "downloading", "have": "have"}  # lidarr_item's, which clients see
+CLIENT_STATES = {"missing": "wanted", "downloading": "downloading", "have": "have"}  # want_item's, which clients see
 RETRY_NO_MATCH = 1800     # seconds before looking an unmatched name up again
 RETRY_ERROR = 300         # seconds before retrying after MusicBrainz errors
 SEARCH_GAP = 60           # seconds between searches, so a burst of stars doesn't trip TorBox's rate limit
@@ -109,17 +108,17 @@ def library_id(db, id: str) -> str | None:
 
 def refs(db, kind: str, mbid: str) -> set[str]:
     """Every id the artist or release group may be wanted under."""
-    return {MB_IDS[kind] + mbid, *(r[0] for r in db.execute("select ref from lidarr_item where kind = ? and mbid = ?", (kind, mbid))),
+    return {MB_IDS[kind] + mbid, *(r[0] for r in db.execute("select ref from want_item where kind = ? and mbid = ?", (kind, mbid))),
             *filter(None, [library_id(db, MB_IDS[kind] + mbid)])}
 
 
 def adopt(db):
     """A MusicBrainz-only artist or album that arrived in the library takes its library id: stars, wants and follows
     move there, and the old id keeps working through moved, as clients keep ids."""
-    for (old,) in db.execute("select ref from wanted where ref like 'a_-mb-%' union select ref from lidarr_item where ref like 'a_-mb-%' "
+    for (old,) in db.execute("select ref from wanted where ref like 'a_-mb-%' union select ref from want_item where ref like 'a_-mb-%' "
                              "union select id from stat where id like 'a_-mb-%'").fetchall():
         if new := library_id(db, old):
-            for table in ("wanted", "lidarr_item"):
+            for table in ("wanted", "want_item"):
                 db.execute(f"update or ignore {table} set ref = ? where ref = ?", (new, old))
                 db.execute(f"delete from {table} where ref = ?", (old,))
             move_stat(db, old, new)
@@ -152,15 +151,15 @@ class Acquire:
         try:
             adopt(db)
             for kind, ref in db.execute("select distinct kind, ref from wanted").fetchall():
-                db.execute("insert or ignore into lidarr_item(kind, ref, state, updated) values (?, ?, 'wanted', ?)", (kind, ref, time.time()))
-            for item in db.execute("select * from lidarr_item").fetchall():
+                db.execute("insert or ignore into want_item(kind, ref, state, updated) values (?, ?, 'wanted', ?)", (kind, ref, time.time()))
+            for item in db.execute("select * from want_item").fetchall():
                 wanted = db.execute("select 1 from wanted where kind = ? and ref = ?", (item["kind"], item["ref"])).fetchone()
                 if wanted and (item["retry_at"] or 0) > time.time():
                     continue
                 try:
                     if not wanted:
                         self.release(db, item)
-                        db.execute("delete from lidarr_item where kind = ? and ref = ?", (item["kind"], item["ref"]))
+                        db.execute("delete from want_item where kind = ? and ref = ?", (item["kind"], item["ref"]))
                     else:
                         set_state(db, item, *(self.want(db, item) if item["kind"] == "album" else self.follow(db, item)))
                 except LookupError as e:
@@ -169,8 +168,8 @@ class Acquire:
                     log.warning("%s %s: %s", item["kind"], item["ref"], e)
                     set_state(db, item, item["state"] if item["mbid"] else "wanted", str(e)[:300], retry=RETRY_ERROR)
             # One catalogue a pass: a first read of many artists takes MusicBrainz minutes, and searches go on meanwhile.
-            due = db.execute("select * from lidarr_item where kind = 'artist' and mbid is not null and coalesce(catalogued, 0) < ? "
-                             "and coalesce(retry_at, 0) <= ? and exists (select 1 from wanted w where w.kind = 'artist' and w.ref = lidarr_item.ref) "
+            due = db.execute("select * from want_item where kind = 'artist' and mbid is not null and coalesce(catalogued, 0) < ? "
+                             "and coalesce(retry_at, 0) <= ? and exists (select 1 from wanted w where w.kind = 'artist' and w.ref = want_item.ref) "
                              "order by catalogued is not null, catalogued limit 1", (time.time() - RECATALOGUE, time.time())).fetchone()
             if due:
                 try:
@@ -189,7 +188,7 @@ class Acquire:
         rg = item["mbid"]
         if not rg:
             rg = self.find_album(db, item)
-            db.execute("update lidarr_item set mbid = ? where kind = ? and ref = ?", (rg, item["kind"], item["ref"]))
+            db.execute("update want_item set mbid = ? where kind = ? and ref = ?", (rg, item["kind"], item["ref"]))
         row = db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
         if row is None or row["reason"] != "starred":
             group = musicbrainz.get(GROUP.format(rg), db, KEEP_GROUP)
@@ -204,7 +203,7 @@ class Acquire:
         mbid = item["mbid"]
         if not mbid:
             mbid = self.find_artist(db, item)
-            db.execute("update lidarr_item set mbid = ? where kind = ? and ref = ?", (mbid, item["kind"], item["ref"]))
+            db.execute("update want_item set mbid = ? where kind = ? and ref = ?", (mbid, item["kind"], item["ref"]))
         busy = db.execute("select 1 from want_album where artist_mbid = ? and state = 'downloading'", (mbid,)).fetchone()
         return ("downloading" if busy else "followed"), None
 
@@ -256,7 +255,7 @@ class Acquire:
             db.execute("delete from want_album where artist_mbid = ? and reason = 'followed'", (item["mbid"],))
         elif row := db.execute("select artist_mbid from want_album where rg = ? and reason = 'starred'", (item["mbid"],)).fetchone():
             db.execute("delete from want_album where rg = ?", (item["mbid"],))
-            db.execute("update lidarr_item set catalogued = null where kind = 'artist' and mbid = ?", (row[0],))  # back, if followed
+            db.execute("update want_item set catalogued = null where kind = 'artist' and mbid = ?", (row[0],))  # back, if followed
 
     def browse(self, db, mbid: str) -> list[dict]:
         """The artist's albums, EPs and singles with an allowed secondary type (or none)."""
@@ -283,10 +282,10 @@ class Acquire:
         albums and EPs Lidarr looked for never are, given up or not."""
         groups = sorted(self.browse(db, item["mbid"]), key=lambda g: g.get("first-release-date") or "9999")
         editions = {g["id"]: self.edition(db, g["id"]) for g in groups}
-        starred = {r[0] for r in db.execute("select mbid from lidarr_item where kind = 'album' and mbid is not null")}
-        lidarrs = {r[0] for r in db.execute("select mbid from catalogue_search where mbid is not null")}  # Lidarr's, carried over once
+        starred = {r[0] for r in db.execute("select mbid from want_item where kind = 'album' and mbid is not null")}
+        looked_for = {r[0] for r in db.execute("select mbid from catalogue_search where mbid is not null")}  # Lidarr's, carried over once
         kept = lambda g: g["id"] not in why or g["id"] in starred or self.have_files(db, g["id"]) or \
-            g["primary-type"] != "Single" and g["id"] in lidarrs
+            g["primary-type"] != "Single" and g["id"] in looked_for
         seen, why = set(), {}
         for g in (g for g in groups if g["primary-type"] != "Single"):
             songs = editions[g["id"]]["songs"]
@@ -313,7 +312,7 @@ class Acquire:
         listed = {g["id"] for g in groups}
         db.executemany("delete from want_album where rg = ?", [(rg,) for (rg,) in db.execute(
             "select rg from want_album where artist_mbid = ? and reason = 'followed'", (item["mbid"],)).fetchall() if rg not in listed])
-        db.execute("update lidarr_item set catalogued = ?, error = null, retry_at = null where kind = 'artist' and ref = ?", (time.time(), item["ref"]))
+        db.execute("update want_item set catalogued = ?, error = null, retry_at = null where kind = 'artist' and ref = ?", (time.time(), item["ref"]))
         log.info("catalogue of %s: %d release groups, %d left out", name or item["mbid"], len(groups), len(skipped))
 
     def have_files(self, db, rg: str) -> bool:
@@ -323,7 +322,7 @@ class Acquire:
         """Adds or updates a release group's row. A new one carries over Lidarr's last search of it."""
         self.edition(db, group["id"])
         searched = db.execute("select max(searched) from (select searched from catalogue_search where mbid = ? union all "
-                              "select searched from lidarr_item where kind = 'album' and mbid = ?)", (group["id"], group["id"])).fetchone()[0]
+                              "select searched from want_item where kind = 'album' and mbid = ?)", (group["id"], group["id"])).fetchone()[0]
         db.execute("insert into want_album(rg, artist_mbid, artist, title, primary_type, secondary_types, first_date, reason, state, error, "
                    "searched, next_search, tries) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict(rg) do update set "
                    "artist_mbid = excluded.artist_mbid, artist = coalesce(excluded.artist, want_album.artist), title = excluded.title, "
@@ -465,5 +464,5 @@ def song_key(title: str) -> str:
 
 
 def set_state(db, item, state: str, error: str | None, retry: float | None = None):
-    db.execute("update lidarr_item set state = ?, error = ?, retry_at = ?, updated = ? where kind = ? and ref = ?",
+    db.execute("update want_item set state = ?, error = ?, retry_at = ?, updated = ? where kind = ? and ref = ?",
                (state, error, time.time() + retry if retry else None, time.time(), item["kind"], item["ref"]))

@@ -537,9 +537,9 @@ def routes(api) -> list[Route]:
         if not rows:
             body += '<p class="muted">Nothing wanted matches.</p>' if here != "/music/wanted" else '<p class="muted">Nothing left to find.</p>'
         body += '</section>'
-        lost = db.execute("select li.*, exists (select 1 from wanted w where w.kind = li.kind and w.ref = li.ref and w.user = ?) mine "
-                          "from lidarr_item li where li.state = 'failed' and exists (select 1 from wanted w where w.kind = li.kind "
-                          "and w.ref = li.ref)", (user["name"],)).fetchall()
+        lost = db.execute("select wi.*, exists (select 1 from wanted w where w.kind = wi.kind and w.ref = wi.ref and w.user = ?) mine "
+                          "from want_item wi where wi.state = 'failed' and exists (select 1 from wanted w where w.kind = wi.kind "
+                          "and w.ref = wi.ref)", (user["name"],)).fetchall()
         if lost:
             names = {"album": ("select album_artist || ' – ' || album from track where album_id = ?",
                                "select a.name || ' – ' || r.title from ytm_release r join ytm_artist a using (artist_id) where r.album_id = ?"),

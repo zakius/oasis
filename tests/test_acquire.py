@@ -137,11 +137,11 @@ def test_a_followed_artists_catalogue_leaves_out_repackages_and_singles_with_not
         "Second (Deluxe)": ("skipped", "followed", "a repackage")}  # live albums aren't in the catalogue
     db = client.app.state.api._db()
     assert db.execute("select tracks, discs from mb_group where rg = 'g-second'").fetchone()[:] == (3, 2)
-    assert db.execute("select state, catalogued is not null from lidarr_item where kind = 'artist'").fetchone()[:] == ("followed", 1)
+    assert db.execute("select state, catalogued is not null from want_item where kind = 'artist'").fetchone()[:] == ("followed", 1)
 
     db.execute("update track set mb_release_group = 'g-hits' where album = 'Second'")  # a repackage with files isn't left out
     mb.catalogues["mb-beta"] = mb.catalogues["mb-beta"][1:]  # nor is what the catalogue lost kept
-    db.execute("update lidarr_item set catalogued = 0")
+    db.execute("update want_item set catalogued = 0")
     sync(client)
     assert wants(client)["Greatest Hits"] == ("have", "followed", None) and "First" not in wants(client)
 
@@ -242,16 +242,16 @@ def test_a_new_star_resolves_through_musicbrainz_search_exact_matches_only(clien
     sync(client)
     assert any("arid%3Amb-kenshi" in u for u in mb.asked) and not any("arid%3Amb-other" in u for u in mb.asked)
     assert wants(client) == {"Stray Sheep": ("missing", "starred", "searched, no release found yet")}  # searched at once: starred first
-    item = db.execute("select state, mbid, error from lidarr_item").fetchone()
+    item = db.execute("select state, mbid, error from want_item").fetchone()
     assert item[:] == ("wanted", "g-ss", "waiting for its search")
     sync(client)
-    assert db.execute("select error from lidarr_item").fetchone()[0] == "searched, no release found yet"
+    assert db.execute("select error from want_item").fetchone()[0] == "searched, no release found yet"
     assert db.execute("select artist from want_album").fetchone()[0] == "米津玄師"
 
     mb.artists, mb.found = [], []  # an artist MusicBrainz doesn't know: failed, looked up again later
     call(client, "star", artistId=artist_id(client, "The Alpha"))
     sync(client)
-    row = db.execute("select state, error, retry_at > ? from lidarr_item where kind = 'artist'", (time.time(),)).fetchone()
+    row = db.execute("select state, error, retry_at > ? from want_item where kind = 'artist'", (time.time(),)).fetchone()
     assert row[:] == ("failed", "no MusicBrainz artist named The Alpha", 1)
 
     call(client, "unstar", albumId="al-yt")
@@ -262,7 +262,7 @@ def test_a_new_star_resolves_through_musicbrainz_search_exact_matches_only(clien
 def test_unfollowing_drops_the_catalogue_but_keeps_starred_albums_and_unstarring_gives_them_back(client, mb):
     follow_beta(client, mb)
     db = client.app.state.api._db()
-    db.execute("insert into lidarr_item(kind, ref, state, mbid, updated) values ('album', 'al-x', 'wanted', 'g-hits', 0)")
+    db.execute("insert into want_item(kind, ref, state, mbid, updated) values ('album', 'al-x', 'wanted', 'g-hits', 0)")
     db.execute("insert into wanted values ('admin', 'album', 'al-x')")
     sync(client)
     assert wants(client)["Greatest Hits"] == ("missing", "starred", None)  # starred: never left out
@@ -301,9 +301,9 @@ def test_catalogue_reads_keep_musicbrainzs_pace(tmp_path, monkeypatch):
         return io.BytesIO(json.dumps({"releases": [{"media": [{"tracks": [{"title": "x"}]}]}]}).encode())
 
     monkeypatch.setattr(musicbrainz.urllib.request, "urlopen", urlopen)
-    connect(tmp_path / "oasis.db").execute("insert into lidarr_item(kind, ref, state, mbid, updated) values ('artist', 'ar-b', 'followed', 'mb-beta', 0)")
+    connect(tmp_path / "oasis.db").execute("insert into want_item(kind, ref, state, mbid, updated) values ('artist', 'ar-b', 'followed', 'mb-beta', 0)")
     acq = Acquire(lambda: connect(tmp_path / "oasis.db"), FakeDownloads())
-    read = lambda db: acq.catalogue(db, db.execute("select * from lidarr_item").fetchone())
+    read = lambda db: acq.catalogue(db, db.execute("select * from want_item").fetchone())
     reader = threading.Thread(target=lambda: read(connect(tmp_path / "oasis.db")))
     other = threading.Thread(target=lambda: musicbrainz.get("https://musicbrainz.org/ws/2/release/r?fmt=json"))
     reader.start(), other.start()
@@ -432,7 +432,7 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     client.post(f"/music/wanted/{LEMON}/give-up")
     assert "Gave up on 1 album" in client.post("/music/wanted/give-up", data={"rgs": STRAY}).text
     db.execute("delete from given_up where rg = ?", (STRAY,))  # wanted again
-    db.execute("update lidarr_item set catalogued = 0")
+    db.execute("update want_item set catalogued = 0")
     sync(client)
     sync(client)
     assert {t: w[:2] for t, w in wants(client).items()} == {"STRAY SHEEP": ("missing", "followed"), "Lemon": ("skipped", "followed"),

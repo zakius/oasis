@@ -76,7 +76,7 @@ With `[torbox]`, a worker also keeps TorBox's active slots free every 5 minutes 
 
 Any signed-in user can also find music on the dashboard: `/music` searches MusicBrainz for artists (by any name or alias, in any script: "Kenshi Yonezu" finds 米津玄師) or albums, and shows whether each is in the library, wanted or followed. An artist's page (`/music/artist/<MusicBrainz id>`) follows or unfollows it and lists its albums, EPs and singles, each with Want or Unwant. Wanting and following are starring: the dashboard stars the library's id, or `ar-mb-<id>` / `al-mb-<release group id>` for what only MusicBrainz has. `/music/wanted` lists every album oasis is looking for with its state (waiting for its search, not found yet, downloading with its progress, importing, failed and why), and can search one next, block the release downloading and try another, or give up on it (unwanted, and left out of its artist's catalogue; files stay). In Subsonic clients, `search3` adds MusicBrainz artists and albums that neither the library nor YouTube Music has, for queries of 3 or more characters, after the other results; searches are kept a week. Such an artist lists its release groups, an album has no songs until it arrives, and starring them wants or follows them as for any other. Once one arrives, its stars and wants move to the library's id, and the old id keeps working.
 
-Lidarr searched and imported before oasis did. Its tables (`lidarr_item`, which still holds the stars and follows, `lidarr_rescue`, `catalogue_search`) stay in the database, so the code before can come back. Usenet isn't supported.
+Lidarr searched and imported before oasis did. Its tables `lidarr_rescue` and `catalogue_search` stay in the database. Usenet isn't supported.
 
 ## Run
 

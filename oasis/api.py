@@ -137,14 +137,14 @@ select t.album_id as id, t.album as name, t.album_artist as artist, t.artist_id,
        count(*) as song_count, sum(t.duration) as duration, min(t.created) as created,
        max(t.year) as year, max(t.genre) as genre, max(t.cover is not null) as has_cover,
        s.starred as album_starred, s.rating as album_rating,
-       coalesce(sum(ps.play_count), 0) as plays, max(ps.played) as last_played, li.state as want_state, li.error as want_error
+       coalesce(sum(ps.play_count), 0) as plays, max(ps.played) as last_played, wi.state as want_state, wi.error as want_error
 from track t left join stat s on s.id = t.album_id left join stat ps on ps.id = t.id
-left join lidarr_item li on li.kind = 'album' and li.ref = t.album_id
+left join want_item wi on wi.kind = 'album' and wi.ref = t.album_id
 """
 ARTISTS = """
 select t.artist_id as id, t.album_artist as name, count(distinct t.album_id) as album_count,
-       max(t.cover is not null) as has_cover, s.starred, s.rating, li.state as want_state, li.error as want_error
-from track t left join stat s on s.id = t.artist_id left join lidarr_item li on li.kind = 'artist' and li.ref = t.artist_id
+       max(t.cover is not null) as has_cover, s.starred, s.rating, wi.state as want_state, wi.error as want_error
+from track t left join stat s on s.id = t.artist_id left join want_item wi on wi.kind = 'artist' and wi.ref = t.artist_id
 """
 
 
@@ -736,7 +736,7 @@ class Api:
     def _wanted(self, db, kind, id) -> dict:
         """Starred and oasisWanted of an artist or album, as album() and artist() give them."""
         starred = db.execute("select starred from stat where id = ?", (id,)).fetchone()
-        item = db.execute("select state, error from lidarr_item where kind = ? and ref = ?", (kind, id)).fetchone()
+        item = db.execute("select state, error from want_item where kind = ? and ref = ?", (kind, id)).fetchone()
         state = WANTED_STATES.get(item and item["state"])
         return {"starred": iso(starred and starred[0]), "oasisWanted": state, "oasisWantedError": item["error"] if state else None}
 
