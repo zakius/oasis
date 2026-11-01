@@ -213,3 +213,11 @@ def test_an_indexer_whose_torrents_were_often_dead_is_tried_last(downloads, db):
     lime, good = result("Artist - Album [FLAC]", "aa", seeders=40, guid="https://lime.example/x"), result("Artist - Album [MP3 320]", "bb", guid="https://good.example/y")
     assert [r["infoHash"] for r in releases.rank([lime, good], set(), unreliable=downloads.unreliable(db))] == ["bb", "aa"]
     assert [r["infoHash"] for r in releases.rank([lime, good], {"aa"}, unreliable=downloads.unreliable(db))] == ["aa", "bb"]  # cached: fine
+
+
+def test_how_much_of_a_download_is_copied_here_counts_partly_fetched_files(downloads, tmp_path):
+    done, partial, missing = tmp_path / "a.flac", tmp_path / "b.flac", tmp_path / "c.flac"
+    done.write_bytes(b"x" * 50)
+    (tmp_path / "b.flac.part").write_bytes(b"x" * 25)
+    downloads.copying["h"] = [(done, 50), (partial, 50), (missing, 100)]
+    assert downloads.copied("h") == 0.375 and downloads.copied("other") is None

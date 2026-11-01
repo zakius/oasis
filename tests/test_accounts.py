@@ -119,5 +119,5 @@ def test_status_shows_oasis_downloads_and_what_arrived_lately(client):
     db.executemany("insert into download(hash, album_id, title, state, error, created, updated) values (?, 1, ?, ?, ?, strftime('%s'), strftime('%s'))", rows)
     sign_in(client)
     page = client.get("/").text
-    assert 'Downloading <span class="count">1<' in page and "Mili - Hue [FLAC]" in page and "TorBox downloading" in page
+    assert 'Downloading <span class="count">1<' in page and "Mili - Hue [FLAC]" in page and "downloading on TorBox" in page
     assert '✓</span><div class="grow">Rammstein - Mutter [FLAC]' in page and "dead torrent: no seeds, no progress" in page

@@ -81,8 +81,8 @@ section > .row + .row { margin-top: 1rem; } form.inline { display: inline; }
         vertical-align: .08em; color: var(--muted); background: color-mix(in srgb, currentColor 14%, transparent); }
 .muted { color: var(--muted); font-size: .875rem; } .good, .ok { color: var(--good); } .busy { color: var(--busy); } .bad, .error { color: var(--bad); }
 .accent { color: var(--link); } .star { color: var(--star); } .ok::before { content: "✓ "; } a.pill:hover { text-decoration: none; filter: brightness(1.15); }
-.meter { display: inline-block; width: 4rem; height: .4rem; margin-right: .5rem; border-radius: 999px; overflow: hidden;
-  vertical-align: .1em; background: color-mix(in srgb, var(--busy) 20%, transparent); } .meter i { display: block; height: 100%; background: var(--busy); }
+.progress { display: flex; flex-wrap: wrap; justify-content: space-between; gap: .3rem .75rem; min-width: 10rem; }
+.meter { display: block; flex-basis: 100%; height: .4rem; border-radius: 999px; overflow: hidden; background: color-mix(in srgb, var(--busy) 20%, transparent); } .meter i { display: block; height: 100%; background: var(--busy); }
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr)); gap: .75rem; margin: 0 0 1.25rem; }
 .stats > div { padding: .85rem 1rem; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow); }
 .stats b { display: block; font-size: 1.6rem; line-height: 1.15; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
@@ -181,7 +181,7 @@ a.card:hover b { text-decoration: underline; } .card .muted { font-size: .8rem; 
 """
 
 
-STATES = {"added": "waiting for TorBox", "downloading": "TorBox downloading", "fetching": "copying here", "importing": "importing"}
+STATES = {"added": "queued on TorBox", "downloading": "downloading on TorBox", "fetching": "copying here", "importing": "importing"}
 NO_COVER = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#8883"/>'
             '<text x="50" y="64" font-size="42" text-anchor="middle" fill="#8889">♪</text></svg>')
 confirm = lambda question: f' onsubmit="return confirm({escape(json.dumps(question, ensure_ascii=False))})"'  # for buttons that drop things
@@ -456,11 +456,17 @@ def routes(api) -> list[Route]:
         accounts.set_field(db, user["name"], password=form["password"])
         return back("/", message="Password changed. Update it in your apps.")
 
-    def progress(hash: str, state: str) -> str:
-        """How far a download is: TorBox's share done while it downloads, else the step it is at."""
-        seen = api.downloads.seen.get(hash) if api.downloads and state == "downloading" else None
-        return (f'<span class="meter"><i style="width:{seen[0]:.0%}"></i></span><span class="busy">{seen[0]:.0%}</span>' if seen else
-                f'<span class="pill busy">{STATES.get(state, state)}</span>')
+    def progress(hash: str, state: str, since: float) -> str:
+        """Where a download is: queued on TorBox, TorBox downloading it (its share done), copying it here from TorBox
+        (the share here), importing it. The step, share and age on one line, the bar under them."""
+        d = api.downloads
+        if d and state == "fetching" and time.time() < d.paused_until:
+            return f'<div class="progress"><span class="busy">copying here: paused by TorBox\'s rate limit</span><span class="muted">{ago(since)}</span></div>'
+        share = (d.seen.get(hash, (None,))[0] if state == "downloading" else d.copied(hash) if state == "fetching" else None) if d else None
+        label = STATES.get(state, state)
+        return (f'<div class="progress"><span class="busy">{label}{f" {share:.0%}" if share is not None else ""}</span>'
+                f'<span class="muted">{ago(since)}</span>'
+                f'{f"""<span class="meter"><i style="width:{share:.0%}"></i></span>""" if share is not None else ""}</div>')
 
     def status(db) -> str:
         """What oasis is busy with: downloads, the MusicBrainz fill and dedupe."""
@@ -471,7 +477,7 @@ def routes(api) -> list[Route]:
         html = '<div class="stats">' + "".join(f'<div><b>{n}</b><span>{label}</span></div>' for n, label in tiles) + '</div>'
         active = db.execute("select hash, title, state, created from download where state not in ('done', 'failed') order by created").fetchall()
         html += (f'<section><h2>Downloading <span class="count">{len(active)}</span></h2><ul class="rows">' + "".join(
-            f'<li><div class="grow">{escape(r["title"])}<div class="muted">{progress(r["hash"], r["state"])} {ago(r["created"])}</div></div></li>'
+            f'<li><div class="grow">{escape(r["title"])}{progress(r["hash"], r["state"], r["created"])}</div></li>'
             for r in active) + '</ul></section>' if active else '<section><h2>Downloading</h2><p class="muted">Nothing downloading.</p></section>')
         recent = db.execute("select title, state, error, updated from download where state in ('done', 'failed') "
                             "order by updated desc limit 5").fetchall()
@@ -640,13 +646,13 @@ def routes(api) -> list[Route]:
         artist_f, type_f, text = q.get("artist", ""), q.get("type", ""), q.get("q", "").strip()
         here = "/music/wanted" + ("?" + urlencode({k: v for k, v in (("artist", artist_f), ("type", type_f), ("q", text)) if v})
                                   if artist_f or type_f or text else "")
-        active = {r["rg"]: r for r in db.execute("select d.hash, d.state, coalesce(t.rg, d.album_mbid) rg from download d left join download_target t "
+        active = {r["rg"]: r for r in db.execute("select d.hash, d.state, d.created, coalesce(t.rg, d.album_mbid) rg from download d left join download_target t "
                                                  "on t.hash = d.hash where d.state not in ('done', 'failed') and coalesce(t.rg, d.album_mbid) is not null")}
 
         def place(r) -> tuple[str, str]:
             """The group a wanted album goes in, and what to say about it."""
             if d := active.get(r["rg"]):
-                return "downloading", progress(d["hash"], d["state"])
+                return "downloading", progress(d["hash"], d["state"], d["created"])
             if r["state"] == "downloading":
                 return "downloading", pill("downloading", "busy")
             if r["rg"] in acq.soon:

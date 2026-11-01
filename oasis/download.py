@@ -109,6 +109,7 @@ class Downloads:
         self.client = None
         self.seen = {}       # hash -> (progress, since when)
         self.failures = {}   # hash -> polls in a row its files failed to download
+        self.copying = {}    # hash -> [(path, size)]: the files being fetched here, for copied()
         self.pace, self.last_request, self.paused_until = threading.Lock(), 0.0, 0.0
 
     def torbox(self):
@@ -262,6 +263,13 @@ class Downloads:
             todo += [(listed[n], self.folder / row["hash"] / rg / inside(posixpath.relpath(n, top))) for n in names]
         return todo
 
+    def copied(self, hash: str) -> float | None:
+        """The share of a download's files fetched here so far, partly fetched ones too; None when none is being fetched."""
+        if not (files := self.copying.get(hash)):
+            return None
+        size = lambda p: p.stat().st_size if p.exists() else 0
+        return sum(min(total, size(path) or size(path.with_name(path.name + ".part"))) for path, total in files) / (sum(t for _, t in files) or 1)
+
     def fetch(self, db, row, torrent) -> bool:
         """Fetches the chosen files. Files already there at full size are kept; others are fetched again. True once
         all are there."""
@@ -273,6 +281,7 @@ class Downloads:
         if not any(f["name"].rsplit(".", 1)[-1].lower() in (*AUDIO, *ARCHIVES) for f, _ in todo):
             self.fail(db, row, "no audio files in the torrent")
             return False
+        self.copying[row["hash"]] = [(path, f["size"]) for f, path in todo]
         todo = [(f, path) for f, path in todo if not (path.exists() and path.stat().st_size == f["size"])]
         with ThreadPoolExecutor(PARALLEL) as pool:
             errors = [e for e in pool.map(lambda job: self.fetch_file(torrent["id"], *job), todo) if e]
