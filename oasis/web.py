@@ -202,16 +202,16 @@ def routes(api) -> list[Route]:
     def account(db, request, user, form):
         q = request.query_params
         youtube = (f'<p class="ok">Linked as <b>{escape(user["ytm_name"] or "")}</b>. Your mixes show up as playlists and your plays '
-                   f'go to its history.</p><form method="post" action="/account/youtube/unlink"><button>Unlink</button></form>'
+                   f'go to its history.</p><form method="post" action="/account/youtube/unlink"{confirm("Unlink YouTube Music?")}><button>Unlink</button></form>'
                    if user["ytm_auth"] else YOUTUBE_STEPS)
         if not api.ytm:
             youtube = '<p class="muted">YouTube Music is off on this server (<code>[ytmusic] enabled</code>).</p>'
         lastfm = ((LASTFM_APP_STEPS if user["admin"] else '<p class="muted">An admin needs to connect oasis to Last.fm first.</p>')
                   if not (api.config.lastfm_key and api.config.lastfm_secret) else
                   f'<p class="ok">Linked as <b>{escape(user["lastfm_name"] or "")}</b>.</p><form method="post" '
-                  f'action="/account/lastfm/unlink"><button>Unlink</button></form>' if user["lastfm_session"] else
+                  f'action="/account/lastfm/unlink"{confirm("Unlink Last.fm?")}><button>Unlink</button></form>' if user["lastfm_session"] else
                   '<p><a href="/account/lastfm"><button type="button">Sign in with Last.fm</button></a></p>')
-        listenbrainz = (f'<p class="ok">Linked.</p><form method="post" action="/account/listenbrainz"><input type="hidden" name="token">'
+        listenbrainz = (f'<p class="ok">Linked.</p><form method="post" action="/account/listenbrainz"{confirm("Unlink ListenBrainz?")}><input type="hidden" name="token">'
                         f'<button>Unlink</button></form>' if user["listenbrainz_token"] else
                         '<form method="post" action="/account/listenbrainz"><label>User token from '
                         '<a href="https://listenbrainz.org/settings/" target="_blank">listenbrainz.org/settings</a>'
@@ -226,7 +226,7 @@ def routes(api) -> list[Route]:
                 f'<section><h2>ListenBrainz</h2>{listenbrainz}</section>'
                 f'<section><h2>Password</h2>' + (
                     '<p class="muted">Set in oasis.toml.</p>' if user["name"] in api.config.users else
-                    '<form method="post" action="/account/password"><label>New password<input type="password" name="password">'
+                    f'<form method="post" action="/account/password"{confirm("Change your password? Apps signed in with the old one stop working until you update them.")}><label>New password<input type="password" name="password">'
                     '</label><button>Change</button></form>') + '</section>')
         return page("Dashboard", body, q.get("message", ""), q.get("error", ""))
 
@@ -350,7 +350,7 @@ def routes(api) -> list[Route]:
             f'<td class="muted">{"YouTube Music " if r["ytm_auth"] else ""}{"Last.fm " if r["lastfm_session"] else ""}'
             f'{"ListenBrainz" if r["listenbrainz_token"] else ""}</td><td>' + (
                 '<span class="muted">from oasis.toml</span>' if r["name"] in api.config.users else
-                f'<form class="inline" method="post" action="/admin/users/{quote(r["name"])}/delete"><button>Delete</button></form>') +
+                f'<form class="inline" method="post" action="/admin/users/{quote(r["name"])}/delete"{confirm(f"Delete the user {r['name']}?")}><button>Delete</button></form>') +
             '</td></tr>' for r in db.execute("select * from user order by name"))
         body = (f'<p><a href="/">Back to the dashboard</a></p><section><h2>Users</h2><table>{rows}</table></section>'
                 '<section><h2>New user</h2><form method="post" action="/admin/users"><label>User<input type="text" name="name">'
@@ -388,7 +388,8 @@ def routes(api) -> list[Route]:
 
     def want_button(kind: str, mbid: str, on: bool, here: str) -> str:
         label = {("album", True): "Want", ("album", False): "Unwant", ("artist", True): "Follow", ("artist", False): "Unfollow"}[kind, on]
-        return (f'<form class="inline" method="post" action="/music/want"><input type="hidden" name="kind" value="{kind}">'
+        ask = "" if on else confirm(f"{label}? Its search stops; files already here stay.")
+        return (f'<form class="inline" method="post" action="/music/want"{ask}><input type="hidden" name="kind" value="{kind}">'
                 f'<input type="hidden" name="mbid" value="{escape(mbid)}"><input type="hidden" name="on" value="{"1" if on else ""}">'
                 f'<input type="hidden" name="next" value="{escape(here)}"><button>{label}</button></form>')
 
@@ -528,7 +529,7 @@ def routes(api) -> list[Route]:
                 f'{" · " + escape(r["secondary_types"]) if r["secondary_types"] else ""}</td>'
                 f'<td class="num">{escape((r["first_date"] or "")[:4])}</td>'
                 f'<td>{"★ starred" if r["reason"] == "starred" else "followed"}</td><td>{note}</td>'
-                f'<td class="actions">{action(r["rg"], "block", "Try another") if key == "downloading" else action(r["rg"], "search", "Search now")}'
+                f'<td class="actions">{action(r["rg"], "block", "Try another", f"Drop this download of {r['artist']} – {r['title']} and try another release?") if key == "downloading" else action(r["rg"], "search", "Search now")}'
                 f'{action(r["rg"], "give-up", "Give up", f"Give up on {r['artist']} – {r['title']}?")}</td></tr>' for r, note in items)
             opened = " open" if key in ("attention", "downloading", "next") or len(items) <= 30 else ""
             body += (f'<details class="group"{opened}><summary>{title} <span class="pill">{len(items)}</span></summary>'
