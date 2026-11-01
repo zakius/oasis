@@ -36,7 +36,12 @@ section { background: #fff; border-radius: 12px; padding: 1rem 1.25rem; margin: 
 input, textarea, button { font: inherit; } textarea { width: 100%; min-height: 6rem; box-sizing: border-box; }
 input[type=text], input[type=password] { width: 100%; box-sizing: border-box; margin: .2rem 0 .6rem; padding: .4rem; }
 button { padding: .4rem 1rem; border-radius: 8px; border: 1px solid #888; cursor: pointer; }
-.ok { color: #1a7f37; } .error { color: #c62828; } .muted { opacity: .7; font-size: .9rem; }
+.ok { color: #1a7f37; }
+.toast { position: fixed; z-index: 9; left: 50%; bottom: 1.25rem; transform: translateX(-50%); width: max-content; max-width: calc(100% - 2rem);
+         margin: 0; padding: .6rem 1rem; border-radius: 10px; background: #1a7f37; color: #fff; box-shadow: 0 4px 16px #0005; cursor: pointer;
+         animation: fade 1s 6s forwards; } .toast.bad { background: #c62828; animation: none; }
+@keyframes fade { to { opacity: 0; visibility: hidden; } }
+tr:target td { background: #2f6fd022 !important; } tr[id] { scroll-margin-top: 30vh; } .error { color: #c62828; } .muted { opacity: .7; font-size: .9rem; }
 ol { padding-left: 1.2rem; } form.inline { display: inline; } td { padding: .2rem .6rem .2rem 0; vertical-align: top; }
 li { margin: .25rem 0; } form.inline button { padding: .1rem .6rem; font-size: .85rem; }
 body.wide { max-width: 72rem; } a { color: #2f6fd0; } @media (prefers-color-scheme: dark) { a { color: #7fb0ff; } }
@@ -114,6 +119,11 @@ def size(n) -> str:
     return f"{(n or 0) / 1e9:.1f} GB" if (n or 0) >= 1e9 else f"{(n or 0) / 1e6:.0f} MB"
 
 
+def until(ts: float | None) -> str:
+    minutes = int(((ts or 0) - time.time()) // 60)
+    return "soon" if minutes < 2 else f"in {minutes} min" if minutes < 120 else f"in {minutes // 60} h" if minutes < 2880 else f"in {minutes // 1440} days"
+
+
 def ago(ts: float) -> str:
     minutes = int((time.time() - ts) // 60)
     return f"{minutes} min ago" if minutes < 120 else f"{minutes // 60} h ago"
@@ -124,16 +134,17 @@ async def read_form(request: Request) -> dict:
 
 
 def page(title: str, body: str, message: str = "", error: str = "", wide: bool = False) -> HTMLResponse:
-    notice = f'<p class="ok">{escape(message)}</p>' if message else ""
-    notice += f'<p class="error">{escape(error)}</p>' if error else ""
+    notice = f'<p class="toast" onclick="this.remove()">{escape(message)}</p>' if message else ""
+    notice += f'<p class="toast bad" onclick="this.remove()">{escape(error)}</p>' if error else ""
     return HTMLResponse(f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
                         f'<title>{escape(title)} · oasis</title><style>{STYLE}</style></head><body{' class="wide"' if wide else ""}><h1>{escape(title)}</h1>'
                         f'{notice}{body}</body></html>')
 
 
-def back(path: str, message: str = "", error: str = "") -> RedirectResponse:
+def back(path: str, message: str = "", error: str = "", anchor: str = "") -> RedirectResponse:
+    """anchor: the element to scroll back to, so a phone stays where the button was."""
     query = f"message={quote(message)}" if message else f"error={quote(error)}" if error else ""
-    return RedirectResponse(path + ("&" if "?" in path else "?") + query if query else path, status_code=303)
+    return RedirectResponse((path + ("&" if "?" in path else "?") + query if query else path) + (f"#{anchor}" if anchor else ""), status_code=303)
 
 
 def details(*parts) -> str:
@@ -477,10 +488,10 @@ def routes(api) -> list[Route]:
                                        else f'<span class="pill busy">{STATES.get(d["state"], d["state"])}</span>')
             if r["state"] == "downloading":
                 return "downloading", '<span class="pill busy">downloading</span>'
-            if (r["error"] or "").startswith(("download failed", "search failed")):
-                return "attention", f'<span class="error">{escape(r["error"])}</span>'
             if r["rg"] in acq.soon:
                 return "next", '<span class="pill">in a minute or two</span>'
+            if (r["error"] or "").startswith(("download failed", "search failed")):
+                return "attention", f'<span class="error">{escape(r["error"])}</span> <span class="muted">· tries again {until(r["next_search"])}</span>'
             return ("notfound", f'searched {ago(r["searched"])}') if r["searched"] else ("waiting", "")
 
         def action(rg: str, name: str, label: str, ask: str = "") -> str:
@@ -513,7 +524,7 @@ def routes(api) -> list[Route]:
                 + f'</select><input type="text" name="q" value="{escape(text)}" placeholder="Title or artist"><button>Filter</button>'
                 + (' <a href="/music/wanted">Clear</a>' if here != "/music/wanted" else "") + '</form>'
                 + '<p class="muted">Giving up stops the search; files already here stay, and wanting it again brings it back.</p>')
-        titles = [("attention", "Needs a look"), ("downloading", "Downloading"), ("next", "Searched next"),
+        titles = [("attention", "Failed, trying again"), ("downloading", "Downloading"), ("next", "Searched next"),
                   ("notfound", "Not found yet"), ("waiting", "Waiting for a first search")]
         for key, title in titles:
             items = groups.get(key, [])
@@ -524,7 +535,7 @@ def routes(api) -> list[Route]:
                     f'value="{",".join(r["rg"] for r, _ in items)}"><input type="hidden" name="next" value="{escape(here)}">'
                     f'<button>Give up on {"all " + str(len(items)) if len(items) > 1 else "it"}…</button></form>')
             table = "".join(
-                f'<tr><td class="lead"><a href="/music/artist/{escape(r["artist_mbid"])}">{escape(r["artist"] or "")}</a> – '
+                f'<tr id="rg-{escape(r["rg"])}"><td class="lead"><a href="/music/artist/{escape(r["artist_mbid"])}">{escape(r["artist"] or "")}</a> – '
                 f'{escape(r["title"])}</td><td>{escape(r["primary_type"] or "")}'
                 f'{" · " + escape(r["secondary_types"]) if r["secondary_types"] else ""}</td>'
                 f'<td class="num">{escape((r["first_date"] or "")[:4])}</td>'
@@ -770,7 +781,7 @@ def routes(api) -> list[Route]:
             api.library.soon.add(rg)
             api.library.wake.set()
             return back(here, message=f"{name} is searched next, in a minute or two." if action == "search" else
-                        f"Blocked that release of {name}; the next search picks another.")
+                        f"Blocked that release of {name}; the next search picks another.", anchor=f"rg-{rg}")
         give_up(db, user, rg)
         return back(here, message=f"Gave up on {name}. Files already here stay.")
 

@@ -401,7 +401,7 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     api.library.downloads.active.add(BOOTLEG)
     sync(client)
     page = client.get("/music/wanted").text
-    assert page.index("Needs a look") < page.index("Lemon") < page.index("Downloading") < page.index("BOOTLEG") \
+    assert page.index("Failed, trying again") < page.index("Lemon") < page.index("Downloading") < page.index("BOOTLEG") \
         < page.index("Not found yet") < page.index("STRAY SHEEP")  # what needs a look first
     assert "42%" in page and "download failed: dead torrent" in page and "searched 0 min ago" in page
     filtered = client.get("/music/wanted", params={"type": "Single", "q": "stray"}).text
