@@ -91,7 +91,8 @@ def read(path: Path, root: Path, covers: dict[Path, str | None]) -> dict | None:
 
 
 def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
-    known = {r["ref"]: r["mtime"] for r in db.execute("select ref, mtime from track where source = 'local'")}
+    # A file keeps the id it was first scanned with when relocate.py renames it: stars, plays and playlists hang on it.
+    known = {r["ref"]: r for r in db.execute("select ref, id, mtime from track where source = 'local'")}
     seen, covers, changed = set(), {}, 0
     for root in roots:
         for directory, folders, files in os.walk(root):
@@ -101,7 +102,7 @@ def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
                 if path.suffix.lower().lstrip(".") not in CONTENT_TYPES:
                     continue
                 seen.add(str(path))
-                if known.get(str(path)) == path.stat().st_mtime:
+                if (had := known.get(str(path))) and had["mtime"] == path.stat().st_mtime:
                     continue
                 try:
                     row = read(path, root, covers)
@@ -109,6 +110,7 @@ def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
                     log.warning("skipping %s: %s", path, e)
                     continue
                 if row:
+                    row["id"] = had["id"] if had else row["id"]
                     credits, mbids = row.pop("_credits"), row.pop("_albumartist_mbids") or []
                     row["artist_id"] = artist_id(db, row["album_artist"], mbids[0] if len(mbids) == 1 else None)
                     columns = ", ".join(row)

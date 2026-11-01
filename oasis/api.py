@@ -379,10 +379,11 @@ class Api:
         replaced = dedupe.run(db)
         if not replaced:
             return
+        ids = dict(db.execute("select ref, id from track where source = 'local'").fetchall())  # the scan drops the old paths' rows
         scan.scan(db, self.config.library)
         renamed = [(old, new) for old, new in replaced if old != new]  # took the kept copy's format, so a new path and id
         for old, new in renamed:
-            move_track(db, make_id("tr-", old), make_id("tr-", new))
+            move_track(db, ids.get(old, make_id("tr-", old)), make_id("tr-", new))
         db.commit()
 
     def _authenticate(self, db, p: Params) -> str:
