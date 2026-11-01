@@ -289,6 +289,23 @@ def test_an_album_packed_in_a_zip_is_unpacked_and_imported(make, tmp_path, root)
     assert importer.LATER_PART.search("a.part2.rar") and not importer.LATER_PART.search("a.part01.rar")
 
 
+def test_an_archive_is_unpacked_only_with_twice_its_size_free(tmp_path, monkeypatch):
+    import shutil
+    import zipfile
+    from types import SimpleNamespace
+    with zipfile.ZipFile(tmp_path / "Discography.zip", "w") as z:
+        z.writestr("First/01 One.flac", "x" * 100)
+    size, free = (tmp_path / "Discography.zip").stat().st_size, []
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=free[-1]))
+    free.append(importer.UNPACK_ROOM * size - 1)
+    with pytest.raises(importer.NoSpace, match="too little disk space to unpack Discography.zip"):
+        importer.unpack(tmp_path)
+    assert not (tmp_path / importer.UNPACKED).exists()
+    free.append(importer.UNPACK_ROOM * size)
+    importer.unpack(tmp_path)
+    assert (tmp_path / importer.UNPACKED / "Discography/First/01 One.flac").read_text() == "x" * 100
+
+
 def test_a_flac_made_from_a_lossy_file_fails_the_import_before_anything_is_placed(make, tmp_path, root):
     audio(tmp_path / "dl/01 One.flac", 10, title="One")
     lossy(tmp_path / "dl/02 Two.flac", tmp_path / "work")

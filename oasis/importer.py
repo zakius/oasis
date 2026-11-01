@@ -37,6 +37,7 @@ NAMED_SLACK = 5, 0.1       # and by 10 % when the file has the track's title and
 SPLIT = ".oasis-split"     # a download's disc images, split, in <download>/.oasis-split/<image>/
 ARCHIVES = ("zip", "rar", "7z")
 UNPACKED = ".oasis-unpacked"  # a download's archives, unpacked, in <download>/.oasis-unpacked/<archive>/
+UNPACK_ROOM = 2            # free space an archive needs to unpack, in times its size: its music, then the library's copy
 LATER_PART = re.compile(r"\.part0*([2-9]|[1-9]\d+)\.rar$", re.I)  # a multi-volume RAR unpacks from its first part
 SIDE = re.compile(r"([A-H])(\d{0,2})[\s._-]+")  # a vinyl side's position opening a file's name: 'A Amerika', 'B2. Title'
 CUE_LINE = re.compile(r'\s*(FILE|TRACK|TITLE|INDEX)\s+(?:"(.*)"|(\S+))(?:\s+(\S+))?', re.I)
@@ -193,12 +194,20 @@ def image_of(sheet: Path, name: str) -> Path | None:
     return next((p for p in audio if p.stem.casefold() in stems), None) or (audio[0] if len(audio) == 1 else None)
 
 
+class NoSpace(OSError):
+    """Too little disk space: the download waits for more, and its release isn't at fault."""
+
+
 def unpack(folder: Path):
-    """Unpacks the archives below folder (an album uploaded as one .zip or .rar): ZIP itself, the rest with unar."""
+    """Unpacks the archives below folder (an album uploaded as one .zip or .rar, a discography as one .zip): ZIP itself,
+    the rest with unar. NoSpace when the disk hasn't UNPACK_ROOM for one."""
     for archive in sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower().lstrip(".") in ARCHIVES
                           and UNPACKED not in p.parts and not LATER_PART.search(p.name)):
         if (target := folder / UNPACKED / archive.stem).exists():
             continue
+        size = sum(p.stat().st_size for p in archive.parent.iterdir() if p == archive or LATER_PART.search(p.name) and p.name.startswith(archive.name.split(".part")[0]))
+        if (free := shutil.disk_usage(folder).free) < UNPACK_ROOM * size:
+            raise NoSpace(f"too little disk space to unpack {archive.name}: {UNPACK_ROOM * size / 1e9:.1f} GB needed, {free / 1e9:.1f} GB free")
         part = target.with_name(f"{target.name}.oasis-part")
         shutil.rmtree(part, ignore_errors=True)
         try:
