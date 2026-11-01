@@ -219,13 +219,16 @@ def ago(ts: float) -> str:
 def to_find(db) -> tuple[list[tuple[int, str]], str]:
     """The albums still to find, albums and EPs apart from singles: tiles of how many, and when their next searches are,
     so a long wait between searches doesn't look stuck."""
-    now, tiles, lines = time.time(), [], []
+    now, tiles, lines, due = time.time(), [], [], 0
     for label, kind, single in (("albums & EPs to find", "Albums and EPs", 0), ("singles to find", "Singles", 1)):
         n, waiting, first = db.execute("select count(*), coalesce(sum(next_search > ?), 0), min(case when next_search > ? then next_search end) "
                                        "from want_album where state = 'missing' and (primary_type is 'Single') = ?", (now, now, single)).fetchone()
         tiles.append((n, label))
         parts = [f"{waiting} searched, nothing found; next try {until(first)}." if waiting else "", f"{n - waiting} due for a search." if n > waiting else ""]
         lines += [f"{kind}: " + " ".join(filter(None, parts))] if n else []
+        due += n - waiting
+    if tiles[0][0] + tiles[1][0] and not due:
+        lines.append("Nothing is due, so oasis searches ahead of schedule every 5 min while TorBox has room.")
     return tiles, " ".join(lines)
 
 

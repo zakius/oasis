@@ -467,8 +467,9 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     assert "searched 0 min ago · next try in 59 min" in page and waits in page and "<b>1</b><span>albums & EPs to find" in page
     dashboard = client.get("/").text
     assert waits in dashboard and "<b>1</b><span>albums & EPs to find" in dashboard and "<b>1</b><span>singles to find" in dashboard
+    assert "searches ahead of schedule every 5 min" in dashboard
     db.execute("update want_album set next_search = null where rg = ?", (LEMON,))
-    assert "Singles: 1 due for a search." in client.get("/").text
+    assert "Singles: 1 due for a search." in (dashboard := client.get("/").text) and "ahead of schedule" not in dashboard
     filtered = client.get("/music/wanted", params={"type": "Single", "q": "stray"}).text
     assert "STRAY SHEEP" not in filtered or "Lemon" not in filtered
     library = client.get("/music/library").text
@@ -582,3 +583,34 @@ def test_an_album_searched_before_waits_behind_every_album_not_tried_yet(client,
     now[0] += acquire.SEARCH_GAP
     sync(client)
     assert acq.downloads.found[-1] == "g-second"
+
+
+def test_with_nothing_due_and_room_it_searches_early_without_touching_backoff(client, mb, monkeypatch, caplog):
+    follow_beta(client, mb)
+    acq, now = client.app.state.api.library, [time.time() + 3600]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    db = client.app.state.api._db()
+    h = 3600
+    for rg, searched, due, tries in (("g-ost", 7 * h, 2 * 86400, 3), ("g-second", h, 3 * 86400, 2), ("g-new", 2 * h, 30 * h, 1)):
+        db.execute("update want_album set searched = ?, next_search = ?, tries = ? where rg = ?", (now[0] - searched, now[0] + due, tries, rg))
+    db.commit()
+    backoff = db.execute("select rg, next_search, tries from want_album order by rg").fetchall()
+    assert db.execute("select primary_type from want_album where rg = 'g-new'").fetchone()[0] == "Single"
+
+    def step(seconds):
+        now[0] += seconds
+        sync(client)
+        return acq.downloads.found[-1] if acq.downloads.found[n:] else None
+    n = len(acq.downloads.found)
+    with caplog.at_level("INFO"):
+        assert step(acquire.EARLY_GAP) == "g-ost"  # searched 7 h ago: early, though its next try is in 2 days
+    assert "nothing due; next search at" in caplog.text
+    assert db.execute("select rg, next_search, tries from want_album order by rg").fetchall() == backoff  # backoff untouched
+    assert step(acquire.EARLY_GAP) == "g-ost" and len(acq.downloads.found) == n + 1  # the others were searched too lately
+    # An album 6 h after its last search; the single, though its next try is soonest, waits a day.
+    assert step(5 * h) == "g-second" and len(acq.downloads.found) == n + 2
+    acq.downloads.free = False
+    step(22 * h)
+    assert len(acq.downloads.found) == n + 2  # TorBox full: no early search
+    acq.downloads.free = True
+    assert step(acquire.EARLY_GAP) == "g-new"  # the single: a day since its last search

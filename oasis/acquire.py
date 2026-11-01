@@ -41,6 +41,9 @@ KEEP_GROUP = 30 * 86400
 RESEARCH, RESEARCH_MOST = 6 * 3600, 7 * 86400       # a missing album is searched again after 6 h, then twice as long each time
 SINGLE_RESEARCH, SINGLE_MOST = 7 * 86400, 28 * 86400
 BUNDLE_AGAIN = 7 * 86400             # seconds between an artist's bundle searches
+# Nothing due and TorBox has room: a search ahead of schedule every EARLY_GAP, leaving backoffs as they are. An artist's
+# bundles at most daily, an album (or a lossless copy) every RESEARCH, a single daily.
+EARLY_GAP, BUNDLE_EARLY, SINGLE_EARLY = 5 * 60, 86400, 86400
 MAP_RELEASES = 20                    # files tagged with a release but no release group, looked up per pass
 CLIENT_STATES = {"missing": "wanted", "downloading": "downloading", "have": "have"}  # want_item's, which clients see
 RETRY_NO_MATCH = 1800     # seconds before looking an unmatched name up again
@@ -136,6 +139,7 @@ class Acquire:
         self.wake = threading.Event()
         self.last_search, self.gap = 0.0, SEARCH_GAP
         self.soon: set[str] = set()  # release groups to search before any other (the dashboard's "search now")
+        self.idle = False  # nothing was due at the last pass: searching early
 
     def start(self):
         threading.Thread(target=self.run, daemon=True).start()
@@ -388,15 +392,38 @@ class Acquire:
                           f"and t.suffix in ({lossless}))) order by state = 'have', searched is not null, reason != 'starred', primary_type = 'Single', "
                           "first_date desc limit 50", (now, now - UPGRADE_AGAIN)).fetchall()
         if row := next((r for r in rows if r["rg"] not in queued), None):
-            self.search(db, row)
+            if self.idle:
+                log.info("searches due again")
+            self.idle = False
+            return self.search(db, row)
+        self.early(db, queued)
 
-    def bundle_next(self, db) -> bool:
+    def early(self, db, queued):
+        """Nothing due while TorBox has room: one search ahead of schedule every EARLY_GAP, bundles first, then lossless
+        copies, then the albums whose next try is soonest. Their backoff stays: only searched moves."""
+        now = time.time()
+        if not self.idle:
+            first = db.execute("select min(next_search) from want_album where state = 'missing'").fetchone()[0]
+            log.info("nothing due; next search at %s; searching early every %d min meanwhile",
+                     time.strftime("%H:%M", time.localtime(first)) if first else "none", EARLY_GAP // 60)
+            self.idle = True
+        if now - self.last_search < EARLY_GAP or self.bundles and self.bundle_next(db, BUNDLE_EARLY):
+            return
+        lossless = ", ".join(f"'{s}'" for s in LOSSLESS)
+        rows = db.execute("select * from want_album w where (state = 'have' and coalesce(searched, 0) < ? and not exists (select 1 from track t "
+                          f"where t.mb_release_group = w.rg and t.source = 'local' and t.suffix in ({lossless}))) or (state = 'missing' and "
+                          "coalesce(searched, 0) < case when primary_type = 'Single' then ? else ? end) "
+                          "order by state = 'missing', next_search limit 50", (now - RESEARCH, now - SINGLE_EARLY, now - RESEARCH)).fetchall()
+        if row := next((r for r in rows if r["rg"] not in queued), None):
+            self.search(db, row, early=True)
+
+    def bundle_next(self, db, again: float = BUNDLE_AGAIN) -> bool:
         """A bundle search instead of an album search, for an artist with two albums, EPs or singles missing or one a
         search found nothing for, weekly at most. True when one ran."""
         row = db.execute("select artist_mbid, artist from want_album where state = 'missing' and artist is not null "
                          "and artist_mbid not in (select artist_mbid from bundle_search where searched > ?) group by artist_mbid "
                          "having count(*) >= 2 or max(searched) is not null order by min(reason != 'starred') limit 1",
-                         (time.time() - BUNDLE_AGAIN,)).fetchone()
+                         (time.time() - again,)).fetchone()
         if row is None:
             return False
         mbid, sent, failed, started = row["artist_mbid"], None, False, time.time()
@@ -416,8 +443,9 @@ class Acquire:
         db.execute("insert or replace into bundle_search values (?, ?)", (mbid, now - BUNDLE_AGAIN + RETRY_FULL if sent is False else now))
         return True
 
-    def search(self, db, row):
-        """Never raises: a search that fails still counts, so the next one moves on to another album."""
+    def search(self, db, row, early=False):
+        """Never raises: a search that fails still counts, so the next one moves on to another album. An early one
+        leaves the album's backoff (tries, next_search) as it was."""
         error, failed, started = "searched, no release found yet", False, time.time()
         try:
             sent = self.downloads.find(db, self.target(db, row), row["rg"])
@@ -425,6 +453,9 @@ class Acquire:
             log.warning("search for %s - %s failed: %s", row["artist"], row["title"], e)
             sent, error, failed = None, f"search failed: {e}"[:300], True
         now = self.searched(started, sent, failed)
+        if early:
+            db.execute("update want_album set searched = ?, error = ? where rg = ?", (now, None if sent else error, row["rg"]))
+            return
         if sent is False:  # TorBox had no free slot
             db.execute("update want_album set next_search = ? where rg = ?", (now + RETRY_FULL, row["rg"]))
             return
