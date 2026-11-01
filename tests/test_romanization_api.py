@@ -97,6 +97,7 @@ def test_search_finds_romaji(client):
     assert titles("yoru kakeru") == ["夜に駆ける"]
     assert titles("qing tian") == titles("Qíng") == ["晴天"]
     assert titles("夜に") == ["夜に駆ける"] and titles("beta") == ["One"]
+    assert titles("runika") == []  # no match across words (yo|ru ni ka|keru)
     assert titles("yoru", romanization="latin") == ["Yoru ni Kakeru"]
     result = call(client, "search3", query="zhou")["searchResult3"]
     assert [a["name"] for a in result["artist"]] == ["周杰倫"] and [a["name"] for a in result["album"]] == ["葉惠美"]

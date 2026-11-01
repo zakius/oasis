@@ -354,7 +354,7 @@ def latin_index(db):
                       f"where t.library = 1 and l.source is not {LATIN_SOURCE}").fetchall()
 
     def folded(s, *siblings, title_of=False):
-        return ytm.fold(latin_of(s, siblings, title_of) or "")
+        return " ".join(filter(None, map(ytm.fold, (latin_of(s, siblings, title_of) or "").split())))  # words kept apart
     db.executemany("insert or replace into track_latin values (?, ?, ?, ?, ?, ?)", [(
         r["id"], r["source"], folded(r["title"], r["artist"], r["album"], title_of=True), folded(r["artist"], r["title"], r["album"]),
         folded(r["album"], r["title"], r["artist"], title_of=True), folded(r["album_artist"], r["title"], r["album"])) for r in rows])
@@ -800,10 +800,10 @@ class Api:
         cond, args = match("t.album_artist", "l.album_artist")
         artists = [artist(r) for r in db.execute(ARTISTS + latin + f" where {cond} group by t.artist_id order by t.album_artist collate nocase "
                                                  "limit ? offset ?", (*args, p.int("artistCount", 20), p.int("artistOffset", 0)))]
-        cond, args = match("t.album || ' ' || t.album_artist", "l.album || l.album_artist")
+        cond, args = match("t.album || ' ' || t.album_artist", "l.album || ' ' || l.album_artist")
         albums = [album(r) for r in db.execute(ALBUMS + latin + f" where {cond} group by t.album_id order by name collate nocase limit ? offset ?",
                                                (*args, p.int("albumCount", 20), p.int("albumOffset", 0)))]
-        cond, args = match("t.title || ' ' || t.artist || ' ' || t.album", "l.title || l.artist || l.album")
+        cond, args = match("t.title || ' ' || t.artist || ' ' || t.album", "l.title || ' ' || l.artist || ' ' || l.album")
         songs = [song(r) for r in db.execute(SONGS + latin + f" where {cond} order by t.album_artist, t.album, t.disc_no, t.track_no limit ? offset ?",
                                              (*args, p.int("songCount", 20), p.int("songOffset", 0)))]
         if self.ytm and terms and p.int("songOffset", 0) == 0:
