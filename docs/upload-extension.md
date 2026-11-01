@@ -79,8 +79,8 @@ Param `uploadId`, optional `replace=true`.
 - An album already in the library: refused with code 0 "already in the library", unless the upload is lossless
   and the library copy lossy, or `replace=true`. Already in the library means library tracks of the same album
   (album artist and album name, or MusicBrainz release group) on the uploaded discs, or files of the same names
-  where the upload goes; another disc of an album isn't. The library copy is replaced: its files are deleted once
-  the upload is in.
+  where the upload goes; another disc of an album isn't. The library tracks the upload replaces (same disc and
+  number, or same file name) are deleted once the upload is in; the album's other tracks stay.
 - Response `album`: the new `AlbumID3` (with `song[]`).
 
 ### `cancelUpload`
@@ -116,4 +116,5 @@ Param `uploadId`. Deletes the upload and its files.
 11. `commitUpload` runs downloads' FLAC checks (`quality.py`): a FLAC made from a lossy file is refused, fake hi-res
     and badly compressed FLACs are converted or recompressed.
 12. "Already in the library" is defined: the same album on the uploaded discs, or files of the same names at the
-    target. Another disc of an album already there is accepted. The replaced library files are deleted.
+    target. Another disc of an album already there is accepted. Only the replaced tracks (same disc and number) are
+    deleted; others, such as a deluxe edition's extra tracks, stay.

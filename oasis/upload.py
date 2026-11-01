@@ -262,12 +262,16 @@ class Uploads:
                 write(source, tags)
             targets = {source: album / source.name for source in staged}
             tags = next(iter(staged.values()))
-            old = {Path(r[0]) for r in db.execute(
-                f"select ref from track where source = 'local' and (album_id = ? or mb_release_group = ?) and coalesce(disc_no, 1) in "
-                f"({','.join('?' * len(slots))})", (make_id("al-", tags["albumartist"][0], tags["album"][0]), group, *(s["disc"] for s in slots)))}
+            rows = db.execute(
+                f"select ref, coalesce(disc_no, 1), track_no from track where source = 'local' and (album_id = ? or mb_release_group = ?) and "
+                f"coalesce(disc_no, 1) in ({','.join('?' * len(slots))})", (make_id("al-", tags["albumartist"][0], tags["album"][0]), group, *(s["disc"] for s in slots))).fetchall()
+            # Only the tracks the upload replaces go: a deluxe edition's extra tracks stay.
+            uploaded = {(s["disc"], s["number"]) for s in slots}
+            old = {Path(r[0]) for r in rows if (r[1], r[2]) in uploaded}
             old |= {p for t in targets.values() if t.parent.is_dir() for p in t.parent.iterdir() if p.stem == t.stem and p.suffix.lower().lstrip(".") in AUDIO}
             old = {p for p in old if p.is_file()}
-            if old and not replace and not (all(map(lossless, staged)) and not any(map(lossless, old))):
+            present = old | {p for r in rows if (p := Path(r[0])).is_file()}
+            if present and not replace and not (all(map(lossless, staged)) and not any(map(lossless, present))):
                 raise Refused("already in the library")
             try:
                 self.place(targets, old)

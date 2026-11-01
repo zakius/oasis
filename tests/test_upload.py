@@ -149,6 +149,12 @@ def test_a_lossless_upload_replaces_the_librarys_lossy_copy(client, root, tmp_pa
     assert upload(client, tmp_path, tags("One", "Two"), suffix="mp3")["error"]["message"] == "already in the library"
 
 
+def test_an_upgrade_keeps_the_library_tracks_it_does_not_replace(client, root, tmp_path):
+    upload(client, tmp_path, tags("One", "Two"), suffix="mp3")
+    upload(client, tmp_path, tags("One"))
+    assert sorted(p.name for p in (root / "Beta/2001 - First").iterdir()) == ["01 - One.flac", "02 - Two.mp3"]
+
+
 def test_a_failed_placement_leaves_the_library_as_it_was_and_the_upload_for_a_retry(client, root, tmp_path, monkeypatch):
     upload(client, tmp_path, tags("One", "Two"), suffix="mp3")
     made = call(client, "createUpload", tags=json.dumps(tags("One", "Two")))["upload"]
