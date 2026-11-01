@@ -33,11 +33,12 @@ EDITIONS = "https://musicbrainz.org/ws/2/release?release-group={}&inc=media+reco
 KEEP_EDITIONS = 7 * 86400  # seconds a release group's editions stay cached
 COVER_ART = "https://coverartarchive.org/release/{}/front"
 SLACK = 5, 0.03            # a file's length may differ from the track's by 5 s or 3 %, whichever is more
-NAMED_SLACK = 5, 0.1       # and by 10 % when the file has the track's title and number
+NAMED_SLACK = 5, 0.1       # and by 10 % when the file has the track's title and number, or a neighbour's (a tape's other order)
 SPLIT = ".oasis-split"     # a download's disc images, split, in <download>/.oasis-split/<image>/
 ARCHIVES = ("zip", "rar", "7z")
 UNPACKED = ".oasis-unpacked"  # a download's archives, unpacked, in <download>/.oasis-unpacked/<archive>/
 LATER_PART = re.compile(r"\.part0*([2-9]|[1-9]\d+)\.rar$", re.I)  # a multi-volume RAR unpacks from its first part
+SIDE = re.compile(r"([A-H])(\d{0,2})[\s._-]+")  # a vinyl side's position opening a file's name: 'A Amerika', 'B2. Title'
 CUE_LINE = re.compile(r'\s*(FILE|TRACK|TITLE|INDEX)\s+(?:"(.*)"|(\S+))(?:\s+(\S+))?', re.I)
 
 
@@ -76,6 +77,27 @@ def read(path: Path, artist: str) -> dict:
             "length": getattr(audio.info, "length", 0) if audio is not None else 0}
 
 
+def sides(files: list[dict], artist: str) -> list[dict]:
+    """Files numbered only by a vinyl side's position in their names ('A Amerika.flac', 'B Wilder Wein.flac'), a folder
+    of them all from side A, are numbered in side order, and their titles read without it."""
+    folders = {}
+    for f in files:
+        folders.setdefault(f["path"].parent, []).append(f)
+    for group in folders.values():
+        found = [(m[1], int(m[2] or 0), f, m) for f in group if not f["number"] and (m := SIDE.match(f["path"].name))]
+        if len(found) < max(2, len(group)) or len({s[:2] for s in found}) < len(found) or min(s[0] for s in found) != "A":
+            continue
+        for n, (_, _, f, m) in enumerate(sorted(found, key=lambda s: s[:2]), 1):
+            f["number"] = 1, n
+            if f["key"] == key(title_of(f["path"].name, artist)):  # not a title tag's
+                f["key"] = key(title_of(f["path"].name[m.end():], artist))
+    return files
+
+
+def near(number, place) -> bool:
+    return bool(number) and number[0] == place[0] and abs(number[1] - place[1]) <= 1
+
+
 def close(length: float, ms, slack=SLACK) -> bool:
     return not ms or abs(length - ms / 1000) <= max(slack[0], slack[1] * ms / 1000)
 
@@ -88,9 +110,9 @@ def match(files: list[dict], tracks: list[tuple[dict, dict]]) -> dict | None:
     for medium, track in tracks:
         length = track.get("length") or track["recording"].get("length")
         want, place = key(track["title"]), (medium["position"], track["position"])
-        # A file named and numbered as the track may differ more: another master, a longer fade.
+        # A file named and numbered as the track (or its neighbour) may differ more: another master, a longer fade, a tape.
         fits = [f for f in files if f["path"] not in used and (f["length"] is None or close(f["length"], length)
-                                                                or f["key"] == want and f["number"] == place and close(f["length"], length, NAMED_SLACK))]
+                                                                or f["key"] == want and near(f["number"], place) and close(f["length"], length, NAMED_SLACK))]
         found = [f for f in fits if f["key"] == want] or [f for f in fits if want and f["key"] and (want in f["key"] or f["key"] in want)] or \
                 [f for f in fits if f["number"] == place]
         if not found:
@@ -337,7 +359,7 @@ class Importer:
         try:
             releases = editions(db, group)
             artist = releases[0]["artist-credit"][0]["name"] if releases else ""
-            files = [read(p, artist) for p in sorted(folder.rglob("*")) if p.is_file() and p.suffix.lower().lstrip(".") in AUDIO and p not in images]
+            files = sides([read(p, artist) for p in sorted(folder.rglob("*")) if p.is_file() and p.suffix.lower().lstrip(".") in AUDIO and p not in images], artist)
             release, mapping = pick(releases, files)
         finally:
             db.close()

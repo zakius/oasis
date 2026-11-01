@@ -227,8 +227,49 @@ def test_a_file_named_and_numbered_as_its_track_may_be_longer_off():
     file = lambda n, title, s: {"path": f"{n}.flac", "key": importer.key(title), "number": (1, n), "length": s}
     tracks = [track(1, "Casus Belli", 322_000), track(2, "O Worze", 267_000)]
     assert importer.match([file(1, "Casus Belli", 318), file(2, "O Worze", 249)], tracks)
-    assert importer.match([file(1, "Casus Belli", 318), file(3, "O Worze", 249)], tracks) is None  # numbered otherwise
+    assert importer.match([file(1, "Casus Belli", 318), file(4, "O Worze", 249)], tracks) is None  # numbered otherwise
     assert importer.match([file(1, "Casus Belli", 318), file(2, "O Worze", 230)], tracks) is None  # 14 % off
+
+
+def test_a_tape_in_another_order_matches_by_titles_a_track_apart():
+    """Lou Reed's Rock and Roll Heart on cassette: Rock and Roll Heart moved from 6 to 8, and a tape runs long."""
+    lp = [("I Believe in Love", 167), ("Banging on My Drum", 132), ("Follow the Leader", 133), ("You Wear It So Well", 292),
+          ("Ladies Pay", 263), ("Rock and Roll Heart", 186), ("Chooser and the Chosen One", 167), ("Senselessly Cruel", 128),
+          ("Claim to Fame", 172), ("Vicious Circle", 174), ("A Sheltered Life", 140), ("Temporary Thing", 313)]
+    tape = [*lp[:5], (lp[6][0], 174), (lp[7][0], 136), (lp[5][0], 190), (lp[8][0], 175), (lp[9][0], 180), lp[10], (lp[11][0], 321)]
+    files = lambda tracks: [{"path": f"{n}.flac", "key": importer.key(t), "number": (1, n + 1), "length": s} for n, (t, s) in enumerate(tracks)]
+    assert importer.pick([edition("lp", lp)], files(tape))[0]["id"] == "lp"
+    with pytest.raises(LookupError):  # Chooser, 4 % long, two tracks off
+        importer.pick([edition("lp", lp)], files([*tape[:5], tape[8], tape[6], tape[7], tape[5], *tape[9:]]))
+
+
+def test_vinyl_sides_number_a_folder_of_untagged_files(make, tmp_path, root):
+    """Rammstein's UK 7" singles in one torrent: 'A Amerika', 'B Wilder Wine' (sic) is the Amerika 7"."""
+    audio(tmp_path / "dl/UK 7/Amerika UK 7/A Amerika.flac", 2)
+    audio(tmp_path / "dl/UK 7/Amerika UK 7/B Wilder Wine (Exclusive Track).flac", 4)
+    audio(tmp_path / "dl/UK 7/Keine Lust UK 7/A Keine Lust.flac", 3)
+    audio(tmp_path / "dl/UK 7/Keine Lust UK 7/B Du hast - Live.flac", 9)
+    seven = edition("7in", [("Amerika", 2), ("Wilder Wein", 4)], title="Amerika", fmt='7" Vinyl')
+    cd = edition("cd", [("Amerika", 2), ("Amerika (Digital Hardcore mix)", 6)], title="Amerika")
+    album = make(cd, seven).place(tmp_path / "dl", "rg-1")
+    assert sorted(p.name for p in album.glob("*.flac")) == ["01 - Amerika.flac", "02 - Wilder Wein.flac"]
+
+
+def test_side_letters_need_a_whole_folder_of_them():
+    files = lambda *names: [{"path": importer.Path("dl", n), "key": importer.key(importer.title_of(n, "Linkin Park")), "number": None, "length": 1}
+                            for n in names]
+    assert [f["number"] for f in importer.sides(files("A Place for My Head.flac", "Papercut.flac"), "Linkin Park")] == [None, None]
+    assert [f["key"] for f in importer.sides(files("B Side.flac", "C Side.flac"), "")] == ["bside", "cside"]  # no side A
+    assert [(f["number"], f["key"]) for f in importer.sides(files("B1. Two.flac", "A1 One.flac", "A2 - Three.flac"), "")] == \
+           [((1, 3), "two"), ((1, 1), "one"), ((1, 2), "three")]
+
+
+def test_another_album_of_the_same_titles_still_fails():
+    """Live takes of the album's songs, in its order: none within the album's lengths."""
+    studio = [("Papercut", 185), ("One Step Closer", 156), ("With You", 203)]
+    live = [{"path": f"{n}.flac", "key": importer.key(t), "number": (1, n + 1), "length": s * 1.15} for n, (t, s) in enumerate(studio)]
+    with pytest.raises(LookupError):
+        importer.pick([edition("studio", studio)], live)
 
 
 def test_a_polish_cue_sheet_reads_as_polish():
