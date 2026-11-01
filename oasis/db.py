@@ -100,7 +100,7 @@ create table if not exists download_target(  -- a bundle's albums, fetched and i
 );
 create table if not exists bundle_search(artist_mbid text primary key, searched real not null);  -- see acquire.py
 create table if not exists mb_cache(url text primary key, body text not null, fetched real not null);  -- see musicbrainz.py
-create table if not exists release_block(  -- releases that failed: never picked again. hash: info hash, or guid for those listed without one
+create table if not exists release_block(  -- releases that failed: never picked again, but slow ones last. hash: info hash, or guid for those listed without one
     hash text primary key, reason text, at real not null
 );
 create table if not exists audio_pair(  -- dedupe verdicts, valid while both files are unchanged

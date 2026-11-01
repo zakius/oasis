@@ -111,6 +111,7 @@ class Downloads:
         self.seen = {}       # hash -> (progress, since when)
         self.failures = {}   # hash -> polls in a row its files failed to download
         self.copying = {}    # hash -> [(path, size)]: the files being fetched here, for copied()
+        self.crowded = False  # TorBox's slots are all taken and albums wait: see step
         self.pace, self.last_request, self.paused_until = threading.Lock(), 0.0, 0.0
 
     def torbox(self):
@@ -140,7 +141,7 @@ class Downloads:
     def find(self, db, want: dict, group: str) -> bool | None:
         """Searches Prowlarr for an album of oasis's own catalogue (acquire.py); see send."""
         blocked = self.blocked(db)
-        return self.send(db, releases.find(self.prowlarr, want, blocked, self.torbox().cached, self.unreliable(db)), blocked, group,
+        return self.send(db, releases.find(self.prowlarr, want, blocked, self.torbox().cached, self.unreliable(db), self.slow(db)), blocked, group,
                          f"{want['artist']} - {want['title']}")
 
     def bundle(self, db, want: dict, groups: list[dict], wanted: set[str]) -> bool | None:
@@ -162,7 +163,11 @@ class Downloads:
         return frozenset(s for s, deaths in tally.items() if len(deaths) >= UNRELIABLE[0] and sum(deaths) >= UNRELIABLE[1] * len(deaths))
 
     def blocked(self, db) -> set[str]:
-        return {r[0] for r in db.execute("select hash from release_block")}
+        return {r[0] for r in db.execute("select hash from release_block where reason not like 'too slow%'")}
+
+    def slow(self, db) -> frozenset:
+        """Releases that made way for others while slow: tried last, not never."""
+        return frozenset(r[0] for r in db.execute("select hash from release_block where reason like 'too slow%'"))
 
     def send(self, db, picks: list[dict], blocked: set, group: str | None, label: str, targets: dict | None = None) -> bool | None:
         """Sends the first pick TorBox takes. True when one went, None when none would, False when TorBox had no free
@@ -210,7 +215,11 @@ class Downloads:
             rows = db.execute("select * from download where state not in ('done', 'failed') order by created").fetchall()
             if not rows:
                 return
-            torrents = {t["id"]: t for t in self.torbox().torrents()}
+            listed = self.torbox().torrents()
+            torrents = {t["id"]: t for t in listed}
+            # Slots all taken while albums wait for a search: slow downloads make way.
+            self.crowded = sum(bool(t["active"]) for t in listed) >= self.max_active and bool(db.execute(
+                "select 1 from want_album where state = 'missing' and coalesce(next_search, 0) <= ? limit 1", (time.time(),)).fetchone())
             for row in rows:
                 try:
                     self.step(db, row, torrents.get(row["torbox_id"]))
@@ -236,8 +245,9 @@ class Downloads:
                 # Not a byte from no seeder: dead soon. Stalled part way: the usual wait, as seeders come and go.
                 if not torrent["seeds"] and time.time() - since > (DEAD_AFTER if not torrent["progress"] else self.stall):
                     return self.fail(db, row, "dead torrent: no seeds, no progress")
-                # A trickle from one seeder: past the usual wait, a torrent on course to take longer than SLOWEST goes.
-                if (took := time.time() - row["created"]) > self.stall and torrent["progress"] < took / SLOWEST:
+                # A trickle from one seeder: past the usual wait, a torrent on course to take longer than SLOWEST makes
+                # way when others wait for its slot. It is tried again last (slow), when nothing better turns up.
+                if self.crowded and (took := time.time() - row["created"]) > self.stall and torrent["progress"] < took / SLOWEST:
                     return self.fail(db, row, f"too slow: {torrent['progress']:.0%} in {took / 3600:.0f} h")
                 return self.set(db, row, "downloading")
             state = self.set(db, row, "fetching")

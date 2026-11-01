@@ -223,13 +223,15 @@ def test_how_much_of_a_download_is_copied_here_counts_partly_fetched_files(downl
     assert downloads.copied("h") == 0.375 and downloads.copied("other") is None
 
 
-def test_a_trickling_torrent_goes_once_it_is_on_course_to_take_more_than_12_hours(downloads, torbox, db, monkeypatch):
+def test_a_trickling_torrent_makes_way_when_slots_are_full_and_albums_wait_and_is_tried_last_again(downloads, torbox, db, monkeypatch):
     now = [time.time()]
     monkeypatch.setattr(time, "time", lambda: now[0])
     downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
     downloads.find(db, WANT, "mb-album")
     torbox.list = [tb(71, "abcd", progress=0.01, seeds=1)]
     downloads.cycle()
+    downloads.max_active = 1
+    db.execute("insert into want_album(rg, artist_mbid, title, reason, state) values ('waiting', 'a', 'Next', 'followed', 'missing')")
     now[0] += 1800
     downloads.cycle()
     assert db.execute("select state from download").fetchone()[0] == "downloading"  # within the usual wait
@@ -237,6 +239,12 @@ def test_a_trickling_torrent_goes_once_it_is_on_course_to_take_more_than_12_hour
     torbox.list = [tb(71, "abcd", progress=0.2, seeds=1)]  # 20 % in 1.5 h: done in 7.5 h
     downloads.cycle()
     assert db.execute("select state from download").fetchone()[0] == "downloading"
-    torbox.list = [tb(71, "abcd", progress=0.1, seeds=1)]
+    torbox.list = [tb(71, "abcd", progress=0.1, seeds=1, active=False)]  # a slot free: slow is fine
+    downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "downloading"
+    torbox.list = [tb(71, "abcd", progress=0.1, seeds=1)]  # every slot taken and an album waits: it makes way
     downloads.cycle()
     assert db.execute("select state, error from download").fetchone()[:] == ("failed", "too slow: 10% in 2 h")
+    assert "abcd" in downloads.slow(db) and "abcd" not in downloads.blocked(db)
+    other = result("Artist - Album [FLAC]", "beef", seeders=1)
+    assert [r["infoHash"] for r in releases.rank([offer("abcd", seeders=90), other], set(), slow=downloads.slow(db))] == ["beef", "abcd"]
