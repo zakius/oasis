@@ -568,7 +568,7 @@ def routes(api) -> list[Route]:
         return bool(db.execute(f"select 1 from wanted where kind = 'artist' and ref in ({','.join('?' * len(ids))})", list(ids)).fetchone())
 
     def artist_state(db, mbid: str) -> str:
-        return (pill("in the library", "good") + " " if acquire.library_id(db, MB_IDS["artist"] + mbid) else ""
+        return (f'<a class="pill good" href="/music/library/artist/{mbid}">in the library</a> ' if acquire.library_id(db, MB_IDS["artist"] + mbid) else ""
                 ) + (pill("followed", "accent") if followed(db, mbid) else "")
 
     def album_line(db, user, g: dict, here: str, by: bool = True) -> str:
@@ -746,6 +746,7 @@ def routes(api) -> list[Route]:
                           for v, label in (("", "Everything"), ("here", "With music here"), ("wanted", "With wanted albums")))
         body = (f'<form class="filters"><input type="text" name="q" value="{escape(text)}" placeholder="Artist" aria-label="Artist">'
                 f'<select name="show" aria-label="Show">{options}</select><button>Show</button></form>'
+                + (f'<p class="muted">Not here? <a href="/music?q={quote(text)}">Find “{escape(text)}” on MusicBrainz</a>.</p>' if text else "")
                 + (f'<section><table class="grid thumbs"><thead><tr><th></th><th>Artist</th><th class="num">Albums here</th><th class="num">Wanted</th>'
                    f'<th class="num">Songs</th><th class="num">Length</th><th class="num">Size</th></tr></thead><tbody>{rows}</tbody></table></section>'
                    if rows else '<section><p class="muted">Nothing matches.</p></section>'))
@@ -760,9 +761,9 @@ def routes(api) -> list[Route]:
                             "sum(size) bytes, max(album_id) album from track where source = 'local' group by artist_id"):
             key = mbid_of.get(r["artist_id"]) or r["artist_id"]
             artists[key] = {**dict(r), "wanted": 0, "followed": r["artist_id"] in followed, "cover": r["album"], "genres": []}
-        for r in db.execute("select artist_mbid, min(artist) name, count(*) n from want_album where state in ('missing', 'downloading') "
+        for r in db.execute("select artist_mbid, min(artist) name, count(*) n, min(rg) rg from want_album where state in ('missing', 'downloading') "
                             "group by artist_mbid"):
-            a = artists.setdefault(r["artist_mbid"], {"name": r["name"], "albums": 0, "songs": 0, "seconds": 0, "bytes": 0, "cover": None,
+            a = artists.setdefault(r["artist_mbid"], {"name": r["name"], "albums": 0, "songs": 0, "seconds": 0, "bytes": 0, "cover": "al-mb-" + r["rg"],
                                                       "followed": False, "genres": []})
             a["wanted"] = r["n"]
         for key, a in artists.items():
@@ -823,7 +824,8 @@ def routes(api) -> list[Route]:
         facts = [("MusicBrainz", f'<a href="https://musicbrainz.org/artist/{mbid}">{mbid[:8]}…</a>' if mbid else None), ("Related", links.rstrip(" · ") or None)]
         image = (f'<img class="cover round" loading="lazy" alt="" src="{escape(info["image"])}" {HIDE_BROKEN}>' if info and info["image"]
                  else picture(albums[-1]["album_id"] if albums else None, "round"))
-        manage = f'<div class="row"><a class="button" href="/music/artist/{mbid}">Full discography</a></div>' if mbid else ""
+        manage = (f'<div class="row"><a class="button" href="/music/artist/{mbid}">Full discography</a><div class="right">'
+                  f'{want_button("artist", mbid, not mine(db, user, "artist", mbid), f"/music/library/artist/{quote(key)}")}</div></div>' if mbid else "")
         body = hero(image, "Artist" + (f" · {escape(about[0])}" if about and about[0] else ""), name, escape(" · ".join(filter(None, counts))),
                     f'{manage}<dl class="meta">{dl(facts)}</dl>{"<p class=muted>" + escape(info["description"][:600]) + "</p>" if info else ""}')
         for kind in ("Album", "EP", "Single", "Compilation", "Soundtrack", "Live", "Other"):
