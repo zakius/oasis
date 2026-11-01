@@ -3,9 +3,11 @@ artist's albums, EPs and singles are read daily, and guest appearances, repackag
 albums left out.
 An album is here when the library holds as many of its tracks as its smallest edition has. Missing albums are searched
 (Prowlarr, then TorBox: download.py) one a minute, or 15 s after a search that found nothing, again and again, ever
-further apart; an artist with gaps gets a weekly search for cached discographies, singles collections and bundles,
-which can fill many at once. Anything MusicBrainz has can be wanted, under ids of its own until it arrives (see
-adopt). want_album holds the albums; want_item the stars and follows."""
+further apart; an artist with gaps gets a weekly search for discographies, singles collections and bundles, which can
+fill many at once: one a pass while they hold albums the others don't, before its albums' own searches. Its EPs,
+singles, live, demo and compilation releases, likelier in bundles than on their own, wait for that search. Anything
+MusicBrainz has can be wanted, under ids of its own until it arrives (see adopt). want_album holds the albums;
+want_item the stars and follows."""
 import itertools
 import json
 import logging
@@ -41,6 +43,9 @@ KEEP_GROUP = 30 * 86400
 RESEARCH, RESEARCH_MOST = 6 * 3600, 7 * 86400       # a missing album is searched again after 6 h, then twice as long each time
 SINGLE_RESEARCH, SINGLE_MOST = 7 * 86400, 28 * 86400
 BUNDLE_AGAIN = 7 * 86400             # seconds between an artist's bundle searches
+# Releases far likelier found in an artist's bundles than on their own (fan-club and live EPs, singles, demos, B-sides
+# and rarities): searched on their own only after their artist's bundle search.
+BUNDLE_FIRST = "(primary_type in ('EP', 'Single') or secondary_types like '%Live%' or secondary_types like '%Demo%' or secondary_types like '%Compilation%')"
 # Nothing due and TorBox has room: a search ahead of schedule every EARLY_GAP, leaving backoffs as they are. An artist's
 # bundles at most daily, an album (or a lossless copy) every RESEARCH, a single daily.
 EARLY_GAP, BUNDLE_EARLY, SINGLE_EARLY = 5 * 60, 86400, 86400
@@ -375,10 +380,10 @@ class Acquire:
             return False
 
     def search_next(self, db):
-        """One search, a gap apart (see searched): albums asked for on the dashboard first; then albums never searched,
-        then those searched before (a dead or slow release's album waits behind every untried one), each by starred
-        albums, followed artists' albums and EPs, their singles, newest first. Then albums here only lossy, for a
-        lossless copy weekly."""
+        """One search, a gap apart (see searched): albums asked for on the dashboard first; then an artist's bundles
+        (bundle_next); then albums never searched, then those searched before (a dead or slow release's album waits
+        behind every untried one), each by starred albums, followed artists' albums and EPs, their singles, newest
+        first; BUNDLE_FIRST ones once their artist's bundles are. Then albums here only lossy, for a lossless copy weekly."""
         if time.time() - self.last_search < self.gap:
             return
         if self.soon and (row := db.execute("select * from want_album where rg = ? and state = 'missing'", (self.soon.pop(),)).fetchone()):
@@ -387,10 +392,11 @@ class Acquire:
             return
         now, queued = time.time(), self.downloads.groups(db)
         lossless = ", ".join(f"'{s}'" for s in LOSSLESS)
-        rows = db.execute("select * from want_album w where (state = 'missing' and coalesce(next_search, 0) <= ?) or (state = 'have' and "
+        bundled = f"and not ({BUNDLE_FIRST} and artist is not null and artist_mbid not in (select artist_mbid from bundle_search where searched > ?))"
+        rows = db.execute(f"select * from want_album w where (state = 'missing' and coalesce(next_search, 0) <= ? {bundled if self.bundles else ''}) or (state = 'have' and "
                           "coalesce(searched, 0) < ? and not exists (select 1 from track t where t.mb_release_group = w.rg and t.source = 'local' "
                           f"and t.suffix in ({lossless}))) order by state = 'have', searched is not null, reason != 'starred', primary_type = 'Single', "
-                          "first_date desc limit 50", (now, now - UPGRADE_AGAIN)).fetchall()
+                          "first_date desc limit 50", (now, *[now - BUNDLE_AGAIN] * self.bundles, now - UPGRADE_AGAIN)).fetchall()
         if row := next((r for r in rows if r["rg"] not in queued), None):
             if self.idle:
                 log.info("searches due again")
@@ -418,19 +424,21 @@ class Acquire:
             self.search(db, row, early=True)
 
     def bundle_next(self, db, again: float = BUNDLE_AGAIN) -> bool:
-        """A bundle search instead of an album search, for an artist with two albums, EPs or singles missing or one a
-        search found nothing for, weekly at most. True when one ran."""
+        """A bundle search instead of an album search, for an artist with two albums, EPs or singles missing, one a
+        search found nothing for or one BUNDLE_FIRST, weekly at most; but again at the next pass after one that sent a
+        bundle, for one of the rest (see Downloads.bundle), till none holds any. True when one ran."""
         row = db.execute("select artist_mbid, artist from want_album where state = 'missing' and artist is not null "
                          "and artist_mbid not in (select artist_mbid from bundle_search where searched > ?) group by artist_mbid "
-                         "having count(*) >= 2 or max(searched) is not null order by min(reason != 'starred') limit 1",
+                         f"having count(*) >= 2 or max(searched) is not null or max({BUNDLE_FIRST}) order by min(reason != 'starred') limit 1",
                          (time.time() - again,)).fetchone()
         if row is None:
             return False
         mbid, sent, failed, started = row["artist_mbid"], None, False, time.time()
         try:
             alternatives, queued = other_titles(db, mbid), self.downloads.groups(db)
-            groups = [{**g, "other_titles": alternatives.get(g["id"], [])} for g in self.browse(db, mbid)]
             wanted = {rg for (rg,) in db.execute("select rg from want_album where artist_mbid = ? and state = 'missing'", (mbid,)) if rg not in queued}
+            kept = {g["id"] for g in self.browse(db, mbid)} | wanted  # starred ones of other types too
+            groups = [{**g, "other_titles": alternatives.get(g["id"], [])} for g in release_groups(db, mbid) if g["id"] in kept]
             titles = [g["title"] for g in groups if g["primary-type"] != "Single"]
             names = releases.aliases(db, row["artist"], mbid, titles)
             sent = self.downloads.bundle(db, {"artist": row["artist"], "names": names, "native": releases.native(names), "albums": titles},
@@ -439,8 +447,8 @@ class Acquire:
             log.warning("bundle search for %s failed: %s", row["artist"], e)
             failed = True
         now = self.searched(started, sent, failed)
-        # TorBox had no free slot: soon again.
-        db.execute("insert or replace into bundle_search values (?, ?)", (mbid, now - BUNDLE_AGAIN + RETRY_FULL if sent is False else now))
+        # One sent: the next pass, for the rest. TorBox had no free slot: soon again.
+        db.execute("insert or replace into bundle_search values (?, ?)", (mbid, now - BUNDLE_AGAIN if sent else now - BUNDLE_AGAIN + RETRY_FULL if sent is False else now))
         return True
 
     def search(self, db, row, early=False):

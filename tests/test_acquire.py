@@ -60,6 +60,7 @@ class MusicBrainz:
 class FakeDownloads:
     def __init__(self):
         self.active, self.found, self.result, self.free, self.added = set(), [], None, True, 0.0
+        self.bundled = []  # what bundle answers, in turn; then result
 
     def groups(self, db):
         return set(self.active)
@@ -76,7 +77,8 @@ class FakeDownloads:
 
     def bundle(self, db, want, groups, wanted):
         self.found.append(("bundle", want["artist"], sorted(wanted)))
-        return self.result
+        self.groups_seen = [g["id"] for g in groups]
+        return self.bundled.pop(0) if self.bundled else self.result
 
 
 @pytest.fixture
@@ -280,6 +282,56 @@ def test_an_artist_missing_only_singles_gets_a_bundle_search_too(client, mb, mon
     now[0] += acquire.SEARCH_GAP
     sync(client)
     assert acq.downloads.found == [("bundle", "Beta", ["g-b", "g-new"])]
+
+
+def test_bundles_go_one_a_pass_till_none_holds_more_then_album_searches_with_bundle_first_kinds_last(client, mb, monkeypatch):
+    follow_beta(client, mb)
+    acq, now = client.app.state.api.library, [time.time()]
+    acq.bundles, acq.downloads.found, acq.downloads.bundled = True, [], [True, True, None]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    for _ in range(3):
+        now[0] += acquire.SEARCH_GAP
+        sync(client)
+        acq.downloads.active.add("g-ost")  # the first bundle holds Film
+    assert [f[0] for f in acq.downloads.found] == ["bundle"] * 3  # not weekly: again after each that sent one
+    assert acq.downloads.found[1] == ("bundle", "Beta", ["g-new", "g-second"])
+    now[0] += acquire.SEARCH_GAP
+    sync(client)
+    assert acq.downloads.found[3] == "g-second"  # the bundle searches are done for the week
+
+    # Till the artist's bundles are searched, its singles, EPs, live and demo releases wait; its albums don't.
+    db = client.app.state.api._db()
+    db.execute("update bundle_search set searched = 0")
+    db.execute("update want_album set next_search = 0, searched = null where rg in ('g-second', 'g-new')")
+    monkeypatch.setattr(acq, "bundle_next", lambda db, again=0: False)
+    acq.downloads.active.add("g-second")
+    now[0] += acquire.SEARCH_GAP
+    sync(client)
+    assert len(acq.downloads.found) == 4
+    acq.bundles = False
+    now[0] += acquire.SEARCH_GAP
+    sync(client)
+    assert acq.downloads.found[4] == "g-new"
+
+
+def test_one_missing_ep_or_single_gets_a_bundle_search_first_and_starred_groups_of_any_type_count(client, mb, monkeypatch):
+    follow_beta(client, mb)
+    acq, now = client.app.state.api.library, [time.time()]
+    acq.bundles, acq.downloads.found = True, []
+    db = client.app.state.api._db()
+    db.execute("update want_album set state = 'skipped' where rg != 'g-new'")
+    db.execute("update want_album set searched = null, next_search = null")
+    db.execute("insert into want_album(rg, artist_mbid, artist, title, primary_type, secondary_types, reason, state) "
+               "values ('g-live', 'mb-beta', 'Beta', 'Live at Home', 'Album', 'Live', 'starred', 'skipped')")
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    now[0] += acquire.SEARCH_GAP
+    sync(client)
+    assert acq.downloads.found == [("bundle", "Beta", ["g-new"])]
+    db.execute("update want_album set state = 'missing' where rg = 'g-live'")
+    db.execute("delete from bundle_search")
+    now[0] += acquire.SEARCH_GAP
+    sync(client)
+    assert acq.downloads.found[1] == ("bundle", "Beta", ["g-live", "g-new"]) and "g-live" in acq.downloads.groups_seen  # not a type followed, but wanted
 
 
 def test_collaboration_credits_split_into_artist_names():
