@@ -220,3 +220,22 @@ def test_artist_page_lists_the_whole_youtube_discography(client, ytm, monkeypatc
     assert [s["title"] for s in call(client, "getTopSongs", artist="Beta")["topSongs"]["song"]][-1] == "Hit"
     info = call(client, "getArtistInfo2", id=beta["id"])["artistInfo2"]
     assert info["largeImageUrl"] == "https://img/beta"
+
+
+def test_a_song_on_an_album_and_its_single_stays_on_both(client, ytm, monkeypatch):
+    beta = next(a for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"] if a["name"] == "Beta")
+    monkeypatch.setattr(ytm, "artist", lambda name: {"name": "Beta", "description": None, "image": None, "songs": None, "releases": [
+        {"browse_id": "MPREb_new", "title": "Newer Album", "year": 2020, "type": "album", "cover": None},
+        {"browse_id": "MPREb_single", "title": "Track 2", "year": 2019, "type": "single", "cover": None}]}, raising=False)
+    listings = {"MPREb_new": [(f"alb{i}", f"Track {i}", i) for i in (1, 2, 3)], "MPREb_single": [("alb2", "Track 2", 1)]}
+    monkeypatch.setattr(ytm, "album", lambda browse_id: [
+        track_row(item(v, t, artist="Beta", album="Newer Album" if browse_id == "MPREb_new" else "Track 2", album_id=browse_id)) | {"track_no": n}
+        for v, t, n in listings[browse_id]])
+    albums = {a["name"]: a for a in call(client, "getArtist", id=beta["id"])["artist"]["album"]}
+    first = call(client, "getAlbum", id=albums["Newer Album"]["id"])["album"]
+    single = call(client, "getAlbum", id=albums["Track 2"]["id"])["album"]
+    again = call(client, "getAlbum", id=albums["Newer Album"]["id"])["album"]
+    assert titles(first["song"]) == titles(again["song"]) == ["Track 1", "Track 2", "Track 3"] and again["songCount"] == 3
+    assert titles(single["song"]) == ["Track 2"] and single["songCount"] == 1 and single["song"][0]["id"] == first["song"][1]["id"]
+    counts = {a["name"]: a["songCount"] for a in call(client, "getArtist", id=beta["id"])["artist"]["album"]}
+    assert counts["Track 2"] == 1

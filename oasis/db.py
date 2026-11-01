@@ -150,6 +150,9 @@ create table if not exists ytm_release(  -- albums and singles from YouTube Musi
 );
 create table if not exists moved(old_id text primary key, new_id text not null);  -- stream ids now local
 create table if not exists play(user text not null, track_id text not null, played real not null);
+create table if not exists album_track(  -- the songs each YouTube Music album lists: a song is on its album and its single too
+    album_id text not null, track_id text not null, disc_no int, track_no int, primary key(album_id, track_id)
+);
 create index if not exists play_track on play(track_id);
 create table if not exists session(token text primary key, user text not null, expires real not null);
 create table if not exists lyrics(track_id text primary key, found text, fetched real not null);
@@ -236,12 +239,11 @@ def remember(db, row: dict) -> str:
     if known and not db.execute("select 1 from track where id = ?", (row["id"],)).fetchone():
         if known["source"] == "local":
             db.execute("update track set ytm_id = ? where id = ?", (row["ytm_id"], known["id"]))
-        elif row.get("track_no"):  # an album listing places the song on its album
-            db.execute("update track set album = ?, album_id = ?, ytm_album = ?, track_no = ?, year = coalesce(?, year), "
-                       "cover = coalesce(?, cover) where id = ?", (row["album"], row["album_id"], row["ytm_album"],
-                       row["track_no"], row["year"], row["cover"], known["id"]))
         return known["id"]
-    updates = ", ".join(f"{k} = excluded.{k}" for k in row if k not in ("id", "library", "created"))
+    # The album a song was first seen on stays its own: other albums that list it hold it in album_track.
+    kept = ("album", "album_id", "ytm_album", "track_no", "disc_no")
+    updates = ", ".join(f"{k} = coalesce(track.{k}, excluded.{k})" if k in kept else f"{k} = excluded.{k}"
+                        for k in row if k not in ("id", "library", "created"))
     db.execute(f"insert into track({', '.join(row)}) values ({', '.join('?' * len(row))}) "
                f"on conflict(id) do update set {updates}", list(row.values()))
     return row["id"]

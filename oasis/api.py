@@ -530,7 +530,11 @@ class Api:
         return [album(r) for r in db.execute(sql, (artist_id, 1))] or [album(r) for r in db.execute(sql, (artist_id, 0))]
 
     def _album_songs(self, db, album_id):
-        return [song(r) for r in db.execute(SONGS + " where t.album_id = ? order by disc_no, track_no is null, track_no, title", (album_id,))]
+        """The album's own songs, and the songs its YouTube Music listing shares with another album, in its order."""
+        return [song(r) for r in db.execute(
+            f"select {SONG_COLUMNS}, coalesce(at.disc_no, t.disc_no) as disc, coalesce(at.track_no, t.track_no) as no "
+            "from track t left join stat s on s.id = t.id left join album_track at on at.track_id = t.id and at.album_id = ? "
+            "where t.album_id = ? or at.album_id is not null order by disc, no is null, no, title", (album_id, album_id))]
 
     def getArtist(self, db, p, user):
         if acquire.mbid_of(id := p.need("id")):
@@ -546,12 +550,22 @@ class Api:
         known = {a["id"] for a in albums}
         self._artist_page(db, r["id"], r["name"])
         # The rest of the artist's discography on YouTube Music, newest first; opening one fetches its tracks.
-        albums += [clean({"id": x["album_id"], "name": x["title"], "title": x["title"], "album": x["title"], "artist": r["name"],
-                          "artistId": r["id"], "parent": r["id"], "isDir": True, "coverArt": x["album_id"] if x["cover"] else None,
-                          "year": x["year"], "releaseTypes": [x["type"].title()] if x["type"] else None})
+        listed = {a: (n, d) for a, n, d in db.execute("select at.album_id, count(*), sum(t.duration) from album_track at join track t "
+                                                       "on t.id = at.track_id join ytm_release x on x.album_id = at.album_id "
+                                                       "where x.artist_id = ? group by at.album_id", (r["id"],))}
+        albums += [self._release_album(x, r["name"], *listed.get(x["album_id"], (None, None)))
                    for x in db.execute("select * from ytm_release where artist_id = ? order by coalesce(year, 0) desc, title", (r["id"],))
                    if x["album_id"] not in known]
         return {"artist": {**artist(r), "albumCount": len(albums), "album": albums}}
+
+    @staticmethod
+    def _release_album(x, artist_name, song_count=None, duration=None) -> dict:
+        """An album from an artist's YouTube Music page. Its song count and length are known once it was opened."""
+        return clean({"id": x["album_id"], "name": x["title"], "title": x["title"], "album": x["title"], "artist": artist_name,
+                      "artistId": x["artist_id"], "parent": x["artist_id"], "isDir": True,
+                      "coverArt": x["album_id"] if x["cover"] else None, "year": x["year"],
+                      "releaseTypes": [x["type"].title()] if x["type"] else None,
+                      "songCount": song_count or 0, "duration": duration or 0})
 
     def _credited_artist(self, db, artist_id):
         """An artist only credited on others' songs (a guest singer, a band member, a composer): the albums they're on."""
@@ -581,9 +595,16 @@ class Api:
         if acquire.mbid_of(id := p.need("id")):
             return {"album": {**self._mb_album(db, self._musicbrainz(acquire.GROUP.format(acquire.mbid_of(id)), db, acquire.KEEP_GROUP)),
                               "song": []}}  # nothing to play until it arrives
-        self._complete_album(db, p.need("id"))
-        r = self._one(db, ALBUMS + " where t.album_id = ? group by t.album_id", p.need("id"))
-        return {"album": {**album(r), "song": self._album_songs(db, r["id"])}}
+        self._complete_album(db, id)
+        songs = self._album_songs(db, id)
+        r = db.execute(ALBUMS + " where t.album_id = ? group by t.album_id", (id,)).fetchone()
+        if r:
+            return {"album": {**album(r), "song": songs, "songCount": len(songs), "duration": sum(x.get("duration", 0) for x in songs)}}
+        release = db.execute("select * from ytm_release where album_id = ?", (id,)).fetchone()
+        if not (release and songs):
+            raise Fail(NOT_FOUND, "Data not found")
+        # Every song of this one (a single, usually) is on another album too.
+        return {"album": {**self._release_album(release, songs[0]["artist"], len(songs), sum(x.get("duration", 0) for x in songs)), "song": songs}}
 
     def _complete_album(self, db, album_id):
         """Fetches the rest of an album that is only known from streaming tracks seen in search or radio, or only
@@ -601,9 +622,11 @@ class Api:
             log.info("album %s unavailable: %s", browse_id, e)
             return
         ids = [remember(db, row) for row in rows]
-        if release:  # file them under the artist page's album, whatever spelling YouTube credits the tracks with
-            db.executemany("update track set album_id = ?, artist_id = ? where id = ? and source = 'ytm'",
-                           [(album_id, release["artist_id"], id) for id in ids])
+        db.executemany("insert or replace into album_track values (?, ?, ?, ?)",
+                       [(album_id, id, row.get("disc_no"), row.get("track_no")) for id, row in zip(ids, rows)])
+        if release:  # file this album's own songs under the artist page's album, whatever spelling YouTube credits them with
+            db.executemany("update track set album_id = ?, artist_id = ? where id = ? and source = 'ytm' and ytm_album = ?",
+                           [(album_id, release["artist_id"], id, browse_id) for id in ids])
         self.completed.add(album_id)
 
     def getSong(self, db, p, user):
