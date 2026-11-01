@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 INTERVAL = 60            # seconds between polls of TorBox
 SLOWEST = 12 * 3600     # seconds a download may take at its pace so far
-PATIENT = 2 * 3600       # seconds those waits last while TorBox has slots free
+PATIENT = 30 * 60        # seconds those waits last while TorBox has slots free: a dead torrent keeps its album from another release
 EMPTY_SWARM = 10 * 60    # seconds a torrent may go without progress, seeders and a full copy among its peers
 DEAD_AFTER = 20 * 60     # seconds a torrent may sit at 0% without seeders
 UNRELIABLE = 5, 1 / 3    # an indexer with this many downloads, this share of them dead, is tried last

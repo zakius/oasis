@@ -276,16 +276,16 @@ def test_a_torrent_nobody_or_only_part_of_which_is_shared_goes_after_10_minutes(
     assert db.execute("select state, error from download").fetchone()[:] == ("failed", why)
 
 
-def test_while_slots_are_free_a_torrent_without_seeders_gets_two_hours(downloads, torbox, db, monkeypatch):
+def test_while_slots_are_free_a_torrent_without_seeders_gets_half_an_hour(downloads, torbox, db, monkeypatch):
     now = [time.time()]
     monkeypatch.setattr(time, "time", lambda: now[0])
     downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
     downloads.find(db, WANT, "mb-album")
     torbox.list = [tb(71, "abcd", progress=0, seeds=0, peers=0)]
     downloads.cycle()
-    now[0] += 3600
+    now[0] += 1500
     downloads.cycle()
     assert db.execute("select state from download").fetchone()[0] == "downloading"
-    now[0] += 3700
+    now[0] += 400
     downloads.cycle()
     assert db.execute("select state, error from download").fetchone()[:] == ("failed", "dead torrent: nobody shares it")
