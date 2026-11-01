@@ -463,6 +463,12 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     assert page.index("Failed, trying again") < page.index("Lemon") < page.index("Downloading") < page.index("BOOTLEG") \
         < page.index("Not found yet") < page.index("STRAY SHEEP")  # what needs a look first
     assert "42%" in page and "download failed: dead torrent" in page and "searched 0 min ago" in page
+    waits = "Albums and EPs: 1 searched, nothing found; next try in 59 min. Singles: 1 searched, nothing found; next try in 6 days."
+    assert "searched 0 min ago · next try in 59 min" in page and waits in page and "<b>1</b><span>albums & EPs to find" in page
+    dashboard = client.get("/").text
+    assert waits in dashboard and "<b>1</b><span>albums & EPs to find" in dashboard and "<b>1</b><span>singles to find" in dashboard
+    db.execute("update want_album set next_search = null where rg = ?", (LEMON,))
+    assert "Singles: 1 due for a search." in client.get("/").text
     filtered = client.get("/music/wanted", params={"type": "Single", "q": "stray"}).text
     assert "STRAY SHEEP" not in filtered or "Lemon" not in filtered
     library = client.get("/music/library").text

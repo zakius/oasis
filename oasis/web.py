@@ -216,6 +216,19 @@ def ago(ts: float) -> str:
     return f"{minutes} min ago" if minutes < 120 else f"{minutes // 60} h ago"
 
 
+def to_find(db) -> tuple[list[tuple[int, str]], str]:
+    """The albums still to find, albums and EPs apart from singles: tiles of how many, and when their next searches are,
+    so a long wait between searches doesn't look stuck."""
+    now, tiles, lines = time.time(), [], []
+    for label, kind, single in (("albums & EPs to find", "Albums and EPs", 0), ("singles to find", "Singles", 1)):
+        n, waiting, first = db.execute("select count(*), coalesce(sum(next_search > ?), 0), min(case when next_search > ? then next_search end) "
+                                       "from want_album where state = 'missing' and (primary_type is 'Single') = ?", (now, now, single)).fetchone()
+        tiles.append((n, label))
+        parts = [f"{waiting} searched, nothing found; next try {until(first)}." if waiting else "", f"{n - waiting} due for a search." if n > waiting else ""]
+        lines += [f"{kind}: " + " ".join(filter(None, parts))] if n else []
+    return tiles, " ".join(lines)
+
+
 async def read_form(request: Request) -> dict:
     return dict(parse_qsl((await request.body()).decode()))
 
@@ -488,8 +501,10 @@ def routes(api) -> list[Route]:
         count = lambda sql: db.execute(sql).fetchone()[0]
         songs, albums, artists = db.execute("select count(*), count(distinct album_id), count(distinct artist_id) from track "
                                             "where source = 'local'").fetchone()
-        tiles = [(songs, "songs"), (albums, "albums"), (artists, "artists"), *([(api.library.still_to_find(db), "albums to find")] if api.library else [])]
+        finding, waits = to_find(db) if api.library else ([], "")
+        tiles = [(songs, "songs"), (albums, "albums"), (artists, "artists"), *finding]
         html = '<div class="stats">' + "".join(f'<div><b>{n}</b><span>{label}</span></div>' for n, label in tiles) + '</div>'
+        html += f'<p class="muted">{waits}</p>' if waits else ""
         active = db.execute("select hash, title, state, created from download where state not in ('done', 'failed') order by created").fetchall()
         html += (f'<section><h2>Downloading <span class="count">{len(active)}</span></h2><ul class="rows">' + "".join(
             f'<li><div class="grow">{escape(r["title"])}{progress(r["hash"], r["state"], r["created"])}</div></li>'
@@ -682,7 +697,7 @@ def routes(api) -> list[Route]:
                 return "next", pill("in a minute or two", "accent")
             if (r["error"] or "").startswith(("download failed", "search failed")):
                 return "attention", f'<span class="error">{escape(r["error"])}</span> <span class="muted">· tries again {again(r)}</span>'
-            return ("notfound", f'<span class="muted">searched {ago(r["searched"])}</span>') if r["searched"] else ("waiting", "")
+            return ("notfound", f'<span class="muted">searched {ago(r["searched"])} · next try {again(r)}</span>') if r["searched"] else ("waiting", "")
 
         def action(rg: str, name: str, label: str, ask: str = "") -> str:
             return (f'<form method="post" action="/music/wanted/{escape(rg)}/{name}"{ask and confirm(ask)}><input type="hidden" name="next" value="{escape(here)}">'
@@ -705,9 +720,10 @@ def routes(api) -> list[Route]:
                              "group by artist_mbid order by artist collate nocase").fetchall()
         option = lambda value, label, chosen: f'<option value="{escape(value)}"{" selected" if value == chosen else ""}>{escape(label)}</option>'
         counts = dict(db.execute("select state, count(*) from want_album group by state").fetchall())
-        tiles = [(counts.get("missing", 0), "albums to find"), (counts.get("downloading", 0), "downloading"), (counts.get("have", 0), "arrived"),
-                 (counts.get("skipped", 0), "left out")]
+        finding, waits = to_find(db)
+        tiles = [*finding, (counts.get("downloading", 0), "downloading"), (counts.get("have", 0), "arrived"), (counts.get("skipped", 0), "left out")]
         body = ('<div class="stats">' + "".join(f'<div><b>{n}</b><span>{label}</span></div>' for n, label in tiles) + '</div>'
+                + (f'<p class="muted">{waits}</p>' if waits else "") +
                 f'<form class="filters"><select name="artist" aria-label="Artist">{option("", "All artists", artist_f)}'
                 + "".join(option(a["artist_mbid"], f'{a["artist"]} ({a["n"]})', artist_f) for a in artists)
                 + f'</select><select name="type" aria-label="Type">{option("", "Any type", type_f)}'
