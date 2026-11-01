@@ -13,13 +13,14 @@ from pathlib import Path
 from urllib.parse import parse_qsl
 from xml.etree.ElementTree import Element, tostring
 
+import anyio
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import accounts, acquire, artists, cover, dedupe, forward, lyrics, musicbrainz, releases, romanize, scan, web, ytm
+from . import accounts, acquire, artists, cover, dedupe, forward, lyrics, musicbrainz, releases, romanize, scan, upload, web, ytm
 from .acquire import MB_IDS, SECONDARY, Acquire
 from .config import Config
 from .credits import PERFORMANCE_ROLES, Credits
@@ -30,6 +31,7 @@ from .importer import Importer
 from .forward import Forwarder, LastFm
 from .prowlarr import Prowlarr
 from .recommend import Recommender, set_entries
+from .upload import Uploads
 from .ytm import YouTubeMusic
 
 log = logging.getLogger(__name__)
@@ -325,6 +327,13 @@ def romanized(payload: dict, mode: str | None) -> dict:
             for a in [*value.get("artists", []), *value.get("albumArtists", []), *(c["artist"] for c in value.get("contributors", []))]:
                 put(a, "name", title, album)
             return
+        if key == "release" and "track" in value:  # lookupDisc's
+            put(value, "title", value.get("artist"), title_of=True)
+            put(value, "artist", value.get("title"))
+            for t in value["track"]:
+                put(t, "title", t.get("artist"), value.get("title"), title_of=True)
+                put(t, "artist", t.get("title"), value.get("title"))
+            return
         if value.get("isDir"):  # an album
             name = value.get("name")
             for field in ("name", "title", "album") if mode == "latin" else ("name",):
@@ -423,6 +432,8 @@ class Api:
         self.forwarder = Forwarder(self._db, services_for, self.ytm.match if self.ytm else None)
         lastfm = LastFm(config.lastfm_key, config.lastfm_secret or "", None) if config.lastfm_key else None
         self.recommender = Recommender(self._db, self.ytm, lastfm)
+        self.uploads = Uploads(self._db, config.library[0], config.database.parent / "uploads")
+        self.recommender.chores.append(self.uploads.clean)
         self.completed: set[str] = set()
         torbox = config.torbox
         self.doctor = Doctor(self._db, **{k: v for k, v in torbox.items() if k in DOCTOR_KEYS}) if torbox else None
@@ -467,11 +478,7 @@ class Api:
             try:
                 while True:
                     self.scan_again = False
-                    scan.scan(db, self.config.library)
-                    if self.config.dedupe:
-                        self._dedupe(db)
-                    latin_index(db)
-                    self.credits.wake.set()
+                    self._scan(db)
                     if not self.scan_again:
                         break
             finally:
@@ -479,6 +486,21 @@ class Api:
                 self.scanning = False
                 self.scan_lock.release()
         threading.Thread(target=run, daemon=True).start()
+
+    def _scan(self, db):
+        scan.scan(db, self.config.library)
+        if self.config.dedupe:
+            self._dedupe(db)
+        latin_index(db)
+        self.credits.wake.set()
+
+    def _scan_now(self, db):
+        """A scan that is done on return, after the one running if any; one asked for meanwhile follows it."""
+        with self.scan_lock:
+            self.scan_again = False
+            self._scan(db)
+        if self.scan_again:
+            self._start_scan()
 
     def _dedupe(self, db):
         replaced = dedupe.run(db)
@@ -521,13 +543,13 @@ class Api:
 
     def getOpenSubsonicExtensions(self, db, p, user):
         return {"openSubsonicExtensions": [{"name": name, "versions": versions} for name, versions in (
-            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]))]}
+            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]))]}
 
     def _user(self, row) -> dict:
         roles = ("scrobbling", "settings", "download", "playlist", "coverArt", "comment", "stream", "share")
         lastfm = bool(self.config.lastfm_key and self.config.lastfm_secret and row["lastfm_session"])  # plays forward to Last.fm
         return {"username": row["name"], "adminRole": bool(row["admin"]), "scrobblingEnabled": lastfm, **{f"{r}Role": True for r in roles},
-                **{f"{r}Role": False for r in ("upload", "podcast", "jukebox")}, "folder": [1]}
+                "uploadRole": bool(row["admin"]), **{f"{r}Role": False for r in ("podcast", "jukebox")}, "folder": [1]}
 
     def _admin(self, db, user):
         if not accounts.get(db, user)["admin"]:
@@ -702,14 +724,17 @@ class Api:
                               "song": []}}  # nothing to play until it arrives
         self._complete_album(db, id)
         songs = self._album_songs(db, id)
-        r = db.execute(ALBUMS + " where t.album_id = ? group by t.album_id", (id,)).fetchone()
-        if r:
-            return {"album": {**album(r), "song": songs, "songCount": len(songs), "duration": sum(x.get("duration", 0) for x in songs)}}
+        if found := self._library_album(db, id, songs):
+            return found
         release = db.execute("select * from ytm_release where album_id = ?", (id,)).fetchone()
         if not (release and songs):
             raise Fail(NOT_FOUND, "Data not found")
         # Every song of this one (a single, usually) is on another album too.
         return {"album": {**self._release_album(release, songs[0]["artist"], len(songs), sum(x.get("duration", 0) for x in songs)), "song": songs}}
+
+    def _library_album(self, db, id, songs):
+        r = db.execute(ALBUMS + " where t.album_id = ? group by t.album_id", (id,)).fetchone()
+        return r and {"album": {**album(r), "song": songs, "songCount": len(songs), "duration": sum(x.get("duration", 0) for x in songs)}}
 
     def _complete_album(self, db, album_id):
         """Fetches the rest of an album that is only known from streaming tracks seen in search or radio, or only
@@ -1287,6 +1312,44 @@ class Api:
         db.execute("delete from playlist where id = ?", (playlist_id,))
         return {}
 
+    # The upload extension (docs/upload-extension.md): admins only, the users with uploadRole.
+
+    def lookupDisc(self, db, p, user):
+        self._admin(db, user)
+        return {"discLookup": {"release": self.uploads.lookup(db, p.need("discId"), p.get("toc"))}}
+
+    def createUpload(self, db, p, user):
+        self._admin(db, user)
+        if not p.get("releaseId") and p.get("tags") is None:
+            raise Fail(MISSING, "Required parameter 'releaseId' or 'tags' is missing")
+        return {"upload": self.uploads.create(db, user, p.get("releaseId"), p.int("disc", 1), p.get("tags"))}
+
+    def uploadTrack(self, db, p, user):
+        self._admin(db, user)
+        return {"uploadTrack": {"received": self.uploads.receive(db, user, p.need("uploadId"), *(int(p.need(k)) for k in ("disc", "number", "offset", "size")),
+                                                                 p.need("suffix"), p.body)}}
+
+    def getUpload(self, db, p, user):
+        self._admin(db, user)
+        return {"upload": self.uploads.describe(db, user, p.need("id"))}
+
+    def uploadCover(self, db, p, user):
+        self._admin(db, user)
+        self.uploads.cover(db, user, p.need("uploadId"), p.body)
+        return {}
+
+    def cancelUpload(self, db, p, user):
+        self._admin(db, user)
+        self.uploads.cancel(db, user, p.need("uploadId"))
+        return {}
+
+    def commitUpload(self, db, p, user):
+        self._admin(db, user)
+        placed = self.uploads.commit(db, user, p.need("uploadId"), p.get("replace") == "true")
+        self._scan_now(db)
+        id = self._one(db, "select album_id from track where ref = ?", str(placed))["album_id"]
+        return self._library_album(db, id, self._album_songs(db, id))
+
     def getCoverArt(self, db, p, user):
         try:
             return self._cover_art(db, p)
@@ -1415,14 +1478,26 @@ def respond(fmt: str, payload: dict, error: Fail | None = None) -> Response:
     return Response(b'<?xml version="1.0" encoding="UTF-8"?>' + tostring(root), media_type="application/xml")
 
 
+RAW_BODY = ("uploadTrack", "uploadCover")  # the body is a file, read as it arrives; parameters go in the query
+
+
+def body_chunks(request: Request):
+    """The request body's chunks, for a handler in a worker thread."""
+    stream = request.stream()
+    while (chunk := anyio.from_thread.run(anext, stream, None)) is not None:
+        yield chunk
+
+
 def create_app(config: Config, background: bool = True, ytm=None, services=None) -> Starlette:
     """background starts the scan and the forwarding, radio and mix workers; tests drive those themselves."""
     api = Api(config, ytm, services, background)
 
     async def endpoint(request: Request):
-        p = Params(request, await request.body())
-        fmt = p.get("f", "xml")
         method = request.path_params["method"].removesuffix(".view")
+        raw = method in RAW_BODY
+        p = Params(request, b"" if raw else await request.body())
+        p.body = body_chunks(request) if raw else iter(())
+        fmt = p.get("f", "xml")
         handler = getattr(Api, method, None)
         if handler is None or method.startswith("_"):
             return respond(fmt, {}, Fail(0, f"Unknown method '{method}'"))
@@ -1436,6 +1511,8 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
                 return result if isinstance(result, Response) else respond(fmt, romanized(describe(db, result), p.get("romanization")))
             except Fail as e:
                 return respond(fmt, {}, e)
+            except upload.Refused as e:
+                return respond(fmt, {}, Fail(e.code, str(e)))
             finally:
                 db.close()
         return await run_in_threadpool(run)

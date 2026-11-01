@@ -38,6 +38,8 @@ Lyrics (`getLyricsBySongId`, OpenSubsonic `songLyrics`, and `getLyrics`) come fr
 
 Names and lyrics in other scripts come romanized for clients that ask, through the OpenSubsonic extension `romanization` ([docs/romanization-extension.md](docs/romanization-extension.md)): Japanese in Hepburn, Chinese in pinyin, Korean, Cyrillic and Greek in their usual Latin forms, as roma romanizes them. Search finds songs, albums and artists by their romanized names whatever the client asks.
 
+Desktop clients (mirage) send ripped CDs and albums through the OpenSubsonic extension `upload` ([docs/upload-extension.md](docs/upload-extension.md)): oasis tags them from MusicBrainz or the client's tags, checks and files them as it does downloads, and scans them in. Admins only.
+
 `stream` transcodes when a client asks for `format=opus` (in WebM), `mp3` or `aac`, or for a `maxBitRate` below the file's bitrate; `timeOffset` starts partway in. Transcoding needs `ffmpeg` on `PATH`, which the container includes. Without it, oasis sends the original file.
 
 ## Getting music

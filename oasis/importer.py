@@ -290,6 +290,12 @@ def album_folder(artist: str, year: str, title: str) -> Path:
     return Path(clean(artist), clean(f"{year} - {title}" if year else title))
 
 
+def release_folder(release: dict) -> Path:
+    """An edition's album folder: its first artist's MusicBrainz name, the release group's year (else its own)."""
+    group = release.get("release-group") or {}
+    return album_folder(release["artist-credit"][0]["artist"]["name"], (group.get("first-release-date") or release.get("date") or "")[:4], release["title"])
+
+
 def track_file(disc: int, discs: int, track: int, tracks: int, title: str, suffix: str) -> str:
     """A track's file name, "07 - Title.flac"; on an album of several discs "1-07 - Title.flac", so one folder keeps
     the discs in order. Each number is as wide as the album's widest one, a track's at least two digits."""
@@ -336,9 +342,7 @@ class Importer:
         finally:
             db.close()
         checked = quality.import_check(sorted({f["path"] for f in mapping.values() if f["path"].suffix.lower() == ".flac"}))
-        group = release.get("release-group") or {}
-        album = self.root / album_folder(release["artist-credit"][0]["artist"]["name"], (group.get("first-release-date") or release.get("date") or "")[:4],
-                                         release["title"])
+        album = self.root / release_folder(release)
         discs, tracks = len(release["media"]), max(t["position"] for m in release["media"] for t in m["tracks"])
         placed = 0
         db = self.connect()
@@ -375,13 +379,15 @@ class Importer:
             log.info("replaced %s with %s", old, target.name)
         return 1
 
-    def cover(self, release: dict, folders: set[Path], album: Path):
-        """The download's cover image, else the Cover Art Archive's front cover, unless the album has one."""
+    def cover(self, release: dict | None, folders: set[Path], album: Path):
+        """The download's cover image, else the Cover Art Archive's front cover of the release if any, unless the album has one."""
         if any(p.stem.lower() == "cover" for p in album.iterdir()):
             return
         found = sorted(p for d in folders for p in d.iterdir() if p.suffix.lower() in COVER_SUFFIXES and p.stem.lower() in COVER_NAMES)
         if found:
             return copy(found[0], album / ("cover" + found[0].suffix.lower().replace("jpeg", "jpg")))
+        if release is None:
+            return
         try:
             with urllib.request.urlopen(urllib.request.Request(COVER_ART.format(release["id"]), headers={"User-Agent": musicbrainz.USER_AGENT}),
                                         timeout=60) as response:

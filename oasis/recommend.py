@@ -19,6 +19,7 @@ class Recommender:
     def __init__(self, connect, ytm, lastfm):
         self.connect, self.ytm, self.lastfm = connect, ytm, lastfm
         self.wake = threading.Event()
+        self.chores = []  # other upkeep done on each pass, given a db
         self.similar_artists: dict[str, list[str]] = {}  # Last.fm's answers by artist, kept while running
 
     def similar(self, db, seed, count: int, deep: bool = False) -> list[str]:
@@ -124,6 +125,8 @@ class Recommender:
             try:
                 for playlist in db.execute("select * from playlist where radio > 0").fetchall():
                     self.top_up(db, playlist)
+                for chore in self.chores:
+                    chore(db)
             except Exception:
                 log.exception("radio update failed")
             finally:

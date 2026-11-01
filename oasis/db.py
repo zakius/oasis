@@ -160,6 +160,13 @@ create table if not exists track_latin(  -- library tracks' names romanized and 
     id text primary key, source text not null,  -- source: the names they were made from
     title text, artist text, album text, album_artist text
 );
+create table if not exists upload(  -- uploads in progress (see upload.py); release: MusicBrainz's JSON, else tags: the client's
+    id text primary key, user text not null, release text, disc int, tags text, touched real not null
+);
+create table if not exists upload_track(  -- the tracks an upload expects; the file is <uploads>/<upload>/<disc>-<number>.<suffix>
+    upload text not null references upload(id) on delete cascade, disc int not null, number int not null,
+    suffix text, size int, received int not null default 0, primary key(upload, disc, number)
+);
 create table if not exists playlist_entry(
     playlist_id int not null references playlist(id) on delete cascade,
     pos int not null, track_id text not null
