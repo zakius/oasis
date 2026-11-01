@@ -1,0 +1,315 @@
+# Golden cases for oasis/romanize.py: outputs of roma's own Romanizer (default settings), so the two stay the same.
+# Columns: kind, input, siblings ("|"-separated), expected. Kinds: name, title (a song or album title), line (a lyric
+# line in sentence case), parts (karaoke words, "|"-separated), pieces, chinese (looksChinese), lyrics (lines
+# separated by a literal \n). Never edit an expected value by hand: regenerate them with roma core's GoldenCasesTest.
+name	夜に駆ける		Yoru ni Kakeru
+name	君の声		Kimi no Koe
+name	君の名は		Kimi no Na wa
+name	東京		Tōkyō
+name	映画		Eiga
+name	君は		Kimi wa
+name	コーヒー		Kōhī
+name	沈むように		Shizumu Yō ni
+name	さよならだけだった		Sayonara dake Datta
+name	全てが分かった		Subete ga Wakatta
+name	ＬＯＶＥ		LOVE
+name	ｱｲ		Ai
+name	君に、届け。		Kimi ni, Todoke.
+name	ロミオ・ジュリエット		Romio Jurietto
+name	君の「歌」		Kimi no "Uta"
+name	Happy 🎉		Happy 🎉
+name	(´・ω・`)		(´・ω・`)
+name	ΛRCTIC		ΛRCTIC
+name	ЯOCK		ЯOCK
+name	μ's		μ's
+name	Я и ты		Ya i ty
+name	звёзды и я		Zvyozdy i ya
+name	Βίος		Bios
+name	βίος		Bios
+name	Αθηνα		Athena
+name	Daft Punk		Daft Punk
+name	Beyoncé		Beyoncé
+name	米津玄師		Yonetsu Genshi
+name	椎名林檎		Shiina Ringo
+name	倖田來未		Kōda Kumi
+name	山﨑		Yamazaki
+name	紅蓮華		Gurenka
+name	千本桜		Senbon Sakura
+name	津軽海峡冬景色		Tsugaru Kaikyō Fuyugeshiki
+name	周杰倫		Zhōu Jié Lún
+name	周杰伦		Zhōu Jié Lún
+name	張學友		Zhāng Xué Yǒu
+name	晴天		Seiten
+name	BTS 봄날		BTS Bomnal
+name	사랑해		Saranghae
+name	한국어		Hangugeo
+name	감사합니다		Gamsahamnida
+name	신라		Silla
+name	좋아해		Joahae
+name	방탄소년단		Bangtansonyeondan
+name	아이유		Aiyu
+name	Группа крови		Gruppa krovi
+name	Я люблю тебя		Ya lyublyu tebya
+name	Кино		Kino
+name	Жанна Агузарова		Zhanna Aguzarova
+name	Евгений		Yevgeniy
+name	ПЛАЩ		PLASHCH
+name	Земфира		Zemfira
+name	Мумий Тролль		Mumiy Troll
+name	Ёлка		Yolka
+name	Би-2		Bi-2
+name	ДДТ		DDT
+name	Святослав Вакарчук		Svyatoslav Vakarchuk
+name	Кузьма Скрябін		Kuzma Skriabin
+name	Ляпіс Трубяцкой		Liapis Trubiatskoi
+name	Қайрат Нұртас		Qairat Nūrtas
+name	Ђорђе Балашевић		Đorđe Balašević
+name	Тоше Проески		Toshe Proyeski
+name	Ѓорѓи		Gjorgji
+name	Чингис хаан		Chingis khaan
+name	Монгол үндэстэн		Mongol ündesten
+name	Βασίλης Παπακωνσταντίνου		Basiles Papakonstantinou
+name	Ελευθερία Αρβανιτάκη		Eleutheria Arbanitake
+name	Μίκης Θεοδωράκης		Mikes Theodorakes
+name	ヨルシカ		Yorushika
+name	YOASOBI		YOASOBI
+name	あいみょん		A Imi yo n
+name	ずっと真夜中でいいのに。		Zutto Mayonaka de Ii no ni.
+name	宇多田ヒカル		Utada Hikaru
+name	中島みゆき		Nakajima Miyuki
+name	ポルノグラフィティ		Poruno Gurafiti
+name	キタニタツヤ		Kitanitatsuya
+name	藤井 風		Fujii Kaze
+name	優里		Yuri
+name	女王蜂		Jōbachi
+name	ＢＵＭＰ ＯＦ ＣＨＩＣＫＥＮ		BUMP OF CHICKEN
+name	鬼束ちひろ		Onitsuka Chihiro
+name	林原めぐみ		Hayashibara Megumi
+name	坂本真綾		Sakamoto Maaya
+name	Departures ~あなたにおくるアイの歌~		Departures ~Anata ni Okuru Ai no Uta~
+name	ぼくらのLIVE 君とのLIFE		Bokura no LIVE Kimi to no LIFE
+name	LiSAの歌 (Ballade Ver.)		LiSA no Uta (Ballade Ver.)
+name	テトリス（feat. Kasane Teto）		Tetorisu (feat. Kasane Teto)
+name	you to the monster （Yeah）		you to the monster (Yeah)
+name	दिल से		Dila Sē
+name	حبيبي		Ḥbyby
+name	สวัสดี		S̄wạs̄dī
+name	שלום		Şlwm
+name	2000年		2000Nen
+name	一人ぼっち		Hitoribotchi
+name	第一話		Daiichi Hanashi
+name	R-指定		R-Shitei
+name	カード一枚		Kādo Ichimai
+name	セブンティーン		Sebuntīn
+name	ヴァイオリン		Vaiorin
+name	ディズニー		Dizunī
+name	ウィンター		Wintā
+name	フィーバー		Fībā
+name	ティッシュ		Tisshu
+name	コンピューター		Konpyūtā
+name	ファッション		Fasshon
+name	シャッター		Shattā
+name	あっ		A
+name	原因		Gen'in
+name	金曜日		Kin'yōbi
+name	本屋		Hon'ya
+name	恋愛		Ren'ai
+name	千円		Senen
+name	雰囲気		Fun'iki
+name	うっせぇわ		Ussee wa
+name	ﾊﾟﾗﾀﾞｲｽ		Paradaisu
+name	ｶﾞﾝﾀﾞﾑ		Gandamu
+name	おおきい		Ōkii
+name	王様		Ōsama
+name	ゆうき		Yūki
+name	通り		Tōri
+name	スピカ - Spica		Supika - Spica
+name	Ｊ－ＰＯＰ		J-POP
+name	ラブ・ストーリーは突然に		Rabu sutōrī wa Totsuzen ni
+name	Ｂ’ｚ		B’z
+name	モーニング娘。'24		Mōningu Musume.'24
+name	晴天	周杰倫	Qíng Tiān
+name	晴天	周杰倫|あいみょん	Seiten
+name	紅蓮華	LiSA|紅蓮華 (ぐれんげ)	Gurenka
+name	米津玄師	Lemon	Yonetsu Genshi
+name	田馥甄	小幸运	Tián Fù Zhēn
+title	スピカ - Spica		Spica
+title	アイドル - Idol		Idol
+title	すずめ - Suzume (feat. Toaka)		Suzume (feat. Toaka)
+title	夜に駆ける - Live		Yoru ni Kakeru - Live
+title	シルエット (Silhouette)		Silhouette
+title	夜に駆ける (Ballade Ver.)		Yoru ni Kakeru (Ballade Ver.)
+title	テトリス（feat. Kasane Teto）		Tetorisu (feat. Kasane Teto)
+title	打上花火 / Uchiage Hanabi		Uchiage Hanabi
+title	千本桜 (TV Size)		Senbon Sakura (TV Size)
+title	群青 (Gunjō)		Gunjō
+title	残酷な天使のテーゼ (Director's Edit Version)		Zankoku na Tenshi no Tēze (Director's Edit Version)
+title	Lemon		Lemon
+title	ワタリドリ		Wataridori
+title	Bling-Bang-Bang-Born		Bling-Bang-Bang-Born
+title	うっせぇわ		Ussee wa
+title	シャルル		Sharuru
+title	よふかしのうた		Yofukashi no Uta
+title	二人		Futari
+title	綺麗な花		Kirei na Hana
+title	溶けてゆく		Tokete Yuku
+title	君の名は。		Kimi no Na wa.
+title	봄날 (Spring Day)		Spring Day
+title	다시 만난 세계 (Into the New World)		Into the New World
+title	光るなら		Hikaru Nara
+title	ライブver		Raibu ver
+title	ハルジオン (Remix)		Harujion (Remix)
+title	新時代 (ウタ from ONE PIECE FILM RED)		Shinjidai (Uta from ONE PIECE FILM RED)
+title	夜明けと蛍 / n-buna feat. 初音ミク		Yoake to Hotaru / n-buna feat. Hatsune Miku
+title	白日 - King Gnu		King Gnu
+title	夜に駆ける	YOASOBI	Yoru ni Kakeru
+title	晴天	周杰倫	Qíng Tiān
+title	告白気球	周杰倫	Gào Bái Qì Qiú
+title	稻香	周杰倫	Dào Xiāng
+title	七里香	周杰倫	Qī Lǐ Xiāng
+title	炎	LiSA	Honō
+title	炎	周杰倫	Yán
+title	小幸运	田馥甄	Xiǎo Xìng Yùn
+title	后来	刘若英	Hòu Lái
+title	月亮代表我的心	鄧麗君	Yuè Liàng Dài Biǎo Wǒ De Xīn
+title	紅蓮華	LiSA|鬼滅の刃	Gurenka
+line	沈むように		Shizumu yō ni
+line	さよならだけだった		Sayonara dake datta
+line	全てが分かった		Subete ga wakatta
+line	の歌		No uta
+line	溶けてゆく		Tokete yuku
+line	食べている		Tabete iru
+line	食べてる		Tabeteru
+line	食べちゃう		Tabechau
+line	Ізі қалған бабалардың қастерлі жерім!		Izı qalğan babalardyñ qasterlı jerım!
+line	Ерлерін елін сүйген		Erlerın elın süigen
+line	Ит пен мысық		İt pen mysyq
+line	Добрий вечір, ми з України		Dobryi vechir, my z Ukrainy
+line	Їжак і згода, м'ясо		Yizhak i zghoda, miaso
+line	Добрай раніцы, сябры з Беларусі		Dobraj ranicy, siabry z Bielarusi
+line	Ён любіць сваю сям'ю ў Гомелі		Jon liubić svaju siamju ŭ Homieli
+line	Љубав и живот у Београду		Ljubav i život u Beogradu
+line	Ђорђе, ћерка, џем, њега, ЉУБАВ		Đorđe, ćerka, džem, njega, LJUBAV
+line	Ѓорѓи, ќе дојдам		Gjorgji, kje dojdam
+line	Съвсем сам в България		Savsem sam v Balgaria
+line	Өглөөний мэнд		Öglöönii mend
+line	Мең сени сүйөм		Meng seni süyöm
+line	Җир, Ӂ, Ԥ, ҷ		Žir, Ž̆, P, č
+line	Ізі җир		Izi žyr
+line	目を奪ってブル一ライト		Me o ubatte burū raito
+line	目を奪ってブルーライト		Me o ubatte burū raito
+line	作词 : R-指定		Zuò cí : R-zhǐ dìng
+line	照らしてってmoonlight		Terashitette moonlight
+line	東京		Tōkyō
+line	映画		Eiga
+line	大きい		Ōkii
+line	空気		Kūki
+line	思う		Omou
+line	会いたいと思う		Aitai to omou
+line	学校へ行こう		Gakkō e ikō
+line	今日は本を読む		Kyō wa hon o yomu
+line	海へ		Umi e
+line	もう一度		Mō ichido
+line	お父さんとお母さん		Otōsan to okaasan
+line	何もない		Nani mo nai
+line	何で		Nan de
+line	三人		Sannin
+line	走り出す		Hashiridasu
+line	嬉しくない		Ureshikunai
+line	死んじゃだめ		Shinja dame
+line	行くでしょう		Iku deshō
+line	綺麗な花		Kirei na hana
+line	こんなんじゃきっと物足りない		Konnan ja kitto monotarinai
+line	既視感何がそんな不満なんだ?		Kishikan nani ga sonna fuman nan da?
+line	安心感		Anshinkan
+line	物 金 愛 言		Mono kin ai gen
+line	雨が降ってる		Ame ga futteru
+line	I love you 愛してる		I love you aishiteru
+line	君(きみ)の歌		Kimi no uta
+line	Объявление в подъезде		Obyavleniye v podezde
+line	ευχαριστώ		Eucharisto
+line	Σ' αγαπώ		S' agapo
+line	我爱你		Wǒ ài nǐ
+line	月亮代表我的心		Yuè liàng dài biǎo wǒ de xīn
+line	사랑해요 너를		Saranghaeyo neoreul
+line	夢を見ていた		Yume o mite ita
+line	ずっと一緒にいたいよ		Zutto issho ni itai yo
+line	「さよなら」って言った		"Sayonara" tte itta
+line	待ってて		Mattete
+line	行っちゃった		Itchatta
+line	言わなきゃ		Iwanakya
+line	ねえ、聞いて。		Nee, kiite.
+line	〜君へ〜		~Kun e~
+line	ラララ		Rarara
+line	1, 2, 3, 4!		1, 2, 3, 4!
+line	キミとボク		Kimi to boku
+line	歌って踊って		Utatte odotte
+line	愛してる、愛してる		Aishiteru, aishiteru
+line	ＰＬＡＹ　ＢＡＣＫ		PLAY　BACK
+line	マッチャ		Matcha
+line	コンヤ		Kon'ya
+line	ファン		Fan
+line	Yeah! 夏だ!		Yeah! natsu da!
+line	ПРИВЕТ МИР		PRIVET MIR
+line	晴天的时候	周杰倫	Qíng tiān de shí hòu
+parts	夜|に|駆|ける		Yoru| ni| ka|keru
+parts	夜は|忙|し|い		Yoru wa| isoga|shi|i
+parts	行|こ|う		Ikō||
+parts	ブル|一|ライト		Burū|| raito
+parts	君(きみ)|の|歌		Kimi| no| uta
+parts	君と|私		Kimi to| watakushi
+parts	沈|む|よ|う|に		Shizu|mu| yō|| ni
+parts	会|い|た|い		A|i|ta|i
+parts	東|京		Tōkyō|
+parts	愛|して|る		Ai|shite|ru
+parts	Я| люблю| тебя		Ya| lyublyu| tebya
+parts	봄|날		Bom|nal
+parts	走|り|出|す		Hashi|ri|da|su
+parts	笑|って		Wara|tte
+parts	待っ|て		Ma|tte
+parts	大|き|い		Ō|ki|i
+parts	学校|へ|行こう		Gakkō| e| ikō
+parts	キ|ミ|と|ボ|ク		Ki|mi| to| bo|ku
+parts	ハロー| |グッバイ		Harō| |gubbai
+parts	你|好	周杰倫	Nǐ|hǎo
+parts	晴|天	周杰倫	Qíng|tiān
+pieces	君に、会いたい		君|に、|会いたい
+pieces	食べますか？		食べます|か？
+pieces	「夜に駆ける」 私は		「夜|に|駆ける」 |私|は
+pieces	Группа крови на рукаве		Группа |крови |на |рукаве
+pieces	  あの日の夏		  あの|日|の|夏
+pieces	うっせぇうっせぇ		うっせぇ|うっせぇ
+pieces	クソだりぃな		クソ|だりぃ|な
+pieces	沈むように		沈む|よう|に
+pieces	夜に駆ける		夜|に|駆ける
+pieces	I love you 愛してる		I |love |you |愛してる
+pieces	봄날 이야		봄날 |이야
+chinese	不能說的秘密		true
+chinese	周杰伦		true
+chinese	青花瓷		true
+chinese	周杰倫		true
+chinese	超人不會飛		true
+chinese	張學友		true
+chinese	米津玄師		false
+chinese	紅蓮華		false
+chinese	千本桜		false
+chinese	薔薇		false
+chinese	津軽海峡冬景色		false
+chinese	椎名林檎		false
+chinese	倖田來未		false
+chinese	山﨑		false
+chinese	晴天		false
+chinese	稻香		true
+chinese	后来		false
+chinese	東京事変		false
+chinese	月亮代表我的心		true
+chinese	天気の子		false
+lyrics	夜に駆ける\n沈むように溶けてゆくように\n二人だけの空が広がる夜に	YOASOBI	Yoru ni kakeru\nShizumu yō ni tokete yuku yō ni\nFutari dake no sora ga hirogaru yoru ni
+lyrics	故事的小黄花\n从出生那年就飘着\n晴天	周杰倫	Gù shì de xiǎo huáng huā\nCóng chū shēng nà nián jiù piāo zhe\nQíng tiān
+lyrics	晴天\n东京		Qíng tiān\nDōng jīng
+lyrics	Ерлерін елін сүйген\nҰлы дала		Erlerın elın süigen\nŪly dala
+lyrics	Добрий вечір\nЭто ты		Dobryi vechir\nEto ty
+lyrics	東京\nあの日の夏		Tōkyō\nAno hi no natsu
+lyrics	사랑해\n보고 싶어		Saranghae\nBogo sipeo
+lyrics	\nLa la la\n君の声		\nLa la la\nKimi no koe
+lyrics	Ελλάδα\nΣ' αγαπώ		Ellada\nS' agapo
