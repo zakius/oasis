@@ -27,6 +27,7 @@ log = logging.getLogger(__name__)
 
 INTERVAL = 60            # seconds between polls of TorBox
 SLOWEST = 12 * 3600     # seconds a download may take at its pace so far
+WARM_UP = 30 * 60        # seconds a download runs before its pace counts: finding peers takes a while
 PATIENT = 30 * 60        # seconds those waits last while TorBox has slots free: a dead torrent keeps its album from another release
 EMPTY_SWARM = 10 * 60    # seconds a torrent may go without progress, seeders and a full copy among its peers
 DEAD_AFTER = 20 * 60     # seconds a torrent may sit at 0% without seeders
@@ -186,7 +187,7 @@ class Downloads:
         group: the album's release group. targets: a bundle's albums, {group: files}. search: an uncached bundle's, for
         resolve."""
         tb = self.torbox()
-        for release in picks[:GRAB_TRIES]:
+        for i, release in enumerate(picks[:GRAB_TRIES]):
             try:
                 found = source(release)
             except OSError as e:
@@ -208,9 +209,11 @@ class Downloads:
                 log.info("TorBox has no free slot for %s: later", release["title"])
                 return False
             now = time.time()
-            db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated, bundle) "
-                       "values (?, ?, 0, ?, ?, ?, 'added', ?, ?, ?)", (added["hash"].lower(), release.get("guid"), group, release["title"],
-                                                                       added["torrent_id"], now, now, search and json.dumps(search)))
+            later = [{k: r[k] for k in ("title", "guid", "infoHash", "magnetUrl", "downloadUrl", "seeders") if k in r} for r in picks[i + 1:i + 1 + GRAB_TRIES]]
+            db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated, bundle, picks) "
+                       "values (?, ?, 0, ?, ?, ?, 'added', ?, ?, ?, ?)", (added["hash"].lower(), release.get("guid"), group, release["title"],
+                                                                          added["torrent_id"], now, now, search and json.dumps(search),
+                                                                          json.dumps(later) if group and later else None))
             self.seen.pop(added["hash"].lower(), None)  # added again after a failure: its stall timer starts anew
             self.failures.pop(added["hash"].lower(), None)
             db.execute("delete from download_target where hash = ?", (added["hash"].lower(),))
@@ -269,10 +272,16 @@ class Downloads:
                 # Not a byte from no seeder: dead soon. Stalled part way: the usual wait, as seeders come and go.
                 if not torrent["seeds"] and time.time() - since > wait(DEAD_AFTER if not torrent["progress"] else self.stall):
                     return self.fail(db, row, "dead torrent: no seeds, no progress")
-                # A trickle from one seeder: past the usual wait, a torrent on course to take longer than SLOWEST makes
-                # way when others wait for its slot. It is tried again last (slow), when nothing better turns up.
-                if self.crowded and (took := time.time() - row["created"]) > self.stall and torrent["progress"] < took / SLOWEST:
-                    return self.fail(db, row, f"too slow: {torrent['progress']:.0%} in {took / 3600:.0f} h")
+                # A trickle from one seeder: a torrent on course to take longer than SLOWEST, at its pace so far or
+                # TorBox's speed now, whichever is faster, makes way: past the usual wait when others wait for its
+                # slot, past WARM_UP for another pick of its search. It is tried again last (slow), when nothing better turns up.
+                took, speed = time.time() - row["created"], (torrent.get("download_speed") or 0) / (torrent.get("size") or float("inf"))
+                if took > WARM_UP and 1 - torrent["progress"] > (SLOWEST - took) * max(torrent["progress"] / took, speed):
+                    why = f"too slow: {torrent['progress']:.0%} in {took / 3600:.0f} h"
+                    if self.crowded and took > self.stall:
+                        return self.fail(db, row, why)
+                    if row["picks"] and self.switch(db, row, why):
+                        return
                 return self.set(db, row, "downloading")
             state = self.set(db, row, "fetching")
         if state == "fetching":
@@ -283,6 +292,21 @@ class Downloads:
             state = self.set(db, row, "importing")
         if state == "importing":
             self.finish(db, row)
+
+    def switch(self, db, row, why: str) -> bool:
+        """Sends the next of the album's search's picks in place of a slow download, cached ones first, and blocks the
+        slow one as too slow. The picks are tried once: False, and they're dropped, when none went."""
+        avoid = self.blocked(db) | self.slow(db) | {row["hash"]}
+        picks = [r for r in json.loads(row["picks"]) if not {hash_of(r), r.get("guid")} & avoid]
+        cached = self.torbox().cached([h for r in picks if (h := hash_of(r))]) if picks else set()
+        if not self.send(db, sorted(picks, key=lambda r: hash_of(r) not in cached), avoid, row["album_mbid"], f"{row['title']} (too slow)"):
+            db.execute("update download set picks = null where hash = ?", (row["hash"],))
+            return False
+        self.delete(row)
+        self.block_release(db, row, why)
+        self.set(db, row, "failed", why)
+        log.info("download %s made way: %s", row["title"], why)
+        return True
 
     def resolve(self, db, row, files: list[dict]) -> bool:
         """An uncached bundle's targets, from the files TorBox lists once it has the torrent (when it has downloaded

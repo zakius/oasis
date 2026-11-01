@@ -91,7 +91,8 @@ create table if not exists download(  -- releases oasis downloads through TorBox
     title text, torbox_id int,
     state text not null,                    -- added, downloading, fetching, importing, done, failed
     error text, created real not null, updated real not null,
-    bundle text                             -- an uncached bundle's search (JSON: want, groups, wanted) until its targets are known
+    bundle text,                            -- an uncached bundle's search (JSON: want, groups, wanted) until its targets are known
+    picks text                              -- an album's search's next picks (JSON), for a slow download to make way for (see download.py)
 );
 create table if not exists download_target(  -- a bundle's albums, fetched and imported from one download (see download.py)
     hash text not null, rg text not null,   -- the download; the album's release group

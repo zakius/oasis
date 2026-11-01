@@ -1,3 +1,4 @@
+import json
 import time
 
 import pytest
@@ -26,9 +27,9 @@ class TorBox(FakeTorBox):
         return (self.tmp / "cdn" / str(file_id)).as_uri()
 
 
-def tb(id, hash, peers=1, availability=1.0, **extra):
+def tb(id, hash, peers=1, availability=1.0, speed=0, size=0, **extra):
     return {"download_state": "downloading", "download_finished": False, "download_present": False, "peers": peers,
-            "availability": availability, **torrent(id, hash, **extra)}
+            "availability": availability, "download_speed": speed, "size": size, **torrent(id, hash, **extra)}
 
 
 def crowd(downloads, db):
@@ -289,3 +290,55 @@ def test_while_slots_are_free_a_torrent_without_seeders_gets_half_an_hour(downlo
     now[0] += 400
     downloads.cycle()
     assert db.execute("select state, error from download").fetchone()[:] == ("failed", "dead torrent: nobody shares it")
+
+
+def test_a_slow_torrent_makes_way_for_the_searchs_next_pick_even_with_slots_free(downloads, torbox, db, monkeypatch):
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd", seeders=90), offer("beef", seeders=3)]
+    downloads.find(db, WANT, "mb-album")
+    now[0] += 3600
+    torbox.list = [tb(71, "abcd", progress=0.01, seeds=1, speed=50e3, size=400e6)]  # 1 % in 1 h, but done in 2 h at its speed now
+    downloads.cycle()
+    assert len(torbox.added) == 1 and db.execute("select state from download").fetchone()[0] == "downloading"
+    torbox.list = [tb(71, "abcd", progress=0.01, seeds=1, speed=1e3, size=400e6)]
+    downloads.cycle()
+    assert torbox.added[1][1] == "magnet:?xt=urn:btih:beef" and torbox.deleted == [71]
+    assert [tuple(r) for r in db.execute("select hash, state, error from download order by created")] == [
+        ("abcd", "failed", "too slow: 1% in 1 h"), ("beef", "added", None)]
+    assert "abcd" in downloads.slow(db) and downloads.groups(db) == {"mb-album"}
+
+
+def test_a_slow_torrent_keeps_going_when_its_search_found_nothing_else(downloads, torbox, db, monkeypatch):
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
+    downloads.find(db, WANT, "mb-album")
+    now[0] += 7200
+    torbox.list = [tb(71, "abcd", progress=0.02, seeds=1)]
+    downloads.cycle()
+    assert len(torbox.added) == 1 and torbox.deleted == [] and db.execute("select state from download").fetchone()[0] == "downloading"
+
+
+def test_a_slow_torrent_is_not_judged_before_its_warm_up(downloads, torbox, db, monkeypatch):
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd", seeders=90), offer("beef", seeders=3)]
+    downloads.find(db, WANT, "mb-album")
+    now[0] += download.WARM_UP - 60
+    torbox.list = [tb(71, "abcd", progress=0, seeds=1)]
+    downloads.cycle()
+    assert len(torbox.added) == 1 and db.execute("select state from download").fetchone()[0] == "downloading"
+
+
+def test_a_slow_torrent_makes_way_for_a_cached_pick_first(downloads, torbox, db, monkeypatch):
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd", seeders=90), offer("beef", seeders=50), offer("cafe", seeders=2)]
+    downloads.find(db, WANT, "mb-album")
+    torbox.have = {"cafe"}  # cached since the search
+    now[0] += 3600
+    torbox.list = [tb(71, "abcd", progress=0.01, seeds=1)]
+    downloads.cycle()
+    assert torbox.added[1][1] == "magnet:?xt=urn:btih:cafe"
+    assert [r["infoHash"] for r in json.loads(db.execute("select picks from download where hash = 'cafe'").fetchone()[0])] == ["beef"]
