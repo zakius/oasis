@@ -28,7 +28,7 @@ VARIANTS = re.compile(r"\b(best of|greatest hits|very best|the essential|antholo
                       r"acoustic|demos?|tribute|orchestral|symphonic|piano|lullaby|8 ?bit|sped up|slowed|nightcore|tv size)\b")
 VARIANTS_JA = re.compile(r"インスト|カラオケ|ライ[ブヴ]|リミックス|オフボーカル")
 BUNDLES = re.compile(r"discograph|collection|complete|box ?set|anthology|全集|ディスコグラフィ", re.I)
-VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|\d{3,4}p|x26[45]|h ?26[45]|hevc|mkv|avi|video)\b")
+VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|hdtv|\d{3,4}[pi]|x26[45]|h ?26[45]|hevc|mkv|avi|video)\b")
 TYPES = {"single": "Single", "maxi": "Single", "ep": "EP"}  # words naming a release's type
 IMAGE = re.compile(r"\b(image|img) cue\b")  # one file for the whole disc, which the importer splits: a file per track is surer
 LOSSLESS = re.compile(r"\b(flac|alac|wav|lossless|24 ?bits?|hi ?res|ape)\b")

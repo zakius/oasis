@@ -55,6 +55,7 @@ def test_variants_bundles_videos_and_sizes_are_not_the_album():
     assert reject(result("Linkin Park - Meteora 20th Anniversary Edition (2023) FLAC"), meteora) == "variant: anniversary"
     assert reject(result("Linkin Park - Hybrid Theory + Meteora [FLAC]"), meteora) == "bundle: also Hybrid Theory"
     assert reject(result("David Hasselhoff - Open Your Eyes - 2019, FLAC"), want("Open Your Eyes", "David Hasselhoff", others=["David"])) is None
+    assert reject(result("Rammstein - Feuer frei!, Du hast [2013, Industrial, HDTV 1080i]"), want("Feuer frei!", "Rammstein")) == "video"
     assert reject(result("Linkin Park - Meteora (2003) [FLAC]", size=6e9), meteora) == "size"
     assert reject(result("Linkin Park - Meteora (2003) [FLAC]", size=6e9), {**meteora, "discs": 2}) is None
     # An anniversary edition wanted isn't the plain album.
