@@ -421,7 +421,8 @@ class Api:
 
     def _user(self, row) -> dict:
         roles = ("scrobbling", "settings", "download", "playlist", "coverArt", "comment", "stream", "share")
-        return {"username": row["name"], "adminRole": bool(row["admin"]), **{f"{r}Role": True for r in roles},
+        lastfm = bool(self.config.lastfm_key and self.config.lastfm_secret and row["lastfm_session"])  # plays forward to Last.fm
+        return {"username": row["name"], "adminRole": bool(row["admin"]), "scrobblingEnabled": lastfm, **{f"{r}Role": True for r in roles},
                 **{f"{r}Role": False for r in ("upload", "podcast", "jukebox")}, "folder": [1]}
 
     def _admin(self, db, user):

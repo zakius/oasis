@@ -121,3 +121,13 @@ def test_status_shows_oasis_downloads_and_what_arrived_lately(client):
     page = client.get("/").text
     assert 'Downloading <span class="count">1<' in page and "Mili - Hue [FLAC]" in page and "downloading on TorBox" in page
     assert '✓</span><div class="grow">Rammstein - Mutter [FLAC]' in page and "dead torrent: no seeds, no progress" in page
+
+
+def test_get_user_reports_lastfm_forwarding(client):
+    api, db = client.app.state.api, client.app.state.api._db()
+    assert call(client, "getUser")["user"]["scrobblingEnabled"] is False
+    api.config.lastfm_key, api.config.lastfm_secret = "k", "s"
+    assert call(client, "getUser")["user"]["scrobblingEnabled"] is False
+    db.execute("update user set lastfm_session = 'sk' where name = 'admin'")
+    db.commit()
+    assert call(client, "getUser")["user"]["scrobblingEnabled"] is True
