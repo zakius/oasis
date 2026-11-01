@@ -209,9 +209,42 @@ def test_a_bundles_file_list_gives_the_wanted_albums_each_folder_wholly_holds():
                                                                                                        "03. In the End.flac", "cover.jpg")]
     assert sorted(found["g-mtm"]) == sorted(f"LP Discography/Minutes to Midnight (2007)/{n}" for n in ("CD1/01 Wake.flac", "CD1/02 Given Up.flac",
                                                                                                         "CD2/01 Leave Out All the Rest.flac", "folder.jpg"))
-    # Without a year, one title of two release groups is neither.
-    assert releases.targets(listing({"Hybrid Theory": ["01 Papercut.flac", "02 One Step Closer.flac", "03 In the End.flac"]}),
-                            LP, LP_GROUPS, wanted, editions) == {}
+
+
+def test_the_songs_tell_which_of_the_groups_a_folder_may_be_it_is_and_a_folder_named_otherwise_is_the_group_it_holds_exactly():
+    wanted = {"g-ht", "g-ht-ep", "g-met"}
+    album, ep = ["01 Papercut.flac", "02 One Step Closer.flac", "03 In the End.flac"], ["1. Carousel.mp3", "2. Technique.mp3"]
+    assert releases.targets(listing({"Hybrid Theory": album}), LP, LP_GROUPS, wanted, editions) == {"g-ht": [f"LP Discography/Hybrid Theory/{n}" for n in album]}
+    assert releases.targets(listing({"Hybrid Theory": ep}), LP, LP_GROUPS, wanted, editions) == {"g-ht-ep": [f"LP Discography/Hybrid Theory/{n}" for n in ep]}
+    assert releases.targets(listing({"Hybrid Theory": ["01 Intro.flac", "02 Outro.flac"]}), LP, LP_GROUPS, wanted, editions) == {}  # numbers don't do here
+    # Named after none of the artist's albums: the one it holds song for song, not one it holds part of or more than.
+    assert releases.targets(listing({"Fan Club CD (2003)": ["Foreword.flac", "Don't Stay.flac"]}), LP, LP_GROUPS, wanted, editions) == \
+        {"g-met": ["LP Discography/Fan Club CD (2003)/Foreword.flac", "LP Discography/Fan Club CD (2003)/Don't Stay.flac"]}
+    assert releases.targets(listing({"Fan Club CD": ["Foreword.flac", "Don't Stay.flac", "Bonus.flac"]}), LP, LP_GROUPS, wanted, editions) == {}
+    assert releases.targets(listing({"Live Bootleg": ["Foreword.flac", "Don't Stay.flac"]}), LP, LP_GROUPS, wanted, editions) == {}  # a variant
+
+
+@pytest.mark.parametrize("folder, title", [
+    ("2014 - Underground XIV", "Underground 14"), ("Linkin Park - LP Underground Fourteen (2014)", "Underground 14"),
+    ("2006 - Underground 6.0", "Underground 6"), ("Underground V6 [2006]", "Underground 6"),
+    ("2009 - Underground 9.0 (Demos)", "LP Underground 9: Demos"), ("(2009) Underground 9", "LP Underground 9: Demos"),
+    ("2010 - Underground X", "LP Underground X: Demos"), ("2011 - Underground 11", "Underground Eleven"),
+    ("Underground V2.5 [Limited Edition Fan Club CD]", "Underground V2.5: Limited Edition Fan Club CD"), ("Underground 2.0 (2002)", "Underground V2.0"),
+    ("2011 - North American Tour EP", "2011 North American Tour EP"), ("2002 - In the End (Live & Rare)", "In the End: Live & Rare"),
+    ("Linkin Park - Hybrid Theory [EP]", "Hybrid Theory EP"), ("Hybrid Theory CD-EP", "Hybrid Theory EP"), ("1999 - Hybrid Theory", "Hybrid Theory EP"),
+    ("Hybrid Theory (2000)", "Hybrid Theory"),
+    ("2008 - Underground 8.0 (mmm...Cookies - Sweet Hamster Like Jewels From America!)", "Mmm...Cookies: Sweet Hamster Like Jewels from America!"),
+])
+def test_a_folder_is_matched_by_its_title_however_numbered_prefixed_subtitled_or_typed(folder, title):
+    group = lambda id, title, date, kind="EP": {"id": id, "title": title, "first-release-date": date, "primary-type": kind}
+    groups = [group("Underground 14", "LP Underground XIV", "2014"), group("Underground 6", "Underground 6", "2006"),
+              group("Underground V2.5: Limited Edition Fan Club CD", "Underground V2.5: Limited Edition Fan Club CD", "2003", "Album"),
+              group("Underground V2.0", "Underground V2.0", "2002"), group("Hybrid Theory EP", "Hybrid Theory", "1999"),
+              group("Hybrid Theory", "Hybrid Theory", "2000", "Album"), group("In the End", "In the End", "2001", "Single"),
+              *(group(t, t, d) for t, d in [("LP Underground 9: Demos", "2009"), ("LP Underground X: Demos", "2010"), ("Underground Eleven", "2011"),
+                                           ("2011 North American Tour EP", "2010-12-20"), ("In the End: Live & Rare", "2002"),
+                                           ("Mmm...Cookies: Sweet Hamster Like Jewels from America!", "2008")])]
+    assert releases.folder_groups(folder, LP, groups) == [title]
 
 
 def test_a_wanted_single_is_also_found_as_loose_tracks_by_their_exact_titles():

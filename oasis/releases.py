@@ -6,9 +6,9 @@ MusicBrainz ('Ensemble Play'), which count as its own. A wrong album is worse th
 instrumentals, deluxe...), bundles and videos are left out, and so are short or self-titled names that don't pin the
 album down. Disc images are tried after a file per track. The importer's edition match comes after, as a second check.
 Discographies, singles collections and other bundles are read by their file lists: each folder that is one wanted
-album, EP or single becomes a target, and only its files are fetched; a single may be loose tracks too (see loose). A
-folder of disc images is taken by its name and size alone. TorBox lists the files of bundles it has cached; of others,
-once it has downloaded them (download.py)."""
+album, EP or single becomes a target, by its name and its songs, and only its files are fetched; a single may be loose
+tracks too (see loose). A folder of disc images is taken by its name and size alone. TorBox lists the files of bundles
+it has cached; of others, once it has downloaded them (download.py)."""
 import logging
 import re
 import unicodedata
@@ -32,7 +32,7 @@ VARIANTS = re.compile(r"\b(best of|greatest hits|very best|the essential|antholo
 CREDITED_AS_SOURCE = re.compile(r"\b(based on (the )?music of|music of|tribute to|covers? of|in the style of|songs of|plays|presents?)( the)?$")  # "Funk Daddy Present Jay-Z": a mixtape of theirs
 VARIANTS_JA = re.compile(r"インスト|カラオケ|ライ[ブヴ]|リミックス|オフボーカル")
 BUNDLES = re.compile(r"discograph|collection|complete|box ?set|anthology|\bsingles\b|全集|ディスコグラフィ", re.I)
-VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|hdtv|web ?rip|\d{3,4}[pi]|x26[45]|h ?26[45]|hevc|xvid|divx|mkv|avi|mpe?g|mp4|vob|video)\b")
+VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|hdtv|web ?rip|\d{3,4}[pi]|x26[45]|h ?26[45]|hevc|xvid|divx|mkv|avi|mpe?g|mp4|vob|videos?)\b")
 TYPES = {"single": "Single", "maxi": "Single", "ep": "EP"}  # words naming a release's type
 IMAGE = re.compile(r"\b(image|img) cue\b")  # one file for the whole disc, which the importer splits: a file per track is surer
 LOSSLESS = re.compile(r"\b(flac|alac|wav|lossless|24 ?bits?|hi ?res|ape)\b")
@@ -47,6 +47,9 @@ OTHER_TITLE_QUERIES = 2  # searches by the album's other titles (romanised, tran
 DISC = re.compile(r"^(?:cd|disc|disk)\s*(\d+)\b", re.I)  # a disc's folder inside its album's
 YEAR = re.compile(r"^(19|20)\d\d$")
 IMAGES = ("jpg", "jpeg", "png", "webp", "gif")
+NUMBERS = {w: str(n) for n, w in enumerate("one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
+                                            "seventeen eighteen nineteen twenty".split(), 1)}
+ROMAN = re.compile(r"x{0,3}(ix|iv|v?i{0,3})")
 
 
 def plain(text: str) -> str:
@@ -267,45 +270,77 @@ def bundle_queries(want: dict) -> list[str]:
     return list(dict.fromkeys([f"{artist} discography", artist, f"{artist} singles", f"{artist} complete singles", *map(clean, want["native"])]))
 
 
-def folder_album(name: str, want: dict, groups: list[dict]) -> str | None:
-    """The release group an album folder inside a bundle is: its name holds the title (or one of the group's
-    other_titles) apart from the artist's name, and the year when it has one; variants and videos aren't the album. Of
-    titles inside one another the longest wins ('One More Light' over 'One'); two groups of one title that the year
-    doesn't tell apart are neither, but a single loses to the album or EP unless the name says single: a title track's
-    single doesn't take its album's folder."""
-    tokens = words(name)
-    text, years = " ".join(tokens), {t for t in tokens if YEAR.match(t)}
-    artists = [s for n in want["names"] for s in spans(tokens, words(n))]
+def roman(token: str) -> int:
+    values = [{"i": 1, "v": 5, "x": 10}[c] for c in token]
+    return sum(-v if v < after else v for v, after in zip(values, [*values[1:], 0]))
+
+
+def numbered(tokens: list[str]) -> list[str]:
+    """Numbers as digits, however written: 'Underground XIV', 'Underground Eleven', 'Underground V2.0' -> underground
+    14, underground 11, underground 2. A '.0' goes ('6.0' is 6); other decimals stay ('2.5' is 2 5)."""
+    found = []
+    for t in tokens:
+        t = NUMBERS.get(t) or (str(roman(t)) if t and ROMAN.fullmatch(t) else re.sub(r"^v(?=\d)", "", t))
+        if not (t == "0" and found and found[-1].isdigit()):
+            found.append(t)
+    return found
+
+
+def forms(title: str, want: dict) -> list[str]:
+    """The ways a bundle's folder may name a title: as it is, without its subtitle ('LP Underground 9: Demos' ->
+    LP Underground 9), and either without the artist's initials opening it ('Underground 9: Demos', 'Underground 9')."""
+    initials = {"".join(w[0] for w in words(n)) for n in want["names"] if len(words(n)) > 1}
+    found = [title, *([title.split(":")[0]] if ":" in title else [])]
+    return found + [" ".join(w[1:]) for t in found if len(w := words(t)) > 1 and w[0] in initials]
+
+
+def folder_groups(name: str, want: dict, groups: list[dict]) -> list[str]:
+    """The release groups an album folder inside a bundle may be by its name: its name holds the title (one of its
+    forms, or one of the group's other_titles) apart from the artist's name, numbers however written, and the year when
+    it has one besides the title's own; variants and videos aren't the album. Of titles inside one another only the
+    longest counts ('One More Light', not 'One'). Of groups of one title a single loses to the album or EP unless the
+    name says single (a title track's single doesn't take its album's folder), and a name that says EP or single keeps
+    that type. The folder's files tell the rest (targets)."""
+    tokens, plain_tokens = numbered(words(name)), words(name)
+    text = " ".join(plain_tokens)
+    artists = [s for n in want["names"] for s in spans(tokens, numbered(words(n)))]
     names = {"".join(words(n)) for n in want["names"]}
-    fits = []
-    for g, named in ((g, t) for g in groups for t in [g["title"], *g.get("other_titles", ())]):
-        title, year = words(named), (g.get("first-release-date") or "")[:4]
-        compact, title_text = "".join(title), " ".join(title)
-        if not compact or not any(all(e <= a or b <= s for a, b in artists) for s, e in spans(tokens, title)):
-            continue
-        if years and year not in years or (len(compact) < 4 or compact in names) and year not in years:
+    fits = {}
+    for g, named in ((g, f) for g in groups for t in [g["title"], *g.get("other_titles", ())] for f in forms(t, want)):
+        title, year = numbered(words(named)), (g.get("first-release-date") or "")[:4]
+        compact, title_text = "".join(words(named)), " ".join(words(named))
+        found = [(s, e) for s, e in spans(tokens, title) if all(e <= a or b <= s for a, b in artists)]
+        # A year in the name, not the title's own ('2011 - North American Tour EP' for '2011 North American Tour EP' of 2010), must be the group's.
+        dated = [{t for i, t in enumerate(tokens) if YEAR.match(t) and not s <= i < e} for s, e in found]
+        if not compact or not any(year in years or not years and len(compact) >= 4 and compact not in names for years in dated):
             continue
         allowed = hits(VARIANTS, " ".join([title_text, *(" ".join(words(n)) for n in want["names"])]))
         if hits(VARIANTS, text) - allowed or hits(VARIANTS_JA, plain(name)) - hits(VARIANTS_JA, plain(named)) or \
                 hits(VARIANTS, title_text) - hits(VARIANTS, text) or VIDEO.search(text) and not VIDEO.search(title_text):
             continue
-        fits.append((len(compact), g["id"]))
-    best = {rg for n, rg in fits if n == max(fits)[0]}
+        fits[g["id"]] = max(fits.get(g["id"], 0), len("".join(title)))
+    best = [rg for rg, n in fits.items() if n == max(fits.values())]
     if len(best) > 1:
-        kinds, single = {g["id"]: g.get("primary-type") for g in groups}, any(TYPES.get(t) == "Single" for t in tokens)
-        best = {rg for rg in best if (kinds[rg] == "Single") == single}
-    return best.pop() if len(best) == 1 else None
+        kinds, named = {g["id"]: g.get("primary-type") for g in groups}, next((TYPES[t] for t in plain_tokens if t in TYPES), None)
+        best = [rg for rg in best if kinds[rg] == named] if named else [rg for rg in best if kinds[rg] != "Single"]
+    return best
 
 
-def covers(audio: list[dict], editions: list[dict], artist: str) -> bool:
-    """Whether the files' names cover every track of an edition: by title, or by disc and track number. Their
-    lengths are checked when they are imported."""
+def folder_album(name: str, want: dict, groups: list[dict]) -> str | None:
+    """The release group an album folder inside a bundle is by its name alone, when that tells (folder_groups)."""
+    found = folder_groups(name, want, groups)
+    return found[0] if len(found) == 1 else None
+
+
+def covers(audio: list[dict], editions: list[dict], artist: str, titled: bool = False) -> int:
+    """The most tracks of an edition the files' names cover, every one of them: by title, or by disc and track number
+    unless titled; 0 when they cover none. Their lengths are checked when they are imported."""
     def number(name):
         found, disc = number_of(name), DISC.match(PurePosixPath(name).parent.name)
         return (int(disc[1]), found[1]) if found and disc else found
-    files = [{"path": f["name"], "key": key(title_of(f["name"], artist)), "number": number(f["name"]), "length": None} for f in audio]
-    return any(r.get("status") != "Pseudo-Release" and (tracks := [(m, t) for m in r.get("media") or [] for t in m.get("tracks") or []])
-               and len(tracks) <= len(files) and match(files, tracks) is not None for r in editions)
+    files = [{"path": f["name"], "key": key(title_of(f["name"], artist)), "number": None if titled else number(f["name"]), "length": None} for f in audio]
+    return max((len(tracks) for r in editions if r.get("status") != "Pseudo-Release" and (tracks := [(m, t) for m in r.get("media") or [] for t in m.get("tracks") or []])
+                and len(tracks) <= len(files) and match(files, tracks) is not None), default=0)
 
 
 def disc_images(audio: list[dict], sheets: set[PurePosixPath]) -> bool:
@@ -326,33 +361,52 @@ def sized(audio: list[dict], editions: list[dict]) -> bool:
 def targets(files: list[dict], want: dict, groups: list[dict], wanted: set[str], editions) -> dict[str, list[str]]:
     """The wanted albums, EPs and singles a bundle's file list ({name, size}) holds, by release group, each with its files to fetch:
     one album folder's music (its discs' folders too), cue sheets and images. A folder must cover a whole edition by
-    its file names, or be disc images of an edition's size; lossless folders are tried first, a file per track before
-    images; then singles in loose tracks. groups: the artist's release groups; wanted: those missing. editions(rg): the
-    release group's editions with their tracks."""
+    its file names, or be disc images of an edition's size. Of several groups its name may be (folder_groups), it is the
+    one whose songs it holds by title, the most of them ('Hybrid Theory' with the EP's songs is the EP). A folder whose
+    name is none of the artist's groups ('CD 2', 'Fan Club 2005') and no variant is the one wanted group an edition of
+    which it holds exactly, song for song by title.
+    Lossless folders are tried first, a file per track before images; then singles in loose tracks. groups: the
+    artist's release groups; wanted: those missing. editions(rg): the release group's editions with their tracks."""
     folders, sheets = {}, {PurePosixPath(f["name"]).parent for f in files if f["name"].lower().endswith(".cue")}
     for f in files:
         if f["name"].rsplit(".", 1)[-1].lower() in AUDIO:
             parent = PurePosixPath(f["name"]).parent
             folders.setdefault(parent.parent if DISC.match(parent.name) else parent, []).append(f)
     lossless = lambda audio: sum(f["name"].rsplit(".", 1)[-1].lower() in LOSSLESS_FILES for f in audio)
+    known, allowed = {}, hits(VARIANTS, " ".join(words(" ".join(want["names"]))))
+
+    def fits(rg, audio, titled=False, exact=False) -> int:
+        try:
+            if rg not in known:
+                known[rg] = editions(rg)
+            if disc_images(audio, sheets):
+                return int(not titled and sized(audio, known[rg]))
+            return covers(audio, [r for r in known[rg] if not exact or sum(len(m.get("tracks") or []) for m in r.get("media") or []) == len(audio)],
+                          want["artist"], titled)
+        except (OSError, LookupError) as e:
+            log.info("editions of %s: %s", rg, e)
+            known[rg] = []
+            return 0
+
     found = {}
     for folder, audio in sorted(folders.items(), key=lambda item: (lossless(item[1]) > 0, not disc_images(item[1], sheets), lossless(item[1]),
                                                                     len(item[1])), reverse=True):
-        rg = folder_album(folder.name, want, groups)
-        if rg not in wanted or rg in found:
-            continue
-        try:
-            fits = sized(audio, editions(rg)) if disc_images(audio, sheets) else covers(audio, editions(rg), want["artist"])
-        except (OSError, LookupError) as e:
-            log.info("editions of %s: %s", rg, e)
-            continue
-        if fits:
+        if len(named := folder_groups(folder.name, want, groups)) == 1:
+            rg = named[0] if named[0] in wanted and fits(named[0], audio) else None
+        elif named:
+            rg = max(named, key=lambda rg: fits(rg, audio, titled=True)) if any(fits(rg, audio, titled=True) for rg in named) else None
+        elif not hits(VARIANTS, " ".join(words(folder.name))) - allowed and not VIDEO.search(" ".join(words(folder.name))):
+            by_songs = [rg for rg in sorted(wanted - set(found)) if fits(rg, audio, titled=True, exact=True)]
+            rg = by_songs[0] if len(by_songs) == 1 else None
+        else:
+            rg = None
+        if rg in wanted and rg not in found:
             extras = [f["name"] for f in files if f["name"].rsplit(".", 1)[-1].lower() in (*IMAGES, "cue") and PurePosixPath(f["name"]).is_relative_to(folder)]
             found[rg] = [f["name"] for f in audio] + extras
-        else:
-            log.info("%s holds only part of %s", folder, rg)
+        elif set(named) & wanted - set(found):
+            log.info("%s holds only part of %s", folder, named)
     singles = [g["id"] for g in groups if g.get("primary-type") == "Single" and g["id"] in wanted and g["id"] not in found]
-    return found | loose([f for a in folders.values() if not disc_images(a, sheets) for f in a], want, singles, editions)
+    return found | loose([f for a in folders.values() if not disc_images(a, sheets) for f in a], want, singles, lambda rg: known.get(rg) or editions(rg))
 
 
 def loose(audio: list[dict], want: dict, singles: list[str], editions) -> dict[str, list[str]]:
