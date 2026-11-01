@@ -2,9 +2,10 @@
 artist's albums, EPs and singles are read daily, and guest appearances, repackages and singles whose songs are all on its
 albums left out.
 An album is here when the library holds as many of its tracks as its smallest edition has. Missing albums are searched
-(Prowlarr, then TorBox: download.py) one a minute, again and again, ever further apart; an artist with gaps gets a
-weekly search for cached discographies and bundles, which can fill many at once. Anything MusicBrainz has can be
-wanted, under ids of its own until it arrives (see adopt). want_album holds the albums; want_item the stars and follows."""
+(Prowlarr, then TorBox: download.py) one a minute, or 15 s after a search that found nothing, again and again, ever
+further apart; an artist with gaps gets a weekly search for cached discographies and bundles, which can fill many at
+once. Anything MusicBrainz has can be wanted, under ids of its own until it arrives (see adopt). want_album holds
+the albums; want_item the stars and follows."""
 import itertools
 import json
 import logging
@@ -45,6 +46,7 @@ CLIENT_STATES = {"missing": "wanted", "downloading": "downloading", "have": "hav
 RETRY_NO_MATCH = 1800     # seconds before looking an unmatched name up again
 RETRY_ERROR = 300         # seconds before retrying after MusicBrainz errors
 SEARCH_GAP = 60           # seconds between searches, so a burst of stars doesn't trip TorBox's rate limit
+MISS_GAP = 15             # seconds after a search that asked TorBox to add nothing: only Prowlarr had work
 RETRY_FULL = 600          # seconds before an album TorBox had no free slot for is searched again
 UPGRADE_AGAIN = 7 * 86400  # seconds between searches for a lossless copy of an album here lossy
 REPEATS = 0.6             # share of an album's songs already on the artist's earlier releases that makes it a repackage
@@ -132,7 +134,7 @@ class Acquire:
         """downloads: download.py's. bundles: also search for cached discographies and bundles."""
         self.connect, self.downloads, self.allowed, self.bundles = connect, downloads, set(secondary_types), bundles
         self.wake = threading.Event()
-        self.last_search = 0.0
+        self.last_search, self.gap = 0.0, SEARCH_GAP
         self.soon: set[str] = set()  # release groups to search before any other (the dashboard's "search now")
 
     def start(self):
@@ -144,7 +146,7 @@ class Acquire:
                 self.reconcile()
             except Exception:
                 log.exception("acquire pass failed")
-            self.wake.wait(60)
+            self.wake.wait(self.gap if time.time() - self.last_search < self.gap else 60)
             self.wake.clear()
 
     def reconcile(self):
@@ -369,9 +371,9 @@ class Acquire:
             return False
 
     def search_next(self, db):
-        """One search, SEARCH_GAP apart: albums asked for on the dashboard first, then starred albums, then followed artists' albums and EPs, then their singles;
+        """One search, a gap apart (see searched): albums asked for on the dashboard first, then starred albums, then followed artists' albums and EPs, then their singles;
         each time those never searched first, then the newest. Then albums here only lossy, for a lossless copy weekly."""
-        if time.time() - self.last_search < SEARCH_GAP:
+        if time.time() - self.last_search < self.gap:
             return
         if self.soon and (row := db.execute("select * from want_album where rg = ? and state = 'missing'", (self.soon.pop(),)).fetchone()):
             return self.search(db, row)
@@ -395,7 +397,7 @@ class Acquire:
                          (time.time() - BUNDLE_AGAIN,)).fetchone()
         if row is None:
             return False
-        mbid, sent = row["artist_mbid"], None
+        mbid, sent, failed, started = row["artist_mbid"], None, False, time.time()
         try:
             alternatives, queued = other_titles(db, mbid), self.downloads.groups(db)
             groups = [{**g, "other_titles": alternatives.get(g["id"], [])} for g in self.browse(db, mbid)]
@@ -406,26 +408,34 @@ class Acquire:
                                          groups, wanted)
         except (OSError, LookupError) as e:
             log.warning("bundle search for %s failed: %s", row["artist"], e)
-        self.last_search = now = time.time()
+            failed = True
+        now = self.searched(started, sent, failed)
         # TorBox had no free slot: soon again.
         db.execute("insert or replace into bundle_search values (?, ?)", (mbid, now - BUNDLE_AGAIN + RETRY_FULL if sent is False else now))
         return True
 
     def search(self, db, row):
         """Never raises: a search that fails still counts, so the next one moves on to another album."""
-        error = "searched, no release found yet"
+        error, failed, started = "searched, no release found yet", False, time.time()
         try:
             sent = self.downloads.find(db, self.target(db, row), row["rg"])
         except (OSError, LookupError) as e:
             log.warning("search for %s - %s failed: %s", row["artist"], row["title"], e)
-            sent, error = None, f"search failed: {e}"[:300]
-        self.last_search = now = time.time()
+            sent, error, failed = None, f"search failed: {e}"[:300], True
+        now = self.searched(started, sent, failed)
         if sent is False:  # TorBox had no free slot
             db.execute("update want_album set next_search = ? where rg = ?", (now + RETRY_FULL, row["rg"]))
             return
         first, most = (SINGLE_RESEARCH, SINGLE_MOST) if row["primary_type"] == "Single" else (RESEARCH, RESEARCH_MOST)
         db.execute("update want_album set searched = ?, tries = tries + 1, next_search = ?, error = ? where rg = ?",
                    (now, now + min(first * 2 ** row["tries"], most), None if sent else error, row["rg"]))
+
+    def searched(self, started: float, sent: bool | None, failed: bool) -> float:
+        """Sets the gap to the next search: SEARCH_GAP after one that asked TorBox to add a torrent (or failed), for its
+        rate limit; MISS_GAP after one that found nothing to add. Returns the time."""
+        self.last_search = now = time.time()
+        self.gap = MISS_GAP if sent is None and not failed and self.downloads.added < started else SEARCH_GAP
+        return now
 
     def target(self, db, row) -> dict:
         """What releases.find looks for: the artist under all its names, the title and its other titles, year, discs, the

@@ -186,7 +186,7 @@ def test_a_torrent_added_again_after_a_failure_gets_a_new_stall_timer(downloads,
 def test_a_queued_add_is_dropped_without_blocking(downloads, torbox, db):
     downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
     torbox.full = True
-    assert downloads.find(db, WANT, "mb-album") is False  # acquire.py makes the album due again soon
+    assert downloads.find(db, WANT, "mb-album") is False and downloads.added  # acquire.py makes the album due again soon, a full gap on
     assert torbox.dropped == [90] and db.execute("select count(*) from release_block").fetchone()[0] == 0
     assert db.execute("select count(*) from download").fetchone()[0] == 0
 

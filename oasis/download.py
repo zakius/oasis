@@ -114,6 +114,7 @@ class Downloads:
         self.failures = {}   # hash -> polls in a row its files failed to download
         self.copying = {}    # hash -> [(path, size)]: the files being fetched here, for copied()
         self.crowded = False  # TorBox's slots are all taken and albums wait: see step
+        self.added = 0.0     # when send last asked TorBox to add a torrent, for acquire's gap between searches
         self.pace, self.last_request, self.paused_until = threading.Lock(), 0.0, 0.0
 
     def torbox(self):
@@ -186,6 +187,7 @@ class Downloads:
                 log.info("%s failed before: next", release["title"])
                 continue
             try:
+                self.added = time.time()
                 added = tb.add(release["title"], **found)
             except OSError as e:
                 log.info("couldn't add %s to TorBox: %s", release["title"], e)

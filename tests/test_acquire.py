@@ -59,7 +59,7 @@ class MusicBrainz:
 
 class FakeDownloads:
     def __init__(self):
-        self.active, self.found, self.result, self.free = set(), [], None, True
+        self.active, self.found, self.result, self.free, self.added = set(), [], None, True, 0.0
 
     def groups(self, db):
         return set(self.active)
@@ -68,6 +68,8 @@ class FakeDownloads:
         return self.free
 
     def find(self, db, want, group):
+        if self.result is not None:
+            self.added = time.time()
         self.found.append(group)
         self.wants = getattr(self, "wants", []) + [want]
         return self.result
@@ -191,6 +193,25 @@ def test_missing_albums_are_searched_in_order_and_again_ever_further_apart(clien
     assert wants(client)[db.execute("select title from want_album where rg = ?", (sent,)).fetchone()[0]][0] == "downloading"
     want = acq.downloads.wants[-1]
     assert want["artist"] == "Beta" and want["names"] == ["Beta"] and "Greatest Hits" in want["others"] and want["upgrade"] is False
+
+
+def test_after_a_search_that_added_nothing_to_torbox_the_next_may_start_sooner(client, mb, monkeypatch):
+    follow_beta(client, mb)
+    acq, now = client.app.state.api.library, [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    assert acq.downloads.found == ["g-ost"] and acq.gap == acquire.MISS_GAP  # nothing found: only Prowlarr was asked
+    now[0] += acquire.MISS_GAP
+    acq.downloads.result = True
+    sync(client)
+    assert acq.downloads.found == ["g-ost", "g-second"] and acq.gap == acquire.SEARCH_GAP  # sent to TorBox: its rate limit's gap
+    now[0] += acquire.MISS_GAP
+    sync(client)
+    assert len(acq.downloads.found) == 2
+    acq.downloads.result = None
+    now[0] += acquire.SEARCH_GAP
+    acq.downloads.added = now[0]  # TorBox wouldn't take it: asked all the same
+    sync(client)
+    assert len(acq.downloads.found) == 3 and acq.gap == acquire.SEARCH_GAP
 
 
 def test_a_search_knows_the_albums_other_titles_from_its_aliases_and_pseudo_releases(client, mb):
