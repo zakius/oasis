@@ -156,6 +156,10 @@ create table if not exists album_track(  -- the songs each YouTube Music album l
 create index if not exists play_track on play(track_id);
 create table if not exists session(token text primary key, user text not null, expires real not null);
 create table if not exists lyrics(track_id text primary key, found text, fetched real not null);
+create table if not exists track_latin(  -- library tracks' names romanized and folded, for search to match romaji (see api.py)
+    id text primary key, source text not null,  -- source: the names they were made from
+    title text, artist text, album text, album_artist text
+);
 create table if not exists playlist_entry(
     playlist_id int not null references playlist(id) on delete cascade,
     pos int not null, track_id text not null

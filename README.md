@@ -36,6 +36,8 @@ With YouTube Music linked, each user's personal mixes (My Supermix, the themed M
 
 Lyrics (`getLyricsBySongId`, OpenSubsonic `songLyrics`, and `getLyrics`) come from a `.lrc` file next to the track or lyrics tags in the file. Otherwise oasis asks the sources roma uses at once: YouTube Music, LRCLIB, NetEase, KuGou and LyricsPlus. It picks by roma's rules, with YouTube Music's text as the reference: word-timed lyrics that match it, then YouTube Music's line-timed lyrics, then other synced lyrics that match, then YouTube Music's plain text. Credit lines are dropped. Results are cached, and a miss is retried after a day. NetEase and KuGou are unofficial APIs and may change.
 
+Names and lyrics in other scripts come romanized for clients that ask, through the OpenSubsonic extension `romanization` ([docs/romanization-extension.md](docs/romanization-extension.md)): Japanese in Hepburn, Chinese in pinyin, Korean, Cyrillic and Greek in their usual Latin forms, as roma romanizes them. Search finds songs, albums and artists by their romanized names whatever the client asks.
+
 `stream` transcodes when a client asks for `format=opus` (in WebM), `mp3` or `aac`, or for a `maxBitRate` below the file's bitrate; `timeOffset` starts partway in. Transcoding needs `ffmpeg` on `PATH`, which the container includes. Without it, oasis sends the original file.
 
 ## Getting music

@@ -19,7 +19,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import accounts, acquire, artists, cover, dedupe, forward, lyrics, musicbrainz, releases, scan, web, ytm
+from . import accounts, acquire, artists, cover, dedupe, forward, lyrics, musicbrainz, releases, romanize, scan, web, ytm
 from .acquire import MB_IDS, SECONDARY, Acquire
 from .config import Config
 from .credits import PERFORMANCE_ROLES, Credits
@@ -287,6 +287,79 @@ def describe_albums(db, albums: list[dict]):
             a["releaseTypes"] = [t.title() for t in types]
 
 
+def latin_of(s, siblings=(), title_of=False) -> str | None:
+    """s romanized, or None when it needs no romanizing."""
+    if not isinstance(s, str) or not romanize.has_non_latin(s):
+        return None
+    latin = romanize.text(s, [x for x in siblings if x], title_of)
+    return None if romanize.is_latin(s, latin) else latin
+
+
+ARTIST_KEYS = ("artist", "artists", "albumArtists", "similarArtist", "directory")
+
+
+def romanized(payload: dict, mode: str | None) -> dict:
+    """The OpenSubsonic extension romanization (docs/romanization-extension.md): mode both adds a …Latin field next to
+    each name whose romanized form differs, latin puts that form in the name fields themselves. Siblings are as roma
+    gives them: a title is read with its artist and album, so a Chinese singer's song isn't read as Japanese."""
+    if mode not in ("both", "latin"):
+        return payload
+
+    def put(item, field, *siblings, title_of=False):
+        if (latin := latin_of(item.get(field), siblings, title_of)) is not None:
+            item[field if mode == "latin" else field + "Latin"] = latin
+
+    def walk(value, key=None):
+        if isinstance(value, list):
+            for v in value:
+                walk(v, key)
+            return
+        if not isinstance(value, dict):
+            return
+        if value.get("mediaType") == "song":
+            title, artist, album = value.get("title"), value.get("artist"), value.get("album")
+            put(value, "title", artist, album, title_of=True)
+            put(value, "album", title, artist, title_of=True)
+            for field in ("artist", "displayArtist", "displayAlbumArtist", "displayComposer"):
+                put(value, field, title, album)
+            for a in [*value.get("artists", []), *value.get("albumArtists", []), *(c["artist"] for c in value.get("contributors", []))]:
+                put(a, "name", title, album)
+            return
+        if value.get("isDir"):  # an album
+            name = value.get("name")
+            for field in ("name", "title", "album") if mode == "latin" else ("name",):
+                put(value, field, value.get("artist"), title_of=True)
+            for field in ("artist", "displayArtist"):
+                put(value, field, name)
+            for a in value.get("artists", []):
+                put(a, "name", name)
+            walk(value.get("song"))
+            return
+        if "owner" in value or key in ARTIST_KEYS:  # a playlist, an artist, or a directory named as its artist or album
+            put(value, "name")
+        for k, v in value.items():
+            walk(v, k)
+        if mode == "latin" and "ignoredArticles" in value:
+            value["index"] = indexed(sorted((a for i in value["index"] for a in i["artist"]), key=lambda a: a["name"].casefold()))
+    walk(payload)
+    return payload
+
+
+LATIN_SOURCE = "coalesce(t.title, '') || char(31) || coalesce(t.artist, '') || char(31) || coalesce(t.album, '') || char(31) || coalesce(t.album_artist, '')"
+
+
+def latin_index(db):
+    """Fills track_latin for library tracks new or renamed since, as the songs show their names romanized."""
+    rows = db.execute(f"select t.*, {LATIN_SOURCE} as source from track t left join track_latin l on l.id = t.id "
+                      f"where t.library = 1 and l.source is not {LATIN_SOURCE}").fetchall()
+
+    def folded(s, *siblings, title_of=False):
+        return ytm.fold(latin_of(s, siblings, title_of) or "")
+    db.executemany("insert or replace into track_latin values (?, ?, ?, ?, ?, ?)", [(
+        r["id"], r["source"], folded(r["title"], r["artist"], r["album"], title_of=True), folded(r["artist"], r["title"], r["album"]),
+        folded(r["album"], r["title"], r["artist"], title_of=True), folded(r["album_artist"], r["title"], r["album"])) for r in rows])
+
+
 def decode_password(value: str) -> str:
     return bytes.fromhex(value[4:]).decode() if value.startswith("enc:") else value
 
@@ -294,6 +367,13 @@ def decode_password(value: str) -> str:
 def is_radio(playlist_name: str) -> int:
     """Playlists named "Radio ..." grow by themselves from the tracks played in them."""
     return int(playlist_name.casefold().startswith("radio"))
+
+
+def indexed(artists: list[dict]) -> list[dict]:
+    groups: dict[str, list] = {}
+    for a in artists:
+        groups.setdefault(index_letter(a["name"]), []).append(a)
+    return [{"name": k, "artist": v} for k, v in sorted(groups.items())]
 
 
 def index_letter(name: str) -> str:
@@ -368,6 +448,7 @@ class Api:
                     scan.scan(db, self.config.library)
                     if self.config.dedupe:
                         self._dedupe(db)
+                    latin_index(db)
                     self.credits.wake.set()
                     if not self.scan_again:
                         break
@@ -417,7 +498,8 @@ class Api:
         return {"license": {"valid": True}}
 
     def getOpenSubsonicExtensions(self, db, p, user):
-        return {"openSubsonicExtensions": [{"name": name, "versions": [1]} for name in ("formPost", "songLyrics", "transcodeOffset")]}
+        return {"openSubsonicExtensions": [{"name": name, "versions": versions} for name, versions in (
+            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]))]}
 
     def _user(self, row) -> dict:
         roles = ("scrobbling", "settings", "download", "playlist", "coverArt", "comment", "stream", "share")
@@ -516,10 +598,8 @@ class Api:
         return self.getScanStatus(db, p, user)
 
     def _artists_index(self, db):
-        groups: dict[str, list] = {}
-        for r in db.execute(ARTISTS + " where t.library = 1 group by t.artist_id order by t.album_artist collate nocase"):
-            groups.setdefault(index_letter(r["name"]), []).append(artist(r))
-        return {"ignoredArticles": "The A", "index": [{"name": k, "artist": v} for k, v in sorted(groups.items())]}
+        rows = db.execute(ARTISTS + " where t.library = 1 group by t.artist_id order by t.album_artist collate nocase")
+        return {"ignoredArticles": "The A", "index": indexed([artist(r) for r in rows])}
 
     def getArtists(self, db, p, user):
         return {"artists": self._artists_index(db)}
@@ -707,20 +787,24 @@ class Api:
 
     def _search(self, db, p):
         terms = [t for t in p.get("query", "").replace('"', "").split() if t]
+        latin_index(db)
 
-        def match(columns: str):
-            return " and ".join(["t.library = 1", *[f"({columns}) like ?"] * len(terms)]), [f"%{t}%" for t in terms]
+        def match(columns: str, latin: str):
+            """Each term in the names or in their romanized forms (track_latin, folded: "tokyo" finds 東京)."""
+            return " and ".join(["t.library = 1", *[f"(({columns}) like ? or ({latin}) like ?)"] * len(terms)]), \
+                [x for t in terms for x in (f"%{t}%", f"%{ytm.fold(t)}%" if ytm.fold(t) else None)]
+        latin = " left join track_latin l on l.id = t.id"
 
         # Every row is read before YouTube Music is asked: a cursor left open keeps its read snapshot, and remember()
         # can't write from a snapshot that another connection's write (the mix refresh's) made stale: "database is locked".
-        cond, args = match("t.album_artist")
-        artists = [artist(r) for r in db.execute(ARTISTS + f" where {cond} group by t.artist_id order by t.album_artist collate nocase "
+        cond, args = match("t.album_artist", "l.album_artist")
+        artists = [artist(r) for r in db.execute(ARTISTS + latin + f" where {cond} group by t.artist_id order by t.album_artist collate nocase "
                                                  "limit ? offset ?", (*args, p.int("artistCount", 20), p.int("artistOffset", 0)))]
-        cond, args = match("t.album || ' ' || t.album_artist")
-        albums = [album(r) for r in db.execute(ALBUMS + f" where {cond} group by t.album_id order by name collate nocase limit ? offset ?",
+        cond, args = match("t.album || ' ' || t.album_artist", "l.album || l.album_artist")
+        albums = [album(r) for r in db.execute(ALBUMS + latin + f" where {cond} group by t.album_id order by name collate nocase limit ? offset ?",
                                                (*args, p.int("albumCount", 20), p.int("albumOffset", 0)))]
-        cond, args = match("t.title || ' ' || t.artist || ' ' || t.album")
-        songs = [song(r) for r in db.execute(SONGS + f" where {cond} order by t.album_artist, t.album, t.disc_no, t.track_no limit ? offset ?",
+        cond, args = match("t.title || ' ' || t.artist || ' ' || t.album", "l.title || l.artist || l.album")
+        songs = [song(r) for r in db.execute(SONGS + latin + f" where {cond} order by t.album_artist, t.album, t.disc_no, t.track_no limit ? offset ?",
                                              (*args, p.int("songCount", 20), p.int("songOffset", 0)))]
         if self.ytm and terms and p.int("songOffset", 0) == 0:
             known = {s["id"] for s in songs}
@@ -736,7 +820,7 @@ class Api:
             # The artists and albums of YouTube Music's songs that the query names, as the library's are matched, after
             # the library's: opening one fetches the rest of it.
             folded = [ytm.fold(t) for t in terms]
-            def named(*texts): return all(t in ytm.fold(" ".join(x or "" for x in texts)) for t in folded)
+            def named(*texts): return all(t in ytm.fold(" ".join(x or "" for x in [*texts, *map(latin_of, texts)])) for t in folded)
             if p.int("artistOffset", 0) == 0 and (room := p.int("artistCount", 20) - len(artists)) > 0:
                 ids = [i for i in dict.fromkeys(s["artistId"] for s in found if s.get("artistId")) if i not in {a["id"] for a in artists}]
                 artists += [a for a in self._in_order(db, ARTISTS, "t.artist_id", ids, artist) if named(a["name"])][:room]
@@ -942,9 +1026,20 @@ class Api:
         found = self._lyrics(db, r)
         if not found:
             return {"lyricsList": {}}
-        return {"lyricsList": {"structuredLyrics": [{
-            "displayArtist": r["artist"], "displayTitle": r["title"], "lang": "xxx", "offset": 0, "synced": found.synced,
-            "line": [clean({"start": start, "value": text}) for start, text in found.lines]}]}}
+        main = {"displayArtist": r["artist"], "displayTitle": r["title"], "lang": "xxx", "offset": 0, "synced": found.synced,
+                "line": [clean({"start": start, "value": text}) for start, text in found.lines]}
+        if p.get("enhanced") != "true":
+            return {"lyricsList": {"structuredLyrics": [main]}}
+        # songLyrics v2, with the romanization extension's kinds. oasis keeps no word timing (so no cueLine) and no
+        # translations; lyrics already in Latin script have no pronunciation, and main stands in for one.
+        kinds = (p.get("kinds") or "main,pronunciation,translation").split(",")
+        texts, siblings = [text for _, text in found.lines], [x for x in (r["artist"], r["album"]) if x]
+        latin = romanize.lyrics(texts, siblings) if any(map(romanize.has_non_latin, texts)) else None
+        entries = [{**main, "kind": "main"}] if "main" in kinds or "pronunciation" in kinds and latin is None else []
+        if latin and "pronunciation" in kinds:
+            entries.append({**main, "kind": "pronunciation", "lang": romanize.language(texts, siblings) + "-Latn",
+                            "line": [clean({"start": start, "value": l}) for (start, _), l in zip(found.lines, latin)]})
+        return {"lyricsList": clean({"structuredLyrics": entries or None})}
 
     def getLyrics(self, db, p, user):
         artist, title = p.get("artist", ""), p.get("title", "")
@@ -1310,7 +1405,7 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
                 user = api._authenticate(db, p)
                 p.follow_moves(db)
                 result = handler(api, db, p, user)
-                return result if isinstance(result, Response) else respond(fmt, describe(db, result))
+                return result if isinstance(result, Response) else respond(fmt, romanized(describe(db, result), p.get("romanization")))
             except Fail as e:
                 return respond(fmt, {}, e)
             finally:
