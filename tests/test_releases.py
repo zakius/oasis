@@ -334,3 +334,14 @@ def test_another_album_holding_the_title_a_namesake_or_various_artists_are_not_t
 
 def test_slashes_leave_queries():
     assert queries(want("Avid / Hands Up to the Sky", "SawanoHiroyuki[nZk]"))[0] == "SawanoHiroyuki nZk Avid Hands Up to the Sky"
+
+
+@pytest.mark.parametrize("name, why", [
+    ("Rammstein - Mein Herz brennt (2012) [FLAC]", None),
+    ("Torsten Rasch - Mein Herz Brennt (Based on Music of Rammstein) - 2003, FLAC", "another artist's: based on music of"),
+    ("Some Quartet plays Rammstein - Mein Herz brennt [FLAC]", "another artist's: plays"),
+    ("Mein Herz brennt - in the style of Rammstein [FLAC]", "another artist's: in the style of"),
+    ("Rammstein - Mein Herz brennt (Songs of Rammstein) [FLAC]", None),  # the artist is credited before the phrase
+])
+def test_an_artist_named_only_as_the_source_is_not_the_albums_artist(name, why):
+    assert reject(result(name), want("Mein Herz brennt", "Rammstein", year="2012")) == why

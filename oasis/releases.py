@@ -26,6 +26,7 @@ QUOTED = re.compile(r"[「『\"“]([^」』\"”]+)[」』\"”]")
 VARIANTS = re.compile(r"\b(best of|greatest hits|very best|the essential|anthology|singles|anniversary|deluxe|expanded|tour edition|bonus tracks?|"
                       r"re ?recorded|reissue|remix(es|ed)?|instrumentals?|inst|off vocal|karaoke|acapellas?|a ?cappellas?|live|unplugged|"
                       r"acoustic|demos?|tribute|orchestral|symphonic|piano|lullaby|8 ?bit|sped up|slowed|nightcore|tv size)\b")
+CREDITED_AS_SOURCE = re.compile(r"\b(based on (the )?music of|music of|tribute to|covers? of|in the style of|songs of|plays)( the)?$")
 VARIANTS_JA = re.compile(r"インスト|カラオケ|ライ[ブヴ]|リミックス|オフボーカル")
 BUNDLES = re.compile(r"discograph|collection|complete|box ?set|anthology|全集|ディスコグラフィ", re.I)
 VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|hdtv|\d{3,4}[pi]|x26[45]|h ?26[45]|hevc|mkv|avi|video)\b")
@@ -141,6 +142,9 @@ def reject_title(release: dict, want: dict) -> str | None:
     titles = apart([t for v in variants for t in spans(tokens, v)])
     if not titles:
         return "no title"
+    # 'Torsten Rasch - Mein Herz Brennt (Based on Music of Rammstein)': the artist is only the source of another's work.
+    if all(m := CREDITED_AS_SOURCE.search(" ".join(tokens[:a])) for a, _ in artists):
+        return f"another artist's: {m[1]}"
     allowed = hits(VARIANTS, " ".join([title_text, *(" ".join(words(n)) for n in want["names"])]))
     if extra := hits(VARIANTS, text) - allowed or hits(VARIANTS_JA, plain(name)) - hits(VARIANTS_JA, plain(title)):
         return f"variant: {sorted(extra)[0]}"
