@@ -27,12 +27,12 @@ BRACKETED = re.compile(r"\s*[\[(（【][^\])）】]*[\])）】]")
 QUOTED = re.compile(r"[「『\"“]([^」』\"”]+)[」』\"”]")
 # Words that make a release something else than the album, unless its title says so. Remasters are the album.
 VARIANTS = re.compile(r"\b(best of|greatest hits|very best|the essential|anthology|singles|anniversary|deluxe|expanded|tour edition|bonus tracks?|"
-                      r"re ?recorded|reissue|remix(es|ed)?|mix ?tapes?|instrumentals?|inst|off vocal|karaoke|acapellas?|a ?cappellas?|live|unplugged|"
+                      r"re ?recorded|reissue|remix(es|ed)?|mix ?tapes?|instrumentals?|inst|off vocal|no vocals?|karaoke|acapellas?|a ?cappellas?|live|unplugged|"
                       r"acoustic|demos?|tribute|orchestral|symphonic|piano|lullaby|8 ?bit|sped up|slowed|nightcore|tv size)\b")
 CREDITED_AS_SOURCE = re.compile(r"\b(based on (the )?music of|music of|tribute to|covers? of|in the style of|songs of|plays|presents?)( the)?$")  # "Funk Daddy Present Jay-Z": a mixtape of theirs
 VARIANTS_JA = re.compile(r"インスト|カラオケ|ライ[ブヴ]|リミックス|オフボーカル")
 BUNDLES = re.compile(r"discograph|collection|complete|box ?set|anthology|\bsingles\b|全集|ディスコグラフィ", re.I)
-VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|hdtv|web ?rip|\d{3,4}[pi]|x26[45]|h ?26[45]|hevc|xvid|divx|mkv|avi|video)\b")
+VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|hdtv|web ?rip|\d{3,4}[pi]|x26[45]|h ?26[45]|hevc|xvid|divx|mkv|avi|mpe?g|mp4|vob|video)\b")
 TYPES = {"single": "Single", "maxi": "Single", "ep": "EP"}  # words naming a release's type
 IMAGE = re.compile(r"\b(image|img) cue\b")  # one file for the whole disc, which the importer splits: a file per track is surer
 LOSSLESS = re.compile(r"\b(flac|alac|wav|lossless|24 ?bits?|hi ?res|ape)\b")

@@ -427,3 +427,8 @@ def test_other_peoples_mixtapes_of_an_album_are_not_it():
     assert reject(result("Jay-Z & Teknology - Blu Magik (The American Gangster Re-Mix-Tape)"), gangster) == "variant: mixtape"
     assert reject(result("Funk Daddy & Mistah Clark Present Jay-Z - West Coast American Gangster"), gangster) == "another artist's: present"
     assert reject(result("Jay-Z - American Gangster (2007) [FLAC]"), gangster) is None
+
+
+def test_music_videos_and_vocal_free_tracks_are_not_the_single():
+    assert reject(result("Metallica - Whiskey In The Jar.MPG (uncensored)"), want("Whiskey in the Jar", "Metallica")) == "video"
+    assert reject(result("Foo Fighters  Everlong (No Vocal Original Track) flac"), want("Everlong", "Foo Fighters")) == "variant: novocal"
