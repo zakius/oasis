@@ -563,3 +563,16 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     assert album_of(client, "First")["starred"] and call(client, "search3", query="Kenshi Yonezu")["searchResult3"]["artist"] == []
     call(client, "unstar", albumId="al-mb-" + STRAY)
     assert db.execute("select count(*) from wanted where kind = 'album'").fetchone()[0] == 0
+
+
+def test_an_album_searched_before_waits_behind_every_album_not_tried_yet(client, mb, monkeypatch):
+    follow_beta(client, mb)
+    acq, now = client.app.state.api.library, [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    assert acq.downloads.found == ["g-ost"]
+    db = client.app.state.api._db()
+    db.execute("update want_album set next_search = null where rg = 'g-ost'")  # its download failed: due again at once
+    db.execute("update want_album set reason = 'starred' where rg = 'g-ost'")  # starred, even
+    now[0] += acquire.SEARCH_GAP
+    sync(client)
+    assert acq.downloads.found[-1] == "g-second"
