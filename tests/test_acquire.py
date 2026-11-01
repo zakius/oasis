@@ -541,7 +541,7 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     response = client.get("/rest/getCoverArt", params={**params, "id": "al-mb-" + STRAY})
     assert (response.status_code, response.content, response.headers["content-type"]) == (200, b"jpeg", "image/jpeg")
     assert covers == [f"https://coverartarchive.org/release-group/{STRAY}/front-500"] and "max-age" in response.headers["cache-control"]
-    assert "error" in client.get("/rest/getCoverArt", params={**params, "id": "al-mb-" + LEMON, "f": "json"}).text  # none there
+    assert client.get("/rest/getCoverArt", params={**params, "id": "al-mb-" + LEMON, "f": "json"}).status_code == 404  # none there
     assert wants(client)["STRAY SHEEP"][:2] == ("missing", "starred") and wants(client)["BOOTLEG"][1] == "followed"
     for method, key in (("getStarred2", "starred2"), ("getStarred", "starred")):
         starred = call(client, method)[key]

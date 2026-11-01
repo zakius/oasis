@@ -1059,6 +1059,7 @@ class Api:
         result = clean({
             "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": MIX_OWNER if r["mix"] else r["owner"], "public": False,
             "coverArt": f"pl-{r['id']}" if r["cover"] else None,
+            "readonly": True if r["mix"] else None,  # OpenSubsonic: clients offer no edits
             "oasisMix": True if (r["mix"] or "").startswith("RDTMAK") else None, "youtubeId": r["mix"],
             "songCount": len(songs), "duration": sum(s.get("duration", 0) for s in songs),
             "created": iso(r["created"]), "changed": iso(r["changed"]),
@@ -1070,7 +1071,10 @@ class Api:
         return {"playlists": {"playlist": [self._playlist(db, r, False) for r in rows]}}
 
     def _own_playlist(self, db, id, user):
-        return self._one(db, "select * from playlist where id = ? and owner = ? and mix is null", id, user)
+        r = self._one(db, "select * from playlist where id = ? and owner = ?", id, user)
+        if r["mix"]:
+            raise Fail(DENIED, "YouTube Music's playlists are read-only")
+        return r
 
     def getPlaylist(self, db, p, user):
         r = self._one(db, "select * from playlist where id = ? and owner = ?", p.need("id"), user)
@@ -1176,8 +1180,8 @@ class Api:
         except OSError as e:
             log.warning("cover %s unavailable: %s", r["cover"], e)
             image = None
-        if image is None:
-            raise Fail(NOT_FOUND, "Cover art not found")
+        if image is None:  # a status clients see, not an error document they would try to show as an image
+            return Response(status_code=404)
         return Response(image[0], media_type=image[1], headers={"Cache-Control": "public, max-age=86400"})
 
     def stream(self, db, p, user):

@@ -85,7 +85,8 @@ def test_mixes_are_read_only_playlists_in_the_library(client, ytm):
     assert ytm.fetched == []  # mixes don't download
     cover = mixes["My Supermix"]["coverArt"]
     assert cover.startswith("pl-")
-    assert call(client, "updatePlaylist", playlistId=mixes["My Mix 1"]["id"], name="mine")["error"]["code"] == 70
+    assert mixes["My Mix 1"]["readonly"] is True
+    assert call(client, "updatePlaylist", playlistId=mixes["My Mix 1"]["id"], name="mine")["error"]["code"] == 50  # not authorized
     call(client, "oasisUnlinkYouTubeMusic")
     assert playlists(client) == {}
     assert call(client, "deletePlaylist", id=mixes["My Mix 1"]["id"])["error"]["code"] == 70
