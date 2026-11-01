@@ -1,5 +1,6 @@
 """oasis's own catalogue: what users want, from MusicBrainz. A starred album resolves to its release group; a followed
-artist's albums, EPs and singles are read daily, and repackages and singles whose songs are all on its albums left out.
+artist's albums, EPs and singles are read daily, and guest appearances, repackages and singles whose songs are all on its
+albums left out.
 An album is here when the library holds as many of its tracks as its smallest edition has. Missing albums are searched
 (Prowlarr, then TorBox: download.py) one a minute, again and again, ever further apart; an artist with gaps gets a
 weekly search for cached discographies and bundles, which can fill many at once. Anything MusicBrainz has can be
@@ -47,6 +48,7 @@ SEARCH_GAP = 60           # seconds between searches, so a burst of stars doesn'
 RETRY_FULL = 600          # seconds before an album TorBox had no free slot for is searched again
 UPGRADE_AGAIN = 7 * 86400  # seconds between searches for a lossless copy of an album here lossy
 REPEATS = 0.6             # share of an album's songs already on the artist's earlier releases that makes it a repackage
+GUEST = re.compile(r"feat|ft\.|\bwith\b", re.I)  # joinphrases after which artists are guests: 'Beyoncé feat. Jay-Z'
 REPACKAGE = re.compile(r"\b(best of|greatest hits|very best|the essential|anthology|collection|singles|remaster(ed)?|anniversary|"
                        r"deluxe|bonus ?tracks?|re-?recorded|reissue|remixes|instrumentals?|karaoke)\b", re.I)
 
@@ -276,18 +278,20 @@ class Acquire:
         return edition
 
     def catalogue(self, db, item):
-        """Reads the followed artist's catalogue into want_album. Left out: repackages (best-ofs, deluxe and anniversary
-        editions, re-recordings, albums most of whose songs are on its earlier ones), singles whose songs are all on its
-        albums or EPs, what has no official release and what a user gave up on. Starred albums, albums with files and
-        albums and EPs Lidarr looked for never are, given up or not."""
+        """Reads the followed artist's catalogue into want_album. Left out: guest appearances (see guest), repackages
+        (best-ofs, deluxe and anniversary editions, re-recordings, albums most of whose songs are on its earlier ones),
+        singles whose songs are all on its albums or EPs, what has no official release and what a user gave up on.
+        Starred albums and albums with files never are, given up or not, and nor are albums and EPs Lidarr looked for
+        unless the artist is only a guest on them."""
         groups = sorted(self.browse(db, item["mbid"]), key=lambda g: g.get("first-release-date") or "9999")
         editions = {g["id"]: self.edition(db, g["id"]) for g in groups}
         starred = {r[0] for r in db.execute("select mbid from want_item where kind = 'album' and mbid is not null")}
         looked_for = {r[0] for r in db.execute("select mbid from catalogue_search where mbid is not null")}  # Lidarr's, carried over once
+        why = {g["id"]: "a guest appearance" for g in groups if guest(g, item["mbid"])}
+        guests, seen = set(why), set()
         kept = lambda g: g["id"] not in why or g["id"] in starred or self.have_files(db, g["id"]) or \
-            g["primary-type"] != "Single" and g["id"] in looked_for
-        seen, why = set(), {}
-        for g in (g for g in groups if g["primary-type"] != "Single"):
+            g["primary-type"] != "Single" and g["id"] in looked_for and g["id"] not in guests
+        for g in (g for g in groups if g["primary-type"] != "Single" and g["id"] not in guests):
             songs = editions[g["id"]]["songs"]
             if not editions[g["id"]]["tracks"]:
                 why[g["id"]] = "no official release"
@@ -297,7 +301,7 @@ class Acquire:
                 why[g["id"]] = "most of its songs are on earlier releases"
             seen |= songs
         on_albums = set().union(*(editions[g["id"]]["songs"] for g in groups if g["primary-type"] != "Single" and kept(g)))
-        for g in (g for g in groups if g["primary-type"] == "Single"):
+        for g in (g for g in groups if g["primary-type"] == "Single" and g["id"] not in guests):
             if not editions[g["id"]]["tracks"]:
                 why[g["id"]] = "no official release"
             elif editions[g["id"]]["songs"] <= on_albums:
@@ -456,6 +460,17 @@ def artist_names(credit: str) -> list[str]:
     for part in re.split(r"\s*(?:,|&|:|×|/|\bfeat\.?|\bft\.?|\bwith\b)\s*", credit, flags=re.I):
         names += [part, re.sub(r"\s*[\[(][^\])]*[\])]\s*$", "", part)]
     return [n for n in dict.fromkeys(n.strip() for n in names) if n]
+
+
+def guest(group: dict, mbid: str) -> bool:
+    """Whether the artist is only a guest on the release group: credited after a 'feat.', 'ft.' or 'with'
+    ('Beyoncé feat. Jay-Z'), not as a main or joint artist ('Jay-Z & Kanye West', 'Jay-Z featuring Gwen Dickey')."""
+    for credit in group.get("artist-credit") or []:
+        if credit["artist"]["id"] == mbid:
+            return False
+        if GUEST.search(credit.get("joinphrase") or ""):
+            return True
+    return False
 
 
 def song_key(title: str) -> str:

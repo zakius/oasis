@@ -223,6 +223,31 @@ def test_an_artist_with_gaps_gets_a_weekly_bundle_search_in_an_album_searchs_pla
     assert acq.downloads.found[2][0] == "bundle"
 
 
+def test_guest_appearances_are_skipped_unless_starred_and_joint_credits_count(client, mb):
+    follow_beta(client, mb)
+    credit = lambda *parts: [{"name": n, "joinphrase": j, "artist": {"id": i, "name": n}} for i, n, j in parts]
+    guests = {"g-feat": credit(("mb-b", "Beyoncé", " feat. "), ("mb-beta", "Beta", "")),
+              "g-with": credit(("mb-b", "Beyoncé", " With "), ("mb-beta", "Beta", "")),
+              "g-joint": credit(("mb-k", "Kanye", " & "), ("mb-beta", "Beta", "")),
+              "g-slash": credit(("mb-beta", "Beta", " / "), ("mb-lp", "Linkin Park", "")),
+              "g-lead": credit(("mb-beta", "Beta", " featuring "), ("mb-g", "Gwen", ""))}
+    for id, artists in guests.items():
+        mb.catalogues["mb-beta"].append({**group(id, id, date="2012"), "artist-credit": artists})
+        mb.songs[id] = [id]
+    db = client.app.state.api._db()
+    db.execute("update want_item set catalogued = 0")
+    sync(client)
+    found = {rg: (state, error) for rg, state, error in db.execute("select rg, state, error from want_album where rg in (%s)" % ",".join("?" * 5), list(guests))}
+    assert found["g-feat"] == found["g-with"] == ("skipped", "a guest appearance")
+    assert all(found[rg][0] != "skipped" for rg in ("g-joint", "g-slash", "g-lead"))
+
+    db.execute("insert into want_item(kind, ref, mbid, state, updated) values ('album', 'al-mb-g-feat', 'g-feat', 'wanted', 0)")
+    db.execute("insert into wanted(kind, ref, user) values ('album', 'al-mb-g-feat', 'admin')")
+    db.execute("update want_item set catalogued = 0 where kind = 'artist'")
+    sync(client)
+    assert db.execute("select state, reason, error from want_album where rg = 'g-feat'").fetchone()[:] == ("missing", "starred", None)
+
+
 def test_collaboration_credits_split_into_artist_names():
     assert artist_names("SawanoHiroyuki[nZk]:mizuki") == ["SawanoHiroyuki[nZk]:mizuki", "SawanoHiroyuki[nZk]", "SawanoHiroyuki", "mizuki"]
     assert artist_names("Falling In Reverse, Corey Taylor, Serj Tankian")[:2] == ["Falling In Reverse, Corey Taylor, Serj Tankian", "Falling In Reverse"]
