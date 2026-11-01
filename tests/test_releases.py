@@ -413,6 +413,15 @@ def test_another_album_holding_the_title_a_namesake_or_various_artists_are_not_t
     assert reject(result("Metallica - St. Anger (Single) 2003 FLAC"), single) is None
 
 
+def test_an_accented_artist_is_searched_as_release_names_spell_it_first():
+    assert queries(want("4:44", "JAŸ-Z")) == ["JAY-Z 4:44", "JAŸ-Z 4:44"]
+    assert queries({**want("Homogenic", "Björk"), "other_titles": ["Homogénic"]}) == ["Bjork Homogenic", "Björk Homogenic", "Homogenic", "Bjork Homogénic"]
+    assert queries(want("Case", "Creepy Nuts"))[0] == "Creepy Nuts Case"
+    assert queries(want("ID", "Димаш"))[0] == "Димаш ID"  # Cyrillic stays: й isn't и
+    assert queries(want("The Blueprint²: The Gift & The Curse", "JAŸ-Z"))[0] == "JAY-Z The Blueprint 2: The Gift & The Curse"
+    assert releases.bundle_queries({"artist": "JAŸ-Z", "native": []})[:2] == ["JAY-Z discography", "JAY-Z"]
+
+
 def test_slashes_leave_queries():
     assert queries(want("Avid / Hands Up to the Sky", "SawanoHiroyuki[nZk]"))[0] == "SawanoHiroyuki nZk Avid Hands Up to the Sky"
 

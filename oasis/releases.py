@@ -215,16 +215,25 @@ def rank(releases: list[dict], have: set[str], upgrade: bool = False, unreliable
 
 
 def clean(text: str) -> str:
-    return " ".join(BRACKETS.sub(" ", unicodedata.normalize("NFKC", text)).split())
+    """A query's words: 'The Blueprint²' -> 'The Blueprint 2', as release names write it."""
+    return " ".join(BRACKETS.sub(" ", unicodedata.normalize("NFKC", re.sub(r"(?<=[^\W\d])([¹²³⁰⁴-⁹])(?!\w)", r" \1", text))).split())
+
+
+def spellings(artist: str) -> list[str]:
+    """The artist's name for queries: without accents first when that leaves it plain ASCII, as release names mostly
+    spell it ('JAY-Z' for 'JAŸ-Z', which indexers don't fold), then as it is."""
+    artist = clean(artist)
+    folded = "".join(c for c in unicodedata.normalize("NFKD", artist) if not unicodedata.combining(c))
+    return list(dict.fromkeys([folded, artist] if folded.isascii() else [artist]))
 
 
 def queries(want: dict) -> list[str]:
     """Artist and album; the album alone when distinctive; the album with the artist's names in other scripts; the
     artist and the album's other titles. Brackets and quotes go: indexers find nothing for '[Rammstein]'."""
-    title = clean(want["title"])
-    return list(dict.fromkeys([f"{clean(want['artist'])} {title}", *([title] if len(title.split()) >= 2 or len(title) >= 8 else []),
+    title, artists = clean(want["title"]), spellings(want["artist"])
+    return list(dict.fromkeys([*(f"{a} {title}" for a in artists), *([title] if len(title.split()) >= 2 or len(title) >= 8 else []),
                                *(f"{clean(n)} {title}" for n in want["native"]),
-                               *(f"{clean(want['artist'])} {clean(t)}" for t in want["other_titles"][:OTHER_TITLE_QUERIES])]))
+                               *(f"{artists[0]} {clean(t)}" for t in want["other_titles"][:OTHER_TITLE_QUERIES])]))
 
 
 def find(prowlarr, want: dict, blocked: set, cached, unreliable: frozenset = frozenset(), slow: frozenset = frozenset()) -> list[dict]:
@@ -254,7 +263,7 @@ def is_bundle(release: dict, want: dict) -> bool:
 
 
 def bundle_queries(want: dict) -> list[str]:
-    artist = clean(want["artist"])
+    artist = spellings(want["artist"])[0]
     return list(dict.fromkeys([f"{artist} discography", artist, f"{artist} singles", f"{artist} complete singles", *map(clean, want["native"])]))
 
 
