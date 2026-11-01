@@ -133,12 +133,53 @@ async def read_form(request: Request) -> dict:
     return dict(parse_qsl((await request.body()).decode()))
 
 
-def page(title: str, body: str, message: str = "", error: str = "", wide: bool = False) -> HTMLResponse:
+# Forms post in the background and the page's content is swapped for what the server sends back, toast and all; pages
+# that show changing state (live) fetch themselves again every 10 s while visible. Without JavaScript, all still works.
+SCRIPT = """(() => {
+  const main = () => document.getElementById("main");
+  const clean = url => { url = new URL(url); url.searchParams.delete("message"); url.searchParams.delete("error"); url.hash = ""; return url; };
+  history.replaceState(null, "", clean(location.href));
+  function swap(doc) {
+    const next = doc.getElementById("main"), open = {};
+    if (!next) return;
+    main().querySelectorAll("details[id]").forEach(d => open[d.id] = d.open);
+    next.querySelectorAll("details[id]").forEach(d => { if (d.id in open) d.open = open[d.id]; });
+    main().replaceChildren(...next.childNodes);
+    document.title = doc.title;
+  }
+  async function load(url, options) {
+    const response = await fetch(url, options);
+    if (clean(response.url).pathname !== location.pathname) return location.assign(response.url);  // signed out, or a page elsewhere
+    return new DOMParser().parseFromString(await response.text(), "text/html");
+  }
+  document.addEventListener("submit", async e => {
+    const form = e.target;
+    if (e.defaultPrevented || form.method !== "post") return;
+    e.preventDefault();
+    form.querySelectorAll("button").forEach(b => b.disabled = true);
+    try {
+      const doc = await load(form.action, {method: "POST", body: new URLSearchParams(new FormData(form))});
+      if (doc) {
+        swap(doc);
+        document.querySelectorAll(".toast").forEach(t => t.remove());
+        document.body.append(...doc.querySelectorAll(".toast"));
+      }
+    } catch { form.submit(); }
+  });
+  if (document.body.dataset.live) setInterval(async () => {
+    const typing = [...main().querySelectorAll("input:not([type=hidden]), textarea")].some(i => i.value !== i.defaultValue);
+    if (document.hidden || typing || document.activeElement?.matches("input, textarea, select")) return;
+    try { const doc = await load(clean(location.href)); if (doc) swap(doc); } catch {}
+  }, 10000);
+})();"""
+
+
+def page(title: str, body: str, message: str = "", error: str = "", wide: bool = False, live: bool = False) -> HTMLResponse:
     notice = f'<p class="toast" onclick="this.remove()">{escape(message)}</p>' if message else ""
     notice += f'<p class="toast bad" onclick="this.remove()">{escape(error)}</p>' if error else ""
     return HTMLResponse(f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
-                        f'<title>{escape(title)} · oasis</title><style>{STYLE}</style></head><body{' class="wide"' if wide else ""}><h1>{escape(title)}</h1>'
-                        f'{notice}{body}</body></html>')
+                        f'<title>{escape(title)} · oasis</title><style>{STYLE}</style></head><body{' class="wide"' if wide else ""}'
+                        f'{' data-live="1"' if live else ""}><h1>{escape(title)}</h1>{notice}<main id="main">{body}</main><script>{SCRIPT}</script></body></html>')
 
 
 def back(path: str, message: str = "", error: str = "", anchor: str = "") -> RedirectResponse:
@@ -239,7 +280,7 @@ def routes(api) -> list[Route]:
                     '<p class="muted">Set in oasis.toml.</p>' if user["name"] in api.config.users else
                     f'<form method="post" action="/account/password"{confirm("Change your password? Apps signed in with the old one stop working until you update them.")}><label>New password<input type="password" name="password">'
                     '</label><button>Change</button></form>') + '</section>')
-        return page("Dashboard", body, q.get("message", ""), q.get("error", ""))
+        return page("Dashboard", body, q.get("message", ""), q.get("error", ""), live=True)
 
     def link_youtube(db, request, user, form):
         try:
@@ -543,7 +584,7 @@ def routes(api) -> list[Route]:
                 f'<td class="actions">{action(r["rg"], "block", "Try another", f"Drop this download of {r['artist']} – {r['title']} and try another release?") if key == "downloading" else action(r["rg"], "search", "Search now")}'
                 f'{action(r["rg"], "give-up", "Give up", f"Give up on {r['artist']} – {r['title']}?")}</td></tr>' for r, note in items)
             opened = " open" if key in ("attention", "downloading", "next") or len(items) <= 30 else ""
-            body += (f'<details class="group"{opened}><summary>{title} <span class="pill">{len(items)}</span></summary>'
+            body += (f'<details class="group" id="group-{key}"{opened}><summary>{title} <span class="pill">{len(items)}</span></summary>'
                      f'<table class="grid"><thead><tr><th>Album</th><th>Type</th><th class="num">Year</th><th>Why</th><th>State</th><th></th>'
                      f'</tr></thead><tbody>{table}</tbody></table>{bulk}</details>')
         if not rows:
@@ -564,7 +605,7 @@ def routes(api) -> list[Route]:
                              f'<form method="post" action="/music/unwant"{confirm(f"Give up on {name(r)}?")}><input type="hidden" name="kind" value="{r["kind"]}">'
                              f'<input type="hidden" name="ref" value="{escape(r["ref"])}"><button>Give up</button></form>' if r["mine"] else "")
                          + '</td></tr>' for r in lost) + '</tbody></table></section>')
-        return page("Wanted", body, q.get("message", ""), q.get("error", ""), wide=True)
+        return page("Wanted", body, q.get("message", ""), q.get("error", ""), wide=True, live=True)
 
     def music_library(db, request, user, form):
         """Every artist with music here or wanted, one row each; their pages go deeper."""
