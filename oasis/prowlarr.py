@@ -2,6 +2,7 @@
 by oasis (releases.py), not by Lidarr's parser."""
 import json
 import logging
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -11,6 +12,17 @@ from datetime import datetime, timezone
 log = logging.getLogger(__name__)
 
 TIMEOUT = 90  # seconds: indexers behind FlareSolverr are slow
+AUDIO = 3000
+# Categories a search skips on an indexer without Audio (RuTor files music under Other): Movies, TV, XXX, by number or name.
+VIDEO = re.compile(r"movie|tv|xxx|anime|video|hdtv|dvd|фильм|сериал|кино", re.I)
+
+
+def music_categories(indexer: dict) -> list[int]:
+    """Audio when the indexer has it; else its categories but video ones, where it files music among the rest."""
+    found = indexer.get("capabilities", {}).get("categories", [])
+    if any(c["id"] == AUDIO for c in found):
+        return [AUDIO]
+    return [c["id"] for c in found if not (2000 <= c["id"] < 3000 or 5000 <= c["id"] < 7000 or VIDEO.search(c["name"]))]
 
 
 class Prowlarr:
@@ -26,18 +38,20 @@ class Prowlarr:
         except urllib.error.HTTPError as e:
             raise OSError(f"Prowlarr {path.split('?')[0]}: {e.code} {e.read()[:200].decode(errors='replace')}") from e
 
-    def indexers(self) -> list[int]:
-        """The enabled music indexers Prowlarr hasn't paused after failures."""
+    def indexers(self) -> dict[int, list[int]]:
+        """The enabled music indexers Prowlarr hasn't paused after failures, with the categories to search them in."""
         now = datetime.now(timezone.utc).isoformat()
         paused = {s["indexerId"] for s in self.call("indexerstatus") if (s.get("disabledTill") or "") > now}
-        return [i["id"] for i in self.call("indexer") if i["enable"] and self.tag in i["tags"] and i["protocol"] == "torrent" and i["id"] not in paused]
+        return {i["id"]: music_categories(i) for i in self.call("indexer")
+                if i["enable"] and self.tag in i["tags"] and i["protocol"] == "torrent" and i["id"] not in paused}
 
     def search(self, query: str) -> list[dict]:
-        """Torrents in the audio categories: title, size, seeders, infoHash, magnetUrl/downloadUrl (Prowlarr's proxy), guid, indexerId.
+        """Torrents in each indexer's music categories (music_categories): title, size, seeders, infoHash, magnetUrl/downloadUrl (Prowlarr's proxy), guid, indexerId.
         Each indexer is asked on its own, so a slow or broken one costs only its own results; OSError when all fail."""
-        ask = lambda i: self.call("search?" + urllib.parse.urlencode([("query", query), ("type", "search"), ("categories", 3000),
+        ids = self.indexers()
+        ask = lambda i: self.call("search?" + urllib.parse.urlencode([("query", query), ("type", "search"), *(("categories", c) for c in ids[i]),
                                                                        ("limit", 100), ("indexerIds", i)])) or []
-        found, errors, ids = [], [], self.indexers()
+        found, errors = [], []
         with ThreadPoolExecutor(8) as pool:
             for i, job in [(i, pool.submit(ask, i)) for i in ids]:
                 try:
