@@ -5,9 +5,9 @@ is a word of its own, as those scripts don't space words. Uploads may name the a
 MusicBrainz ('Ensemble Play'), which count as its own. A wrong album is worse than none: variants (live,
 instrumentals, deluxe...), bundles and videos are left out, and so are short or self-titled names that don't pin the
 album down. Disc images are tried after a file per track. The importer's edition match comes after, as a second check.
-Discographies, singles collections and other bundles TorBox has cached are read by their file lists: each folder that
-is one wanted album, EP or single becomes a target, and only its files are fetched. A folder of disc images is taken
-by its name and size alone."""
+Discographies, singles collections and other bundles are read by their file lists: each folder that is one wanted
+album, EP or single becomes a target, and only its files are fetched. A folder of disc images is taken by its name and
+size alone. TorBox lists the files of bundles it has cached; of others, once it has downloaded them (download.py)."""
 import logging
 import re
 import unicodedata
@@ -340,13 +340,19 @@ def targets(files: list[dict], want: dict, groups: list[dict], wanted: set[str],
     return found
 
 
-def bundles(prowlarr, want: dict, groups: list[dict], wanted: set[str], blocked: set, cached_files, editions) -> list[tuple[dict, dict]]:
+def bundles(prowlarr, want: dict, groups: list[dict], wanted: set[str], blocked: set, cached_files, editions, uncached: bool = False,
+            slow: frozenset = frozenset()) -> list[tuple[dict, dict | None]]:
     """The artist's bundles TorBox has cached that hold wanted albums, with their targets: most albums first, then
-    quality and seeders. Uncached ones are left out, as they would download everything and hold a slot for long."""
+    quality and seeders. With uncached, those TorBox hasn't cached follow, seeded ones only, with None for targets: what
+    they hold is known once TorBox has them. They download whole and hold a slot for long, so only while slots are free;
+    slow ones (see rank) last."""
     found = unique([r for q in bundle_queries(want) for r in prowlarr.search(q)], hash_of)
     candidates = sorted((r for r in found if hash_of(r) and not {hash_of(r), r.get("guid")} & blocked and is_bundle(r, want)),
                         key=lambda r: r.get("seeders") or 0, reverse=True)[:100]
     listed = cached_files([hash_of(r) for r in candidates]) if candidates else {}
     picks = [(r, t) for r in candidates if hash_of(r) in listed and (t := targets(listed[hash_of(r)], want, groups, wanted, editions))]
-    log.info("bundles of %s: %d results, %d bundles, %d cached, %d with wanted albums", want["artist"], len(found), len(candidates), len(listed), len(picks))
-    return sorted(picks, key=lambda p: (len(p[1]), quality(p[0]["title"]), p[0].get("seeders") or 0), reverse=True)
+    others = sorted((r for r in candidates if uncached and hash_of(r) not in listed and (r.get("seeders") or 0) >= 1),
+                    key=lambda r: (hash_of(r) not in slow, quality(r["title"]), r.get("seeders") or 0), reverse=True)
+    log.info("bundles of %s: %d results, %d bundles, %d cached, %d with wanted albums, %d uncached to try", want["artist"], len(found), len(candidates),
+             len(listed), len(picks), len(others))
+    return sorted(picks, key=lambda p: (len(p[1]), quality(p[0]["title"]), p[0].get("seeders") or 0), reverse=True) + [(r, None) for r in others]

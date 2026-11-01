@@ -304,6 +304,48 @@ def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloa
     assert "bcde" in downloads.blocked(db)
 
 
+def test_uncached_bundles_come_after_cached_ones_and_only_while_slots_are_free():
+    prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [MP3]", "aa", seeders=50), result("Linkin Park - Discography [FLAC]", "bb"),
+                                                     result("Linkin Park - Complete [FLAC]", "cc", seeders=0), result("Linkin Park - Box Set [FLAC]", "dd", seeders=90)]})
+    cached = lambda hashes: {"aa": DISCOGRAPHY}
+    found = lambda **more: [(r["infoHash"], t and sorted(t)) for r, t in releases.bundles(prowlarr, LP, LP_GROUPS, {"g-ht"}, set(), cached, editions, **more)]
+    assert found() == [("aa", ["g-ht"])]
+    assert found(uncached=True) == [("aa", ["g-ht"]), ("dd", None), ("bb", None)]  # lossless, then seeders; cc has no seeder
+    assert found(uncached=True, slow=frozenset({"dd"})) == [("aa", ["g-ht"]), ("bb", None), ("dd", None)]
+
+
+def test_an_uncached_bundles_albums_are_found_once_torbox_lists_its_files(downloads, torbox, db, tmp_path, monkeypatch):
+    placed, downloads.own.place = {}, lambda folder, group: placed.setdefault(group, sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file()))
+    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
+    torbox.cached_files = lambda hashes: {}
+    db.executemany("insert into want_album(rg, artist_mbid, title, reason, state) values (?, 'mb-lp', ?, 'followed', 'missing')",
+                   [("g-ht", "Hybrid Theory"), ("g-mtm", "Minutes to Midnight"), ("g-met", "Meteora")])
+    downloads.crowded = True
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm"}) is None  # slots all needed: cached bundles only
+    downloads.crowded = False
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm"})
+    assert db.execute("select state, bundle is not null from download").fetchone()[:] == ("added", 1) and downloads.groups(db) == set()
+
+    torbox.list = [tb(71, "abcd", progress=0.5)]  # TorBox lists no files while it downloads
+    downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "downloading" and downloads.groups(db) == set()
+
+    db.execute("update want_album set state = 'have' where rg = 'g-mtm'")  # arrived meanwhile
+    torbox.list = [finished(71, "abcd", [f["name"] for f in DISCOGRAPHY], tmp_path)]
+    downloads.cycle()
+    assert db.execute("select state, bundle from download").fetchone()[:] == ("done", None)
+    assert placed == {"g-ht": ["01. Papercut.flac", "02. One Step Closer.flac", "03. In the End.flac", "cover.jpg"]}
+
+    # One that holds no wanted album fails and is blocked.
+    downloads.prowlarr.results["Linkin Park discography"][0].update(infoHash="bcde", magnetUrl="magnet:?xt=urn:btih:bcde")
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met"})
+    torbox.list = [finished(72, "bcde", ["LP/Meteora (2003)/01 Foreword.flac"], tmp_path)]  # a track short
+    downloads.cycle()
+    assert db.execute("select state, error from download where hash = 'bcde'").fetchone()[:] == ("failed", "the bundle holds no wanted album")
+    assert "bcde" in downloads.blocked(db) and 72 in torbox.deleted
+
+
 def test_a_bundles_disc_image_arrives_with_its_cue_sheet_for_the_importer_to_split(downloads, torbox, db, tmp_path, monkeypatch):
     class Own:
         def place(self, folder, group):
