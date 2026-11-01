@@ -53,7 +53,7 @@ details > summary { cursor: pointer; list-style: none; } details > summary::-web
 details > summary::before { content: "▸"; display: inline-block; width: 1em; transition: transform .15s; opacity: .6; }
 details[open] > summary::before { transform: rotate(90deg); }
 details.group { margin: .8rem 0; } details.group > summary { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; font-weight: 600; padding: .3rem 0; }
-details.group > summary .bulk { margin-left: auto; font-weight: normal; }
+details.group > .bulk { margin: .6rem 0 0; text-align: right; }
 details.artist { border-bottom: 1px solid #8883; padding: .35rem 0; } details.artist > summary, details.album > summary {
   display: flex; flex-wrap: wrap; gap: .25rem .75rem; align-items: baseline; }
 details.artist > summary b { font-size: 1.05rem; } details.album { margin: .2rem 0 .2rem 1.2rem; }
@@ -83,7 +83,7 @@ details.album > table { margin: .3rem 0 .6rem 1em; width: calc(100% - 1em); } .r
   .num, .actions { text-align: left; } .actions { padding-top: .3rem !important; } details.album { margin-left: .4rem; }
   details.album > table { margin-left: 0; width: 100%; }
   .hero { flex-direction: column; } .hero > .cover { width: 100%; height: auto; aspect-ratio: 1; max-width: 22rem; }
-  .cards { grid-template-columns: repeat(2, 1fr); gap: .75rem; } td.thumb { display: none !important; } details.group > summary .bulk { margin-left: 0; width: 100%; }
+  .cards { grid-template-columns: repeat(2, 1fr); gap: .75rem; } td.thumb { display: none !important; }
 }
 """
 
@@ -510,7 +510,8 @@ def routes(api) -> list[Route]:
             items = groups.get(key, [])
             if not items:
                 continue
-            bulk = (f'<form class="bulk" method="post" action="/music/wanted/give-up"><input type="hidden" name="rgs" '
+            bulk = (f'<form class="bulk" method="post" action="/music/wanted/give-up" '
+                    f'onsubmit="return confirm(\'Give up on all {len(items)} in {title}?\')"><input type="hidden" name="rgs" '
                     f'value="{",".join(r["rg"] for r, _ in items)}"><input type="hidden" name="next" value="{escape(here)}">'
                     f'<button>Give up on {"these " + str(len(items)) if len(items) > 1 else "it"}</button></form>')
             table = "".join(
@@ -522,9 +523,9 @@ def routes(api) -> list[Route]:
                 f'<td class="actions">{action(r["rg"], "block", "Try another") if key == "downloading" else action(r["rg"], "search", "Search now")}'
                 f'{action(r["rg"], "give-up", "Give up")}</td></tr>' for r, note in items)
             opened = " open" if key in ("attention", "downloading", "next") or len(items) <= 30 else ""
-            body += (f'<details class="group"{opened}><summary>{title} <span class="pill">{len(items)}</span>{bulk}</summary>'
+            body += (f'<details class="group"{opened}><summary>{title} <span class="pill">{len(items)}</span></summary>'
                      f'<table class="grid"><thead><tr><th>Album</th><th>Type</th><th class="num">Year</th><th>Why</th><th>State</th><th></th>'
-                     f'</tr></thead><tbody>{table}</tbody></table></details>')
+                     f'</tr></thead><tbody>{table}</tbody></table>{bulk}</details>')
         if not rows:
             body += '<p class="muted">Nothing wanted matches.</p>' if here != "/music/wanted" else '<p class="muted">Nothing left to find.</p>'
         body += '</section>'
