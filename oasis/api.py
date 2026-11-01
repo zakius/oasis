@@ -736,13 +736,11 @@ class Api:
             folded = [ytm.fold(t) for t in terms]
             def named(*texts): return all(t in ytm.fold(" ".join(x or "" for x in texts)) for t in folded)
             if p.int("artistOffset", 0) == 0 and (room := p.int("artistCount", 20) - len(artists)) > 0:
-                ids = [i for i in dict.fromkeys(s["artistId"] for s in found if s.get("artistId") and named(s["artist"]))
-                       if i not in {a["id"] for a in artists}]
-                artists += self._in_order(db, ARTISTS, "t.artist_id", ids[:room], artist)
+                ids = [i for i in dict.fromkeys(s["artistId"] for s in found if s.get("artistId")) if i not in {a["id"] for a in artists}]
+                artists += [a for a in self._in_order(db, ARTISTS, "t.artist_id", ids, artist) if named(a["name"])][:room]
             if p.int("albumOffset", 0) == 0 and (room := p.int("albumCount", 20) - len(albums)) > 0:
-                ids = [i for i in dict.fromkeys(s["albumId"] for s in found if s.get("albumId") and named(s.get("album"), s["artist"]))
-                       if i not in {a["id"] for a in albums}]
-                albums += self._in_order(db, ALBUMS, "t.album_id", ids[:room], album)
+                ids = [i for i in dict.fromkeys(s["albumId"] for s in found if s.get("albumId")) if i not in {a["id"] for a in albums}]
+                albums += [a for a in self._in_order(db, ALBUMS, "t.album_id", ids, album) if named(a["name"], a.get("artist"))][:room]
         text = " ".join(terms)
         if self.library and len(text) >= FIND_FROM:
             # MusicBrainz last, for what neither the library nor YouTube Music has: these can be starred like any other.
