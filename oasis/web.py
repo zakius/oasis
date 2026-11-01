@@ -56,9 +56,7 @@ details.group { margin: 1rem 0; border: 1px solid #8883; border-radius: 10px; ov
 details.group > summary { display: flex; gap: .5rem; align-items: center; font-weight: 600; padding: .55rem .75rem; background: #8881; }
 details.group[open] > summary { border-bottom: 1px solid #8883; } details.group table.grid tr:last-child td { border-bottom: 0; }
 details.group table.grid :is(td, th):first-child { padding-left: .75rem; } details.group table.grid :is(td, th):last-child { padding-right: .75rem; }
-details.group > .bulk { display: flex; justify-content: flex-end; padding: .35rem .75rem; border-top: 1px solid #8883; background: #8881; }
-details.group > .bulk button { background: none; border: 0; padding: .2rem 0; font-size: .85rem; color: #c62828; }
-@media (prefers-color-scheme: dark) { details.group > .bulk button { color: #ef8a8a; } }
+form.bulk { margin-top: 2rem; padding-top: 1rem; border-top: 1px solid #8883; }
 details.artist { border-bottom: 1px solid #8883; padding: .35rem 0; } details.artist > summary, details.album > summary {
   display: flex; flex-wrap: wrap; gap: .25rem .75rem; align-items: baseline; }
 details.artist > summary b { font-size: 1.05rem; } details.album { margin: .2rem 0 .2rem 1.2rem; }
@@ -512,14 +510,12 @@ def routes(api) -> list[Route]:
                 + '<p class="muted">Giving up stops the search; files already here stay, and wanting it again brings it back.</p>')
         titles = [("attention", "Needs a look"), ("downloading", "Downloading"), ("next", "Searched next"),
                   ("notfound", "Not found yet"), ("waiting", "Waiting for a first search")]
+        bulk = []
         for key, title in titles:
             items = groups.get(key, [])
             if not items:
                 continue
-            bulk = (f'<form class="bulk" method="post" action="/music/wanted/give-up" '
-                    f'onsubmit="return confirm(\'Give up on all {len(items)} in {title}?\')"><input type="hidden" name="rgs" '
-                    f'value="{",".join(r["rg"] for r, _ in items)}"><input type="hidden" name="next" value="{escape(here)}">'
-                    f'<button>Give up on {"all " + str(len(items)) if len(items) > 1 else "it"}…</button></form>')
+            bulk.append(f'<option value="{",".join(r["rg"] for r, _ in items)}">{title} ({len(items)})</option>')
             table = "".join(
                 f'<tr><td class="lead"><a href="/music/artist/{escape(r["artist_mbid"])}">{escape(r["artist"] or "")}</a> – '
                 f'{escape(r["title"])}</td><td>{escape(r["primary_type"] or "")}'
@@ -531,7 +527,11 @@ def routes(api) -> list[Route]:
             opened = " open" if key in ("attention", "downloading", "next") or len(items) <= 30 else ""
             body += (f'<details class="group"{opened}><summary>{title} <span class="pill">{len(items)}</span></summary>'
                      f'<table class="grid"><thead><tr><th>Album</th><th>Type</th><th class="num">Year</th><th>Why</th><th>State</th><th></th>'
-                     f'</tr></thead><tbody>{table}</tbody></table>{bulk}</details>')
+                     f'</tr></thead><tbody>{table}</tbody></table></details>')
+        if bulk:  # far from the groups' headers and rows, so no tap meant for them lands on it
+            body += (f'<form class="bulk filters" method="post" action="/music/wanted/give-up" onsubmit="return confirm(\'Give up on '
+                     f'every album in that group?\')"><span class="muted">Give up on a whole group{" (as filtered)" if here != "/music/wanted" else ""}:</span>'
+                     f'<select name="rgs">{"".join(bulk)}</select><input type="hidden" name="next" value="{escape(here)}"><button>Give up…</button></form>')
         if not rows:
             body += '<p class="muted">Nothing wanted matches.</p>' if here != "/music/wanted" else '<p class="muted">Nothing left to find.</p>'
         body += '</section>'
