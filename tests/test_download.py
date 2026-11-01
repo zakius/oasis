@@ -150,7 +150,7 @@ def test_a_dead_torrent_is_deleted_blocked_and_the_next_find_takes_another(downl
 def test_a_torrent_still_moving_or_seeded_is_not_dead(downloads, torbox, db):
     downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
     downloads.find(db, WANT, "mb-album")
-    db.execute("update download set created = ?", (time.time() - 7200,))
+    db.execute("update download set created = ?", (time.time() - 1800,))
     torbox.list = [tb(71, "abcd", progress=0, seeds=2)]
     downloads.cycle()
     assert torbox.deleted == [] and db.execute("select state from download").fetchone()[0] == "downloading"
@@ -221,3 +221,22 @@ def test_how_much_of_a_download_is_copied_here_counts_partly_fetched_files(downl
     (tmp_path / "b.flac.part").write_bytes(b"x" * 25)
     downloads.copying["h"] = [(done, 50), (partial, 50), (missing, 100)]
     assert downloads.copied("h") == 0.375 and downloads.copied("other") is None
+
+
+def test_a_trickling_torrent_goes_once_it_is_on_course_to_take_more_than_12_hours(downloads, torbox, db, monkeypatch):
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
+    downloads.find(db, WANT, "mb-album")
+    torbox.list = [tb(71, "abcd", progress=0.01, seeds=1)]
+    downloads.cycle()
+    now[0] += 1800
+    downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "downloading"  # within the usual wait
+    now[0] += 3600
+    torbox.list = [tb(71, "abcd", progress=0.2, seeds=1)]  # 20 % in 1.5 h: done in 7.5 h
+    downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "downloading"
+    torbox.list = [tb(71, "abcd", progress=0.1, seeds=1)]
+    downloads.cycle()
+    assert db.execute("select state, error from download").fetchone()[:] == ("failed", "too slow: 10% in 2 h")

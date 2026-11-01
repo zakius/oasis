@@ -345,3 +345,10 @@ def test_slashes_leave_queries():
 ])
 def test_an_artist_named_only_as_the_source_is_not_the_albums_artist(name, why):
     assert reject(result(name), want("Mein Herz brennt", "Rammstein", year="2012")) == why
+
+
+def test_other_peoples_mixtapes_of_an_album_are_not_it():
+    gangster = want("American Gangster", "JAŸ-Z", "Jay-Z", year="2007")
+    assert reject(result("Jay-Z & Teknology - Blu Magik (The American Gangster Re-Mix-Tape)"), gangster) == "variant: mixtape"
+    assert reject(result("Funk Daddy & Mistah Clark Present Jay-Z - West Coast American Gangster"), gangster) == "another artist's: present"
+    assert reject(result("Jay-Z - American Gangster (2007) [FLAC]"), gangster) is None

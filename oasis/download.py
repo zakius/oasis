@@ -24,6 +24,7 @@ from .torbox import RateLimited
 log = logging.getLogger(__name__)
 
 INTERVAL = 60            # seconds between polls of TorBox
+SLOWEST = 12 * 3600     # seconds a download may take at its pace so far
 DEAD_AFTER = 20 * 60     # seconds a torrent may sit at 0% without seeders
 UNRELIABLE = 5, 1 / 3    # an indexer with this many downloads, this share of them dead, is tried last
 KEEP = (*AUDIO, *ARCHIVES, "cue", "jpg", "jpeg", "png", "webp", "gif")  # music (perhaps packed), cue sheets and cover art; logs, nfo and the rest stay on TorBox
@@ -235,6 +236,9 @@ class Downloads:
                 # Not a byte from no seeder: dead soon. Stalled part way: the usual wait, as seeders come and go.
                 if not torrent["seeds"] and time.time() - since > (DEAD_AFTER if not torrent["progress"] else self.stall):
                     return self.fail(db, row, "dead torrent: no seeds, no progress")
+                # A trickle from one seeder: past the usual wait, a torrent on course to take longer than SLOWEST goes.
+                if (took := time.time() - row["created"]) > self.stall and torrent["progress"] < took / SLOWEST:
+                    return self.fail(db, row, f"too slow: {torrent['progress']:.0%} in {took / 3600:.0f} h")
                 return self.set(db, row, "downloading")
             state = self.set(db, row, "fetching")
         if state == "fetching":
