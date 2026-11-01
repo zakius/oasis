@@ -11,6 +11,7 @@ import logging
 import re
 import unicodedata
 from pathlib import PurePosixPath
+from urllib.parse import urlparse
 
 from . import musicbrainz
 from .importer import AUDIO, LOSSLESS as LOSSLESS_FILES, key, match, number_of, title_of
@@ -193,14 +194,19 @@ def namesake(tokens: list[str], title_text: str, want: dict) -> str | None:
     return None if want["type"] == "Album" or not album else f"namesake: the Album of {album['year']}"
 
 
-def rank(releases: list[dict], have: set[str], upgrade: bool = False) -> list[dict]:
-    """Best first: lossless, then a file per track over a disc image, then cached on TorBox (it has those at once,
-    seeders or not), then quality, then seeders.
+def site(guid: str) -> str:
+    """The indexer a release came from, by its guid: its host, or 'other' for guids that are magnets."""
+    return urlparse(guid).hostname or "other" if guid.startswith("http") else "other"
+
+
+def rank(releases: list[dict], have: set[str], upgrade: bool = False, unreliable: frozenset = frozenset()) -> list[dict]:
+    """Best first: what will download (cached on TorBox, or seeded per an indexer whose seed counts held up), then
+    lossless, then a file per track over a disc image, then cached, then quality, then seeders.
     A release TorBox hasn't cached needs a seeder. The same torrent from several indexers is tried once."""
     usable = [r for r in releases if hash_of(r) in have or (r.get("seeders") or 0) >= 1]
     if upgrade:
         usable = [r for r in usable if quality(r["title"]) == 3]
-    usable.sort(key=lambda r: (quality(r["title"]) == 3, not IMAGE.search(" ".join(words(r["title"]))), hash_of(r) in have, quality(r["title"]),
+    usable.sort(key=lambda r: (hash_of(r) in have or site(r.get("guid") or "") not in unreliable, quality(r["title"]) == 3, not IMAGE.search(" ".join(words(r["title"]))), hash_of(r) in have, quality(r["title"]),
                                r.get("seeders") or 0), reverse=True)
     return unique(usable, lambda r: hash_of(r) or r["guid"])
 
@@ -218,13 +224,13 @@ def queries(want: dict) -> list[str]:
                                *(f"{clean(want['artist'])} {clean(t)}" for t in want["other_titles"][:OTHER_TITLE_QUERIES])]))
 
 
-def find(prowlarr, want: dict, blocked: set, cached) -> list[dict]:
-    """The releases to try, best first, from the first query that finds a usable one."""
+def find(prowlarr, want: dict, blocked: set, cached, unreliable: frozenset = frozenset()) -> list[dict]:
+    """The releases to try, best first, from the first query that finds a usable one; unreliable: see rank."""
     for query in queries(want):
         found = prowlarr.search(query)
         fits = [r for r in found if not {hash_of(r), r.get("guid")} & blocked and not reject(r, want)]
         hashes = list(dict.fromkeys(h for r in fits if (h := hash_of(r))))[:100]
-        picks = rank(fits, cached(hashes) if hashes else set(), want["upgrade"])
+        picks = rank(fits, cached(hashes) if hashes else set(), want["upgrade"], unreliable)
         log.info("Prowlarr %r: %d results, %d the album, %d usable", query, len(found), len(fits), len(picks))
         if picks:
             return picks

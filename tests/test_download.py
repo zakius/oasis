@@ -3,7 +3,7 @@ import time
 import pytest
 
 from oasis.db import connect
-from oasis import download
+from oasis import download, releases
 from oasis.download import Downloads
 from test_doctor import FakeTorBox, torrent
 
@@ -188,3 +188,28 @@ def test_the_slot_rule_counts_every_active_torbox_torrent_anime_included(downloa
     assert downloads.room()
     torbox.list.append(torrent(8, "seeding", progress=1))
     assert not downloads.room()
+
+
+def test_a_torrent_without_seeders_at_0_percent_is_dead_after_20_minutes(downloads, torbox, db, monkeypatch):
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
+    downloads.find(db, WANT, "mb-album")
+    torbox.list = [tb(71, "abcd", progress=0, seeds=0)]
+    downloads.cycle()
+    now[0] += 1000
+    downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "downloading"
+    now[0] += 300
+    downloads.cycle()
+    assert db.execute("select state, error from download").fetchone()[:] == ("failed", "dead torrent: no seeds, no progress")
+
+
+def test_an_indexer_whose_torrents_were_often_dead_is_tried_last(downloads, db):
+    for n in range(6):
+        db.execute("insert into download(hash, guid, album_id, state, error, created, updated) values (?, ?, 0, ?, ?, 0, 0)",
+                   (f"h{n}", f"https://lime.example/t/{n}", "failed" if n < 2 else "done", "dead torrent: no seeds, no progress" if n < 2 else None))
+    assert downloads.unreliable(db) == {"lime.example"}
+    lime, good = result("Artist - Album [FLAC]", "aa", seeders=40, guid="https://lime.example/x"), result("Artist - Album [MP3 320]", "bb", guid="https://good.example/y")
+    assert [r["infoHash"] for r in releases.rank([lime, good], set(), unreliable=downloads.unreliable(db))] == ["bb", "aa"]
+    assert [r["infoHash"] for r in releases.rank([lime, good], {"aa"}, unreliable=downloads.unreliable(db))] == ["aa", "bb"]  # cached: fine

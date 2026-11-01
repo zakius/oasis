@@ -24,6 +24,8 @@ from .torbox import RateLimited
 log = logging.getLogger(__name__)
 
 INTERVAL = 60            # seconds between polls of TorBox
+DEAD_AFTER = 20 * 60     # seconds a torrent may sit at 0% without seeders
+UNRELIABLE = 5, 1 / 3    # an indexer with this many downloads, this share of them dead, is tried last
 KEEP = (*AUDIO, *ARCHIVES, "cue", "jpg", "jpeg", "png", "webp", "gif")  # music (perhaps packed), cue sheets and cover art; logs, nfo and the rest stay on TorBox
 PACE = 3                 # seconds between file download requests: bursts of them get TorBox's 429
 PARALLEL = 2             # files fetched at once
@@ -136,7 +138,7 @@ class Downloads:
     def find(self, db, want: dict, group: str) -> bool | None:
         """Searches Prowlarr for an album of oasis's own catalogue (acquire.py); see send."""
         blocked = self.blocked(db)
-        return self.send(db, releases.find(self.prowlarr, want, blocked, self.torbox().cached), blocked, group,
+        return self.send(db, releases.find(self.prowlarr, want, blocked, self.torbox().cached, self.unreliable(db)), blocked, group,
                          f"{want['artist']} - {want['title']}")
 
     def bundle(self, db, want: dict, groups: list[dict], wanted: set[str]) -> bool | None:
@@ -148,6 +150,14 @@ class Downloads:
             if (sent := self.send(db, [release], blocked, None, f"{want['artist']}: {len(targets)} albums", targets)) is not None:
                 return sent
         return None
+
+    def unreliable(self, db) -> frozenset:
+        """Indexers whose seed counts don't hold up: a third or more of what oasis took from them was dead."""
+        seen = db.execute("select guid, coalesce(error like 'dead torrent%', 0) from download where guid is not null and (state = 'done' or error like 'dead torrent%')").fetchall()
+        tally = {}
+        for guid, dead in seen:
+            tally.setdefault(releases.site(guid), []).append(dead)
+        return frozenset(s for s, deaths in tally.items() if len(deaths) >= UNRELIABLE[0] and sum(deaths) >= UNRELIABLE[1] * len(deaths))
 
     def blocked(self, db) -> set[str]:
         return {r[0] for r in db.execute("select hash from release_block")}
@@ -221,7 +231,8 @@ class Downloads:
                 if progress != torrent["progress"]:  # a torrent still at 0% has made no progress since it was added, restart or not
                     since = row["created"] if progress is None and not torrent["progress"] else time.time()
                     self.seen[row["hash"]] = (torrent["progress"], since)
-                if not torrent["seeds"] and time.time() - since > self.stall:
+                # Not a byte from no seeder: dead soon. Stalled part way: the usual wait, as seeders come and go.
+                if not torrent["seeds"] and time.time() - since > (DEAD_AFTER if not torrent["progress"] else self.stall):
                     return self.fail(db, row, "dead torrent: no seeds, no progress")
                 return self.set(db, row, "downloading")
             state = self.set(db, row, "fetching")
