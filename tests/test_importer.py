@@ -209,3 +209,29 @@ def test_identical_editions_fall_to_the_official_original():
     later, original, bootleg = edition("af", tracks), edition("jp", tracks), edition("bt", tracks, status="Bootleg")
     later["date"], original["date"], bootleg["date"] = "2023-05-01", "2023-03-15", "2022"
     assert importer.pick([later, bootleg, original], files)[0]["id"] == "jp"
+
+
+def test_a_file_named_and_numbered_as_its_track_may_be_longer_off():
+    track = lambda n, title, ms: ({"position": 1}, {"id": n, "position": n, "title": title, "recording": {"length": ms}})
+    file = lambda n, title, s: {"path": f"{n}.flac", "key": importer.key(title), "number": (1, n), "length": s}
+    tracks = [track(1, "Casus Belli", 322_000), track(2, "O Worze", 267_000)]
+    assert importer.match([file(1, "Casus Belli", 318), file(2, "O Worze", 249)], tracks)
+    assert importer.match([file(1, "Casus Belli", 318), file(3, "O Worze", 249)], tracks) is None  # numbered otherwise
+    assert importer.match([file(1, "Casus Belli", 318), file(2, "O Worze", 230)], tracks) is None  # 14 % off
+
+
+def test_a_polish_cue_sheet_reads_as_polish():
+    assert importer.cue_text('TITLE "Żółta łódź"\nTITLE "Gollum"'.encode("cp1250")) == 'TITLE "Żółta łódź"\nTITLE "Gollum"'
+    assert importer.cue_text('TITLE "Кино"'.encode("cp1251")) == 'TITLE "Кино"'
+
+
+def test_an_album_packed_in_a_zip_is_unpacked_and_imported(make, tmp_path, root):
+    import zipfile
+    one, two = audio(tmp_path / "src/01 One.flac", 2, title="One"), audio(tmp_path / "src/02 Two.flac", 3, title="Two")
+    (tmp_path / "dl").mkdir()
+    with zipfile.ZipFile(tmp_path / "dl/Beta - First.zip", "w") as z:
+        z.write(one, "First/01 One.flac")
+        z.write(two, "First/02 Two.flac")
+    album = make(edition("e", [("One", 2), ("Two", 3)])).place(tmp_path / "dl", "rg-1")
+    assert sorted(p.name for p in album.iterdir() if p.suffix == ".flac") == ["01 - One.flac", "02 - Two.flac"]
+    assert importer.LATER_PART.search("a.part2.rar") and not importer.LATER_PART.search("a.part01.rar")

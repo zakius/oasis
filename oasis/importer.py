@@ -12,6 +12,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import mutagen
@@ -31,7 +32,11 @@ EDITIONS = "https://musicbrainz.org/ws/2/release?release-group={}&inc=media+reco
 KEEP_EDITIONS = 7 * 86400  # seconds a release group's editions stay cached
 COVER_ART = "https://coverartarchive.org/release/{}/front"
 SLACK = 5, 0.03            # a file's length may differ from the track's by 5 s or 3 %, whichever is more
+NAMED_SLACK = 5, 0.1       # and by 10 % when the file has the track's title and number
 SPLIT = ".oasis-split"     # a download's disc images, split, in <download>/.oasis-split/<image>/
+ARCHIVES = ("zip", "rar", "7z")
+UNPACKED = ".oasis-unpacked"  # a download's archives, unpacked, in <download>/.oasis-unpacked/<archive>/
+LATER_PART = re.compile(r"\.part0*([2-9]|[1-9]\d+)\.rar$", re.I)  # a multi-volume RAR unpacks from its first part
 CUE_LINE = re.compile(r'\s*(FILE|TRACK|TITLE|INDEX)\s+(?:"(.*)"|(\S+))(?:\s+(\S+))?', re.I)
 
 
@@ -70,8 +75,8 @@ def read(path: Path, artist: str) -> dict:
             "length": getattr(audio.info, "length", 0) if audio is not None else 0}
 
 
-def close(length: float, ms) -> bool:
-    return not ms or abs(length - ms / 1000) <= max(SLACK[0], SLACK[1] * ms / 1000)
+def close(length: float, ms, slack=SLACK) -> bool:
+    return not ms or abs(length - ms / 1000) <= max(slack[0], slack[1] * ms / 1000)
 
 
 def match(files: list[dict], tracks: list[tuple[dict, dict]]) -> dict | None:
@@ -81,13 +86,15 @@ def match(files: list[dict], tracks: list[tuple[dict, dict]]) -> dict | None:
     mapping, used = {}, set()
     for medium, track in tracks:
         length = track.get("length") or track["recording"].get("length")
-        fits = [f for f in files if f["path"] not in used and (f["length"] is None or close(f["length"], length))]
-        want = key(track["title"])
+        want, place = key(track["title"]), (medium["position"], track["position"])
+        # A file named and numbered as the track may differ more: another master, a longer fade.
+        fits = [f for f in files if f["path"] not in used and (f["length"] is None or close(f["length"], length)
+                                                                or f["key"] == want and f["number"] == place and close(f["length"], length, NAMED_SLACK))]
         found = [f for f in fits if f["key"] == want] or [f for f in fits if want and f["key"] and (want in f["key"] or f["key"] in want)] or \
-                [f for f in fits if f["number"] == (medium["position"], track["position"])]
+                [f for f in fits if f["number"] == place]
         if not found:
             return None
-        found.sort(key=lambda f: f["number"] != (medium["position"], track["position"]))  # one title on two discs
+        found.sort(key=lambda f: f["number"] != place)  # one title on two discs
         mapping[track["id"]] = found[0]
         used.add(found[0]["path"])
     return mapping
@@ -115,7 +122,7 @@ def pick(releases: list[dict], files: list[dict]) -> tuple[dict, dict]:
 
 
 def cue_text(data: bytes) -> str:
-    """Cue sheets are UTF-8 (perhaps with a BOM), UTF-16, Shift-JIS or CP1251. CP1251 Cyrillic reads as Shift-JIS
+    """Cue sheets are UTF-8 (perhaps with a BOM), UTF-16, Shift-JIS, CP1251 or CP1250. CP1251 Cyrillic reads as Shift-JIS
     too, but as half-width kana, which Japanese cue sheets don't use."""
     if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
         return data.decode("utf-16")
@@ -128,7 +135,9 @@ def cue_text(data: bytes) -> str:
             return text
     except UnicodeDecodeError:
         pass
-    return data.decode("cp1251", errors="replace")
+    text = data.decode("cp1251", errors="replace")
+    # Central European (Polish 'Żółć') read as Cyrillic leaves words of Latin and Cyrillic letters mixed: 'iЇуіж'.
+    return data.decode("cp1250", errors="replace") if re.search(r"(?=\w*[a-z])(?=\w*[а-яёіїєў])\w+", text, re.I) else text
 
 
 def cue(path: Path) -> list[tuple[str, list[dict]]]:
@@ -159,6 +168,28 @@ def image_of(sheet: Path, name: str) -> Path | None:
     audio = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower().lstrip(".") in AUDIO]
     stems = {Path(name.replace("\\", "/")).stem.casefold(), sheet.stem.casefold()}
     return next((p for p in audio if p.stem.casefold() in stems), None) or (audio[0] if len(audio) == 1 else None)
+
+
+def unpack(folder: Path):
+    """Unpacks the archives below folder (an album uploaded as one .zip or .rar): ZIP itself, the rest with unar."""
+    for archive in sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower().lstrip(".") in ARCHIVES
+                          and UNPACKED not in p.parts and not LATER_PART.search(p.name)):
+        if (target := folder / UNPACKED / archive.stem).exists():
+            continue
+        part = target.with_name(f"{target.name}.oasis-part")
+        shutil.rmtree(part, ignore_errors=True)
+        try:
+            if archive.suffix.lower() == ".zip":
+                with zipfile.ZipFile(archive) as z:
+                    z.extractall(part)
+            else:
+                subprocess.run(["unar", "-q", "-f", "-D", "-o", str(part), str(archive)], check=True, capture_output=True,
+                               stdin=subprocess.DEVNULL, timeout=1800)
+        except subprocess.CalledProcessError as e:
+            raise LookupError(f"can't unpack {archive.name}: {e.stderr.decode(errors='replace').strip()[-200:]}") from None
+        except (zipfile.BadZipFile, RuntimeError, NotImplementedError) as e:  # RuntimeError: a password
+            raise LookupError(f"can't unpack {archive.name}: {e}") from None
+        part.rename(target)
 
 
 def split(folder: Path) -> set[Path]:
@@ -281,6 +312,7 @@ class Importer:
     def place(self, folder: Path, group: str) -> Path:
         """Imports the download in folder as an edition of the release group; returns the album folder.
         LookupError when no edition matches."""
+        unpack(folder)
         images = split(folder)
         db = self.connect()
         try:

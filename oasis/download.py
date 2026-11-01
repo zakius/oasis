@@ -17,14 +17,14 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 
 from . import releases
-from .importer import AUDIO, editions
+from .importer import ARCHIVES, AUDIO, editions
 from .releases import hash_of
 from .torbox import RateLimited
 
 log = logging.getLogger(__name__)
 
 INTERVAL = 60            # seconds between polls of TorBox
-KEEP = (*AUDIO, "cue", "jpg", "jpeg", "png", "webp", "gif")  # music, cue sheets and cover art; logs, nfo and the rest stay on TorBox
+KEEP = (*AUDIO, *ARCHIVES, "cue", "jpg", "jpeg", "png", "webp", "gif")  # music (perhaps packed), cue sheets and cover art; logs, nfo and the rest stay on TorBox
 PACE = 3                 # seconds between file download requests: bursts of them get TorBox's 429
 PARALLEL = 2             # files fetched at once
 PAUSE = 300              # seconds without file downloads after a 429
@@ -259,7 +259,7 @@ class Downloads:
         if (todo := self.chosen(db, row, torrent)) is None:
             self.fail(db, row, "a bundle's files differ from what TorBox had cached")
             return False
-        if not any(f["name"].rsplit(".", 1)[-1].lower() in AUDIO for f, _ in todo):
+        if not any(f["name"].rsplit(".", 1)[-1].lower() in (*AUDIO, *ARCHIVES) for f, _ in todo):
             self.fail(db, row, "no audio files in the torrent")
             return False
         todo = [(f, path) for f, path in todo if not (path.exists() and path.stat().st_size == f["size"])]

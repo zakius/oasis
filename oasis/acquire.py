@@ -429,10 +429,12 @@ class Acquire:
         artist's other albums and EPs (a name holding one is a bundle), and whether the album is here lossy already
         (then only lossless will do)."""
         try:
-            others = [g["title"] for g in self.browse(db, row["artist_mbid"]) if g["primary-type"] != "Single" and g["id"] != row["rg"]]
+            groups = [(g["title"], g.get("primary-type"), g.get("first-release-date")) for g in self.browse(db, row["artist_mbid"]) if g["id"] != row["rg"]]
         except (OSError, LookupError):
-            others = [r[0] for r in db.execute("select title from want_album where artist_mbid = ? and primary_type != 'Single' and rg != ?",
-                                               (row["artist_mbid"], row["rg"]))]
+            groups = db.execute("select title, primary_type, first_date from want_album where artist_mbid = ? and rg != ?", (row["artist_mbid"], row["rg"])).fetchall()
+        others = [t for t, kind, _ in groups if kind != "Single"]
+        same = "".join(releases.words(row["title"]))
+        namesakes = [{"type": kind, "year": (date or "")[:4]} for t, kind, date in groups if "".join(releases.words(t)) == same]
         names = releases.aliases(db, row["artist"], row["artist_mbid"], [row["title"], *others])
         discs = (db.execute("select discs from mb_group where rg = ?", (row["rg"],)).fetchone() or [1])[0]
         try:
@@ -441,7 +443,8 @@ class Acquire:
             log.info("other titles of %s: %s", row["title"], e)
             alternatives = []
         return {"artist": row["artist"], "names": names, "title": row["title"], "other_titles": alternatives, "year": (row["first_date"] or "")[:4],
-                "native": releases.native(names), "discs": discs, "others": others, "upgrade": row["state"] == "have"}
+                "native": releases.native(names), "discs": discs, "others": others, "upgrade": row["state"] == "have",
+                "type": row["primary_type"], "namesakes": namesakes}
 
     def still_to_find(self, db) -> int:
         return db.execute("select count(*) from want_album where state = 'missing'").fetchone()[0]

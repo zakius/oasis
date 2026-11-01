@@ -11,6 +11,8 @@ FROM python:3.14-slim
 # and ffmpeg and ffprobe decode audio for dedupe.
 COPY --from=node:24-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=mwader/static-ffmpeg:7.1 /ffmpeg /ffprobe /usr/local/bin/
+# unar unpacks RAR and 7z downloads.
+RUN apt-get update && apt-get install -y --no-install-recommends unar && rm -rf /var/lib/apt/lists/*
 COPY --from=build /opt/venv /opt/venv
 ENV PATH=/opt/venv/bin:$PATH PYTHONUNBUFFERED=1
 RUN groupadd --gid 1000 oasis && useradd --uid 1000 --gid 1000 --home-dir /config oasis && mkdir /config && chown oasis:oasis /config

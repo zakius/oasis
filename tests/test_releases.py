@@ -279,3 +279,27 @@ def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloa
     downloads.cycle()
     assert db.execute("select state, error from download where hash = 'bcde'").fetchone()[:] == ("failed", "import failed: no album of the bundle matched")
     assert "bcde" in downloads.blocked(db)
+
+
+def test_another_album_holding_the_title_a_namesake_or_various_artists_are_not_the_album():
+    korn = want("Korn", "Korn", year="1994", others=["Korn III: Remember Who You Are", "Issues"])
+    assert reject(result("Korn - Korn III_ Remember Who You Are (2010) [FLAC] 88"), korn) == "another album: Korn III: Remember Who You Are"
+    assert reject(result("Korn - Korn (1994) [FLAC]"), korn) is None
+    name = "2021 (3 CD), FLAC / Various (Roxy Music, Lou Reed, New York Dolls) – Oh! You Pretty Things"
+    assert reject(result(name), want("New York", "Lou Reed", year="1989")) == "various artists"
+    ep = {**want("Hybrid Theory", "Linkin Park", year="1999"), "type": "EP", "namesakes": [{"type": "Album", "year": "2000"}]}
+    album = {**want("Hybrid Theory", "Linkin Park", year="2000"), "type": "Album", "namesakes": [{"type": "EP", "year": "1999"}]}
+    for name, ep_why, album_why in [
+        ("Linkin Park - Hybrid Theory (2000) [FLAC]", "namesake: the Album of 2000", None),
+        ("Linkin Park - Hybrid Theory [FLAC]", "namesake: the Album of 2000", None),
+        ("Linkin Park - Hybrid Theory (1999) [FLAC]", None, "namesake: the EP of 1999"),
+        ("Linkin Park - Hybrid Theory EP [FLAC]", None, "namesake: the EP"),
+    ]:
+        assert (reject(result(name), ep), reject(result(name), album)) == (ep_why, album_why), name
+    single = {**want("St. Anger", "Metallica", year="2003"), "type": "Single", "namesakes": [{"type": "Album", "year": "2003"}]}
+    assert reject(result("Metallica  St Anger (Full Album) (2003) (16 Bit 44 1 kHz FLAC)"), single) == "namesake: the Album of 2003"
+    assert reject(result("Metallica - St. Anger (Single) 2003 FLAC"), single) is None
+
+
+def test_slashes_leave_queries():
+    assert queries(want("Avid / Hands Up to the Sky", "SawanoHiroyuki[nZk]"))[0] == "SawanoHiroyuki nZk Avid Hands Up to the Sky"

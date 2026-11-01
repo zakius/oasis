@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 
 CJK = re.compile("[぀-ヺー-ヿ㐀-䶿一-鿿가-힯豈-﫿]")  # kana, kanji, Hangul; not ・
 LETTERS = str.maketrans({"æ": "ae", "œ": "oe", "ø": "o", "ł": "l", "đ": "d", "ð": "d", "þ": "th", "ı": "i"})  # no accent to strip
-BRACKETS = re.compile(r"[\[\]「」『』\"“”„«»()〈〉《》【】]")
+BRACKETS = re.compile(r"[\[\]「」『』\"“”„«»()〈〉《》【】/／]")  # and slashes, which break some indexers' search URLs
 BRACKETED = re.compile(r"\s*[\[(（【][^\])）】]*[\])）】]")
 QUOTED = re.compile(r"[「『\"“]([^」』\"”]+)[」』\"”]")
 # Words that make a release something else than the album, unless its title says so. Remasters are the album.
@@ -29,6 +29,7 @@ VARIANTS = re.compile(r"\b(best of|greatest hits|very best|the essential|antholo
 VARIANTS_JA = re.compile(r"インスト|カラオケ|ライ[ブヴ]|リミックス|オフボーカル")
 BUNDLES = re.compile(r"discograph|collection|complete|box ?set|anthology|全集|ディスコグラフィ", re.I)
 VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|\d{3,4}p|x26[45]|h ?26[45]|hevc|mkv|avi|video)\b")
+TYPES = {"single": "Single", "maxi": "Single", "ep": "EP"}  # words naming a release's type
 IMAGE = re.compile(r"\b(image|img) cue\b")  # one file for the whole disc, which the importer splits: a file per track is surer
 LOSSLESS = re.compile(r"\b(flac|alac|wav|lossless|24 ?bits?|hi ?res|ape)\b")
 MP3_320 = re.compile(r"\b320( ?k| ?kbps| ?kbit)?\b")
@@ -148,7 +149,14 @@ def reject_title(release: dict, want: dict) -> str | None:
         return "video"
     if BUNDLES.search(name) and not BUNDLES.search(title):
         return "bundle"
+    if {"various", "va"} & set(tokens) - set(words(" ".join([title, *want["names"]]))):
+        return "various artists"
     compact, names = "".join(words(title)), {"".join(words(n)) for n in want["names"]}
+    for other in want["others"]:  # 'Korn III: Remember Who You Are' holds 'Korn', and is another album
+        if len(o := words(other)) > len(words(title)) and spans(o, words(title)) and apart(spans(tokens, o)):
+            return f"another album: {other}"
+    if why := namesake(tokens, title_text, want):
+        return why
     for other in want["others"]:
         o = words(other)
         if len(joined := "".join(o)) >= 4 and not joined.isdigit() and joined not in names and not spans(words(title), o) \
@@ -163,6 +171,21 @@ def reject_title(release: dict, want: dict) -> str | None:
         if not (want["year"] and want["year"] in tokens or after or quoted):
             return "title too short: no year"
     return None
+
+
+def namesake(tokens: list[str], title_text: str, want: dict) -> str | None:
+    """Why a release is another of the artist's releases with the same title (the EP Hybrid Theory, the album Hybrid
+    Theory), or None. A type word in the name tells them apart, then the year; else it is the album."""
+    if not (namesakes := want.get("namesakes")):
+        return None
+    if named := [TYPES[t] for t in tokens if t in TYPES and t not in title_text.split()]:
+        return None if named[0] == want["type"] or all(n["type"] != named[0] for n in namesakes) else f"namesake: the {named[0]}"
+    if want["year"] in tokens and all(n["year"] != want["year"] and n["year"] not in tokens for n in namesakes):
+        return None
+    if want["year"] not in tokens and (dated := next((n for n in namesakes if n["year"] in tokens), None)):
+        return f"namesake: the {dated['type']} of {dated['year']}"
+    album = next((n for n in namesakes if n["type"] == "Album"), None)
+    return None if want["type"] == "Album" or not album else f"namesake: the Album of {album['year']}"
 
 
 def rank(releases: list[dict], have: set[str], upgrade: bool = False) -> list[dict]:
