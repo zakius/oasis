@@ -52,8 +52,13 @@ table.grid tr:hover td { background: #8881; } table.grid tr.dim td { opacity: .5
 details > summary { cursor: pointer; list-style: none; } details > summary::-webkit-details-marker { display: none; }
 details > summary::before { content: "▸"; display: inline-block; width: 1em; transition: transform .15s; opacity: .6; }
 details[open] > summary::before { transform: rotate(90deg); }
-details.group { margin: .8rem 0; } details.group > summary { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; font-weight: 600; padding: .3rem 0; }
-details.group > .bulk { margin: .6rem 0 0; text-align: right; }
+details.group { margin: 1rem 0; border: 1px solid #8883; border-radius: 10px; overflow: hidden; }
+details.group > summary { display: flex; gap: .5rem; align-items: center; font-weight: 600; padding: .55rem .75rem; background: #8881; }
+details.group[open] > summary { border-bottom: 1px solid #8883; } details.group table.grid tr:last-child td { border-bottom: 0; }
+details.group table.grid :is(td, th):first-child { padding-left: .75rem; } details.group table.grid :is(td, th):last-child { padding-right: .75rem; }
+details.group > .bulk { display: flex; justify-content: flex-end; padding: .35rem .75rem; border-top: 1px solid #8883; background: #8881; }
+details.group > .bulk button { background: none; border: 0; padding: .2rem 0; font-size: .85rem; color: #c62828; }
+@media (prefers-color-scheme: dark) { details.group > .bulk button { color: #ef8a8a; } }
 details.artist { border-bottom: 1px solid #8883; padding: .35rem 0; } details.artist > summary, details.album > summary {
   display: flex; flex-wrap: wrap; gap: .25rem .75rem; align-items: baseline; }
 details.artist > summary b { font-size: 1.05rem; } details.album { margin: .2rem 0 .2rem 1.2rem; }
@@ -80,6 +85,7 @@ details.album > table { margin: .3rem 0 .6rem 1em; width: calc(100% - 1em); } .r
   table.tracks td:nth-child(1) { grid-column: 1; grid-row: 1; } table.tracks td.lead { grid-column: 2; grid-row: 1; }
   table.tracks td:nth-child(4) { grid-column: 3; grid-row: 1; } table.tracks td:nth-child(3) { grid-column: 2; grid-row: 2; }
   table.tracks td:nth-child(5) { grid-column: 3; grid-row: 2; } table.tracks td { padding-right: 0; }
+  details.group table.grid tr { padding: .5rem .75rem; } details.group table.grid td:first-child { padding-left: 0; } details.group table.grid tr:last-child { border-bottom: 0; }
   .num, .actions { text-align: left; } .actions { padding-top: .3rem !important; } details.album { margin-left: .4rem; }
   details.album > table { margin-left: 0; width: 100%; }
   .hero { flex-direction: column; } .hero > .cover { width: 100%; height: auto; aspect-ratio: 1; max-width: 22rem; }
@@ -513,7 +519,7 @@ def routes(api) -> list[Route]:
             bulk = (f'<form class="bulk" method="post" action="/music/wanted/give-up" '
                     f'onsubmit="return confirm(\'Give up on all {len(items)} in {title}?\')"><input type="hidden" name="rgs" '
                     f'value="{",".join(r["rg"] for r, _ in items)}"><input type="hidden" name="next" value="{escape(here)}">'
-                    f'<button>Give up on {"these " + str(len(items)) if len(items) > 1 else "it"}</button></form>')
+                    f'<button>Give up on {"all " + str(len(items)) if len(items) > 1 else "it"}…</button></form>')
             table = "".join(
                 f'<tr><td class="lead"><a href="/music/artist/{escape(r["artist_mbid"])}">{escape(r["artist"] or "")}</a> – '
                 f'{escape(r["title"])}</td><td>{escape(r["primary_type"] or "")}'
