@@ -371,8 +371,10 @@ class Acquire:
             return False
 
     def search_next(self, db):
-        """One search, a gap apart (see searched): albums asked for on the dashboard first, then starred albums, then followed artists' albums and EPs, then their singles;
-        each time those never searched first, then the newest. Then albums here only lossy, for a lossless copy weekly."""
+        """One search, a gap apart (see searched): albums asked for on the dashboard first; then albums never searched,
+        then those searched before (a dead or slow release's album waits behind every untried one), each by starred
+        albums, followed artists' albums and EPs, their singles, newest first. Then albums here only lossy, for a
+        lossless copy weekly."""
         if time.time() - self.last_search < self.gap:
             return
         if self.soon and (row := db.execute("select * from want_album where rg = ? and state = 'missing'", (self.soon.pop(),)).fetchone()):
@@ -383,8 +385,8 @@ class Acquire:
         lossless = ", ".join(f"'{s}'" for s in LOSSLESS)
         rows = db.execute("select * from want_album w where (state = 'missing' and coalesce(next_search, 0) <= ?) or (state = 'have' and "
                           "coalesce(searched, 0) < ? and not exists (select 1 from track t where t.mb_release_group = w.rg and t.source = 'local' "
-                          f"and t.suffix in ({lossless}))) order by state = 'have', reason != 'starred', primary_type = 'Single', "
-                          "searched is not null, first_date desc limit 50", (now, now - UPGRADE_AGAIN)).fetchall()
+                          f"and t.suffix in ({lossless}))) order by state = 'have', searched is not null, reason != 'starred', primary_type = 'Single', "
+                          "first_date desc limit 50", (now, now - UPGRADE_AGAIN)).fetchall()
         if row := next((r for r in rows if r["rg"] not in queued), None):
             self.search(db, row)
 

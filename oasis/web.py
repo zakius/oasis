@@ -649,6 +649,14 @@ def routes(api) -> list[Route]:
         active = {r["rg"]: r for r in db.execute("select d.hash, d.state, d.created, coalesce(t.rg, d.album_mbid) rg from download d left join download_target t "
                                                  "on t.hash = d.hash where d.state not in ('done', 'failed') and coalesce(t.rg, d.album_mbid) is not null")}
 
+        untried = db.execute("select count(*) from want_album where state = 'missing' and searched is null").fetchone()[0]
+
+        def again(r) -> str:
+            """When an album searched before is searched again: after its wait, and after every album not tried yet."""
+            if (r["next_search"] or 0) > time.time():
+                return until(r["next_search"]) + (f", then after {untried} untried albums" if untried else "")
+            return f"after {untried} untried albums" if untried else "soon"
+
         def place(r) -> tuple[str, str]:
             """The group a wanted album goes in, and what to say about it."""
             if d := active.get(r["rg"]):
@@ -658,7 +666,7 @@ def routes(api) -> list[Route]:
             if r["rg"] in acq.soon:
                 return "next", pill("in a minute or two", "accent")
             if (r["error"] or "").startswith(("download failed", "search failed")):
-                return "attention", f'<span class="error">{escape(r["error"])}</span> <span class="muted">· tries again {until(r["next_search"])}</span>'
+                return "attention", f'<span class="error">{escape(r["error"])}</span> <span class="muted">· tries again {again(r)}</span>'
             return ("notfound", f'<span class="muted">searched {ago(r["searched"])}</span>') if r["searched"] else ("waiting", "")
 
         def action(rg: str, name: str, label: str, ask: str = "") -> str:
