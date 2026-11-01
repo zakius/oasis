@@ -7,8 +7,9 @@ instrumentals, deluxe...), bundles and videos are left out, and so are short or 
 album down. Disc images are tried after a file per track. The importer's edition match comes after, as a second check.
 Discographies, singles collections and other bundles are read by their file lists: each folder that is one wanted
 album, EP or single becomes a target, by its name and its songs, and only its files are fetched; a single may be loose
-tracks too (see loose). A folder of disc images is taken by its name and size alone. TorBox lists the files of bundles
-it has cached; of others, once it has downloaded them (download.py)."""
+tracks too (see loose). A folder of disc images is taken by its name and size alone. File lists are TorBox's of bundles
+it has cached, the .torrent's, or TorBox's once it has the torrent (download.py); without one, a bundle's name tells
+what it likely holds (expected)."""
 import logging
 import re
 import unicodedata
@@ -16,7 +17,7 @@ from pathlib import PurePosixPath
 from urllib.parse import urlparse
 
 from . import musicbrainz
-from .importer import AUDIO, LOSSLESS as LOSSLESS_FILES, key, match, number_of, title_of
+from .importer import ARCHIVES, AUDIO, LOSSLESS as LOSSLESS_FILES, key, match, number_of, title_of
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +33,7 @@ VARIANTS = re.compile(r"\b(best of|greatest hits|very best|the essential|antholo
 CREDITED_AS_SOURCE = re.compile(r"\b(based on (the )?music of|music of|tribute to|covers? of|in the style of|songs of|plays|presents?)( the)?$")  # "Funk Daddy Present Jay-Z": a mixtape of theirs
 VARIANTS_JA = re.compile(r"インスト|カラオケ|ライ[ブヴ]|リミックス|オフボーカル")
 BUNDLES = re.compile(r"discograph|collection|complete|box ?set|anthology|\bsingles\b|全集|ディスコグラフィ", re.I)
+DISCOGRAPHY = re.compile(r"discograph|дискограф|complete|box ?set|全集|ディスコグラフィ", re.I)  # more than singles
 VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|hdtv|web ?rip|\d{3,4}[pi]|x26[45]|h ?26[45]|hevc|xvid|divx|mkv|avi|mpe?g|mp4|vob|videos?)\b")
 TYPES = {"single": "Single", "maxi": "Single", "ep": "EP"}  # words naming a release's type
 IMAGE = re.compile(r"\b(image|img) cue\b")  # one file for the whole disc, which the importer splits: a file per track is surer
@@ -50,6 +52,10 @@ IMAGES = ("jpg", "jpeg", "png", "webp", "gif")
 NUMBERS = {w: str(n) for n, w in enumerate("one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
                                             "seventeen eighteen nineteen twenty".split(), 1)}
 ROMAN = re.compile(r"x{0,3}(ix|iv|v?i{0,3})")
+RELEASES = re.compile(r"\b(\d+) (releases|релиз)")  # '(126 Releases)': a bundle's own count
+BUNDLE_WORDS = {"singles", "anthology", "demo", "demos", "live", "bonustrack", "bonustracks", "deluxe", "expanded"}  # variants a discography holds besides the albums
+BUNDLE_SEEDERS = 3       # seeders an uncached bundle needs: it downloads whole, gigabytes, from them
+TORRENTS = 20            # .torrent files read through Prowlarr per bundle search for hashes, as many for file lists, best seeded first: each asks an indexer
 
 
 def plain(text: str) -> str:
@@ -437,19 +443,70 @@ def loose(audio: list[dict], want: dict, singles: list[str], editions) -> dict[s
     return found
 
 
+def expected(release: dict, want: dict, groups: list[dict], wanted: set[str]) -> set[str]:
+    """The wanted release groups a bundle likely holds, by its name alone: those it names; for a discography or
+    collection, the albums and EPs of the years it spans (all without years), and singles too when it counts more
+    releases than the artist has albums and EPs; a singles collection, the singles. None when the artist doesn't open
+    the name ('Mike Shinoda (from Linkin Park) - Discography') or it is a variant (instrumentals, a tribute)."""
+    tokens = words(release["title"])
+    artists = [s for n in want["names"] for s in spans(tokens, words(n))]
+    if not artists or min(a for a, _ in artists) > 1 or hits(VARIANTS, " ".join(tokens)) - BUNDLE_WORDS:
+        return set()
+    names = {"".join(words(n)) for n in want["names"]}
+    found = {g["id"] for g in groups if g["id"] in wanted and len(j := "".join(words(g["title"]))) >= 4 and j not in names
+             and any(all(e <= a or b <= s for a, b in artists) for s, e in spans(tokens, words(g["title"])))}
+    if not BUNDLES.search(release["title"]):
+        return found
+    years, count = sorted(int(t) for t in tokens if YEAR.match(t)), RELEASES.search(" ".join(tokens))
+    only = "singles" in tokens and not DISCOGRAPHY.search(release["title"])
+    singles = "singles" in tokens or bool(count) and int(count[1]) > sum(g.get("primary-type") != "Single" for g in groups)
+    spanned = lambda g: not years or years[0] <= int((g.get("first-release-date") or "0")[:4] or 0) <= years[-1]
+    return found | {g["id"] for g in groups if g["id"] in wanted and spanned(g) and (singles if g.get("primary-type") == "Single" else not only)}
+
+
 def bundles(prowlarr, want: dict, groups: list[dict], wanted: set[str], blocked: set, cached_files, editions, uncached: bool = False,
-            slow: frozenset = frozenset()) -> list[tuple[dict, dict | None]]:
-    """The artist's bundles TorBox has cached that hold wanted albums, with their targets: most albums first, then
-    quality and seeders. With uncached, those TorBox hasn't cached follow, seeded ones only, with None for targets: what
-    they hold is known once TorBox has them. They download whole and hold a slot for long, so only while slots are free;
-    slow ones (see rank) last."""
-    found = unique([r for q in bundle_queries(want) for r in prowlarr.search(q)], hash_of)
-    candidates = sorted((r for r in found if hash_of(r) and not {hash_of(r), r.get("guid")} & blocked and is_bundle(r, want)),
-                        key=lambda r: r.get("seeders") or 0, reverse=True)[:100]
-    listed = cached_files([hash_of(r) for r in candidates]) if candidates else {}
-    picks = [(r, t) for r in candidates if hash_of(r) in listed and (t := targets(listed[hash_of(r)], want, groups, wanted, editions))]
-    others = sorted((r for r in candidates if uncached and hash_of(r) not in listed and (r.get("seeders") or 0) >= 1),
-                    key=lambda r: (hash_of(r) not in slow, quality(r["title"]), r.get("seeders") or 0), reverse=True)
-    log.info("bundles of %s: %d results, %d bundles, %d cached, %d with wanted albums, %d uncached to try", want["artist"], len(found), len(candidates),
-             len(listed), len(picks), len(others))
-    return sorted(picks, key=lambda p: (len(p[1]), quality(p[0]["title"]), p[0].get("seeders") or 0), reverse=True) + [(r, None) for r in others]
+            slow: frozenset = frozenset(), torrent=lambda release: None) -> list[tuple[dict, dict | None, set[str]]]:
+    """The artist's bundles that hold wanted release groups, best first, each with its targets when TorBox's file list
+    gives them (to fetch only theirs), else None (resolve, in download.py, reads them once TorBox has it), and the
+    groups it holds or likely holds. What it holds is read from a file list: TorBox's when it has it cached file by
+    file (it lists a cached torrent of 100 files or more as one zip), else the .torrent's through Prowlarr
+    (torrent(release): {hash, files}, or None for a magnet link), which also gives the hash of a release listed without;
+    else its name tells (expected). Cached ones come first: they download at once. With uncached, while slots are free,
+    those with BUNDLE_SEEDERS follow: they download whole and hold a slot for long. Then known before likely, the most
+    groups, quality and seeders; slow ones (see rank) last."""
+    found = unique([r for q in bundle_queries(want) for r in prowlarr.search(q)], lambda r: hash_of(r) or r["guid"])
+    candidates = sorted((r for r in found if not {hash_of(r), r.get("guid")} & blocked and is_bundle(r, want)), key=lambda r: r.get("seeders") or 0, reverse=True)
+    read, budget = {}, [TORRENTS]
+
+    def listing(r):  # the .torrent's hash and files, within the budget
+        if not (budget[0] and r.get("downloadUrl")):
+            return r
+        budget[0] -= 1
+        if (t := torrent(r)) and t["hash"]:
+            read[t["hash"]] = t["files"]
+            return {**r, "infoHash": t["hash"]}
+        return r
+
+    candidates = unique([r for r in map(lambda r: r if hash_of(r) else listing(r), candidates) if hash_of(r) and hash_of(r) not in blocked], hash_of)
+    budget[0] = TORRENTS  # and as many for the file lists of those with hashes
+    hashes = [hash_of(r) for r in candidates]
+    listed = {h: files for i in range(0, len(hashes), 100) for h, files in cached_files(hashes[i:i + 100]).items()}  # 100 a call
+    music = lambda files, kinds: any(f["name"].rsplit(".", 1)[-1].lower() in kinds for f in files)
+    seeded = lambda r: uncached and (r.get("seeders") or 0) >= BUNDLE_SEEDERS
+    picks = []
+    for r in candidates:
+        h, cached = hash_of(r), hash_of(r) in listed
+        if cached and music(listed[h], AUDIO):
+            got, holds, known = (t := targets(listed[h], want, groups, wanted, editions)), set(t), True
+        elif cached and music(listed[h], ARCHIVES) or not cached and seeded(r):
+            if h not in read:
+                listing(r)
+            got, known = None, bool(read.get(h))
+            holds = set(targets(read[h], want, groups, wanted, editions)) if known else expected(r, want, groups, wanted)
+        else:
+            continue
+        if holds:
+            picks.append(((h not in slow, cached, known, len(holds), quality(r["title"]), r.get("seeders") or 0), r, got, holds))
+    log.info("bundles of %s: %d results, %d bundles, %d cached, %d hold wanted albums (%d cached)", want["artist"], len(found), len(candidates),
+             len(listed), len(picks), sum(p[0][1] for p in picks))
+    return [(r, got, holds) for _, r, got, holds in sorted(picks, key=lambda p: p[0], reverse=True)]

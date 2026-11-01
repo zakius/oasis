@@ -97,7 +97,7 @@ create table if not exists download(  -- releases oasis downloads through TorBox
 create table if not exists download_target(  -- a bundle's albums, fetched and imported from one download (see download.py)
     hash text not null, rg text not null,   -- the download; the album's release group
     files text not null,                    -- its paths inside the torrent (JSON)
-    state text not null,                    -- pending, done, failed
+    state text not null,                    -- pending, done, failed; expected: one it likely holds, till its files are known
     primary key(hash, rg)
 );
 create table if not exists bundle_search(artist_mbid text primary key, searched real not null);  -- see acquire.py
