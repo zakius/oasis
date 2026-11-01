@@ -227,10 +227,12 @@ SCRIPT = """(() => {
   const clean = url => { url = new URL(url); url.searchParams.delete("message"); url.searchParams.delete("error"); url.hash = ""; return url; };
   history.replaceState(null, "", clean(location.href));
   function swap(doc) {
-    const next = doc.getElementById("main"), open = {};
+    const next = doc.getElementById("main"), open = {}, shown = {};
     if (!next) return;
     main().querySelectorAll("details[id]").forEach(d => open[d.id] = d.open);
     next.querySelectorAll("details[id]").forEach(d => { if (d.id in open) d.open = open[d.id]; });
+    main().querySelectorAll("img[src]").forEach(i => shown[i.getAttribute("src")] = i);  // covers on screen stay, not flash on each refresh
+    next.querySelectorAll("img[src]").forEach(i => { const old = shown[i.getAttribute("src")]; if (old) { delete shown[i.getAttribute("src")]; i.replaceWith(old); } });
     main().replaceChildren(...next.childNodes);
     document.title = doc.title;
   }
