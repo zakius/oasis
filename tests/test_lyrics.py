@@ -97,3 +97,8 @@ def test_find_survives_failing_providers(monkeypatch):
 def test_cleaning_drops_credits_and_heading_and_unescapes():
     raw = Lyrics("KuGou", [(0, "Artist - Song"), (1, "作词：someone"), (2, "Composer: X"), (3, "don&apos;t stop"), (4, "it\\'s fine")], True)
     assert lyrics.cleaned(raw, QUERY).lines == [(3, "don't stop"), (4, "it's fine")]
+
+
+def test_lrc_offset_is_applied_positive_sooner():
+    assert lyrics.parse("[offset:+500]\n[00:01.00]a\n[00:00.20]b").lines == [(0, "b"), (500, "a")]
+    assert lyrics.parse("[offset:-250]\n[00:01.00]a").lines == [(1250, "a")]

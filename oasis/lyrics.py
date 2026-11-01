@@ -50,12 +50,14 @@ def ms(minutes: str, seconds: str) -> int:
 
 
 def parse(text: str, source: str = "file") -> Lyrics:
-    """LRC (also with <mm:ss.xx> word stamps) or plain text. A line with several timestamps repeats."""
+    """LRC (also with <mm:ss.xx> word stamps) or plain text. A line with several timestamps repeats. An [offset:ms]
+    tag is applied to the times (positive shows lines sooner), so oasis always sends offset 0."""
     lines, word_level = [], False
+    offset = int(m.group(1)) if (m := re.search(r"^\[offset:\s*([+-]?\d+)\s*\]", text, re.M | re.I)) else 0
     for raw in text.splitlines():
         rest, stamps = raw.strip(), []
         while m := LRC_TIME.match(rest):
-            stamps.append(ms(*m.groups()))
+            stamps.append(max(0, ms(*m.groups()) - offset))
             rest = rest[m.end():]
         if WORD_TIME.search(rest):
             word_level = True

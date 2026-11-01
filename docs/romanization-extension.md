@@ -55,6 +55,13 @@ The `pronunciation` entry's `lang` is the language romanized from plus `-Latn`: 
 language (`ru`, `uk`, `be`, `kk`, `ky`, `sr`, `mk`, `bg`, `mn`) or `und`. Lyrics already in Latin script have no
 `pronunciation` entry.
 
+Alignment, so clients can pair the layers: the `pronunciation` (and `translation`) entry has the same number of
+lines as its `main` entry, in the same order, with the same `start` times when synced; its cues fall inside the
+matching main line's time span. If a server breaks this and the counts differ, clients pair by line index.
+
+`offset` has the OpenSubsonic meaning: positive shows the lyrics sooner, so a line displays at `start - offset`.
+oasis applies an LRC file's `[offset:]` tag to the start times and always sends `offset: 0`.
+
 Extension parameter on `getLyricsBySongId` with `enhanced=true`, to save bandwidth:
 
 - `kinds`: comma-separated subset of `main,pronunciation,translation`. Default: all. A client showing romanized
@@ -88,6 +95,7 @@ Servers that don't know `kinds` ignore it and send everything, which clients mus
 6. With `latin`, albums' `title` and `album` fields change with `name`, and `getArtists` and `getIndexes` regroup
    their index by the romanized names.
 7. `getMusicDirectory`'s `directory.name` gets `nameLatin` too.
-8. Search's matching of romanized forms ignores case, accents, spaces and punctuation.
+8. Search's matching of romanized forms ignores case, accents and punctuation; each search word must fall inside a single
+   word of a name, never across a space ("runika" doesn't find Yoru ni Kakeru).
 9. A `romanization` value other than `both` or `latin` counts as `original`.
 10. Siblings: titles are romanized with their artist and album, and lone artists without context (see Fields).
