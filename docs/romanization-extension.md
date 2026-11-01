@@ -34,6 +34,7 @@ ignores case, accents (ō = o), spaces and punctuation: `qing tian`, `Qíng` and
 - Album (`AlbumID3`): `nameLatin`, `artistLatin`, `displayArtistLatin`. With `latin`, the album's `title` and `album`
   fields (copies of `name`) carry the romanized form too.
 - Artist (`ArtistID3`, also inside `artists`, `albumArtists`, `contributors[].artist` and the `getArtists` index): `nameLatin`.
+  In a list, each entry's `nameLatin` belongs to that entry's own `name`.
 - Playlist: `nameLatin`.
 - `getMusicDirectory`'s `directory` (an artist or an album): `nameLatin`.
 
