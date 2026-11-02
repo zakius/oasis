@@ -31,7 +31,7 @@ from .download import Downloads
 from .importer import Importer
 from .forward import Forwarder, LastFm
 from .prowlarr import Prowlarr
-from .recommend import Recommender, set_entries
+from .recommend import PERIOD, PERIODS, SOURCES, STATIONS, Recommender, set_entries
 from .upload import Uploads
 from .ytm import YouTubeMusic
 
@@ -198,7 +198,7 @@ def artist(r) -> dict:
 
 
 # The oasis extension's fields (docs/oasis-extension.md): sent only to clients asking with oasis=1.
-OASIS_FIELDS = {"oasisWanted", "oasisWantedError", "oasisMix", "oasisLink", "youtubeId"}
+OASIS_FIELDS = {"oasisWanted", "oasisWantedError", "oasisMix", "oasisLink", "youtubeId", "oasisSource", "oasisStation", "oasisPeriod"}
 
 
 def plain(value):
@@ -594,7 +594,7 @@ class Api:
 
     def getOpenSubsonicExtensions(self, db, p, user):
         return {"openSubsonicExtensions": [{"name": name, "versions": versions} for name, versions in (
-            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]), ("oasis", [1]))]}
+            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]), ("oasis", [1, 2]))]}
 
     def _user(self, row) -> dict:
         roles = ("scrobbling", "settings", "download", "playlist", "coverArt", "comment", "stream", "share")
@@ -1206,22 +1206,40 @@ class Api:
     def getAlbumInfo(self, db, p, user):
         return {"albumInfo": {}}
 
-    def _similar(self, db, p):
+    def _source(self, p, account) -> str:
+        """The source a request names (oasis extension only), else the user's default (the dashboard's)."""
+        source = p.get("oasisSource") if p.oasis else None
+        if source is not None and source not in SOURCES:
+            raise Fail(0, f"oasisSource must be one of {', '.join(SOURCES)}")
+        return source or account["radio_source"]
+
+    def _similar(self, db, p, user) -> dict:
         id = p.need("id")
         column = {"ar-": "artist_id", "al-": "album_id"}.get(id[:3], "id")
         seed = self._one(db, SONGS + f" where t.{column} = ? order by s.play_count desc, t.library desc, t.disc_no, t.track_no limit 1", id)
+        account = accounts.get(db, user)
+        source = self._source(p, account)
         try:
-            ids = self.recommender.similar(db, seed, min(p.int("count", 50), 200))
+            ids = self.recommender.similar(db, seed, min(p.int("count", 50), 200), source=source, token=account["listenbrainz_token"])
         except Exception as e:
             log.warning("recommendations failed: %s", e)
             ids = []
-        return [song(self._one(db, SONGS + " where t.id = ?", i)) for i in ids]
+        return {"song": [song(self._one(db, SONGS + " where t.id = ?", i)) for i in ids], "oasisSource": source}
 
     def getSimilarSongs2(self, db, p, user):
-        return {"similarSongs2": {"song": self._similar(db, p)}}
+        return {"similarSongs2": self._similar(db, p, user)}
 
     def getSimilarSongs(self, db, p, user):
-        return {"similarSongs": {"song": self._similar(db, p)}}
+        return {"similarSongs": self._similar(db, p, user)}
+
+    def oasisRadio(self, db, p, user):
+        """The radio sources and stations this user can choose from (docs/oasis-extension.md)."""
+        account = accounts.get(db, user)
+        return {"oasisRadio": {
+            "defaultSource": account["radio_source"],
+            "source": [{"id": s, "name": SOURCES[s]} for s in self.recommender.sources(account)],
+            "station": [clean({"id": s, "name": STATIONS[s], "period": list(PERIODS) if s == "lastfm-top" else None,
+                               "defaultPeriod": PERIOD if s == "lastfm-top" else None}) for s in self.recommender.stations(account)]}}
 
     def getTopSongs(self, db, p, user):
         name, count = p.need("artist"), min(p.int("count", 50), 200)
@@ -1264,6 +1282,8 @@ class Api:
             "coverArt": f"pl-{r['id']}" if r["cover"] else None,
             "readonly": True if r["mix"] or r["radio"] else None,  # OpenSubsonic: clients offer no edits; oasis keeps mixes and radios
             "oasisMix": True if is_mix(r["mix"]) else None, "youtubeId": r["mix"],
+            "oasisSource": (r["radio_source"] or accounts.get(db, r["owner"])["radio_source"]) if r["radio"] else None,
+            "oasisStation": r["station"], "oasisPeriod": r["period"],
             "songCount": len(songs), "duration": sum(s.get("duration", 0) for s in songs),
             "created": iso(r["created"]), "changed": iso(r["changed"]),
         })
@@ -1353,14 +1373,30 @@ class Api:
         self._touch(db, set(old) | set(track_ids))
 
     def createPlaylist(self, db, p, user):
+        """With the oasis extension's oasisSource or oasisStation, a radio whatever its name, filled before the answer."""
+        account = accounts.get(db, user)
+        source, station = (p.get("oasisSource"), p.get("oasisStation")) if p.oasis else (None, None)
         if id := p.get("playlistId"):
-            playlist_id = self._own_playlist(db, id, user)["id"]
+            playlist_id, source, station = self._own_playlist(db, id, user)["id"], None, None
         else:
             now = time.time()
-            name = p.need("name")
-            playlist_id = db.execute("insert into playlist(name, owner, created, changed, radio) values (?, ?, ?, ?, ?)",
-                                     (name, user, now, now, is_radio(name))).lastrowid
+            if source is not None and source not in self.recommender.sources(account):
+                raise Fail(0, f"oasisSource {source} isn't available: oasisRadio lists those that are")
+            if station is not None and station not in self.recommender.stations(account):
+                raise Fail(0, f"oasisStation {station} isn't available: oasisRadio lists those that are")
+            period = (p.get("oasisPeriod") or PERIOD) if station == "lastfm-top" else None
+            if period is not None and period not in PERIODS:
+                raise Fail(0, f"oasisPeriod must be one of {', '.join(PERIODS)}")
+            name = p.get("name") or STATIONS.get(station) or p.need("name")
+            radio = 1 if source or station else is_radio(name)
+            playlist_id = db.execute("insert into playlist(name, owner, created, changed, radio, radio_source, station, period) values (?, ?, ?, ?, ?, ?, ?, ?)",
+                                     (name, user, now, now, radio, (source or account["radio_source"]) if radio else None, station, period)).lastrowid
         self._set_entries(db, playlist_id, p.all("songId"))
+        if source or station:
+            try:
+                self.recommender.top_up(db, self._one(db, "select * from playlist where id = ?", playlist_id))
+            except Exception:
+                log.exception("radio fill failed")
         self.recommender.wake.set()
         return {"playlist": self._playlist(db, self._own_playlist(db, playlist_id, user), True)}
 
@@ -1369,8 +1405,9 @@ class Api:
         for column in ("name", "comment"):
             if (value := p.get(column)) is not None:
                 db.execute(f"update playlist set {column} = ?, changed = ? where id = ?", (value, time.time(), r["id"]))
-        if (name := p.get("name")) is not None and r["radio"] != 2:
-            db.execute("update playlist set radio = ? where id = ?", (is_radio(name), r["id"]))
+        if (name := p.get("name")) is not None and r["radio"] != 2 and not (r["radio"] and not is_radio(r["name"])):  # not one made with oasisSource
+            db.execute("update playlist set radio = ?, radio_source = ? where id = ?",
+                       (is_radio(name), r["radio_source"] or accounts.get(db, user)["radio_source"] if is_radio(name) else None, r["id"]))
         entries = [e["track_id"] for e in db.execute("select track_id from playlist_entry where playlist_id = ? order by pos", (r["id"],))]
         removed = {int(i) for i in p.all("songIndexToRemove")}
         added = p.all("songIdToAdd")

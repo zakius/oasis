@@ -87,6 +87,14 @@ class LastFm:
                             "autocorrect": 1})["similartracks"]["track"]
         return [(t["artist"]["name"], t["name"]) for t in tracks]
 
+    def user_tracks(self, user: str, loved: bool, period: str) -> list[tuple[str, str]]:
+        """A Last.fm user's loved tracks, or top tracks over period, as (artist, title)."""
+        if loved:
+            tracks = self.read({"method": "user.getLovedTracks", "user": user, "limit": 100})["lovedtracks"]["track"]
+        else:
+            tracks = self.read({"method": "user.getTopTracks", "user": user, "period": period, "limit": 100})["toptracks"]["track"]
+        return [(t["artist"]["name"], t["name"]) for t in tracks]
+
     def artist_info(self, name: str) -> dict:
         return self.read({"method": "artist.getInfo", "artist": name, "autocorrect": 1})["artist"]
 

@@ -20,6 +20,7 @@ from . import accounts, acquire, importer, musicbrainz, releases
 from .acquire import MB_IDS, TYPES
 from .artists import linked
 from .forward import LastFm
+from .recommend import SOURCES
 from .ytm import LIKED, MIX
 
 COOKIE = "oasis_session"
@@ -430,6 +431,7 @@ def routes(api) -> list[Route]:
                 f'<section><h2>Last.fm</h2><p class="muted">Your plays are scrobbled here. Turn off scrobbling in your apps, '
                 f'or plays count twice.</p>{lastfm}</section>'
                 f'<section><h2>ListenBrainz</h2>{listenbrainz}</section>'
+                f'<section><h2>Radio</h2>{radio_source(user)}</section>'
                 f'<section><h2>Password</h2>' + (
                     '<p class="muted">Set in oasis.toml.</p>' if user["name"] in api.config.users else
                     f'<form method="post" action="/account/password"{confirm("Change your password? Apps signed in with the old one stop working until you update them.")}><label>New password<input type="password" name="password">'
@@ -444,6 +446,23 @@ def routes(api) -> list[Route]:
         except Exception as e:  # Fail from the API
             return back("/", error=getattr(e, "message", str(e)))
         return back("/", message=f"YouTube Music linked as {name}. Your mixes are loading.")
+
+    def radio_source(user) -> str:
+        """Where similar songs and radios come from when an app doesn't choose; those the server or account lack aren't offered."""
+        offered = api.recommender.sources(user)
+        options = "".join(f'<label class="check"><input type="radio" name="source" value="{s}"{" checked" if s == user["radio_source"] else ""}> {SOURCES[s]}</label>'
+                          for s in offered)
+        missing = [SOURCES[s] for s in SOURCES if s not in offered]
+        return ('<p class="muted">Where similar songs and radios come from when your app doesn\'t choose. A radio keeps the source it '
+                'started with. A source that finds nothing gives nothing: no other stands in.</p>'
+                f'<form method="post" action="/account/radio">{options}<button class="primary">Save</button></form>'
+                + (f'<p class="muted">Not available: {", ".join(missing)} (link it above, or the server lacks it).</p>' if missing else ""))
+
+    def radio_source_save(db, request, user, form):
+        if form.get("source") not in api.recommender.sources(user):
+            return back("/", error="Choose one of the sources offered.")
+        accounts.set_field(db, user["name"], radio_source=form["source"])
+        return back("/", message=f"Radio source: {SOURCES[form['source']]}.")
 
     def youtube_playlists(db, user) -> str:
         """The account's YouTube Music and YouTube library playlists, each shown to apps or not, and what becomes of
@@ -1067,6 +1086,7 @@ def routes(api) -> list[Route]:
         Route("/account/youtube", signed_in(link_youtube), methods=["POST"]),
         Route("/account/youtube/unlink", signed_in(unlink_youtube), methods=["POST"]),
         Route("/account/youtube/playlists", signed_in(youtube_playlists_save), methods=["POST"]),
+        Route("/account/radio", signed_in(radio_source_save), methods=["POST"]),
         Route("/account/lastfm", signed_in(lastfm_start)),
         Route("/account/lastfm/callback", signed_in(lastfm_callback), name="lastfm_callback"),
         Route("/account/lastfm/app", signed_in(lastfm_app, admin=True), methods=["POST"]),

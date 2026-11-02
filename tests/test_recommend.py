@@ -281,3 +281,103 @@ def test_a_failing_chore_leaves_the_radios_and_the_other_chores_be(api):
     recommender.start()
     recommender.wake.set()
     assert done.wait(10)
+
+
+class LastFmUser(FakeLastFm):
+    """A Last.fm that knows the user's top and loved tracks."""
+
+    def __init__(self):
+        self.asked = []
+
+    def user_tracks(self, user, loved, period):
+        self.asked.append((user, loved, period))
+        return [("The Alpha", "Song A"), ("Remote Band", "Tune")] if not loved else [("Beta", "Two")]
+
+
+def similar(client, source=None, oasis="1", seed="One"):
+    params = {"oasis": oasis} | ({"oasisSource": source} if source else {})
+    return call(client, "getSimilarSongs2", id=song_id(client, seed), **params)
+
+
+def link(api, **values):
+    db = api._db()
+    for column, value in values.items():
+        db.execute(f"update user set {column} = ? where name = 'admin'", (value,))
+
+
+def test_a_request_names_its_source_and_gets_that_source_alone(client, ytm):
+    answer = similar(client, "library")
+    assert answer["similarSongs2"]["oasisSource"] == "library" and titles(answer["similarSongs2"]["song"]) == ["Two"] and ytm.radios == []
+    from_youtube = titles(similar(client, "ytm")["similarSongs2"]["song"])
+    assert ytm.radios == ["one-yt"] and from_youtube[0] == "Two" and "one-yt song 0" in from_youtube and "Song B" not in from_youtube
+    assert set(titles(similar(client, "lastfm")["similarSongs2"]["song"])) == {"Song B", "Tune", "Two"}  # similar tracks and artists
+    plain = similar(client, "library", oasis="0")["similarSongs2"]  # without the extension the parameter does nothing
+    assert "oasisSource" not in plain and "one-yt song 0" in titles(plain["song"])
+    assert similar(client, "spotify")["error"]["message"].startswith("oasisSource must be one of")
+
+
+def test_a_source_that_finds_nothing_gives_nothing_rather_than_another(api, client):
+    api.recommender.lastfm = None
+    assert similar(client, "lastfm")["similarSongs2"]["song"] == []
+    assert similar(client, "listenbrainz")["similarSongs2"]["song"] == []  # no ListenBrainz token linked
+
+
+def test_listenbrainz_radio_resolves_like_lastfm_and_its_failures_give_nothing(api, client, ytm, monkeypatch):
+    from oasis import recommend
+    asked = []
+    monkeypatch.setattr(recommend, "lb_radio", lambda token, artist: asked.append((token, artist)) or [("The Alpha", "Song B"), ("Remote Band", "Tune")])
+    link(api, listenbrainz_token="lb-token")
+    assert titles(similar(client, "listenbrainz")["similarSongs2"]["song"]) == ["Song B", "Tune"] and asked == [("lb-token", "Beta")]
+
+    def broken(token, artist):
+        raise OSError("HTTP 500")
+    monkeypatch.setattr(recommend, "lb_radio", broken)
+    assert similar(client, "listenbrainz")["similarSongs2"]["song"] == []
+    assert "one-yt song 0" in titles(similar(client)["similarSongs2"]["song"])  # the mix goes on without it
+
+
+def test_oasis_radio_lists_what_the_user_can_choose(api, client):
+    assert {"name": "oasis", "versions": [1, 2]} in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]
+    radio = call(client, "oasisRadio")["oasisRadio"]
+    assert radio == {"defaultSource": "all", "station": [], "source": [{"id": "all", "name": "Everything mixed"}, {"id": "lastfm", "name": "Last.fm"},
+                                                                        {"id": "ytm", "name": "YouTube Music"}, {"id": "library", "name": "Your library"}]}
+    link(api, listenbrainz_token="t", lastfm_session="s", lastfm_name="me")
+    radio = call(client, "oasisRadio")["oasisRadio"]
+    assert [s["id"] for s in radio["source"]][-1] == "listenbrainz"
+    assert radio["station"] == [{"id": "lastfm-top", "name": "Last.fm top tracks", "period": ["7day", "1month", "3month", "6month", "12month", "overall"],
+                                 "defaultPeriod": "3month"}, {"id": "lastfm-loved", "name": "Last.fm loved tracks"}]
+
+
+def test_the_dashboards_default_source_serves_requests_that_name_none(api, client, ytm):
+    client.post("/login", data={"name": "admin", "password": "secret"})
+    assert "Not available: ListenBrainz" in client.get("/").text
+    client.post("/account/radio", data={"source": "listenbrainz"})  # not linked: not taken
+    client.post("/account/radio", data={"source": "library"})
+    assert call(client, "oasisRadio")["oasisRadio"]["defaultSource"] == "library"
+    assert titles(call(client, "getSimilarSongs", id=song_id(client, "One"))["similarSongs"]["song"]) == ["Two"] and ytm.radios == []
+
+
+def test_a_radio_started_with_a_source_keeps_it_and_fills_at_once(api, client, ytm):
+    radio = call(client, "createPlaylist", oasis="1", name="Beta only", oasisSource="library", songId=song_id(client, "One"))["playlist"]
+    assert radio["readonly"] is True and radio["oasisSource"] == "library" and titles(radio["entry"]) == ["One", "Two"] and ytm.radios == []
+    assert "oasisSource" not in call(client, "getPlaylist", id=radio["id"])["playlist"]  # the extension's field
+    call(client, "updatePlaylist", playlistId=radio["id"], name="Still a radio")
+    db = api._db()
+    assert db.execute("select radio, radio_source from playlist where id = ?", (radio["id"],)).fetchone()[:] == (1, "library")
+    assert call(client, "createPlaylist", oasis="1", name="x", oasisSource="listenbrainz")["error"]["message"].startswith("oasisSource listenbrainz isn't available")
+    named = call(client, "createPlaylist", oasis="1", name="Radio from One", songId=song_id(client, "One"))["playlist"]
+    assert named["oasisSource"] == "all" and titles(named["entry"]) == ["One"]  # by name, as before: filled in the background
+
+
+def test_lastfm_stations_seed_from_the_users_top_or_loved_tracks(api, client):
+    api.recommender.lastfm = lastfm = LastFmUser()
+    assert call(client, "createPlaylist", oasis="1", oasisStation="lastfm-top")["error"]["message"].startswith("oasisStation lastfm-top isn't available")
+    link(api, lastfm_session="s", lastfm_name="me")
+    station = call(client, "createPlaylist", oasis="1", oasisStation="lastfm-top", oasisPeriod="1month", oasisSource="library")["playlist"]
+    assert station["name"] == "Last.fm top tracks" and station["oasisStation"] == "lastfm-top" and station["oasisPeriod"] == "1month"
+    got = titles(station["entry"])
+    assert set(got) == {"Song A", "Song B", "Tune"} and got.index("Song B") == got.index("Song A") + 1  # each of the user's songs, then like ones
+    assert lastfm.asked == [("me", False, "1month")] and len(got) == len(set(got))
+    loved = call(client, "createPlaylist", oasis="1", oasisStation="lastfm-loved", name="Loved")["playlist"]
+    assert loved["name"] == "Loved" and titles(loved["entry"])[0] == "Two" and "oasisPeriod" not in loved
+    assert call(client, "createPlaylist", oasis="1", oasisStation="lastfm-top", oasisPeriod="week")["error"]["message"].startswith("oasisPeriod must be")

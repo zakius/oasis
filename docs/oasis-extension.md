@@ -1,4 +1,4 @@
-# OpenSubsonic extension `oasis`, version 1
+# OpenSubsonic extension `oasis`, versions 1 and 2
 
 Status: written on 2026-11-02 from what oasis already sent every client; this is the canonical copy. caravan and roma
 link to it.
@@ -8,7 +8,8 @@ clients that know them, and other clients get plain OpenSubsonic.
 
 ## Rules
 
-- The server advertises `{"name": "oasis", "versions": [1]}` in `getOpenSubsonicExtensions`.
+- The server advertises `{"name": "oasis", "versions": [1, 2]}` in `getOpenSubsonicExtensions`. Version 2 adds
+  radio sources and stations ([Radio](#radio-version-2)); a client offers them only when the list has 2.
 - Clients decide by that list only, never by `subsonic-response.type`.
 - A client opts in per request with the parameter `oasis=1`. Without it (absent, `0`, anything else) the response
   has none of the fields and none of the items below.
@@ -59,6 +60,107 @@ album.
   their mixes. Response `youtubeMusic.account`: the account name. Error 0 with a message when YouTube Music rejects
   the sign-in or is off on the server.
 - `oasisUnlinkYouTubeMusic`: no params. Unlinks it and removes the mirrored playlists.
+
+## Radio (version 2)
+
+oasis suggests songs like a seed song (`getSimilarSongs`, `getSimilarSongs2`) and keeps radio playlists that grow as
+they are played. Both take their songs from a **source**:
+
+| Source id | Songs from | Available when |
+|---|---|---|
+| `all` | Every source below that is available, taking turns (oasis's behaviour before version 2) | always |
+| `lastfm` | Last.fm's similar tracks, and library songs by Last.fm's similar artists | the server has a Last.fm API key |
+| `ytm` | YouTube Music's radio for the song | the server has YouTube Music on |
+| `library` | The library alone: the artist's linked artists, the same artist, songs played around it, the same genre | always |
+| `listenbrainz` | ListenBrainz's LB Radio for the song's artist and artists ListenBrainz finds similar | the user linked a ListenBrainz token |
+
+Last.fm's and ListenBrainz's picks become library songs where the library has them, else YouTube Music streaming
+songs (`yt-…`). A source that finds nothing, or fails, gives nothing: no other source stands in, so an empty list
+means that source had nothing for this song.
+
+Each user has a **default source**, set on the dashboard (Radio, on the home page) and `all` until set. It serves every
+request that names no source, from any client, and radios started without one.
+
+### `oasisRadio` (answers with or without `oasis=1`)
+
+No params. What this user can choose from now; ask again after the user links or unlinks an account.
+
+```json
+"oasisRadio": {
+  "defaultSource": "all",
+  "source": [{"id": "all", "name": "Everything mixed"}, {"id": "lastfm", "name": "Last.fm"},
+             {"id": "ytm", "name": "YouTube Music"}, {"id": "library", "name": "Your library"},
+             {"id": "listenbrainz", "name": "ListenBrainz"}],
+  "station": [{"id": "lastfm-top", "name": "Last.fm top tracks", "defaultPeriod": "3month",
+               "period": ["7day", "1month", "3month", "6month", "12month", "overall"]},
+              {"id": "lastfm-loved", "name": "Last.fm loved tracks"}]
+}
+```
+
+- `source` lists only the available sources, in this order; `name` is for display.
+- `station` lists only the available stations: both need the server's Last.fm API key and the user's linked Last.fm.
+  It is an empty list otherwise. Only `lastfm-top` has periods.
+- `defaultSource` can name a source that is no longer available (the user unlinked it); requests that rely on it then
+  get nothing until the user picks another.
+
+In XML, `source` and `station` are repeated elements with attributes, and each `period` is a child element.
+
+### Choosing the source of similar songs
+
+`getSimilarSongs` and `getSimilarSongs2` take `oasisSource=<source id>`, read only with `oasis=1`. Without
+`oasis=1` the parameter is ignored and the user's default applies. With `oasis=1`:
+
+- `similarSongs`/`similarSongs2` has `oasisSource`: the source the songs came from (the one asked for, else the
+  default).
+- An unknown id is error 0, `oasisSource must be one of all, lastfm, ytm, library, listenbrainz`.
+- A known but unavailable source gives an empty `song` list.
+
+### Starting a radio playlist
+
+`createPlaylist` with `oasis=1` and one or both of these makes a radio playlist whatever its name:
+
+| Param | Value |
+|---|---|
+| `oasisSource` | A source id from `oasisRadio`. Default: the user's default source. |
+| `oasisStation` | `lastfm-top` or `lastfm-loved`: a station seeded from the user's Last.fm instead of from its own songs. |
+| `oasisPeriod` | With `lastfm-top`: one of its periods. Default `3month`. Ignored for `lastfm-loved`. |
+
+- `name` is optional for a station (default: the station's name) and required otherwise.
+- `songId` (repeatable) gives the first songs. A radio with a source and no station grows from its last played songs,
+  so give it at least one; a station needs none.
+- oasis fills the radio before answering, so the response's `entry` already lists the first 30 or so songs. This can
+  take several seconds while oasis asks Last.fm, YouTube Music or ListenBrainz.
+- Errors (code 0): `oasisSource <id> isn't available: …` (unknown ids too), `oasisStation <id> isn't available: …`,
+  or `oasisPeriod must be one of …`.
+
+Examples:
+
+```
+createPlaylist?oasis=1&name=Radio: Song&songId=<id>&oasisSource=listenbrainz
+createPlaylist?oasis=1&oasisStation=lastfm-top&oasisPeriod=1month
+createPlaylist?oasis=1&oasisStation=lastfm-loved&oasisSource=library
+```
+
+A station takes the user's top tracks over the period (or loved tracks) from Last.fm, shuffled. Each one the library
+or YouTube Music has is added, followed by up to 4 songs like it from the station's source. The source of a station
+is only for the similar songs; `all` is fine.
+
+How radios grow, for every radio:
+
+- oasis keeps about 30 unplayed songs queued after the last song played from the radio (plays reach oasis by
+  `scrobble`). It adds songs in the background. A client reloads the playlist (`getPlaylist`) to see them.
+- It skips songs already in the radio and the user's 100 most recently played.
+- A radio keeps the source it was started with. A radio started by name (`createPlaylist?name=Radio …`, without
+  the params above) takes the user's default at that moment. The automatic `Radio` playlist (created at a user's first
+  play, growing from everything they play) always follows the current default.
+- Radios are `readonly: true`. A radio whose name doesn't start with `Radio` (made with the params above) stays a
+  radio when renamed. One named `Radio …` becomes a plain playlist when renamed to something else, as before.
+
+Playlist fields (only with `oasis=1`, only on radios):
+
+- `oasisSource`: the source the radio grows from.
+- `oasisStation`: `lastfm-top` or `lastfm-loved`, for a station.
+- `oasisPeriod`: a `lastfm-top` station's period.
 
 ## oasis behaviour every client gets
 
