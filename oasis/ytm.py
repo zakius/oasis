@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .db import make_id
+from .db import fold, make_id
 
 MIX = "RDTMAK"  # the id prefix of YouTube Music's own mixes; library playlists are PL…, Liked Music LM
 LIKED = "LM"     # Liked Music: its songs stay in the library even with the playlist hidden
@@ -37,12 +37,6 @@ class Stream:
     content_type: str
     size: int
     expires: float
-
-
-def fold(text: str) -> str:
-    """Case, accents, spaces and punctuation aside: 'Suite‐Pee' (Unicode hyphen) and 'Suite-Pee' are the same title."""
-    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).casefold()
-    return re.sub(r"[\W_]+", "", text)
 
 
 def big_cover(thumbnails) -> str | None:

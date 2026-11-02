@@ -166,6 +166,7 @@ class Credits:
             try:
                 while self.step():
                     pass
+                self.unify()
             except OSError as e:
                 log.warning("MusicBrainz: %s; again in %d s", e, self.retry)
                 wait, self.retry = self.retry, min(self.retry * 2, RETRY[1])
@@ -173,6 +174,14 @@ class Credits:
                 log.exception("credits failed")
             self.wake.wait(wait)
             self.wake.clear()
+
+    def unify(self):
+        """Spellings of artist names that came in since: one artist each (artists.unify)."""
+        db = self.connect()
+        try:
+            artists.unify(db)
+        finally:
+            db.close()
 
     def step(self) -> bool:
         """Fills one release, or when all are, one credited artist's names and links; whether there may be more to do."""

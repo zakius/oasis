@@ -1,6 +1,7 @@
 from starlette.testclient import TestClient
 
 from conftest import call, make_track
+from oasis import artists
 from oasis.api import create_app
 from oasis.config import Config
 from oasis.credits import Credits
@@ -111,3 +112,51 @@ def test_artist_settings_on_the_dashboard_apply_at_once_and_merges_can_be_taken_
         assert [a["name"] for a in call(client, "getArtist", id=make_id("ar-", "Beta"))["artist"]["album"]] == ["One"]
         assert [a["name"] for a in call(client, "getArtist", id=make_id("ar-", "Beta Band"))["artist"]["album"]] == ["Two"]
         assert "<span>artists</span>" in client.get("/").text and "Downloading" in client.get("/").text
+
+
+def stream(id, artist, title, guest=""):
+    return {"id": f"yt-{id}", "source": "ytm", "ref": id, "title": title, "artist": artist + guest, "album_artist": artist, "album": title,
+            "artist_id": make_id("ar-", artist), "album_id": make_id("al-", artist, title), "duration": 200, "library": 1}
+
+
+def spelled_client(tmp_path, streams):
+    config = Config(library=[tmp_path / "music"], users={"admin": "secret"}, database=tmp_path / "oasis.db")
+    client = TestClient(create_app(config, background=False, services={}))
+    db = connect(config.database)
+    for s in streams:
+        remember(db, s)
+    return db, client
+
+
+def test_spellings_of_one_name_are_one_artist_under_the_accented_one_on_a_tie(tmp_path):
+    plain, accented = "Agnieszka Chylinska", "Agnieszka Chylińska"
+    db, client = spelled_client(tmp_path, [stream("a1", accented, "Zero"), stream("a2", accented, "Hand"),
+                                           stream("p1", plain, "Kiedy"), stream("p2", plain, "Duet", ", Guest")])
+    db.execute("insert into stat(user, id, starred) values ('admin', ?, 1)", (make_id("ar-", plain),))
+    with client:
+        artists.unify(db)
+        index = call(client, "getArtists")["artists"]["index"]
+        found = [a for i in index for a in i["artist"]]
+        assert [(a["id"], a["name"]) for a in found] == [(make_id("ar-", accented), accented)]
+        old = call(client, "getArtist", id=make_id("ar-", plain))["artist"]  # an id a client kept from before
+        assert old["id"] == make_id("ar-", accented) and old["starred"] and old["name"] == accented
+        songs = {s["id"]: s for s in call(client, "search3", query="Chylinska")["searchResult3"].get("song", [])}
+        assert {s["artist"] for s in songs.values()} == {accented, f"{accented}, Guest"}
+        assert {s["artistId"] for s in songs.values()} == {make_id("ar-", accented)}
+        # A new spelling from YouTube Music joins the artist as it arrives.
+        assert remember(db, stream("p3", "AGNIESZKA CHYLINSKA", "Nowa")) == "yt-p3"
+        assert call(client, "getSong", id="yt-p3")["song"]["artistId"] == make_id("ar-", accented)
+
+
+def test_youtubes_stylization_loses_to_the_spelling_on_more_tracks_and_musicbrainz_names_the_artist(tmp_path):
+    db, client = spelled_client(tmp_path, [stream("y1", "Jaÿ‐Z", "Run This Town"), stream("j1", "Jay‐Z", "Izzo"),
+                                           stream("j2", "Jay‐Z", "Encore"), stream("u1", "JAY‐Z", "99 Problems")])
+    jay = make_id("ar-", "Jaÿ‐Z")  # the spelling seen first gave the artist its id, and it keeps it
+    with client:
+        artists.unify(db)
+        assert [(a["id"], a["name"]) for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"]] == [(jay, "Jay‐Z")]
+        assert {(s["artistId"], s["artist"]) for s in (call(client, "getSong", id=f"yt-{v}")["song"] for v in ("y1", "u1"))} == {(jay, "Jay‐Z")}
+        db.execute("insert into mb_artist(mbid, artist_id, name) values ('jayz', ?, 'JAŸ-Z')", (jay,))  # MusicBrainz's name for him
+        artists.unify(db)
+        assert [(a["id"], a["name"]) for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"]] == [(jay, "JAŸ-Z")]
+        assert call(client, "getSong", id="yt-y1")["song"]["artist"] == "JAŸ-Z"

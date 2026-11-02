@@ -1,5 +1,7 @@
 import hashlib
+import re
 import sqlite3
+import unicodedata
 from pathlib import Path
 
 SCHEMA = """
@@ -49,6 +51,12 @@ create table if not exists artist_link(  -- separate artists close to each other
     source text not null, primary key(artist_id, other_id, kind)
 );
 create index if not exists artist_link_other on artist_link(other_id);
+create table if not exists artist_key(  -- each folded artist name (fold) -> the artist all its spellings are
+    key text primary key, artist_id text not null
+);
+create table if not exists spelling(  -- artist names shown as another spelling of the same name (artists.unify)
+    variant text primary key, spelled text not null
+);
 create table if not exists setting(key text primary key, value text);  -- settings made on the dashboard
 create table if not exists stat(  -- each user's stars, ratings and plays, as Subsonic keeps them
     user text not null, id text not null,  -- id: any track, album or artist id
@@ -208,12 +216,23 @@ def make_id(prefix: str, *parts: str) -> str:
     return prefix + hashlib.sha1("\0".join(p.casefold() for p in parts).encode()).hexdigest()[:16]
 
 
+def fold(text: str) -> str:
+    """Case, accents, spaces and punctuation aside: 'Suite‐Pee' (Unicode hyphen) and 'Suite-Pee' are the same title,
+    'Chylinska' and 'Chylińska' the same name."""
+    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).casefold().replace("ł", "l")
+    return re.sub(r"[\W_]+", "", text)
+
+
 def artist_id(db, name: str, mbid: str | None = None) -> str:
     """The artist's oasis id. A MusicBrainz artist keeps the id it first got, so its spellings share one and two
-    artists of the same name get two; a name alone follows the merges in artist_alias."""
+    artists of the same name get two; a name alone follows the merges in artist_alias, else is the artist another
+    spelling of it is (artist_key)."""
     id = make_id("ar-", name)
     if not mbid:
-        return resolve(db, id)
+        if (row := db.execute("select artist_id from artist_alias where id = ?", (id,)).fetchone()) or not (key := fold(name)):
+            return row[0] if row else id
+        db.execute("insert or ignore into artist_key values (?, ?)", (key, id))
+        return db.execute("select artist_id from artist_key where key = ?", (key,)).fetchone()[0]
     if row := db.execute("select artist_id from mb_artist where mbid = ?", (mbid,)).fetchone():
         return resolve(db, row[0], config_only=True)
     if db.execute("select 1 from mb_artist where artist_id = ?", (id,)).fetchone():
@@ -291,7 +310,7 @@ def migrate(db: sqlite3.Connection):
 def remember(db, row: dict) -> str:
     """Caches a streaming track's metadata and returns its id. The same song already known (same artist and title,
     length within 5 s), local or under another YouTube upload, keeps its id; a local copy wins."""
-    row["artist_id"] = resolve(db, row["artist_id"])
+    row["artist_id"] = artist_id(db, row["album_artist"]) if row["artist_id"] == make_id("ar-", row["album_artist"]) else resolve(db, row["artist_id"])
     known = db.execute("select id, source from track where artist_id = ? and title = ? collate nocase and abs(duration - ?) <= 5 "
                        "and id != ? order by source != 'local' limit 1",
                        (row["artist_id"], row["title"], row["duration"] or 0, row["id"])).fetchone()

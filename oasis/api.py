@@ -231,7 +231,32 @@ def describe(db, payload: dict) -> dict:
         describe_songs(db, songs)
     if albums:
         describe_albums(db, albums)
+    respell(db, payload)
     return payload
+
+
+ARTIST_TEXT = ("artist", "albumArtist", "displayArtist", "displayAlbumArtist")
+
+
+def respell(db, payload):
+    """Artist names in a response under the spelling their artist is shown with (artists.unify), also within
+    'A, B' and 'A feat. B'."""
+    names = dict(db.execute("select variant, spelled from spelling").fetchall())
+    if not names:
+        return
+    within = re.compile(r"(?<!\w)(?:" + "|".join(map(re.escape, sorted(names, key=len, reverse=True))) + r")(?!\w)")
+
+    def walk(value):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                if isinstance(v, str) and (k in ARTIST_TEXT or k == "name" and str(value.get("id", "")).startswith("ar-")):
+                    value[k] = within.sub(lambda m: names[m[0]], names.get(v, v))
+                else:
+                    walk(v)
+        elif isinstance(value, list):
+            for v in value:
+                walk(v)
+    walk(payload)
 
 
 def credits_of(db, track_ids: list[str]) -> dict[str, list]:
@@ -474,6 +499,7 @@ class Api:
         artists.reidentify(db)
         demix(db)
         artists.configure(db, self._artist_settings(db))
+        artists.unify(db)
         db.close()
         services_for = (lambda db, user: services) if services is not None else \
             (lambda db, user: forward.user_services(config, self.ytm, accounts.get(db, user)))

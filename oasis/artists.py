@@ -3,9 +3,11 @@ Music uses (米津玄師, Kenshi Yonezu), and two artists who share a name get t
 stay separate pages, linked: personas of one person (MusicBrainz), groups the user declares related (oasis.toml), and
 bands with their members. Links lead the similar artists clients show and feed radios. The user's merges, splits and
 groups win over MusicBrainz."""
+import unicodedata
+from collections import Counter, defaultdict
 from itertools import combinations
 
-from .db import artist_id, make_id, move_stat, resolve
+from .db import artist_id, fold, make_id, move_stat, resolve
 
 PERSONA, RELATED, MEMBER = "persona", "related", "member"
 CLOSENESS = (PERSONA, RELATED, MEMBER)
@@ -69,6 +71,53 @@ def merge(db):
         db.execute("delete from ytm_artist where artist_id = ?", (old,))
         db.execute("update or ignore want_item set ref = ? where kind = 'artist' and ref = ?", (new, old))
         move_stat(db, old, new)
+
+
+def accents(name: str) -> int:
+    return sum(1 for c in unicodedata.normalize("NFKD", name) if unicodedata.combining(c)) + name.casefold().count("ł")
+
+
+def unify(db):
+    """One artist per name however it's spelled: names alike but for case, accents and punctuation (fold) are one
+    artist, shown under MusicBrainz's name for it, else the spelling most of its tracks have, more accents breaking a
+    tie ('Chylińska' over 'Chylinska', but 'Jay‐Z' on most tracks over YouTube's 'Jaÿ‐Z'). The artist keeps the id it
+    has (artist_key) unless MusicBrainz's takes over; the others' ids resolve to it. Two MusicBrainz artists of one
+    name stay two, and names the user's merges or separations mention stay as the user has them."""
+    spellings, ids, mb = defaultdict(Counter), defaultdict(set), defaultdict(dict)
+    for sql in ("select album_artist, artist_id, count(*) from track where album_artist is not null group by 1, 2",
+                "select artist_name, artist_id, count(distinct track_id) from credit where mbid is null and artist_name is not null group by 1, 2"):
+        for name, id, n in db.execute(sql):
+            spellings[key := fold(name)][name] += n
+            ids[key] |= {id, make_id("ar-", name)}
+    for (name,) in db.execute("select distinct artist from track where artist is not null"):  # respelled in songs, not counted
+        if (key := fold(name)) in spellings:
+            spellings[key][name] += 0
+    for name, id in db.execute("select name, artist_id from mb_artist"):
+        mb[fold(name)][id] = name
+    mbs = {id for found in mb.values() for id in found}
+    config = {id for row in db.execute("select id, artist_id from artist_alias where source = 'config'") for id in row}
+    keys = dict(db.execute("select key, artist_id from artist_key").fetchall())
+    spelled = {}
+    for key, names in spellings.items():
+        own = {id for id in ids[key] if id in mbs} | set(mb[key])
+        if not key or len(own) > 1 or ids[key] & config:
+            continue
+        display = next(iter(mb[key].values()), None) or max(names, key=lambda n: (names[n], accents(n), n))
+        target = next(iter(own), None) or (keys[key] if keys.get(key) in ids[key] else resolve(db, make_id("ar-", display)))
+        if keys.get(key) != target:
+            db.execute("insert or replace into artist_key values (?, ?)", (key, target))
+        spelled |= {n: display for n in names if n != display}
+        for id in ids[key] - {target}:
+            if resolve(db, id) != target:  # a name MusicBrainz or the user already gave an artist stays theirs
+                db.execute("insert into artist_alias values (?, ?, 'spelling') on conflict(id) do update set artist_id = excluded.artist_id "
+                           "where source = 'spelling'", (id, target))
+                db.execute("update artist_alias set artist_id = ? where artist_id = ? and source != 'config'", (target, id))
+        if resolve(db, target) != target:
+            db.execute("delete from artist_alias where id = ? and source = 'spelling'", (target,))
+    if spelled != dict(db.execute("select variant, spelled from spelling").fetchall()):
+        db.execute("delete from spelling")
+        db.executemany("insert into spelling values (?, ?)", spelled.items())
+    merge(db)
 
 
 def reidentify(db):
