@@ -9,6 +9,7 @@ create table if not exists track(
     ref text not null unique,       -- file path, or the videoId for 'ytm'
     root text,
     title text, artist text, album_artist text, album text,
+    album_by text,                  -- streaming tracks: the album's artist as its YouTube Music album page names it
     artist_id text, album_id text,
     track_no int, disc_no int, year int, genre text,
     duration int, bitrate int, size int, suffix text, content_type text,
@@ -287,7 +288,7 @@ def remember(db, row: dict) -> str:
             db.execute("update track set ytm_id = ? where id = ?", (row["ytm_id"], known["id"]))
         return known["id"]
     # The album a song was first seen on stays its own: other albums that list it hold it in album_track.
-    kept = ("album", "album_id", "ytm_album", "track_no", "disc_no")
+    kept = ("album", "album_id", "ytm_album", "track_no", "disc_no", "year")  # a playlist's sighting carries no year
     updates = ", ".join(f"{k} = coalesce(track.{k}, excluded.{k})" if k in kept else f"{k} = excluded.{k}"
                         for k in row if k not in ("id", "library", "created"))
     db.execute(f"insert into track({', '.join(row)}) values ({', '.join('?' * len(row))}) "

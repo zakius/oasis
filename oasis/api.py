@@ -62,6 +62,7 @@ def playlist_order(r) -> tuple:
         return 0, MIX_ORDER.index(mix) if mix in MIX_ORDER else len(MIX_ORDER), r["name"].casefold()
     return (1 if mix == "LM" else 2), 0, r["name"].casefold()
 MIX_REFRESH = 6 * 3600
+ALBUM_GAP = 5             # seconds between the album pages _album_loop reads
 
 
 class Fail(Exception):
@@ -139,7 +140,7 @@ SONG_COLUMNS = """t.*, s.starred, s.rating, s.play_count, s.played"""
 # Stars, ratings and plays are the requesting user's: me() (db.connect) names them for each request.
 SONGS = f"select {SONG_COLUMNS} from track t left join stat s on s.id = t.id and s.user = me()"
 ALBUMS = """
-select t.album_id as id, t.album as name, t.album_artist as artist, t.artist_id,
+select t.album_id as id, t.album as name, coalesce(max(t.album_by), t.album_artist) as artist, t.artist_id,
        count(*) as song_count, sum(t.duration) as duration, min(t.created) as created,
        coalesce(max(t.year), (select x.year from ytm_release x where x.album_id = t.album_id)) as year,
        max(t.genre) as genre, max(t.cover is not null) as has_cover,
@@ -263,14 +264,38 @@ def genre_list(r) -> list[dict] | None:
     return [{"name": g} for g in names] or None
 
 
+MIX = "RDTMAK"  # the id prefix of YouTube Music's own mixes; library playlists are PL…, Liked Music LM
+
+
+def is_mix(playlist_id: str | None) -> bool:
+    return (playlist_id or "").startswith(MIX)
+
+
+def album_artist_of(track) -> tuple[list[dict], str | None]:
+    """A song's album artist without credits: the album page's (streaming songs), else its album artist column, for a
+    streaming song its first artist."""
+    name = track and (track["album_by"] or track["album_artist"])
+    if not name:
+        return [], None
+    return [{"id": track["artist_id"] if name == track["album_artist"] else make_id("ar-", name), "name": name}], name
+
+
+def demix(db):
+    """Streaming tracks in the library only through a mix leave it."""
+    db.execute("update track set library = 0 where source = 'ytm' and library = 1 and not exists (select 1 from stat s where s.id = track.id "
+               "and s.starred is not null) and not exists (select 1 from playlist_entry e join playlist p on p.id = e.playlist_id "
+               f"where e.track_id = track.id and p.radio = 0 and coalesce(p.mix, '') not like '{MIX}%')")
+
+
 def describe_songs(db, songs: list[dict]):
     ids = list({s["id"] for s in songs})
     credits = credits_of(db, ids)
-    tracks = {r["id"]: r for r in db.execute(f"select id, isrc, genres, genre, mb_recording from track where id in ({','.join('?' * len(ids))})", ids)}
+    tracks = {r["id"]: r for r in db.execute(f"select id, isrc, genres, genre, mb_recording, album_artist, album_by, artist_id, source from track "
+                                              f"where id in ({','.join('?' * len(ids))})", ids)}
     for s in songs:
         mine, track = credits.get(s["id"], []), tracks.get(s["id"])
         artists, display = people(mine, "artist")
-        album_artists, display_album = people(mine, "albumartist")
+        album_artists, display_album = people(mine, "albumartist") if any(c["role"] == "albumartist" for c in mine) else album_artist_of(tracks.get(s["id"]))
         contributors = [clean({"role": c["role"], "subRole": c["sub_role"], "artist": {"id": c["artist_id"], "name": c["name"]}})
                         for c in mine if c["role"] not in ("artist", "albumartist")]
         composers = [c["name"] for c in mine if c["role"] == "composer"] or [c["name"] for c in mine if c["role"] == "writer"]
@@ -446,6 +471,7 @@ class Api:
             settings = dict(db.execute("select key, value from setting where key in ('lastfm_key', 'lastfm_secret')").fetchall())
             config.lastfm_key, config.lastfm_secret = settings.get("lastfm_key"), settings.get("lastfm_secret")
         artists.reidentify(db)
+        demix(db)
         artists.configure(db, self._artist_settings(db))
         db.close()
         services_for = (lambda db, user: services) if services is not None else \
@@ -456,6 +482,7 @@ class Api:
         self.uploads = Uploads(self._db, config.library[0], config.database.parent / "uploads")
         self.recommender.chores.append(self.uploads.clean)
         self.completed: set[str] = set()
+        self.album_tried: set[str] = set()  # albums _album_loop asked YouTube Music for, read or not
         torbox = config.torbox
         self.doctor = Doctor(self._db, **{k: v for k, v in torbox.items() if k in DOCTOR_KEYS}) if torbox else None
         # oasis's search, download and import: all three, or no acquisition.
@@ -965,7 +992,8 @@ class Api:
                       **self._wanted(db, "album", id)})
 
     def _touch(self, db, ids):
-        """Streaming tracks are in the library while starred or in a playlist (radios aside)."""
+        """Streaming tracks are in the library while starred or in a playlist, radios and YouTube Music's own mixes
+        aside: those change daily and stay playlists. The user's YouTube Music library playlists and Liked Music count."""
         for id in ids:
             r = db.execute("select ref, library from track where id = ? and source = 'ytm'", (id,)).fetchone()
             if r is None:
@@ -973,7 +1001,7 @@ class Api:
             starred = db.execute("select 1 from stat where id = ? and starred is not null", (id,)).fetchone()  # by anyone
             playlists = db.execute("select p.mix from playlist_entry e join playlist p on p.id = e.playlist_id "
                                    "where e.track_id = ? and p.radio = 0", (id,)).fetchall()
-            db.execute("update track set library = ? where id = ?", (int(bool(starred or playlists)), id))
+            db.execute("update track set library = ? where id = ?", (int(bool(starred or any(not is_mix(row["mix"]) for row in playlists))), id))
             # Mixes put their tracks in the library but change daily, so only the user's own choices download.
             wanted = starred or any(row["mix"] is None for row in playlists)
             if wanted and self.ytm and not self.ytm.cached(r["ref"]):
@@ -1236,7 +1264,7 @@ class Api:
             "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": MIX_OWNER if r["mix"] else r["owner"], "public": False,
             "coverArt": f"pl-{r['id']}" if r["cover"] else None,
             "readonly": True if r["mix"] or r["radio"] else None,  # OpenSubsonic: clients offer no edits; oasis keeps mixes and radios
-            "oasisMix": True if (r["mix"] or "").startswith("RDTMAK") else None, "youtubeId": r["mix"],
+            "oasisMix": True if is_mix(r["mix"]) else None, "youtubeId": r["mix"],
             "songCount": len(songs), "duration": sum(s.get("duration", 0) for s in songs),
             "created": iso(r["created"]), "changed": iso(r["changed"]),
         })
@@ -1300,6 +1328,24 @@ class Api:
             for user in users:
                 self._refresh_mixes(user)
             time.sleep(MIX_REFRESH)
+
+    def _album_loop(self):
+        """Reads the YouTube Music album page of each library streaming song's album once, ALBUM_GAP apart, for its
+        album artist, year and number (_complete_album)."""
+        while True:
+            db = self._db()
+            try:
+                row = db.execute("select album_id from track where source = 'ytm' and library = 1 and ytm_album is not null "
+                                 "and id not in (select track_id from album_track) and album_id not in (select value from json_each(?)) limit 1",
+                                 (json.dumps([*self.completed, *self.album_tried]),)).fetchone()
+                if row:
+                    self.album_tried.add(row[0])
+                    self._complete_album(db, row[0])
+            except Exception:
+                log.exception("album fill failed")
+            finally:
+                db.close()
+            time.sleep(ALBUM_GAP if row else 600)
 
     def _set_entries(self, db, playlist_id, track_ids):
         old = [r[0] for r in db.execute("select track_id from playlist_entry where playlist_id = ?", (playlist_id,))]
@@ -1571,6 +1617,7 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
             api.downloads.start()
         if api.ytm:
             threading.Thread(target=api._mix_loop, daemon=True).start()
+            threading.Thread(target=api._album_loop, daemon=True).start()
         api.recommender.start()
         api.recommender.wake.set()
         api.credits.start()

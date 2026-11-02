@@ -188,15 +188,17 @@ class YouTubeMusic:
         return [row for t in tracks if (row := track_row(t))]
 
     def album(self, browse_id: str) -> list[dict]:
+        """The album page's songs, each with its year, number and the album's own artist (album_by: 'Various Artists'
+        for a soundtrack, where each song names its singers)."""
         with self.api_lock:
             album = self.api.get_album(browse_id)
-        cover = album.get("thumbnails") or []
+        cover, by = album.get("thumbnails") or [], ", ".join(a["name"] for a in album.get("artists") or [] if a.get("name")) or None
         rows = []
         for t in album.get("tracks", []):
             row = track_row({**t, "album": {"name": album["title"], "id": browse_id}, "thumbnails": t.get("thumbnails") or cover,
                              "artists": t.get("artists") or album.get("artists"), "year": album.get("year")})
             if row:
-                rows.append(row | {"track_no": t.get("trackNumber")})
+                rows.append(row | {"track_no": t.get("trackNumber"), "album_by": by or row["album_artist"]})
         return rows
 
     def add_history(self, client, video_id: str):

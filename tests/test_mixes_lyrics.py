@@ -1,12 +1,15 @@
 import subprocess
+import threading
+from types import SimpleNamespace
 
 import pytest
 from mutagen.id3 import ID3, USLT
 
 from conftest import call, make_client, make_track
+from oasis import api as oasis_api
 from oasis.api import transcode_target
 from oasis.lyrics import Lyrics
-from oasis.ytm import track_row
+from oasis.ytm import YouTubeMusic, track_row
 
 
 def item(video_id, title, artist="Mixer", album="Mix Album"):
@@ -47,6 +50,9 @@ class FakeYtm:
     def search(self, query, limit):
         return []
 
+    def album(self, browse_id):  # a soundtrack: each song names its singer, the album page Various Artists
+        return [track_row(item(v, f"Song {v}")) | {"track_no": n, "year": 2024, "album_by": "Various Artists"} for n, v in enumerate(["m1", "m5"], 1)]
+
 
 @pytest.fixture
 def ytm(tmp_path):
@@ -81,7 +87,8 @@ def test_mixes_are_read_only_playlists_in_the_library(client, ytm):
     assert not {"oasisMix", "youtubeId"} & {k for p in call(client, "getPlaylists")["playlists"]["playlist"] for k in p}  # plain clients
     entries = call(client, "getPlaylist", id=mixes["My Supermix"]["id"])["playlist"]["entry"]
     assert [e["title"] for e in entries] == ["Song m1", "Song m2"]
-    assert {"Song m1", "Song m2", "Song m3"} <= library_titles(client)
+    titles = library_titles(client)
+    assert "Song m5" in titles and not {"Song m1", "Song m2", "Song m3"} & titles  # mixes stay playlists; library playlists count
     assert "Mix Album" in [a["name"] for a in call(client, "getAlbumList2", type="alphabeticalByName", size=50)["albumList2"]["album"]]
     assert ytm.fetched == []  # mixes don't download
     cover = mixes["My Supermix"]["coverArt"]
@@ -104,14 +111,52 @@ def test_mix_refresh_follows_youtube(client, ytm):
     api._refresh_mixes("admin")
     assert set(playlists(client)) == {"My Supermix"}
     titles = library_titles(client)
-    assert "Song m4" in titles and "Song m2" not in titles and "Song m3" not in titles
+    assert not {"Song m2", "Song m3", "Song m4", "Song m5"} & titles  # m5 left with its library playlist
+    assert [e["title"] for e in call(client, "getPlaylist", id=playlists(client)["My Supermix"]["id"])["playlist"]["entry"]] == ["Song m1", "Song m4"]
 
 
 def test_starred_mix_track_downloads(client, ytm):
     link(client)
     client.app.state.api._refresh_mixes("admin")
     call(client, "star", id="yt-m1")
-    assert ytm.fetched == ["m1"]
+    assert ytm.fetched == ["m1"] and "Song m1" in library_titles(client)
+
+
+def test_songs_in_the_library_only_through_a_mix_leave_it(client):
+    link(client)
+    api = client.app.state.api
+    api._refresh_mixes("admin")
+    db = api._db()
+    db.execute("update track set library = 1 where source = 'ytm'")  # as the old rule left them
+    oasis_api.demix(db)
+    assert {r[0] for r in db.execute("select ref from track where source = 'ytm' and library = 1")} == {"m5"}
+
+
+def test_a_streaming_songs_album_artist_is_its_artist_till_its_album_page_names_another(client):
+    link(client)
+    api = client.app.state.api
+    api._refresh_mixes("admin")
+    song = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song m5")
+    assert song["displayAlbumArtist"] == "Mixer" and song["albumArtists"] == [{"id": song["artistId"], "name": "Mixer"}]
+    assert "track" not in song and "year" not in song
+    api._complete_album(api._db(), song["albumId"])  # as _album_loop reads it
+    song = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song m5")
+    assert song["displayAlbumArtist"] == "Various Artists" and (song["track"], song["year"]) == (2, 2024)  # never the album's title
+    album = call(client, "getAlbum", id=song["albumId"])["album"]
+    assert album["artist"] == "Various Artists" and album["year"] == 2024
+    assert "Various Artists" not in {a["name"] for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"]}
+    api._refresh_mixes("admin")  # seen again in a playlist, which carries no year: what the album page gave stays
+    song = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song m5")
+    assert (song["displayAlbumArtist"], song["year"]) == ("Various Artists", 2024)
+
+
+def test_an_album_pages_own_artist_is_its_songs_album_artist():
+    page = {"title": "Hazbin Hotel (Original Soundtrack, Pt. 1)", "year": "2024", "artists": [{"name": "Various Artists"}], "thumbnails": [],
+            "tracks": [{"videoId": "v1", "title": "Happy Day in Hell", "artists": [{"name": "Erika Henningsen"}], "trackNumber": 1}]}
+    ytm = object.__new__(YouTubeMusic)
+    ytm.api, ytm.api_lock = SimpleNamespace(get_album=lambda browse_id: page), threading.Lock()
+    (row,) = ytm.album("MPREb_hh")
+    assert (row["album_by"], row["album_artist"], row["track_no"], row["year"]) == ("Various Artists", "Erika Henningsen", 1, 2024)
 
 
 def lyric_lines(client, id):

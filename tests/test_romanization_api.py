@@ -58,7 +58,7 @@ def test_both_adds_only_differing_fields(client):
     assert not {"artistLatin", "albumLatin", "displayArtistLatin"} & yoru.keys()  # YOASOBI, THE BOOK
     assert found["晴天"]["titleLatin"] == "Qíng Tiān"  # a Chinese singer's song, not Japanese "Seiten"
     assert found["晴天"]["artistLatin"] == "Zhōu Jié Lún" and found["晴天"]["artists"][0]["nameLatin"] == "Zhōu Jié Lún"
-    assert not latin_keys(found["One"]) and not latin_keys(found["Lemon"]) - {"artistLatin", "displayArtistLatin", "nameLatin"}
+    assert not latin_keys(found["One"]) and not latin_keys(found["Lemon"]) - {"artistLatin", "displayArtistLatin", "displayAlbumArtistLatin", "nameLatin"}
     index = call(client, "getArtists", romanization="both")["artists"]["index"]
     artists = {a["name"]: a for i in index for a in i["artist"]}
     assert artists["米津玄師"]["nameLatin"] == "Yonezu Kenshi" and "nameLatin" not in artists["YOASOBI"]
