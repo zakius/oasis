@@ -337,7 +337,7 @@ def test_listenbrainz_radio_resolves_like_lastfm_and_its_failures_give_nothing(a
 
 
 def test_oasis_radio_lists_what_the_user_can_choose(api, client):
-    assert {"name": "oasis", "versions": [1, 2]} in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]
+    assert {"name": "oasis", "versions": [1, 2, 3]} in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]
     radio = call(client, "oasisRadio")["oasisRadio"]
     assert radio == {"defaultSource": "all", "station": [], "source": [{"id": "all", "name": "Everything mixed"}, {"id": "lastfm", "name": "Last.fm"},
                                                                         {"id": "ytm", "name": "YouTube Music"}, {"id": "library", "name": "Your library"}]}

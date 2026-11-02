@@ -126,7 +126,7 @@ def test_oasis_fields_only_with_the_oasis_extension(client):
     db.execute("insert into want_item(kind, ref, state, error, updated) values ('album', ?, 'failed', 'nothing found', 0)", (album["id"],))
     db.execute("insert into want_item(kind, ref, state, updated) values ('artist', ?, 'wanted', 0)", (album["artistId"],))
     db.execute("update track set ytm_id = 'vid' where album_id = ?", (album["id"],))
-    assert {"name": "oasis", "versions": [1, 2]} in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]
+    assert {"name": "oasis", "versions": [1, 2, 3]} in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]
     for params in ({}, {"oasis": "0"}, {"oasis": "1"}):
         got = call(client, "getAlbum", id=album["id"], **params)["album"]
         artist = call(client, "getArtist", id=album["artistId"], **params)["artist"]

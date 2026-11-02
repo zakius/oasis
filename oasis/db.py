@@ -77,7 +77,8 @@ create table if not exists user(
     lastfm_session text, lastfm_name text,
     listenbrainz_token text,
     ytm_new_shown int not null default 0, -- YouTube Music library playlists that appear later: 1 shown till unticked, 0 hidden till ticked
-    radio_source text not null default 'all'  -- the default source of similar songs and radios (recommend.SOURCES)
+    radio_source text not null default 'all', -- the default source of similar songs and radios (recommend.SOURCES)
+    translate_lang text             -- the language lyrics are translated to when an app asks with oasisTranslate=1
 );
 create table if not exists wanted(user text not null, kind text not null, ref text not null, primary key(user, kind, ref));
 create table if not exists want_item(  -- stars and follows (see acquire.py)
@@ -173,6 +174,12 @@ create table if not exists album_track(  -- the songs each YouTube Music album l
 create index if not exists play_track on play(track_id);
 create table if not exists session(token text primary key, user text not null, expires real not null);
 create table if not exists lyrics(track_id text primary key, found text, fetched real not null);
+create table if not exists lyrics_translation(  -- machine translations of lyrics (translate.py), made when an app asked
+    track_id text not null, lang text not null,
+    original text not null,         -- the lines translated, as JSON: other lines are translated again
+    lines text,                     -- JSON, one per line; null: the lyrics are in that language already
+    primary key(track_id, lang)
+);
 create table if not exists mb_latin(  -- Latin names MusicBrainz's editors chose, preferred over generated ones (see latin.py)
     kind text not null, original text not null,  -- artist: a credited name; title: an album's or track's title
     latin text not null, ref text not null,      -- ref: the artist's or release's MusicBrainz id

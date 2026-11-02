@@ -21,6 +21,7 @@ from .acquire import MB_IDS, TYPES
 from .artists import linked
 from .forward import LastFm
 from .recommend import SOURCES
+from .translate import LANGUAGES
 from .ytm import LIKED, MIX
 
 COOKIE = "oasis_session"
@@ -432,6 +433,7 @@ def routes(api) -> list[Route]:
                 f'or plays count twice.</p>{lastfm}</section>'
                 f'<section><h2>ListenBrainz</h2>{listenbrainz}</section>'
                 f'<section><h2>Radio</h2>{radio_source(user)}</section>'
+                f'<section><h2>Lyrics translation</h2>{translation_language(user)}</section>'
                 f'<section><h2>Password</h2>' + (
                     '<p class="muted">Set in oasis.toml.</p>' if user["name"] in api.config.users else
                     f'<form method="post" action="/account/password"{confirm("Change your password? Apps signed in with the old one stop working until you update them.")}><label>New password<input type="password" name="password">'
@@ -457,6 +459,21 @@ def routes(api) -> list[Route]:
                 'started with. A source that finds nothing gives nothing: no other stands in.</p>'
                 f'<form method="post" action="/account/radio">{options}<button class="primary">Save</button></form>'
                 + (f'<p class="muted">Not available: {", ".join(missing)} (link it above, or the server lacks it).</p>' if missing else ""))
+
+    def translation_language(user) -> str:
+        options = "".join(f'<option value="{k}"{" selected" if k == user["translate_lang"] else ""}>{escape(v)}</option>'
+                          for k, v in {"": "None", **LANGUAGES}.items())
+        return ('<p class="muted">The language your apps get lyrics translated to when you ask them to. oasis translates only then, '
+                'with Google Translate, and a translation that comes with the lyrics in that language wins.</p>'
+                f'<form method="post" action="/account/translation"><label>Language<select name="lang">{options}</select></label>'
+                '<button class="primary">Save</button></form>')
+
+    def translation_language_save(db, request, user, form):
+        lang = form.get("lang") or None
+        if lang is not None and lang not in LANGUAGES:
+            return back("/", error="Choose one of the languages offered.")
+        accounts.set_field(db, user["name"], translate_lang=lang)
+        return back("/", message=f"Lyrics translation: {LANGUAGES[lang] if lang else 'none'}.")
 
     def radio_source_save(db, request, user, form):
         if form.get("source") not in api.recommender.sources(user):
@@ -1087,6 +1104,7 @@ def routes(api) -> list[Route]:
         Route("/account/youtube/unlink", signed_in(unlink_youtube), methods=["POST"]),
         Route("/account/youtube/playlists", signed_in(youtube_playlists_save), methods=["POST"]),
         Route("/account/radio", signed_in(radio_source_save), methods=["POST"]),
+        Route("/account/translation", signed_in(translation_language_save), methods=["POST"]),
         Route("/account/lastfm", signed_in(lastfm_start)),
         Route("/account/lastfm/callback", signed_in(lastfm_callback), name="lastfm_callback"),
         Route("/account/lastfm/app", signed_in(lastfm_app, admin=True), methods=["POST"]),

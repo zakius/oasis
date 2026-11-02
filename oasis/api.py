@@ -20,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import accounts, acquire, artists, cover, dedupe, forward, latin, lyrics, musicbrainz, releases, romanize, scan, upload, web, ytm
+from . import accounts, acquire, artists, cover, dedupe, forward, latin, lyrics, musicbrainz, releases, romanize, scan, translate, upload, web, ytm
 from .acquire import MB_IDS, SECONDARY, Acquire
 from .config import Config
 from .credits import PERFORMANCE_ROLES, Credits
@@ -101,6 +101,7 @@ ARTIST_ID_PARAMS = ("id", "artistId")
 MOVED_PARAMS = (*SONG_ID_PARAMS, "albumId", "artistId")
 FIND_FROM = 3  # characters a search needs before MusicBrainz is asked too
 YTM_SEARCH = 50  # YouTube Music songs a search asks for at most
+TRANSLATE_PAUSE = 600  # seconds without lyrics translation after the translator failed
 
 
 class Params:
@@ -198,7 +199,8 @@ def artist(r) -> dict:
 
 
 # The oasis extension's fields (docs/oasis-extension.md): sent only to clients asking with oasis=1.
-OASIS_FIELDS = {"oasisWanted", "oasisWantedError", "oasisMix", "oasisLink", "youtubeId", "oasisSource", "oasisStation", "oasisPeriod"}
+OASIS_FIELDS = {"oasisWanted", "oasisWantedError", "oasisMix", "oasisLink", "youtubeId", "oasisSource", "oasisStation", "oasisPeriod",
+                "oasisMachineTranslation"}
 
 
 def plain(value):
@@ -494,6 +496,8 @@ class Api:
         self.scan_lock = threading.Lock()
         self.credits = Credits(self._db)
         self.throttle = accounts.Throttle()  # the API's and the dashboard's sign-ins
+        self.translator: translate.Translator | None = translate.Google()
+        self.translate_pause = 0.0  # after a failure, no translation till then
 
     def _db(self):
         return connect(self.config.database)
@@ -594,7 +598,7 @@ class Api:
 
     def getOpenSubsonicExtensions(self, db, p, user):
         return {"openSubsonicExtensions": [{"name": name, "versions": versions} for name, versions in (
-            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]), ("oasis", [1, 2]))]}
+            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]), ("oasis", [1, 2, 3]))]}
 
     def _user(self, row) -> dict:
         roles = ("scrobbling", "settings", "download", "playlist", "coverArt", "comment", "stream", "share")
@@ -1155,7 +1159,49 @@ class Api:
         if "translation" in kinds:  # one line per main line, "" where the provider has none
             entries += [{**main, "kind": "translation", "lang": lang, "line": [{**clean({"start": start}), "value": v} for (start, _), v in zip(found.lines, values)]}
                         for lang, values in (found.translations or {}).items()]
+            want = self._translate_to(db, p, user)
+            if want and not any(translate.primary(lang) == translate.primary(want) for lang in found.translations or {}):  # a provider's comes first
+                if machine := self._machine_translation(db, r, [text for _, text in found.lines], want):
+                    entries.append({**main, "kind": "translation", "lang": want, "oasisMachineTranslation": True,
+                                    "line": [{**clean({"start": start}), "value": v} for (start, _), v in zip(found.lines, machine)]})
         return {"lyricsList": clean({"structuredLyrics": entries or None})}
+
+    def _translate_to(self, db, p, user) -> str | None:
+        """The language a request asks lyrics translated to (oasis extension only): oasisTranslate=<lang>, or 1 for the
+        user's (the dashboard's). None: no machine translation."""
+        asked = p.get("oasisTranslate") if p.oasis else None
+        if not asked:
+            return None
+        if asked == "1":
+            return accounts.get(db, user)["translate_lang"]
+        if not translate.LANG.fullmatch(asked):
+            raise Fail(0, "oasisTranslate must be 1 or a language code such as en, pl or zh-CN")
+        return asked
+
+    def _machine_translation(self, db, r, texts: list[str], lang: str) -> list[str] | None:
+        """The lyrics translated to lang, kept per track and language; None when they are in lang already, or the
+        translator is off or failed (logged, then left alone for TRANSLATE_PAUSE)."""
+        original = json.dumps(texts, ensure_ascii=False)
+        row = db.execute("select original, lines from lyrics_translation where track_id = ? and lang = ?", (r["id"], lang)).fetchone()
+        if row and row["original"] == original:
+            return json.loads(row["lines"]) if row["lines"] else None
+        if not self.translator or time.time() < self.translate_pause:
+            return None
+        try:
+            lines, source = self.translator.translate(texts, lang)
+        except Exception as e:
+            log.warning("lyrics translation to %s failed: %s", lang, e)
+            self.translate_pause = time.time() + TRANSLATE_PAUSE
+            return None
+        same = translate.primary(source) == translate.primary(lang)
+        db.execute("insert or replace into lyrics_translation values (?, ?, ?, ?)",
+                   (r["id"], lang, original, None if same else json.dumps(lines, ensure_ascii=False)))
+        return None if same else lines
+
+    def oasisTranslation(self, db, p, user):
+        """Lyrics translation for this user (docs/oasis-extension.md): the dashboard's language and those it offers."""
+        return {"oasisTranslation": clean({"available": self.translator is not None, "language": accounts.get(db, user)["translate_lang"],
+                                           "languages": [{"id": k, "name": v} for k, v in translate.LANGUAGES.items()]})}
 
     def getLyrics(self, db, p, user):
         artist, title = p.get("artist", ""), p.get("title", "")

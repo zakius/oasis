@@ -1,4 +1,4 @@
-# OpenSubsonic extension `oasis`, versions 1 and 2
+# OpenSubsonic extension `oasis`, versions 1 to 3
 
 Status: written on 2026-11-02 from what oasis already sent every client; this is the canonical copy. caravan and roma
 link to it.
@@ -8,8 +8,9 @@ clients that know them, and other clients get plain OpenSubsonic.
 
 ## Rules
 
-- The server advertises `{"name": "oasis", "versions": [1, 2]}` in `getOpenSubsonicExtensions`. Version 2 adds
-  radio sources and stations ([Radio](#radio-version-2)); a client offers them only when the list has 2.
+- The server advertises `{"name": "oasis", "versions": [1, 2, 3]}` in `getOpenSubsonicExtensions`. Version 2 adds
+  radio sources and stations ([Radio](#radio-version-2)), version 3 lyrics translation
+  ([Lyrics translation](#lyrics-translation-version-3)). A client offers each only when the list has its version.
 - Clients decide by that list only, never by `subsonic-response.type`.
 - A client opts in per request with the parameter `oasis=1`. Without it (absent, `0`, anything else) the response
   has none of the fields and none of the items below.
@@ -161,6 +162,58 @@ Playlist fields (only with `oasis=1`, only on radios):
 - `oasisSource`: the source the radio grows from.
 - `oasisStation`: `lastfm-top` or `lastfm-loved`, for a station.
 - `oasisPeriod`: a `lastfm-top` station's period.
+
+## Lyrics translation (version 3)
+
+Lyrics come as songLyrics v2 entries (`getLyricsBySongId` with `enhanced=true`; see the romanization extension's
+Lyrics section for `kinds` and alignment). `main` holds only the song's own lines. Translations come as
+`translation` entries, each with a `lang` and one line per `main` line (`value` `""` where a line has none):
+
+- **Provided translations**, always: the ones lyrics providers send (NetEase, KuGou, QQ: mostly Chinese, `lang`
+  `zh`). They need no parameter; clients choose whether to show them.
+- **Machine translations**, only on request: oasis never translates on its own.
+
+### Asking for a machine translation
+
+`getLyricsBySongId` with `enhanced=true`, `oasis=1` and `oasisTranslate`:
+
+| `oasisTranslate` | Translation to |
+|---|---|
+| absent | none: no machine translation, and no request to the translator |
+| `1` | the user's language, set on the dashboard (Lyrics translation); none if the user has not set one |
+| a language code (`en`, `pl`, `zh-CN`, `zh-TW`, `sr-Latn`; pattern `[a-z]{2,3}(-[A-Z]{2}\|-[A-Z][a-z]{3})?`) | that language |
+
+- A provided translation in the language asked (same primary subtag: `zh` serves `zh-CN` and `zh-TW`) wins, and
+  no machine translation is made.
+- Otherwise the response gets one more `translation` entry with `lang` set to the code asked and
+  `oasisMachineTranslation: true`, so a client can label it.
+- Lyrics already in that language (the translator's own detection) get no machine translation.
+- oasis keeps each translation per song and language, and translates again only when the song's lyrics change. The
+  first request for a song waits for the translator (about a second); later ones don't.
+- If the translator fails or blocks oasis, the response has no machine translation and the lyrics are otherwise as
+  usual. oasis then leaves the translator alone for 10 minutes. A client sees only the missing entry.
+- `oasisTranslate` is ignored without `oasis=1`, without `enhanced=true` (songLyrics v1 has the song's lines only),
+  and when `kinds` leaves out `translation`.
+- An invalid code is error 0, `oasisTranslate must be 1 or a language code such as en, pl or zh-CN`.
+
+The translator is Google Translate's unofficial keyless endpoint, sent the song's lines in one request.
+
+### `oasisTranslation` (answers with or without `oasis=1`)
+
+No params.
+
+```json
+"oasisTranslation": {
+  "available": true,
+  "language": "pl",
+  "languages": [{"id": "en", "name": "English"}, {"id": "pl", "name": "Polish"}, {"id": "zh-CN", "name": "Chinese (Simplified)"}]
+}
+```
+
+- `available`: whether this server makes machine translations. A client offers translation when the server lists
+  oasis version 3 and `available` is true.
+- `language`: the user's language from the dashboard, which `oasisTranslate=1` uses. Absent when not set.
+- `languages`: the languages the dashboard offers, for a client's own picker. Requests may name others.
 
 ## oasis behaviour every client gets
 
