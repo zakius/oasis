@@ -1,5 +1,6 @@
 """Account pages: sign in with the Subsonic user, link YouTube Music, Last.fm and ListenBrainz, manage users. Music
 pages: find any artist or album on MusicBrainz, follow or want it, and see what oasis is looking for."""
+import hmac
 import json
 from collections import Counter
 from pathlib import Path
@@ -369,23 +370,31 @@ def routes(api) -> list[Route]:
             return await run_in_threadpool(with_db(run))
         return endpoint
 
+    def sign_in_page(error: str = "", status: int = 200) -> HTMLResponse:
+        return HTMLResponse(page("Sign in", f'<section class="login"><h1 class="brand">{LOGO}oasis</h1><form method="post"><label>User<input type="text" '
+                                 'name="name" autocomplete="username" autofocus></label><label>Password<input type="password" name="password" '
+                                 'autocomplete="current-password"></label><button class="primary">Sign in</button></form>'
+                                 '<p class="muted">The same user and password as in your Subsonic apps.</p></section>',
+                                 error=error, heading=False).body, status)
+
+    def signed_in_as(response: Response, db, name: str) -> Response:
+        response.set_cookie(COOKIE, accounts.new_session(db, name), max_age=accounts.SESSION_DAYS * 86400, httponly=True, samesite="lax")
+        return response
+
     async def login(request: Request):
         if request.method == "GET":
-            return page("Sign in", f'<section class="login"><h1 class="brand">{LOGO}oasis</h1><form method="post"><label>User<input type="text" '
-                        'name="name" autocomplete="username" autofocus></label><label>Password<input type="password" name="password" '
-                        'autocomplete="current-password"></label><button class="primary">Sign in</button></form>'
-                        '<p class="muted">The same user and password as in your Subsonic apps.</p></section>',
-                        error=request.query_params.get("error", ""), heading=False)
-        form = await read_form(request)
+            return sign_in_page(request.query_params.get("error", ""))
+        form, address = await read_form(request), request.client.host if request.client else ""
+        if api.throttle.blocked(address):
+            return sign_in_page("Too many failed sign-ins. Try again in a minute.", 429)
 
         def run(db):
             user = accounts.get(db, form.get("name", ""))
-            if user is None or user["password"] != form.get("password"):
+            matches = accounts.same(form.get("password", ""), user["password"] if user else "")  # compared for unknown users too
+            if user is None or not matches:
+                api.throttle.fail(address)
                 return back("/login", error="Wrong user or password.")
-            response = RedirectResponse("/", status_code=303)
-            response.set_cookie(COOKIE, accounts.new_session(db, user["name"]), max_age=accounts.SESSION_DAYS * 86400,
-                                httponly=True, samesite="lax")
-            return response
+            return signed_in_as(RedirectResponse("/", status_code=303), db, user["name"])
         return await run_in_threadpool(with_db(run))
 
     def logout(db, request, user, form):
@@ -442,10 +451,16 @@ def routes(api) -> list[Route]:
     def lastfm_service():
         return LastFm(api.config.lastfm_key, api.config.lastfm_secret, None)
 
+    def lastfm_state(request) -> str:
+        """Ties a Last.fm sign-in to the dashboard session that started it, so no other page can link its own account."""
+        return hmac.new(request.cookies.get(COOKIE, "").encode(), b"lastfm", "sha256").hexdigest()
+
     def lastfm_start(db, request, user, form):
-        return RedirectResponse(lastfm_service().auth_url(str(request.url_for("lastfm_callback"))), status_code=303)
+        return RedirectResponse(lastfm_service().auth_url(f'{request.url_for("lastfm_callback")}?state={lastfm_state(request)}'), status_code=303)
 
     def lastfm_callback(db, request, user, form):
+        if not accounts.same(request.query_params.get("state", ""), lastfm_state(request)):
+            return back("/", error="That Last.fm sign-in didn't start here. Sign in with Last.fm again.")
         try:
             key, name = lastfm_service().sign_in(request.query_params.get("token", ""))
         except Exception as e:
@@ -484,8 +499,8 @@ def routes(api) -> list[Route]:
             return back("/", error="This password is set in oasis.toml.")
         if not form.get("password"):
             return back("/", error="A password is needed.")
-        accounts.set_field(db, user["name"], password=form["password"])
-        return back("/", message="Password changed. Update it in your apps.")
+        accounts.set_field(db, user["name"], password=form["password"])  # signs out every session, this one signs in again
+        return signed_in_as(back("/", message="Password changed. Update it in your apps."), db, user["name"])
 
     def progress(hash: str, state: str, since: float) -> str:
         """Where a download is: queued on TorBox, TorBox downloading it (its share done), copying it here from TorBox

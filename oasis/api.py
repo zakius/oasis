@@ -37,7 +37,7 @@ from .ytm import YouTubeMusic
 log = logging.getLogger(__name__)
 
 VERSION = "1.16.1"
-NOT_FOUND, MISSING, AUTH, DENIED = 70, 10, 40, 50
+NOT_FOUND, MISSING, AUTH, MECHANISM, DENIED = 70, 10, 40, 42, 50
 MIX_OWNER = "YouTube Music"
 # YouTube Music's fixed personal mix ids in its own order (the names are localized), as in roma's Mixes.kt.
 MIX_ORDER = [
@@ -106,6 +106,7 @@ class Params:
         self.multi = [*request.query_params.multi_items(), *parse_qsl(body.decode())]
         self.range = request.headers.get("range")
         self.oasis = self.get("oasis") == "1"  # the oasis extension (docs/oasis-extension.md)
+        self.address = request.client.host if request.client else ""
 
     def get(self, key: str, default=None):
         return next((v for k, v in self.multi if k == key), default)
@@ -459,6 +460,7 @@ class Api:
         self.scanning = self.scan_again = False
         self.scan_lock = threading.Lock()
         self.credits = Credits(self._db)
+        self.throttle = accounts.Throttle()  # the API's and the dashboard's sign-ins
 
     def _db(self):
         return connect(self.config.database)
@@ -527,16 +529,19 @@ class Api:
         db.commit()
 
     def _authenticate(self, db, p: Params) -> str:
+        if p.get("apiKey") is not None:  # OpenSubsonic's apiKeyAuthentication, which oasis doesn't advertise
+            raise Fail(MECHANISM, "Provided authentication mechanism not supported")
         user = p.need("u")
+        if self.throttle.blocked(p.address):
+            raise Fail(0, "Too many failed sign-ins from this address. Try again in a minute.")
         row = accounts.get(db, user)
-        if row is None:
-            raise Fail(AUTH, "Wrong username or password")
-        password = row["password"]
+        password = row["password"] if row else ""
         if (token := p.get("t")) is not None:
-            ok = hashlib.md5((password + p.need("s")).encode()).hexdigest() == token.lower()
+            ok = accounts.same(hashlib.md5((password + p.need("s")).encode()).hexdigest(), token.lower())
         else:
-            ok = decode_password(p.need("p")) == password
-        if not ok:
+            ok = accounts.same(decode_password(p.need("p")), password)
+        if row is None or not ok:
+            self.throttle.fail(p.address)
             raise Fail(AUTH, "Wrong username or password")
         return user
 

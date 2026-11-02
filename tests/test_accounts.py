@@ -1,3 +1,5 @@
+import urllib.parse
+
 import pytest
 
 from conftest import call, make_client
@@ -68,7 +70,10 @@ def test_an_admin_connects_oasis_to_lastfm_on_the_dashboard(client, monkeypatch)
     assert "Invalid method signature" in client.post("/account/lastfm/app", data={"key": "k", "secret": "wrong"}).text
     assert "Sign in with Last.fm" in client.post("/account/lastfm/app", data={"key": "k", "secret": "right"}).text
     assert client.app.state.api.recommender.lastfm.api_key == "k"
-    assert "Linked as <b>zak</b>" in client.get("/account/lastfm/callback", params={"token": "t"}).text
+    callback = urllib.parse.parse_qs(urllib.parse.urlsplit(client.get("/account/lastfm", follow_redirects=False).headers["location"]).query)["cb"][0]
+    assert "start here" in client.get("/account/lastfm/callback", params={"token": "t"}).text  # another page's link
+    assert "start here" in client.get("/account/lastfm/callback", params={"token": "t", "state": "forged"}).text
+    assert "Linked as <b>zak</b>" in client.get(callback + "&token=t").text  # Last.fm adds its token to the callback
     db = client.app.state.api._db()
     assert dict(db.execute("select key, value from setting").fetchall()) == {"lastfm_key": "k", "lastfm_secret": "right"}
 
@@ -150,3 +155,44 @@ def test_stars_ratings_and_plays_are_each_users(client):
     db = client.app.state.api._db()
     assert [tuple(r) for r in db.execute("select user, kind, ref from wanted")] == [("bob", "album", album_id)]  # acquisition wants bob's star
     assert [a["id"] for a in call(client, "getStarred2", u="bob", p="pw")["starred2"]["album"]] == [album_id]
+
+
+def test_password_change_signs_out_other_dashboard_sessions(client, library, tmp_path):
+    call(client, "createUser", username="bob", password="pw")
+    sign_in(client, "bob", "pw")
+    with make_client(library, tmp_path / "oasis.db") as other:
+        sign_in(other, "bob", "pw")
+        assert "Password changed" in client.post("/account/password", data={"password": "new"}).text
+        assert "Signed in as <b>bob</b>" in client.get("/").text  # the session that changed it stays signed in
+        assert other.get("/", follow_redirects=False).headers["location"] == "/login"
+        sign_in(other, "bob", "new")
+        call(client, "updateUser", username="bob", password="newer")  # by an admin
+        assert other.get("/", follow_redirects=False).headers["location"] == "/login"
+
+
+def test_failed_sign_ins_are_throttled_per_address(client):
+    for _ in range(accounts.Throttle.LIMIT):
+        assert call(client, "ping", p="wrong")["error"]["code"] == 40
+    error = call(client, "ping")["error"]  # the right password too, until the window passes
+    assert error["code"] == 0 and "Too many" in error["message"]
+    response = client.post("/login", data={"name": "admin", "password": "secret"}, follow_redirects=False)
+    assert response.status_code == 429 and "Too many" in response.text
+    client.app.state.api.throttle.fails.clear()
+    assert call(client, "ping")["status"] == "ok" and sign_in(client)
+
+
+def test_the_dashboard_sign_in_counts_towards_the_throttle(client):
+    for _ in range(accounts.Throttle.LIMIT):
+        client.post("/login", data={"name": "nobody", "password": "x"})
+    assert call(client, "ping")["error"]["code"] == 0
+
+
+def test_an_api_key_is_not_a_supported_mechanism(client):
+    error = call(client, "ping", apiKey="k", u=None, p=None)["error"]
+    assert error == {"code": 42, "message": "Provided authentication mechanism not supported"}
+
+
+def test_token_auth(client):
+    import hashlib
+    assert call(client, "ping", p=None, t=hashlib.md5(b"secretsalt").hexdigest().upper(), s="salt")["status"] == "ok"
+    assert call(client, "ping", p=None, t="ü" * 32, s="salt")["error"]["code"] == 40  # non-ASCII compared, not crashing
