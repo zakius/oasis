@@ -5,6 +5,7 @@ import json
 from collections import Counter
 from pathlib import Path
 import re
+import threading
 import time
 import urllib.request
 from html import escape
@@ -19,6 +20,7 @@ from . import accounts, acquire, importer, musicbrainz, releases
 from .acquire import MB_IDS, TYPES
 from .artists import linked
 from .forward import LastFm
+from .ytm import LIKED, MIX
 
 COOKIE = "oasis_session"
 
@@ -407,7 +409,7 @@ def routes(api) -> list[Route]:
         q = request.query_params
         youtube = (f'<p class="ok">Linked as <b>{escape(user["ytm_name"] or "")}</b>. Your mixes show up as playlists and your plays '
                    f'go to its history.</p><form method="post" action="/account/youtube/unlink"{confirm("Unlink YouTube Music?")}>'
-                   '<button class="danger">Unlink</button></form>'
+                   '<button class="danger">Unlink</button></form>' + youtube_playlists(db, user)
                    if user["ytm_auth"] else YOUTUBE_STEPS)
         if not api.ytm:
             youtube = '<p class="muted">YouTube Music is off on this server (<code>[ytmusic] enabled</code>).</p>'
@@ -442,6 +444,35 @@ def routes(api) -> list[Route]:
         except Exception as e:  # Fail from the API
             return back("/", error=getattr(e, "message", str(e)))
         return back("/", message=f"YouTube Music linked as {name}. Your mixes are loading.")
+
+    def youtube_playlists(db, user) -> str:
+        """The account's YouTube Music and YouTube library playlists, each shown to apps or not, and what becomes of
+        those that appear later."""
+        rows = db.execute(f"select id, name, mix, hidden from playlist where owner = ? and mix is not null and mix not like '{MIX}%' "
+                          "order by mix != ?, name collate nocase", (user["name"], LIKED)).fetchall()
+        boxes = "".join(f'<label class="check"><input type="checkbox" name="show-{r["id"]}"{"" if r["hidden"] else " checked"}> {escape(r["name"])}'
+                        f'{" <span class=muted>(its songs stay in your library)</span>" if r["mix"] == LIKED else ""}</label>' for r in rows)
+        policy = "".join(f'<label class="check"><input type="radio" name="new" value="{v}"{" checked" if int(user["ytm_new_shown"]) == on else ""}> {text}</label>'
+                         for v, on, text in (("hide", 0, "Hidden till I tick them"), ("show", 1, "Shown till I untick them")))
+        return (f'<h3>Playlists shown in your apps</h3><p class="muted">Your mixes always show. A shown playlist\'s songs are in your '
+                f'library; a hidden one is nowhere in your apps.</p><form method="post" action="/account/youtube/playlists">'
+                f'{boxes or "<p class=muted>None yet: they load with your mixes.</p>"}<h3>Playlists added later</h3>{policy}'
+                '<button class="primary">Save</button></form>')
+
+    def youtube_playlists_save(db, request, user, form):
+        accounts.set_field(db, user["name"], ytm_new_shown=int(form.get("new") == "show"))
+        changed, shown = [], False
+        for r in db.execute(f"select id, hidden from playlist where owner = ? and mix is not null and mix not like '{MIX}%'", (user["name"],)).fetchall():
+            hidden = int(f"show-{r['id']}" not in form)
+            if hidden != r["hidden"]:
+                db.execute("update playlist set hidden = ? where id = ?", (hidden, r["id"]))
+                changed.append(r["id"])
+                shown = shown or not hidden
+        # Their songs leave or join the library now; a playlist shown again reads its songs from YouTube Music.
+        api._touch(db, [t for (t,) in db.execute(f"select track_id from playlist_entry where playlist_id in ({','.join('?' * len(changed))})", changed)])
+        if shown:
+            threading.Thread(target=api._refresh_mixes, args=(user["name"],), daemon=True).start()
+        return back("/", message="Playlists saved." + (" Newly shown ones are loading." if shown else ""))
 
     def unlink_youtube(db, request, user, form):
         accounts.set_field(db, user["name"], ytm_auth=None, ytm_name=None)
@@ -1035,6 +1066,7 @@ def routes(api) -> list[Route]:
         Route("/logout", signed_in(logout), methods=["POST"]),
         Route("/account/youtube", signed_in(link_youtube), methods=["POST"]),
         Route("/account/youtube/unlink", signed_in(unlink_youtube), methods=["POST"]),
+        Route("/account/youtube/playlists", signed_in(youtube_playlists_save), methods=["POST"]),
         Route("/account/lastfm", signed_in(lastfm_start)),
         Route("/account/lastfm/callback", signed_in(lastfm_callback), name="lastfm_callback"),
         Route("/account/lastfm/app", signed_in(lastfm_app, admin=True), methods=["POST"]),

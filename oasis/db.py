@@ -61,7 +61,8 @@ create table if not exists playlist(
     radio int not null default 0,   -- 1: grows from its own tracks, 2: grows from everything played
     played_pos int not null default -1,
     mix text,                       -- YouTube Music playlist id (mix or library playlist); such playlists are read-only
-    cover text                      -- image URL
+    cover text,                     -- image URL
+    hidden int not null default 0   -- 1: a YouTube Music library playlist its owner chose not to show (web.py): no client sees it
 );
 create table if not exists outbox(
     id integer primary key, user text not null, service text not null, track_id text not null, played real not null,
@@ -72,7 +73,8 @@ create table if not exists user(
     ytm_auth text,                  -- browser headers (JSON) for ytmusicapi
     ytm_name text,
     lastfm_session text, lastfm_name text,
-    listenbrainz_token text
+    listenbrainz_token text,
+    ytm_new_shown int not null default 0  -- YouTube Music library playlists that appear later: 1 shown till unticked, 0 hidden till ticked
 );
 create table if not exists wanted(user text not null, kind text not null, ref text not null, primary key(user, kind, ref));
 create table if not exists want_item(  -- stars and follows (see acquire.py)

@@ -20,7 +20,7 @@ def item(video_id, title, artist="Mixer", album="Mix Album"):
 class FakeYtm:
     def __init__(self, cache):
         self.cache, self.fetched = cache, []
-        self.current = {"RDTMAK_super": ["m1", "m2"], "RDTMAK_mix1": ["m2", "m3"], "PLmine": ["m5"]}
+        self.current = {"RDTMAK_super": ["m1", "m2"], "RDTMAK_mix1": ["m2", "m3"], "PLmine": ["m5"], "LM": ["m6"]}
 
     def client(self, auth):
         return "client:" + auth
@@ -29,7 +29,8 @@ class FakeYtm:
         return "Test Account"
 
     def playlists(self, client):
-        return [{"id": id, "title": {"RDTMAK_super": "My Supermix", "RDTMAK_mix1": "My Mix 1", "PLmine": "Road trip"}[id], "description": "For you",
+        return [{"id": id, "title": {"RDTMAK_super": "My Supermix", "RDTMAK_mix1": "My Mix 1", "PLmine": "Road trip", "PLsaved": "Saved",
+                                     "PLlater": "Later", "LM": "Liked Music"}[id], "description": "For you",
                  "cover": "https://img/cover"} for id in self.current]
 
     def playlist_tracks(self, client, playlist_id):
@@ -51,7 +52,7 @@ class FakeYtm:
         return []
 
     def album(self, browse_id):  # a soundtrack: each song names its singer, the album page Various Artists
-        return [track_row(item(v, f"Song {v}")) | {"track_no": n, "year": 2024, "album_by": "Various Artists"} for n, v in enumerate(["m1", "m5"], 1)]
+        return [track_row(item(v, f"Song {v}")) | {"track_no": n, "year": 2024, "album_by": "Various Artists"} for n, v in enumerate(["m1", "m6"], 1)]
 
 
 @pytest.fixture
@@ -81,14 +82,14 @@ def test_mixes_are_read_only_playlists_in_the_library(client, ytm):
     link(client)
     client.app.state.api._refresh_mixes("admin")
     mixes = playlists(client)
-    assert set(mixes) == {"My Supermix", "My Mix 1", "Road trip"} and {m["owner"] for m in mixes.values()} == {"YouTube Music"}
-    assert mixes["My Supermix"]["oasisMix"] is True and "oasisMix" not in mixes["Road trip"]
-    assert mixes["My Supermix"]["youtubeId"] == "RDTMAK_super" and mixes["Road trip"]["youtubeId"] == "PLmine"
+    assert set(mixes) == {"My Supermix", "My Mix 1", "Liked Music"} and {m["owner"] for m in mixes.values()} == {"YouTube Music"}  # Road trip waits for a tick
+    assert mixes["My Supermix"]["oasisMix"] is True and "oasisMix" not in mixes["Liked Music"]
+    assert mixes["My Supermix"]["youtubeId"] == "RDTMAK_super" and mixes["Liked Music"]["youtubeId"] == "LM"
     assert not {"oasisMix", "youtubeId"} & {k for p in call(client, "getPlaylists")["playlists"]["playlist"] for k in p}  # plain clients
     entries = call(client, "getPlaylist", id=mixes["My Supermix"]["id"])["playlist"]["entry"]
     assert [e["title"] for e in entries] == ["Song m1", "Song m2"]
     titles = library_titles(client)
-    assert "Song m5" in titles and not {"Song m1", "Song m2", "Song m3"} & titles  # mixes stay playlists; library playlists count
+    assert "Song m6" in titles and not {"Song m1", "Song m2", "Song m3", "Song m5"} & titles  # mixes stay playlists; Liked Music counts
     assert "Mix Album" in [a["name"] for a in call(client, "getAlbumList2", type="alphabeticalByName", size=50)["albumList2"]["album"]]
     assert ytm.fetched == []  # mixes don't download
     cover = mixes["My Supermix"]["coverArt"]
@@ -111,7 +112,7 @@ def test_mix_refresh_follows_youtube(client, ytm):
     api._refresh_mixes("admin")
     assert set(playlists(client)) == {"My Supermix"}
     titles = library_titles(client)
-    assert not {"Song m2", "Song m3", "Song m4", "Song m5"} & titles  # m5 left with its library playlist
+    assert not {"Song m2", "Song m3", "Song m4", "Song m6"} & titles  # m6 left with Liked Music
     assert [e["title"] for e in call(client, "getPlaylist", id=playlists(client)["My Supermix"]["id"])["playlist"]["entry"]] == ["Song m1", "Song m4"]
 
 
@@ -129,25 +130,64 @@ def test_songs_in_the_library_only_through_a_mix_leave_it(client):
     db = api._db()
     db.execute("update track set library = 1 where source = 'ytm'")  # as the old rule left them
     oasis_api.demix(db)
-    assert {r[0] for r in db.execute("select ref from track where source = 'ytm' and library = 1")} == {"m5"}
+    assert {r[0] for r in db.execute("select ref from track where source = 'ytm' and library = 1")} == {"m6"}  # Road trip is hidden, unread
 
 
-def test_a_streaming_songs_album_artist_is_its_artist_till_its_album_page_names_another(client):
+def test_a_streaming_songs_album_artist_is_its_artist_till_its_album_page_names_another(client, ytm):
     link(client)
     api = client.app.state.api
     api._refresh_mixes("admin")
-    song = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song m5")
+    song = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song m6")
     assert song["displayAlbumArtist"] == "Mixer" and song["albumArtists"] == [{"id": song["artistId"], "name": "Mixer"}]
     assert "track" not in song and "year" not in song
     api._complete_album(api._db(), song["albumId"])  # as _album_loop reads it
-    song = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song m5")
+    song = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song m6")
     assert song["displayAlbumArtist"] == "Various Artists" and (song["track"], song["year"]) == (2, 2024)  # never the album's title
     album = call(client, "getAlbum", id=song["albumId"])["album"]
     assert album["artist"] == "Various Artists" and album["year"] == 2024
     assert "Various Artists" not in {a["name"] for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"]}
     api._refresh_mixes("admin")  # seen again in a playlist, which carries no year: what the album page gave stays
-    song = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song m5")
+    song = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song m6")
     assert (song["displayAlbumArtist"], song["year"]) == ("Various Artists", 2024)
+
+
+def save(client, *shown, new="hide"):
+    ids = {p["name"]: p["id"] for p in call(client, "getPlaylists", oasis="1")["playlists"]["playlist"]}
+    db = client.app.state.api._db()
+    ids |= {r["name"]: str(r["id"]) for r in db.execute("select id, name from playlist where mix is not null")}
+    client.post("/login", data={"name": "admin", "password": "secret"})
+    return client.post("/account/youtube/playlists", data={"new": new, **{f"show-{ids[n]}": "on" for n in shown}}).text
+
+
+def test_library_playlists_show_as_ticked_and_their_songs_follow(client, ytm):
+    link(client)
+    api = client.app.state.api
+    api._refresh_mixes("admin")
+    client.post("/login", data={"name": "admin", "password": "secret"})
+    page = client.get("/").text
+    assert "Road trip" in page and "Liked Music" in page and "My Supermix" not in page.split("Playlists shown in your apps")[1].split("</form>")[0]
+    assert "Playlists saved. Newly shown ones are loading." in save(client, "Liked Music", "Road trip")
+    api._refresh_mixes("admin")  # as the thread the save started does
+    assert "Road trip" in playlists(client) and "Song m5" in library_titles(client)
+    save(client, "Liked Music")  # unticked: gone from apps, its songs from the library at once
+    assert "Road trip" not in playlists(client) and "Song m5" not in library_titles(client)
+    hidden = api._db().execute("select id from playlist where name = 'Road trip'").fetchone()[0]
+    assert call(client, "getPlaylist", id=hidden)["error"]["code"] == 70
+    save(client)  # Liked Music hidden too: its songs stay in the library
+    assert "Liked Music" not in playlists(client) and "Song m6" in library_titles(client)
+
+
+def test_playlists_added_later_follow_the_choice(client, ytm):
+    link(client)
+    api = client.app.state.api
+    api._refresh_mixes("admin")
+    ytm.current["PLsaved"] = ["m7"]
+    api._refresh_mixes("admin")
+    assert "Saved" not in playlists(client) and "Song m7" not in library_titles(client)  # opt in: hidden till ticked
+    save(client, "Liked Music", new="show")
+    ytm.current["PLlater"] = ["m8"]
+    api._refresh_mixes("admin")
+    assert "Later" in playlists(client) and "Song m8" in library_titles(client) and "Saved" not in playlists(client)  # opt out: shown till unticked
 
 
 def test_an_album_pages_own_artist_is_its_songs_album_artist():
@@ -216,6 +256,7 @@ def test_playlists_list_mixes_first_in_youtube_order(client, ytm):
     ytm.current = {id: ["m1"] for id in names}
     ytm.playlists = lambda client: [{"id": id, "title": name, "description": None, "cover": None} for id, name in names.items()]
     link(client)
+    client.app.state.api._db().execute("update user set ytm_new_shown = 1")  # library playlists shown as they come
     client.app.state.api._refresh_mixes("admin")
     call(client, "createPlaylist", name="Zebra")
     assert list(playlists(client)) == ["My Supermix", "Bunt", "Mroczna moc", "Replay Mix", "Chill Mix", "Liked Music", "aaa", "Zebra"]

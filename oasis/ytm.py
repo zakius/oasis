@@ -12,6 +12,13 @@ from urllib.parse import parse_qs, urlparse
 
 from .db import make_id
 
+MIX = "RDTMAK"  # the id prefix of YouTube Music's own mixes; library playlists are PL…, Liked Music LM
+LIKED = "LM"     # Liked Music: its songs stay in the library even with the playlist hidden
+
+
+def is_mix(playlist_id: str | None) -> bool:
+    return (playlist_id or "").startswith(MIX)
+
 log = logging.getLogger(__name__)
 
 WATCH = "https://music.youtube.com/watch?v="

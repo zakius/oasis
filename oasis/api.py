@@ -24,6 +24,7 @@ from . import accounts, acquire, artists, cover, dedupe, forward, latin, lyrics,
 from .acquire import MB_IDS, SECONDARY, Acquire
 from .config import Config
 from .credits import PERFORMANCE_ROLES, Credits
+from .ytm import LIKED, MIX, is_mix
 from .db import connect, make_id, move_track, remember, resolve
 from .doctor import Doctor
 from .download import Downloads
@@ -264,13 +265,6 @@ def genre_list(r) -> list[dict] | None:
     return [{"name": g} for g in names] or None
 
 
-MIX = "RDTMAK"  # the id prefix of YouTube Music's own mixes; library playlists are PL…, Liked Music LM
-
-
-def is_mix(playlist_id: str | None) -> bool:
-    return (playlist_id or "").startswith(MIX)
-
-
 def album_artist_of(track) -> tuple[list[dict], str | None]:
     """A song's album artist without credits: the album page's (streaming songs), else its album artist column, for a
     streaming song its first artist."""
@@ -280,11 +274,16 @@ def album_artist_of(track) -> tuple[list[dict], str | None]:
     return [{"id": track["artist_id"] if name == track["album_artist"] else make_id("ar-", name), "name": name}], name
 
 
+def counts(row) -> bool:
+    """Whether a playlist's songs are library songs: not a radio or a mix, and shown (Liked Music's whatever)."""
+    return not row["radio"] and not is_mix(row["mix"]) and (not row["hidden"] or row["mix"] == LIKED)
+
+
 def demix(db):
-    """Streaming tracks in the library only through a mix leave it."""
+    """Streaming tracks in the library only through mixes or hidden playlists leave it (counts)."""
     db.execute("update track set library = 0 where source = 'ytm' and library = 1 and not exists (select 1 from stat s where s.id = track.id "
                "and s.starred is not null) and not exists (select 1 from playlist_entry e join playlist p on p.id = e.playlist_id "
-               f"where e.track_id = track.id and p.radio = 0 and coalesce(p.mix, '') not like '{MIX}%')")
+               f"where e.track_id = track.id and p.radio = 0 and coalesce(p.mix, '') not like '{MIX}%' and (p.hidden = 0 or p.mix = '{LIKED}'))")
 
 
 def describe_songs(db, songs: list[dict]):
@@ -992,16 +991,16 @@ class Api:
                       **self._wanted(db, "album", id)})
 
     def _touch(self, db, ids):
-        """Streaming tracks are in the library while starred or in a playlist, radios and YouTube Music's own mixes
-        aside: those change daily and stay playlists. The user's YouTube Music library playlists and Liked Music count."""
+        """Streaming tracks are in the library while starred or in a playlist that counts: radios and YouTube Music's
+        own mixes change daily and stay playlists; library playlists count while shown, Liked Music always."""
         for id in ids:
             r = db.execute("select ref, library from track where id = ? and source = 'ytm'", (id,)).fetchone()
             if r is None:
                 continue
             starred = db.execute("select 1 from stat where id = ? and starred is not null", (id,)).fetchone()  # by anyone
-            playlists = db.execute("select p.mix from playlist_entry e join playlist p on p.id = e.playlist_id "
+            playlists = db.execute("select p.mix, p.radio, p.hidden from playlist_entry e join playlist p on p.id = e.playlist_id "
                                    "where e.track_id = ? and p.radio = 0", (id,)).fetchall()
-            db.execute("update track set library = ? where id = ?", (int(bool(starred or any(not is_mix(row["mix"]) for row in playlists))), id))
+            db.execute("update track set library = ? where id = ?", (int(bool(starred or any(map(counts, playlists)))), id))
             # Mixes put their tracks in the library but change daily, so only the user's own choices download.
             wanted = starred or any(row["mix"] is None for row in playlists)
             if wanted and self.ytm and not self.ytm.cached(r["ref"]):
@@ -1271,42 +1270,43 @@ class Api:
         return {**result, "entry": songs} if entries else result
 
     def getPlaylists(self, db, p, user):
-        rows = sorted(db.execute("select * from playlist where owner = ?", (user,)), key=playlist_order)
+        rows = sorted(db.execute("select * from playlist where owner = ? and hidden = 0", (user,)), key=playlist_order)
         return {"playlists": {"playlist": [self._playlist(db, r, False) for r in rows]}}
 
     def _own_playlist(self, db, id, user):
-        r = self._one(db, "select * from playlist where id = ? and owner = ?", id, user)
+        r = self._one(db, "select * from playlist where id = ? and owner = ? and hidden = 0", id, user)
         if r["mix"]:
             raise Fail(DENIED, "YouTube Music's playlists are read-only")
         return r
 
     def getPlaylist(self, db, p, user):
-        r = self._one(db, "select * from playlist where id = ? and owner = ?", p.need("id"), user)
+        r = self._one(db, "select * from playlist where id = ? and owner = ? and hidden = 0", p.need("id"), user)
         return {"playlist": self._playlist(db, r, True)}
 
     def _refresh_mixes(self, user: str):
         """Mirrors the user's YouTube Music mixes and library playlists as read-only playlists shown as owned by
-        "YouTube Music"."""
+        "YouTube Music". A library playlist seen first is shown or hidden as the user's ytm_new_shown says (Liked Music
+        is shown); a hidden one's songs aren't read till it is shown."""
         db = self._db()
         try:
-            row = accounts.get(db, user)
-            if not (self.ytm and row and row["ytm_auth"]):
+            account = accounts.get(db, user)
+            if not (self.ytm and account and account["ytm_auth"]):
                 return
-            client = self.ytm.client(row["ytm_auth"])
+            client = self.ytm.client(account["ytm_auth"])
             mixes = self.ytm.playlists(client)
             for mix in mixes:
-                tracks = list(dict.fromkeys(remember(db, row) for row in self.ytm.playlist_tracks(client, mix["id"])))
-                found = db.execute("select id from playlist where owner = ? and mix = ?", (user, mix["id"])).fetchone()
+                found = db.execute("select id, hidden from playlist where owner = ? and mix = ?", (user, mix["id"])).fetchone()
                 if found:
-                    playlist_id = found["id"]
+                    playlist_id, hidden = found["id"], found["hidden"]
                     db.execute("update playlist set name = ?, comment = ?, cover = ? where id = ?",
                                (mix["title"], mix["description"], mix["cover"], playlist_id))
                 else:
-                    now = time.time()
-                    playlist_id = db.execute("insert into playlist(name, owner, comment, created, changed, mix, cover) "
-                                             "values (?, ?, ?, ?, ?, ?, ?)", (mix["title"], user, mix["description"],
-                                             now, now, mix["id"], mix["cover"])).lastrowid
-                self._set_entries(db, playlist_id, tracks)
+                    now, hidden = time.time(), int(not (is_mix(mix["id"]) or mix["id"] == LIKED or account["ytm_new_shown"]))
+                    playlist_id = db.execute("insert into playlist(name, owner, comment, created, changed, mix, cover, hidden) "
+                                             "values (?, ?, ?, ?, ?, ?, ?, ?)", (mix["title"], user, mix["description"],
+                                             now, now, mix["id"], mix["cover"], hidden)).lastrowid
+                if not hidden:
+                    self._set_entries(db, playlist_id, list(dict.fromkeys(remember(db, row) for row in self.ytm.playlist_tracks(client, mix["id"]))))
             self._drop_mixes(db, user, keep=[m["id"] for m in mixes])
             log.info("mixes for %s: %d refreshed", user, len(mixes))
         except Exception as e:
@@ -1445,7 +1445,7 @@ class Api:
         if id.startswith(MB_IDS["album"]):  # a MusicBrainz-only album until it arrives
             r = {"ref": None, "cover": acquire.GROUP_COVER.format(acquire.mbid_of(id))}
         elif id.startswith("pl-"):
-            r = self._one(db, "select null as ref, cover from playlist where id = ? and cover is not null", id[3:])
+            r = self._one(db, "select null as ref, cover from playlist where id = ? and cover is not null and hidden = 0", id[3:])
         else:
             column = {"ar-": "artist_id", "al-": "album_id"}.get(id[:3], "id")
             r = db.execute(f"select ref, cover from track where {column} = ? and cover is not null "
