@@ -54,6 +54,33 @@ def test_a_bracketed_self_titled_album_needs_its_title_apart_from_the_artist(nam
     assert reject(result(name), RAMMSTEIN) == why
 
 
+ON_ITS_OWN = "the artist's name isn't on its own"
+
+
+@pytest.mark.parametrize("name, artists, why", [
+    ("Hunter - Imperium (2013) [FLAC]", ["Hunter"], None),
+    ("Hunter (Poland) - Imperium (2013) [FLAC]", ["Hunter"], None),
+    ("[2013] Hunter - Imperium [FLAC]", ["Hunter"], None),
+    ("Imperium (2013) - Hunter [FLAC]", ["Hunter"], None),                  # the title first
+    ("Hunter Imperium 2013 FLAC", ["Hunter"], None),                        # the title right after
+    ("Hunter_-_Imperium_(2013)_[FLAC]", ["Hunter"], None),
+    ("Tab Hunter - Imperium (2013) [FLAC]", ["Hunter"], ON_ITS_OWN),
+    ("Demon Hunter - Imperium (2013) [FLAC]", ["Hunter"], ON_ITS_OWN),
+    ("Hunter Hayes - Imperium (2013) [FLAC]", ["Hunter"], ON_ITS_OWN),
+    ("Hunter x Hunter OST - Imperium", ["Hunter"], ON_ITS_OWN),
+    ("Imperium - Tab Hunter [FLAC]", ["Hunter"], ON_ITS_OWN),
+    ("Lou Reed & Metallica - Lulu (2011) [FLAC] 88", ["Lou Reed"], None),   # joint credits
+    ("Kanye West & Jay-Z - Watch The Throne", ["JAŸ-Z", "Jay-Z"], None),
+    ("Linkin Park   Jay Z  Collision Course (2004) [FLAC]", ["JAŸ-Z", "Jay-Z"], None),  # separators dropped, their spaces left
+    ("[TSDM自購][Hi-Res][241101]ゲーム『Limbus Company』収録曲「Hero」／Mili[96kHz/24bit][FLAC]", ["Mili"], None),
+    ("Mili feat.KIHOW - Hero [FLAC]", ["Mili"], None),
+])
+def test_the_artists_name_stands_on_its_own_not_inside_anothers(name, artists, why):
+    titles = {"Lulu": "Lulu", "Watch": "Watch the Throne", "Collision": "Collision Course", "Hero": "Hero"}
+    title = next((t for k, t in titles.items() if k in name), "Imperium")
+    assert reject(result(name), want(title, *artists, year="2013" if title == "Imperium" else "")) == why
+
+
 def test_variants_bundles_videos_and_sizes_are_not_the_album():
     meteora = want("Meteora", "Linkin Park", year="2003", others=["Hybrid Theory", "Minutes to Midnight"])
     assert reject(result("Linkin Park - Meteora (2003) [FLAC]"), meteora) is None
@@ -312,6 +339,10 @@ def test_a_bundle_is_the_artists_and_says_so_or_holds_two_albums():
     assert not releases.is_bundle(result("Linkin Park - Meteora [FLAC]"), LP)
     assert not releases.is_bundle(result("Pink Floyd - Discography [FLAC]"), LP)
     assert not releases.is_bundle(result("Linkin Park - Discography [DVD] 1080p"), LP)
+    assert releases.is_bundle(result("Linkin Park Discography FLAC"), LP) and releases.is_bundle(result("Linkin Park 2000-2017 Discography"), LP)
+    assert releases.is_bundle(result("Linkin Park   Papercuts (Singles Collection 2000–2023) (2024) [FLAC]"), LP)
+    assert not releases.is_bundle(result("Hunter Hayes - Discography"), HUNTER) and not releases.is_bundle(result("Hunter x Hunter Collection"), HUNTER)
+    assert releases.is_bundle(result("Daron Malakian & Scars On Broadway - Discography"), {**LP, "names": ["Daron Malakian and Scars on Broadway"]})
 
 
 def test_only_cached_bundles_with_wanted_albums_are_picked_most_albums_first():

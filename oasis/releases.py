@@ -49,6 +49,10 @@ OTHER_TITLE_QUERIES = 2  # searches by the album's other titles (romanised, tran
 DISC = re.compile(r"^(?:cd|disc|disk)\s*(\d+)\b", re.I)  # a disc's folder inside its album's
 LEAD = re.compile(r"(\s*(\[[^]]*]|\([^)]*\)|\{[^}]*}|(19|20)\d\d)[\s\-–—_.:|/]*)*")  # years and bracketed tags opening a name
 YEAR = re.compile(r"^(19|20)\d\d$")
+# Where a release's name splits into parts: separators, brackets and quotes, and runs of spaces where an uploader dropped
+# them ('Linkin Park   Jay Z  Collision Course'); and words joining artists in a credit.
+SEPARATOR = re.compile(r"[\s_]-+[\s_]*|-+[\s_]|[\s_]{2,}|[–—|:：,/／+\[\](){}（）【】「」『』\"“”]")
+CONNECTORS = {"and", "feat", "ft", "featuring", "with", "vs"}
 IMAGES = ("jpg", "jpeg", "png", "webp", "gif")
 NUMBERS = {w: str(n) for n, w in enumerate("one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
                                             "seventeen eighteen nineteen twenty".split(), 1)}
@@ -96,11 +100,12 @@ def leads(title: str, want: dict) -> list[tuple[int, int]]:
 
 
 def alone(title: str, want: dict) -> bool:
-    """Whether the artist's name, opening a release's name (leads), stands alone: a separator, bracket or bundle word
-    follows, not another word ('Hunter - Discography', 'Hunter (Poland) Discography', but not 'Hunter Tom - Discography',
-    'Hunter x Hunter OST'). For a name guess with no file list to check it."""
-    rest = plain(title[len(LEAD.match(title)[0]):])
-    return any(re.match(r"[\W_]*".join(map(re.escape, words(n))) + r"(?![^\W_])[\s.]*($|[-–—(\[{:|/,+]|discograph|дискограф|complete|collection|box|anthology|singles)", rest)
+    """Whether the artist's name, opening a release's name (leads), stands alone: a separator, bracket, run of spaces,
+    joining word, year or bundle word follows, not another word ('Hunter - Discography', 'Hunter (Poland) Discography',
+    'Linkin Park   Papercuts', but not 'Hunter Tom - Discography', 'Hunter Hayes Discography', 'Hunter x Hunter OST')."""
+    rest = re.sub(r"['’`´]", "", plain(title[len(LEAD.match(title)[0]):]).replace("&", " and "))  # as words() reads it
+    return any(re.match(r"[\W_]*".join(map(re.escape, words(n))) + r"(?![^\W_])(\s{2,}|[\s.\]]*($|[-–—(\[{:：|/／,+]|(and|feat|ft|with|vs|(19|20)\d\d)\b|"
+                        r"discograph|дискограф|complete|collection|box|anthology|singles|全集|ディスコグラフィ))", rest)
                for n in want["names"]) and bool(leads(title, want))
 
 
@@ -191,6 +196,8 @@ def reject_title(release: dict, want: dict) -> str | None:
     for other in want["others"]:  # 'Korn III: Remember Who You Are' holds 'Korn', and is another album
         if len(o := words(other)) > len(words(title)) and spans(o, words(title)) and apart(spans(tokens, o)):
             return f"another album: {other}"
+    if not placed(name, tokens, artists, titles, variants):
+        return "the artist's name isn't on its own"
     if why := namesake(tokens, title_text, want):
         return why
     for other in want["others"]:
@@ -207,6 +214,23 @@ def reject_title(release: dict, want: dict) -> str | None:
         if not (want["year"] and want["year"] in tokens or after or quoted):
             return "title too short: no year"
     return None
+
+
+def placed(name: str, tokens: list[str], artists: list[tuple[int, int]], titles: list[tuple[int, int]], variants: list[list[str]]) -> bool:
+    """Whether the artist's name stands on its own, as in a release of theirs, not as part of another's ('Tab Hunter',
+    'Demon Hunter', 'Hunter Hayes', 'Hunter x Hunter' aren't Hunter): opening the name (leads) or after a separator,
+    bracket or joining word ('Kanye West & Jay-Z'), and followed by one, or by the title, perhaps past the year
+    ('Linkin_Park-Meteora-2003'). Opening the name, also when the title is quoted ('Creepy Nuts 3rdアルバム「アンサンブル・プレイ」').
+    Spans as spans()."""
+    texts = SEPARATOR.split(name)
+    part = [i for i, text in enumerate(texts) for _ in words(text)]  # the part each word is in
+    if len(part) != len(tokens):  # can't tell
+        return True
+    lead, quoted = len(words(LEAD.match(name)[0])), any(words(m[1]) in variants for m in QUOTED.finditer(unicodedata.normalize("NFKC", name)))
+    apart = lambda i: i in (0, len(tokens)) or part[i] != part[i - 1]
+    return any((a == lead or apart(a) or tokens[a - 1] in CONNECTORS)
+               and (apart(b) or tokens[b] in CONNECTORS or s == b or s == b + 1 and YEAR.match(tokens[b]) or quoted and a == lead)
+               for a, b in artists for s, _ in titles)
 
 
 def namesake(tokens: list[str], title_text: str, want: dict) -> str | None:
@@ -280,7 +304,8 @@ def find(prowlarr, want: dict, blocked: set, cached, unreliable: frozenset = fro
 
 
 def is_bundle(release: dict, want: dict) -> bool:
-    """A discography or bundle of the artist, whose name opens it (leads): its name says so, or holds two of the artist's album titles.
+    """A discography or bundle of the artist, whose name opens it (leads): its name says so, the artist's name alone
+    ('Hunter Hayes - Discography' is another's), or holds two of the artist's album titles.
     want: artist, names, native, albums (the artist's album and EP titles)."""
     tokens, artists = words(release["title"]), leads(release["title"], want)
     if not artists or VIDEO.search(" ".join(tokens)):
@@ -288,7 +313,7 @@ def is_bundle(release: dict, want: dict) -> bool:
     names = {"".join(words(n)) for n in want["names"]}
     held = {"".join(words(t)) for t in want["albums"] if len(j := "".join(words(t))) >= 4 and j not in names
             and any(all(e <= a or b <= s for a, b in artists) for s, e in spans(tokens, words(t)))}
-    return bool(BUNDLES.search(release["title"])) or len(held) >= 2
+    return bool(BUNDLES.search(release["title"])) and alone(release["title"], want) or len(held) >= 2
 
 
 def bundle_queries(want: dict) -> list[str]:
