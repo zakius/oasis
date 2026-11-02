@@ -138,8 +138,10 @@ def deviations(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
 
 
 def rank(f: dict) -> tuple:
-    """Lossless first, then resolution, the most complete, the best lossy bitrate, then the smallest FLAC."""
-    return (f["lossless"], f["bits"] if f["lossless"] else 0, f["rate"], round(f["length"], 1),
+    """Lossless first, then resolution, the most complete, the best lossy bitrate, then the smallest FLAC. Lossless
+    lengths count in samples, since rips one CD frame (13 ms) apart differ by less than any rounding; lossy ones in
+    tenths of a second, as encoders pad them differently."""
+    return (f["lossless"], f["bits"] if f["lossless"] else 0, f["rate"], round(f["length"] * f["rate"]) if f["lossless"] else round(f["length"], 1),
             0 if f["lossless"] else f["bitrate"], f["codec"] == "flac", -f["size"])
 
 
