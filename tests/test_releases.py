@@ -682,12 +682,15 @@ def test_a_bundle_imported_is_remembered_and_later_albums_come_from_it_while_tor
     assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht"})
     torbox.list = [finished(71, "abcd", [f["name"] for f in DISCOGRAPHY], tmp_path)]
     downloads.cycle()
+    [t.join(10) for t in threading.enumerate() if t.name != "MainThread" and "map_kept" in repr(getattr(t, "_target", None))]
     assert set(placed) == {"g-ht"} and torbox.deleted == [71]
     kept = db.execute("select * from bundle_kept").fetchone()
     assert (kept["hash"], kept["artist_mbid"], len(json.loads(kept["files"]))) == ("abcd", "mb-lp", len(DISCOGRAPHY))
     assert sorted(json.loads(kept["groups"])) == ["g-ht", "g-mtm", "g-oml"]  # all its folders hold, wanted or not
 
-    # An album starred since: from the remembered bundle, its files only, before any search.
+    # An album starred since: from the remembered bundle, its files only, before any search. TorBox's cache check
+    # needn't list its files (it lists one of 100 or more as one zip): the remembered paths are fetched.
+    torbox.cached = lambda hashes: {"abcd"} & set(hashes)
     asked = len(downloads.prowlarr.asked)
     assert downloads.find(db, want("One More Light", "Linkin Park"), "g-oml")
     assert torbox.added[-1][1] == "magnet:?xt=urn:btih:abcd" and len(downloads.prowlarr.asked) == asked
@@ -700,6 +703,6 @@ def test_a_bundle_imported_is_remembered_and_later_albums_come_from_it_while_tor
     assert placed["g-oml"] == ["01 Nobody Can Save Me.flac", "02 Heavy.flac"] and db.execute("select count(*) from bundle_kept").fetchone()[0] == 1
 
     # TorBox no longer has it: it is forgotten and the album searched as usual.
-    torbox.cached_files = lambda hashes: {}
+    torbox.cached = torbox.cached_files = lambda hashes: {}
     downloads.find(db, want("Minutes to Midnight", "Linkin Park"), "g-mtm")
     assert len(downloads.prowlarr.asked) > asked and db.execute("select count(*) from bundle_kept").fetchone()[0] == 0

@@ -242,18 +242,16 @@ class Downloads:
         avoid = self.blocked(db) | {r[0] for r in db.execute("select hash from download where state not in ('done', 'failed')")}
         found = [(r["hash"], r["title"], held) for r in db.execute("select * from bundle_kept order by seen desc")
                  if r["hash"] not in avoid and (held := {rg: f for rg, f in json.loads(r["groups"]).items() if rg in wanted})][:100]
-        listed = self.torbox().cached_files([h for h, _, _ in found]) if found else {}
+        listed = self.torbox().cached([h for h, _, _ in found]) if found else set()
         for hash, title, held in sorted(found, key=lambda k: len(k[2]), reverse=True):
             if hash not in listed:
                 db.execute("delete from bundle_kept where hash = ?", (hash,))
                 log.info("remembered bundle %s is no longer cached on TorBox: forgotten", title)
                 continue
-            names = {f["name"] for f in listed[hash]}
-            if not (targets := {rg: files for rg, files in held.items() if all(n in names for n in files)}):
-                continue  # cached, but listed otherwise (as one zip, past 100 files): searched as usual
             db.execute("update bundle_kept set seen = ? where hash = ?", (time.time(), hash))
             release = {"title": title, "infoHash": hash, "magnetUrl": f"magnet:?xt=urn:btih:{hash}"}
-            if (sent := self.send(db, [release], avoid, None, f"{label}: {len(targets)} albums from a remembered bundle", targets, kept=True)) is not None:
+            # Its remembered paths: TorBox lists the files of one of 100 or more as one zip till it is added.
+            if (sent := self.send(db, [release], avoid, None, f"{label}: {len(held)} albums from a remembered bundle", held, kept=True)) is not None:
                 return sent
         return None
 
@@ -269,12 +267,23 @@ class Downloads:
         if row["kept"] or not row["catalogue"]:
             db.execute("update bundle_kept set seen = ? where hash = ?", (time.time(), row["hash"]))
             return
-        search = json.loads(row["catalogue"])
-        held = releases.targets(files, search["want"], search["groups"], {g["id"] for g in search["groups"]}, lambda rg: editions(db, rg)) | targets
         artist = db.execute(f"select artist_mbid from want_album where rg in ({','.join('?' * len(targets))}) and artist_mbid is not null", list(targets)).fetchone()
         db.execute("insert or replace into bundle_kept values (?, ?, ?, ?, ?, ?)", (row["hash"], row["title"], artist and artist[0],
-                   json.dumps([{"name": f["name"], "size": f.get("size")} for f in files]), json.dumps(held), time.time()))
-        log.info("remembered bundle %s: it holds %d of the artist's release groups", row["title"], len(held))
+                   json.dumps([{"name": f["name"], "size": f.get("size")} for f in files]), json.dumps(targets), time.time()))
+        # The rest of its groups: a MusicBrainz lookup or more each, at one a second, so not in the downloads' poll.
+        threading.Thread(target=self.map_kept, args=(row["hash"], row["title"], files, json.loads(row["catalogue"])), daemon=True).start()
+
+    def map_kept(self, hash: str, title: str, files: list[dict], search: dict):
+        db = self.connect()
+        try:
+            held = releases.targets(files, search["want"], search["groups"], {g["id"] for g in search["groups"]}, lambda rg: editions(db, rg))
+            for (groups,) in db.execute("select groups from bundle_kept where hash = ?", (hash,)).fetchall():
+                db.execute("update bundle_kept set groups = ? where hash = ?", (json.dumps(held | json.loads(groups)), hash))
+                log.info("remembered bundle %s: it holds %d of the artist's release groups", title, len(held | json.loads(groups)))
+        except (OSError, LookupError) as e:
+            log.info("remembered bundle %s: only its imported albums: %s", title, e)
+        finally:
+            db.close()
 
     def unreliable(self, db) -> frozenset:
         """Indexers whose seed counts don't hold up: a third or more of what oasis took from them was dead."""
