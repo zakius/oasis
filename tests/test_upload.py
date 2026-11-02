@@ -134,7 +134,7 @@ def test_a_suffix_oasis_doesnt_take_and_content_of_another_format_are_refused(cl
 def test_an_album_already_in_the_library_is_refused_unless_replaced(client, root, tmp_path):
     assert upload(client, tmp_path, tags("One"))["status"] == "ok"
     again = upload(client, tmp_path, tags("One"), suffix="mp3")
-    assert again["error"] == {"code": 0, "message": "already in the library"}
+    assert again["error"] == {"code": 0, "message": "already in the library", "duplicate": True}
     assert sorted(p.name for p in (root / "Beta/2001 - First").iterdir()) == ["01 - One.flac"]
     album = upload(client, tmp_path, tags("One"), suffix="mp3", replace="true")["album"]
     assert [s["suffix"] for s in album["song"]] == ["mp3"]
@@ -215,3 +215,21 @@ def test_the_extension_is_advertised_and_other_requests_are_as_they_were(client)
     form = client.post("/rest/getUser", data={**AUTH, "username": "admin"}).json()["subsonic-response"]
     assert form["status"] == "ok" and form["user"]["username"] == "admin"
     assert client.post("/rest/getUser", params={"f": "json"}, data={**AUTH}).json()["subsonic-response"]["user"]["adminRole"] is True
+
+
+def test_loose_singles_each_land_as_a_single_of_their_own(client, root, tmp_path):
+    given = {"album": "", "albumArtist": "Beta", "year": "2001", "track": [{"number": 1, "title": "One"}, {"number": 2, "title": "Two"}]}
+    result = upload(client, tmp_path, given)
+    assert [(a["name"], a["songCount"]) for a in result["albums"]] == [("One", 1), ("Two", 1)] and result["album"] == result["albums"][0]
+    assert sorted(str(p.relative_to(root)) for p in root.rglob("*.flac")) == ["Beta/2001 - One/01 - One.flac", "Beta/2001 - Two/01 - Two.flac"]
+    assert mutagen.File(root / "Beta/2001 - Two/01 - Two.flac")["tracknumber"] == ["1"]
+    assert upload(client, tmp_path, given, suffix="mp3")["error"]["duplicate"] is True
+
+
+def test_a_tracks_artists_array_wins_and_the_year_may_be_a_numeric_string(client, root, tmp_path):
+    given = {**tags("One"), "year": "2001", "albumArtist": None}
+    given["track"][0]["artists"] = ["Beta", "Gamma"]
+    album = upload(client, tmp_path, given)["album"]
+    assert (album["artist"], album["year"]) == ("Beta, Gamma", 2001)
+    assert mutagen.File(root / "Beta, Gamma/2001 - First/01 - One.flac")["artists"] == ["Beta", "Gamma"]
+    assert call(client, "createUpload", tags=json.dumps({**tags("One"), "year": "MMI"}))["error"]["message"] == "year must be a number"

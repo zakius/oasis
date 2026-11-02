@@ -65,8 +65,8 @@ MIX_REFRESH = 6 * 3600
 
 
 class Fail(Exception):
-    def __init__(self, code: int, message: str):
-        self.code, self.message = code, message
+    def __init__(self, code: int, message: str, extra: dict | None = None):
+        self.code, self.message, self.extra = code, message, extra or {}
 
 
 def iso(ts: float | None) -> str | None:
@@ -1347,8 +1347,9 @@ class Api:
         self._admin(db, user)
         placed = self.uploads.commit(db, user, p.need("uploadId"), p.get("replace") == "true")
         self._scan_now(db)
-        id = self._one(db, "select album_id from track where ref = ?", str(placed))["album_id"]
-        return self._library_album(db, id, self._album_songs(db, id))
+        ids = list(dict.fromkeys(self._one(db, "select album_id from track where ref = ?", str(f))["album_id"] for f in placed))
+        albums = [self._library_album(db, id, self._album_songs(db, id))["album"] for id in ids]
+        return {"album": albums[0], **({"albums": albums} if len(albums) > 1 else {})}  # loose singles: each an album
 
     def getCoverArt(self, db, p, user):
         try:
@@ -1470,7 +1471,7 @@ def respond(fmt: str, payload: dict, error: Fail | None = None) -> Response:
     body = {"status": "failed" if error else "ok", "version": VERSION, "type": "oasis", "serverVersion": "0.1.0",
             "openSubsonic": True, **payload}
     if error:
-        body["error"] = {"code": error.code, "message": error.message}
+        body["error"] = {"code": error.code, "message": error.message, **error.extra}
     if fmt == "json":
         return JSONResponse({"subsonic-response": body})
     root = to_xml("subsonic-response", body)
@@ -1512,7 +1513,7 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
             except Fail as e:
                 return respond(fmt, {}, e)
             except upload.Refused as e:
-                return respond(fmt, {}, Fail(e.code, str(e)))
+                return respond(fmt, {}, Fail(e.code, str(e), {"duplicate": True} if e.duplicate else None))
             finally:
                 db.close()
         return await run_in_threadpool(run)

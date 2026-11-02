@@ -37,9 +37,9 @@ RELEASE = "https://musicbrainz.org/ws/2/release/{}?inc=media+recordings+artist-c
 
 class Refused(Exception):
     """A request the upload can't take: a Subsonic error code and a message."""
-    def __init__(self, message: str, code: int = 0):
+    def __init__(self, message: str, code: int = 0, duplicate: bool = False):
         super().__init__(message)
-        self.code = code
+        self.code, self.duplicate = code, duplicate
 
 
 def is_format(path: Path, suffix: str) -> bool:
@@ -123,8 +123,10 @@ class Uploads:
                 raise Refused("tags must be a JSON object with track[] of disc, number and title")
             if not slots or len(set(slots)) < len(slots) or len(slots) < len(given["track"]):
                 raise Refused("tags must list each disc and number once, each with a title")
-            if not (given.get("albumArtist") or all(t.get("artist") for t in given["track"])):
+            if not (given.get("albumArtist") or all(t.get("artist") or t.get("artists") for t in given["track"])):
                 raise Refused("tags need an albumArtist, or an artist for each track")
+            if not str(given.get("year") or "0").isdigit():
+                raise Refused("year must be a number")
             release = disc = None
         id = uuid.uuid4().hex
         db.execute("insert into upload values (?, ?, ?, ?, ?, ?)", (id, user, release, disc, tags, time.time()))
@@ -212,30 +214,36 @@ class Uploads:
         for (id,) in db.execute("select id from upload where touched < ?", (time.time() - KEEP,)).fetchall():
             self.remove(db, id)
 
-    def layout(self, row) -> tuple[Path, str | None, int, int, dict]:
-        """The album folder, the release group, the album's discs and widest track number, and per (disc, number) the
-        tags and title."""
+    def layout(self, row) -> list[tuple[Path, str | None, dict]]:
+        """The albums the upload makes: folder, release group, and per (disc, number) slot its tags and file name. One
+        album, or with no album name each track a single of its own."""
         if row["release"]:
             release = json.loads(row["release"])
             medium = next(m for m in release["media"] if m["position"] == row["disc"])
-            return (release_folder(release), (release.get("release-group") or {}).get("id"), len(release["media"]),
-                    max(t["position"] for m in release["media"] for t in m["tracks"]),
-                    {(medium["position"], t["position"]): (tags_for(release, medium, t), t["title"]) for t in medium["tracks"]})
+            discs, widest = len(release["media"]), max(t["position"] for m in release["media"] for t in m["tracks"])
+            return [(release_folder(release), (release.get("release-group") or {}).get("id"), {
+                (medium["position"], t["position"]): (tags_for(release, medium, t), track_file(medium["position"], discs, t["position"], widest, t["title"], ""))
+                for t in medium["tracks"]})]
         given = json.loads(row["tags"])
-        tracks = given["track"]
-        artist, year = given.get("albumArtist") or tracks[0]["artist"], str(given.get("year") or "")[:4]
-        album = given.get("album") or tracks[0]["title"]  # loose singles: an album of the first one's name
-        discs = max(int(t.get("disc") or 1) for t in tracks)
-        per_disc = lambda d: sum(int(t.get("disc") or 1) == d for t in tracks)
-        return album_folder(artist, year, album), None, discs, max(int(t["number"]) for t in tracks), {
-            (d, n): ({"title": [t["title"]], "artist": [t.get("artist") or artist], "albumartist": [artist], "album": [album], "date": [year],
-                      "genre": [given.get("genre")], "tracknumber": [str(n)], "totaltracks": [str(per_disc(d))], "discnumber": [str(d)],
-                      "totaldiscs": [str(discs)]}, t["title"])
-            for t in tracks for d, n in [(int(t.get("disc") or 1), int(t["number"]))]}
+        tracks, year = given["track"], str(given.get("year") or "")[:4]
+        slot = lambda t: (int(t.get("disc") or 1), int(t["number"]))
+        artists = lambda t: t.get("artists") or [t.get("artist") or given["albumArtist"]]
 
-    def commit(self, db, user: str, id: str, replace: bool) -> Path:
-        """Places the upload in the library; returns a placed file. Refused when it isn't complete or doesn't decode,
-        when a FLAC of it was made from a lossy file, and when the library has the album's discs already, unless
+        def tags(t, album, artist, d, n, discs, total):
+            return {"title": [t["title"]], "artist": [t.get("artist") or ", ".join(artists(t))], "artists": artists(t), "albumartist": [artist],
+                    "album": [album], "date": [year], "genre": [given.get("genre")], "tracknumber": [str(n)], "totaltracks": [str(total)],
+                    "discnumber": [str(d)], "totaldiscs": [str(discs)]}
+        if not given.get("album"):  # loose singles
+            return [(album_folder(artist := given.get("albumArtist") or tags(t, "", "", 1, 1, 1, 1)["artist"][0], year, t["title"]), None,
+                     {slot(t): (tags(t, t["title"], artist, 1, 1, 1, 1), track_file(1, 1, 1, 1, t["title"], ""))}) for t in tracks]
+        artist, discs, widest = given.get("albumArtist") or tags(tracks[0], "", "", 1, 1, 1, 1)["artist"][0], max(slot(t)[0] for t in tracks), max(slot(t)[1] for t in tracks)
+        return [(album_folder(artist, year, given["album"]), None, {
+            (d, n): (tags(t, given["album"], artist, d, n, discs, sum(slot(u)[0] == d for u in tracks)), track_file(d, discs, n, widest, t["title"], ""))
+            for t in tracks for d, n in [slot(t)]})]
+
+    def commit(self, db, user: str, id: str, replace: bool) -> list[Path]:
+        """Places the upload in the library; returns a placed file per album. Refused when it isn't complete or doesn't
+        decode, when a FLAC of it was made from a lossy file, and when the library has an album's discs already, unless
         replace or the upload is lossless and they are lossy: those files are deleted once the upload is in."""
         with self.lock:
             row = self.row(db, user, id)
@@ -245,43 +253,51 @@ class Uploads:
                     raise Refused(f"Track {s['disc']}-{s['number']} isn't complete")
                 if not decodes(self.folder / id / f"{s['disc']}-{s['number']}.{s['suffix']}"):
                     raise Refused(f"Track {s['disc']}-{s['number']} doesn't decode")
-            folder, group, discs, widest, tracks = self.layout(row)
-            album, staging = self.importer.root / folder, self.folder / id / "staging"
+            albums, staging = self.layout(row), self.folder / id / "staging"
             shutil.rmtree(staging, ignore_errors=True)
             staging.mkdir()
-            staged = {}
-            for s in slots:
-                tags, title = tracks[s["disc"], s["number"]]
-                copy(self.folder / id / f"{s['disc']}-{s['number']}.{s['suffix']}", source := staging / track_file(s["disc"], discs, s["number"], widest, title, f".{s['suffix']}"))
-                staged[source] = tags
+            by_slot = {(s["disc"], s["number"]): s for s in slots}
+            staged, targets, old, firsts = {}, {}, set(), []
+            for i, (folder, group, tracks) in enumerate(albums):
+                album, mine = self.importer.root / folder, [by_slot[k] for k in tracks if k in by_slot]
+                (staging / str(i)).mkdir()
+                for s in mine:
+                    tags, name = tracks[s["disc"], s["number"]]
+                    copy(self.folder / id / f"{s['disc']}-{s['number']}.{s['suffix']}", source := staging / str(i) / f"{name}.{s['suffix']}")
+                    staged[source], targets[source] = tags, album / source.name
+                tags = tracks[mine[0]["disc"], mine[0]["number"]][0]
+                firsts.append(album / f"{tracks[mine[0]['disc'], mine[0]['number']][1]}.{mine[0]['suffix']}")
+                rows = db.execute(
+                    f"select ref, coalesce(disc_no, 1), track_no from track where source = 'local' and (album_id = ? or mb_release_group = ?) and "
+                    f"coalesce(disc_no, 1) in ({','.join('?' * len(mine))})",
+                    (make_id("al-", tags["albumartist"][0], tags["album"][0]), group, *(int(tags["discnumber"][0]) for _ in mine))).fetchall()
+                # Only the tracks the upload replaces go: a deluxe edition's extra tracks stay.
+                uploaded = {(int(t["discnumber"][0]), int(t["tracknumber"][0])) for t in (tracks[s["disc"], s["number"]][0] for s in mine)}
+                theirs = {Path(r[0]) for r in rows if (r[1], r[2]) in uploaded}
+                theirs |= {p for t in (targets[x] for x in staged if x.parent == staging / str(i)) if t.parent.is_dir()
+                           for p in t.parent.iterdir() if p.stem == t.stem and p.suffix.lower().lstrip(".") in AUDIO}
+                theirs = {p for p in theirs if p.is_file()}
+                present = theirs | {p for r in rows if (p := Path(r[0])).is_file()}
+                mine_staged = [x for x in staged if x.parent == staging / str(i)]
+                if present and not replace and not (all(map(lossless, mine_staged)) and not any(map(lossless, present))):
+                    raise Refused("already in the library", duplicate=True)
+                old |= theirs
             try:
                 checked = quality.import_check(sorted(p for p in staged if p.suffix == ".flac"))
             except quality.LossySource as e:
                 raise Refused(str(e))
             for source, tags in staged.items():
                 write(source, tags)
-            targets = {source: album / source.name for source in staged}
-            tags = next(iter(staged.values()))
-            rows = db.execute(
-                f"select ref, coalesce(disc_no, 1), track_no from track where source = 'local' and (album_id = ? or mb_release_group = ?) and "
-                f"coalesce(disc_no, 1) in ({','.join('?' * len(slots))})", (make_id("al-", tags["albumartist"][0], tags["album"][0]), group, *(s["disc"] for s in slots))).fetchall()
-            # Only the tracks the upload replaces go: a deluxe edition's extra tracks stay.
-            uploaded = {(s["disc"], s["number"]) for s in slots}
-            old = {Path(r[0]) for r in rows if (r[1], r[2]) in uploaded}
-            old |= {p for t in targets.values() if t.parent.is_dir() for p in t.parent.iterdir() if p.stem == t.stem and p.suffix.lower().lstrip(".") in AUDIO}
-            old = {p for p in old if p.is_file()}
-            present = old | {p for r in rows if (p := Path(r[0])).is_file()}
-            if present and not replace and not (all(map(lossless, staged)) and not any(map(lossless, present))):
-                raise Refused("already in the library")
             try:
                 self.place(targets, old)
             except OSError as e:
                 raise Refused(f"Couldn't place the upload: {e}")
             for source, found in checked.items():
                 quality.store(db, targets[source], found)
-            self.importer.cover(json.loads(row["release"]) if row["release"] else None, {self.folder / id}, album)
+            for folder, _, _ in albums:
+                self.importer.cover(json.loads(row["release"]) if row["release"] else None, {self.folder / id}, self.importer.root / folder)
             self.remove(db, id)
-            return next(iter(targets.values()))
+            return firsts
 
     def place(self, targets: dict[Path, Path], old: set[Path]):
         """Copies each source to its target, the old files renamed aside meanwhile: deleted when all are in, else
@@ -302,8 +318,9 @@ class Uploads:
             for p, kept in aside:
                 with suppress(OSError):
                     os.rename(kept, p)
-            with suppress(OSError):
-                next(iter(targets.values())).parent.rmdir()  # a new album's folder, empty again
+            for folder in {t.parent for t in targets.values()}:
+                with suppress(OSError):
+                    folder.rmdir()  # a new album's folder, empty again
             raise
         for _, kept in aside:
             kept.unlink()

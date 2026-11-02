@@ -39,9 +39,10 @@ Either:
 - `releaseId` (a MusicBrainz release id) and `disc` (number, default 1): the server takes all tags from
   MusicBrainz;
 - or `tags`: a JSON object `{"album", "albumArtist", "year", "genre", "track": [{"disc", "number", "title",
-  "artist"}]}` for uploads with no MusicBrainz release (single files go in as an album of one or more tracks;
-  `album` may be empty for loose singles: the upload is then filed as a single named after its first track, so
-  loose singles go one per upload). `albumArtist` may be absent when every track has an `artist`.
+  "artist", "artists"}]}` for uploads with no MusicBrainz release (single files go in as an album of one or more
+  tracks; `album` may be empty for loose singles: each track then becomes its own single, so several singles go in
+  one upload). `artists` is an array, preferred over the joined `artist`. `year` is a number; a numeric string is
+  accepted too. `albumArtist` may be absent when every track has an `artist` or `artists`.
 
 With neither, error 10. An unknown `releaseId`, or a `disc` the release doesn't have, is error 70.
 
@@ -54,6 +55,9 @@ Query params: `uploadId`, `disc`, `number`, `offset` (bytes already sent, 0 for 
 file's size), `suffix` (`flac`, `opus`, `mp3`, `m4a`, `ogg`).
 Body: the next bytes of the file, `Content-Type: application/octet-stream`. Auth params go in the query.
 Response `uploadTrack`: `received` (bytes stored so far). A client resumes from `received` after a failure.
+Before resuming after any error, call `getUpload`: a file the server rejected (format check) is dropped and its
+`received` returns to 0.
+
 An `offset` below `received` sends the file again from there; one above it is refused (0). A resumed file keeps its
 `suffix` and `size`; to change them, start again at offset 0. Bytes beyond `size` are refused and dropped.
 The server rejects a suffix it doesn't accept (0) and a file whose content isn't that format: checked once the last
@@ -76,12 +80,14 @@ Param `uploadId`, optional `replace=true`.
   made from a lossy file is refused (0), and fake hi-res or badly compressed ones are converted or recompressed.
 - Tags each file (from MusicBrainz or `tags`), names and places it by the server's library scheme, adds cover
   art, scans it in. Atomic: on any failure nothing is added and the upload stays for a retry.
-- An album already in the library: refused with code 0 "already in the library", unless the upload is lossless
+- An album already in the library: refused with code 0, message "already in the library" and `"duplicate": true`
+  in the error object (match on that, not the text), unless the upload is lossless
   and the library copy lossy, or `replace=true`. Already in the library means library tracks of the same album
   (album artist and album name, or MusicBrainz release group) on the uploaded discs, or files of the same names
   where the upload goes; another disc of an album isn't. The library tracks the upload replaces (same disc and
   number, or same file name) are deleted once the upload is in; the album's other tracks stay.
-- Response `album`: the new `AlbumID3` (with `song[]`).
+- Response `album`: the new `AlbumID3` (with `song[]`). Loose singles make several albums: `album` is the first,
+  and `albums` lists them all.
 
 ### `cancelUpload`
 
@@ -105,8 +111,7 @@ Param `uploadId`. Deletes the upload and its files.
 4. `discNumber` falls back to the first medium with the TOC's track count when no medium lists the disc id.
 5. `coverArt` in `lookupDisc` is the library album's when the release is already in the library with a cover; oasis
    fetches nothing for a lookup.
-6. An empty `album` files the upload as a single named after its first track, so loose singles go one per upload.
-   `albumArtist` may be left out when every track has an `artist`.
+6. `albumArtist` may be left out when every track has an `artist` or `artists`.
 7. `createUpload` errors: 10 with neither `releaseId` nor `tags`, 70 for an unknown release or disc.
 8. `expires` is 24 h after the upload's last request, not its creation, so a long upload isn't deleted midway.
 9. `uploadTrack`: an `offset` below `received` resends from there; above it is refused. A resumed file keeps its
@@ -118,3 +123,4 @@ Param `uploadId`. Deletes the upload and its files.
 12. "Already in the library" is defined: the same album on the uploaded discs, or files of the same names at the
     target. Another disc of an album already there is accepted. Only the replaced tracks (same disc and number) are
     deleted; others, such as a deluxe edition's extra tracks, stay.
+13. With loose singles, `commitUpload` returns `albums` (each single) besides `album` (the first).
