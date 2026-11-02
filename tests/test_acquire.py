@@ -555,6 +555,14 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     assert "searches ahead of schedule every 5 min" in dashboard
     db.execute("update want_album set next_search = null where rg = ?", (LEMON,))
     assert "Singles: 1 due for a search." in (dashboard := client.get("/").text) and "ahead of schedule" not in dashboard
+    assert f'href="/music/library/album/al-mb-{BOOTLEG}"' in page  # each album opens its page
+    album = client.get(f"/music/library/album/al-mb-{BOOTLEG}").text
+    assert "灰色と青" in album and "<h2>Wanted</h2>" in album and "the artist is followed" not in album and "its artist is followed" in album
+    assert "<h3>Downloads</h3>" in album and "downloading on TorBox" in album and "Try another" in album
+    stray = client.get(f"/music/library/album/al-mb-{STRAY}").text
+    assert "<h2>Wanted</h2>" in stray, stray[stray.find("<main"):][:1500]
+    gone = client.get("/music/library/album/al-mb-55555555-5555-4555-8555-555555555555").text
+    assert "That album isn&#x27;t here" in gone, gone[gone.find("<main"):][:600]
     filtered = client.get("/music/wanted", params={"type": "Single", "q": "stray"}).text
     assert "STRAY SHEEP" not in filtered or "Lemon" not in filtered
     library = client.get("/music/library").text

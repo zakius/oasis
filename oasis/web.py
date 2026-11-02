@@ -702,7 +702,7 @@ def routes(api) -> list[Route]:
         credit = g.get("artist-credit") or []
         artist = f' — <a href="/music/artist/{credit[0]["artist"]["id"]}">{escape(credited(g))}</a>' if by and credit else ""
         info = details(g.get("primary-type"), *(g.get("secondary-types") or []), (g.get("first-release-date") or "")[:4], g.get("disambiguation"))
-        return (f'<li>{cover_of(g["id"])}<div class="grow"><b>{escape(g["title"])}</b>{artist}<div>{info} {state}</div></div>'
+        return (f'<li>{cover_of(g["id"])}<div class="grow"><b><a href="/music/library/album/{quote(acquire.library_id(db, MB_IDS["album"] + g["id"]) or MB_IDS["album"] + g["id"])}">{escape(g["title"])}</a></b>{artist}<div>{info} {state}</div></div>'
                 f'{want_button("album", g["id"], not mine(db, user, "album", g["id"]), here)}</li>')
 
     def find_music(db, request, user, form):
@@ -827,7 +827,7 @@ def routes(api) -> list[Route]:
                     f'value="{",".join(r["rg"] for r, _ in items)}"><input type="hidden" name="next" value="{escape(here)}">'
                     f'<button class="danger">Give up on {"all " + str(len(items)) if len(items) > 1 else "it"}…</button></form>')
             table = "".join(
-                f'<tr id="rg-{escape(r["rg"])}"><td class="thumb">{cover_of(r["rg"])}</td><td class="lead"><b>{escape(r["title"])}</b><div class="muted">'
+                f'<tr id="rg-{escape(r["rg"])}"><td class="thumb">{cover_of(r["rg"])}</td><td class="lead"><b><a href="/music/library/album/{quote(acquire.library_id(db, MB_IDS["album"] + r["rg"]) or MB_IDS["album"] + r["rg"])}">{escape(r["title"])}</a></b><div class="muted">'
                 f'<a href="/music/artist/{escape(r["artist_mbid"])}">{escape(r["artist"] or "")}</a></div></td><td class="meta">{escape(r["primary_type"] or "")}'
                 f'{" · " + escape(r["secondary_types"]) if r["secondary_types"] else ""}</td>'
                 f'<td class="meta num">{escape((r["first_date"] or "")[:4])}</td>'
@@ -991,6 +991,8 @@ def routes(api) -> list[Route]:
         tracks = db.execute("select t.*, s.play_count plays, s.played, s.starred, s.rating from track t left join stat s on s.id = t.id and s.user = ? "
                             "where t.album_id = ? order by t.disc_no, t.track_no, t.title", (user["name"], album_id)).fetchall()
         if not tracks:
+            if album_id.startswith(MB_IDS["album"]):
+                return musicbrainz_album(db, request, user, album_id[len(MB_IDS["album"]):])
             return back("/music/library", error="That album isn't here.")
         t = tracks[0]
         from .api import credits_of  # api imports this module
@@ -1026,7 +1028,8 @@ def routes(api) -> list[Route]:
         body = (hero(picture(album_id), escape(" · ".join(kinds)), t["album"], " · ".join(filter(None, line)), f'<dl class="meta">{dl(facts)}</dl>')
                 + f'<section><table class="grid tracks"><thead><tr><th class="num">#</th><th>Title</th><th>Written by</th><th class="num">Length</th>'
                 f'<th class="num">Plays</th></tr></thead><tbody>{rows}</tbody></table></section>')
-        return page(t["album"], body, wide=True, tab="library", heading=False)
+        body += "".join(wanted_log(db, user, rg, f"/music/library/album/{quote(album_id)}") for rg in {r["mb_release_group"] for r in tracks if r["mb_release_group"]})
+        return page(t["album"], body, request.query_params.get("message", ""), request.query_params.get("error", ""), wide=True, tab="library", heading=False)
 
     def library_song(db, request, user, form):
         r = db.execute("select t.*, s.play_count plays, s.played, s.starred, s.rating from track t left join stat s on s.id = t.id and s.user = ? where t.id = ?",
@@ -1066,7 +1069,7 @@ def routes(api) -> list[Route]:
 
     def wanted_action(db, request, user, form):
         rg, action = request.path_params["rg"], request.path_params["action"]
-        here = form.get("next", "") if form.get("next", "").startswith("/music/wanted") else "/music/wanted"
+        here = form.get("next", "") if form.get("next", "").startswith(("/music/wanted", "/music/library/album/")) else "/music/wanted"
         row = db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
         if row is None or action not in ("search", "block", "give-up"):
             return back(here, error="That album isn't wanted any more.")
@@ -1081,8 +1084,70 @@ def routes(api) -> list[Route]:
         give_up(db, user, rg)
         return back(here, message=f"Gave up on {name}. Files already here stay.")
 
+    def wanted_log(db, user, rg: str, here: str) -> str:
+        """An album's section on what oasis did to get it: whether and why it is wanted, its searches and downloads, and
+        what can be done; empty for an album never wanted nor downloaded."""
+        row = db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
+        downloads = db.execute("select distinct d.* from download d left join download_target t on t.hash = d.hash where d.album_mbid = ? or t.rg = ? "
+                               "order by d.created desc limit 20", (rg, rg)).fetchall()
+        wanted = mine(db, user, "album", rg)
+        if not (row or downloads or wanted):
+            return ""
+        active = next((d for d in downloads if d["state"] not in ("done", "failed")), None)
+        state = progress(active["hash"], active["state"], active["created"]) if active else pill("arrived", "good") if row and row["state"] == "have" else \
+            pill("wanted", "accent") if row else '<span class="muted">not wanted</span>'
+        searched = row and row["searched"] and f'{ago(row["searched"])}, {row["tries"]} time{"s" if row["tries"] != 1 else ""} in all' + (
+            f'; next try {until(row["next_search"])}' if row["state"] == "missing" and (row["next_search"] or 0) > time.time() else "")
+        facts = [("State", state), ("Why", ("★ starred" if row["reason"] == "starred" else "its artist is followed") if row else None),
+                 ("Searched", escape(searched) if searched else "not yet" if row and row["state"] == "missing" else None),
+                 ("Last result", f'<span class="error">{escape(row["error"])}</span>' if row and row["error"] else None)]
+        act = lambda name, label, ask="": (f'<form class="inline" method="post" action="/music/wanted/{escape(rg)}/{name}"{ask and confirm(ask)}>'
+                                           f'<input type="hidden" name="next" value="{escape(here)}"><button{" class=danger" if name == "give-up" else ""}>{label}</button></form>')
+        name = f'{row["artist"]} – {row["title"]}' if row else "it"
+        actions = (act("block", "Try another", f"Drop this download of {name} and try another release?") if active else act("search", "Search now")) + \
+            act("give-up", "Give up", f"Give up on {name}?") if row and row["state"] != "have" else ""
+        log = "".join(f'<tr><td class="meta num">{ago(d["created"])}</td><td class="lead">{escape(d["title"])}</td>'
+                      f'<td class="meta">{escape("imported" if d["state"] == "done" else STATES.get(d["state"], d["state"]))}</td>'
+                      f'<td class="state">{f"""<span class="error">{escape(d["error"])}</span>""" if d["error"] else ""}</td></tr>' for d in downloads)
+        return (f'<section><h2>Wanted</h2><dl class="meta">{dl(facts)}</dl><div class="row">{actions}{want_button("album", rg, not wanted, here)}</div>'
+                + (f'<h3>Downloads</h3><table class="grid"><tbody>{log}</tbody></table>' if log else "") + '</section>')
+
+    def musicbrainz_album(db, request, user, rg: str):
+        """The album page of a release group that isn't here yet: MusicBrainz's smallest edition's songs, and its wanted log."""
+        try:
+            found = importer.editions(db, rg) if MBID.fullmatch(rg) else []
+        except OSError as e:
+            return back("/music/wanted", error=f"MusicBrainz didn't answer: {e}")
+        if not found:
+            return back("/music/wanted", error="That album isn't here, and MusicBrainz doesn't know it.")
+        audio = lambda r: [m for m in r.get("media") or [] if not acquire.VIDEO.search(m.get("format") or "")]
+        smallest = min((r for r in found if audio(r)), key=lambda r: sum(len(m.get("tracks") or []) for m in audio(r)), default=found[0])
+        group, credit = smallest.get("release-group") or {}, smallest.get("artist-credit") or []
+        row = db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
+        group = {"title": row and row["title"], "primary-type": row and row["primary_type"], "first-release-date": row and row["first_date"],
+                 "secondary-types": row["secondary_types"].split("; ") if row and row["secondary_types"] else [], **{k: v for k, v in group.items() if v}}
+        if not credit and row:
+            credit = [{"name": row["artist"], "artist": {"id": row["artist_mbid"]}}]
+        title, media = group["title"] or smallest.get("title") or rg, audio(smallest)
+        tracks = [t for m in media for t in m.get("tracks") or []]
+        facts = [("Released", escape(group.get("first-release-date") or "")),
+                 ("Label", escape(", ".join(dict.fromkeys(l["label"]["name"] for l in smallest.get("label-info") or [] if l.get("label"))))),
+                 ("Discs", len(media) if len(media) > 1 else None), ("Editions", f"{len(found)}; the songs are the smallest one's" if len(found) > 1 else None),
+                 ("MusicBrainz", f'<a href="https://musicbrainz.org/release-group/{escape(rg)}">release group</a>')]
+        rows = "".join(f'<tr><td class="num">{escape(f"{m.get("position")}.{t.get("number") or t.get("position")}" if len(media) > 1 else str(t.get("number") or t.get("position") or ""))}</td>'
+                       f'<td class="lead">{escape(t.get("title") or "")}</td><td class="num">{length((t.get("length") or 0) // 1000)}</td></tr>'
+                       for m in media for t in m.get("tracks") or [])
+        line = [f'by <a href="/music/artist/{escape(credit[0]["artist"]["id"])}">{escape(importer.joined(credit))}</a>' if credit else "",
+                escape((group.get("first-release-date") or "")[:4]), f"{len(tracks)} songs", length(sum(t.get("length") or 0 for t in tracks) // 1000)]
+        kinds = " · ".join(filter(None, [group.get("primary-type"), *(group.get("secondary-types") or [])])) or "Album"
+        body = (hero(f'<img class="cover" alt="" src="/music/cover/al-mb-{escape(rg)}" {HIDE_BROKEN}>', escape(kinds), title,
+                     " · ".join(filter(None, line)), f'<dl class="meta">{dl(facts)}</dl>')
+                + f'<section><table class="grid tracks"><thead><tr><th class="num">#</th><th>Title</th><th class="num">Length</th></tr></thead><tbody>{rows}</tbody></table></section>'
+                + wanted_log(db, user, rg, f"/music/library/album/{MB_IDS['album']}{rg}"))
+        return page(title, body, request.query_params.get("message", ""), request.query_params.get("error", ""), wide=True, tab="wanted", heading=False)
+
     def wanted_give_up(db, request, user, form):
-        here = form.get("next", "") if form.get("next", "").startswith("/music/wanted") else "/music/wanted"
+        here = form.get("next", "") if form.get("next", "").startswith(("/music/wanted", "/music/library/album/")) else "/music/wanted"
         rgs = [rg for rg in form.get("rgs", "").split(",") if MBID.fullmatch(rg)]
         for rg in rgs:
             give_up(db, user, rg)
