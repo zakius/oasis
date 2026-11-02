@@ -20,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import accounts, acquire, artists, cover, dedupe, forward, lyrics, musicbrainz, releases, romanize, scan, upload, web, ytm
+from . import accounts, acquire, artists, cover, dedupe, forward, latin, lyrics, musicbrainz, releases, romanize, scan, upload, web, ytm
 from .acquire import MB_IDS, SECONDARY, Acquire
 from .config import Config
 from .credits import PERFORMANCE_ROLES, Credits
@@ -303,18 +303,23 @@ def describe_albums(db, albums: list[dict]):
             a["releaseTypes"] = [t.title() for t in types]
 
 
-def latin_of(s, siblings=(), title_of=False) -> str | None:
-    """s romanized, or None when it needs no romanizing."""
+def latin_of(s, siblings=(), title_of=False, curated=None) -> str | None:
+    """s romanized, or None when it needs no romanizing: MusicBrainz's Latin name first (latin.py), an artist's in a
+    credit naming several too, else generated."""
     if not isinstance(s, str) or not romanize.has_non_latin(s):
         return None
-    latin = romanize.text(s, [x for x in siblings if x], title_of)
-    return None if romanize.is_latin(s, latin) else latin
+    known = (curated or {}).get("title" if title_of else "artist") or {}
+    if s in known:
+        return known[s]
+    named = s if title_of else latin.names_in(s, known)
+    generated = romanize.text(named, [x for x in siblings if x], title_of) if romanize.has_non_latin(named) else named
+    return None if romanize.is_latin(s, generated) else generated
 
 
 ARTIST_KEYS = ("artist", "artists", "albumArtists", "similarArtist", "directory")
 
 
-def romanized(payload: dict, mode: str | None) -> dict:
+def romanized(payload: dict, mode: str | None, curated=None) -> dict:
     """The OpenSubsonic extension romanization (docs/romanization-extension.md): mode both adds a …Latin field next to
     each name whose romanized form differs, latin puts that form in the name fields themselves. Siblings are as roma
     gives them: a title is read with its artist and album, so a Chinese singer's song isn't read as Japanese."""
@@ -322,8 +327,8 @@ def romanized(payload: dict, mode: str | None) -> dict:
         return payload
 
     def put(item, field, *siblings, title_of=False):
-        if (latin := latin_of(item.get(field), siblings, title_of)) is not None:
-            item[field if mode == "latin" else field + "Latin"] = latin
+        if (found := latin_of(item.get(field), siblings, title_of, curated)) is not None:
+            item[field if mode == "latin" else field + "Latin"] = found
 
     def walk(value, key=None):
         if isinstance(value, list):
@@ -376,8 +381,10 @@ def latin_index(db):
     rows = db.execute(f"select t.*, {LATIN_SOURCE} as source from track t left join track_latin l on l.id = t.id "
                       f"where t.library = 1 and l.source is not {LATIN_SOURCE}").fetchall()
 
+    known = latin.curated(db) if rows else None
+
     def folded(s, *siblings, title_of=False):
-        return " ".join(filter(None, map(ytm.fold, (latin_of(s, siblings, title_of) or "").split())))  # words kept apart
+        return " ".join(filter(None, map(ytm.fold, (latin_of(s, siblings, title_of, known) or "").split())))  # words kept apart
     db.executemany("insert or replace into track_latin values (?, ?, ?, ?, ?, ?)", [(
         r["id"], r["source"], folded(r["title"], r["artist"], r["album"], title_of=True), folded(r["artist"], r["title"], r["album"]),
         folded(r["album"], r["title"], r["artist"], title_of=True), folded(r["album_artist"], r["title"], r["album"])) for r in rows])
@@ -858,18 +865,18 @@ class Api:
             """Each term in the names or in their romanized forms (track_latin, folded: "tokyo" finds 東京)."""
             return " and ".join(["t.library = 1", *[f"(({columns}) like ? or ({latin}) like ?)"] * len(terms)]), \
                 [x for t in terms for x in (f"%{t}%", f"%{ytm.fold(t)}%" if ytm.fold(t) else None)]
-        latin = " left join track_latin l on l.id = t.id"
+        joined = " left join track_latin l on l.id = t.id"
 
         # Every row is read before YouTube Music is asked: a cursor left open keeps its read snapshot, and remember()
         # can't write from a snapshot that another connection's write (the mix refresh's) made stale: "database is locked".
         cond, args = match("t.album_artist", "l.album_artist")
-        artists = [artist(r) for r in db.execute(ARTISTS + latin + f" where {cond} group by t.artist_id order by t.album_artist collate nocase "
+        artists = [artist(r) for r in db.execute(ARTISTS + joined + f" where {cond} group by t.artist_id order by t.album_artist collate nocase "
                                                  "limit ? offset ?", (*args, p.int("artistCount", 20), p.int("artistOffset", 0)))]
         cond, args = match("t.album || ' ' || t.album_artist", "l.album || ' ' || l.album_artist")
-        albums = [album(r) for r in db.execute(ALBUMS + latin + f" where {cond} group by t.album_id order by name collate nocase limit ? offset ?",
+        albums = [album(r) for r in db.execute(ALBUMS + joined + f" where {cond} group by t.album_id order by name collate nocase limit ? offset ?",
                                                (*args, p.int("albumCount", 20), p.int("albumOffset", 0)))]
         cond, args = match("t.title || ' ' || t.artist || ' ' || t.album", "l.title || ' ' || l.artist || ' ' || l.album")
-        songs = [song(r) for r in db.execute(SONGS + latin + f" where {cond} order by t.album_artist, t.album, t.disc_no, t.track_no limit ? offset ?",
+        songs = [song(r) for r in db.execute(SONGS + joined + f" where {cond} order by t.album_artist, t.album, t.disc_no, t.track_no limit ? offset ?",
                                              (*args, p.int("songCount", 20), p.int("songOffset", 0)))]
         if self.ytm and terms and p.int("songOffset", 0) == 0:
             known = {s["id"] for s in songs}
@@ -1103,15 +1110,15 @@ class Api:
         kinds = (p.get("kinds") or "main,pronunciation,translation").split(",")
         texts, siblings = [text for _, text in found.lines], [x for x in (r["artist"], r["album"]) if x]
         words = found.words if found.synced and found.words else [[] for _ in texts]
-        latin = romanize.lyrics(texts, siblings, found.lang) if any(map(romanize.has_non_latin, texts)) else None
-        entries = [{**main, "kind": "main", **cue_lines(texts, words)}] if "main" in kinds or "pronunciation" in kinds and latin is None else []
-        if latin and "pronunciation" in kinds:
+        readings = romanize.lyrics(texts, siblings, found.lang) if any(map(romanize.has_non_latin, texts)) else None
+        entries = [{**main, "kind": "main", **cue_lines(texts, words)}] if "main" in kinds or "pronunciation" in kinds and readings is None else []
+        if readings and "pronunciation" in kinds:
             # A line with karaoke words reads as its words' romaji, each word keeping its timing (roma's romanizeLyrics).
             word_latin = romanize.lyric_words(texts, [[w[2] for w in ws] for ws in words], siblings, found.lang)
-            latin = ["".join(wl).strip() if wl else l for l, wl in zip(latin, word_latin)]
+            readings = ["".join(wl).strip() if wl else l for l, wl in zip(readings, word_latin)]
             words = [[[a, b, t] for (a, b, _), t in zip(ws, wl)] for ws, wl in zip(words, word_latin)]
             entries.append({**main, "kind": "pronunciation", "lang": romanize.language(texts, siblings, found.lang) + "-Latn",
-                            "line": [clean({"start": start, "value": l}) for (start, _), l in zip(found.lines, latin)], **cue_lines(latin, words)})
+                            "line": [clean({"start": start, "value": l}) for (start, _), l in zip(found.lines, readings)], **cue_lines(readings, words)})
         return {"lyricsList": clean({"structuredLyrics": entries or None})}
 
     def getLyrics(self, db, p, user):
@@ -1539,7 +1546,8 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
                 result = handler(api, db, p, user)
                 if isinstance(result, Response):
                     return result
-                return respond(fmt, romanized(describe(db, result if p.oasis else plain(result)), p.get("romanization")))
+                return respond(fmt, romanized(describe(db, result if p.oasis else plain(result)), p.get("romanization"),
+                                                     latin.curated(db) if p.get("romanization") in ("both", "latin") else None))
             except Fail as e:
                 return respond(fmt, {}, e)
             except upload.Refused as e:

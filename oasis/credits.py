@@ -12,7 +12,7 @@ import time
 import mutagen
 from mutagen._vorbis import VCommentDict
 
-from . import artists, musicbrainz
+from . import artists, latin, musicbrainz
 from .db import artist_id
 from .dedupe import retagged, same_audio
 
@@ -151,8 +151,9 @@ def write_tags(path: str, fields: dict, credits: list[dict]) -> bool:
 class Credits:
     """Fills credits for releases that arrived in the library, one MusicBrainz request at a time."""
 
-    def __init__(self, connect, fetch=None, fetch_artist=None):
-        self.connect, self.fetch, self.fetch_artist = connect, fetch or fetch_release, fetch_artist or fetch_artist_data
+    def __init__(self, connect, fetch=None, fetch_artist=None, fetch_latin=None):
+        """fetch_latin: latin.step's, for tests; else MusicBrainz through mb_cache."""
+        self.connect, self.fetch, self.fetch_artist, self.fetch_latin = connect, fetch or fetch_release, fetch_artist or fetch_artist_data, fetch_latin
         self.wake = threading.Event()
         self.retry = RETRY[0]
 
@@ -180,7 +181,7 @@ class Credits:
             row = db.execute("select mb_release from track where source = 'local' and mb_release is not null "
                              "and credits_at is null limit 1").fetchone()
             if row is None:
-                return self.artist_step(db)
+                return self.artist_step(db) or self.latin_step(db)
             release = row["mb_release"]
             try:
                 data = self.fetch(release)
@@ -194,6 +195,14 @@ class Credits:
             return True
         finally:
             db.close()
+
+    def latin_step(self, db) -> bool:
+        """Once credits are all read, one artist's or release's Latin names (latin.py)."""
+        if not latin.step(db, self.fetch_latin):
+            return False
+        self.retry = RETRY[0]
+        db.commit()
+        return True
 
     def artist_step(self, db) -> bool:
         row = db.execute("select mbid from mb_artist where fetched is null and mbid in (select mbid from credit) limit 1").fetchone()

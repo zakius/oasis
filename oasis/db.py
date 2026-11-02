@@ -167,6 +167,12 @@ create table if not exists album_track(  -- the songs each YouTube Music album l
 create index if not exists play_track on play(track_id);
 create table if not exists session(token text primary key, user text not null, expires real not null);
 create table if not exists lyrics(track_id text primary key, found text, fetched real not null);
+create table if not exists mb_latin(  -- Latin names MusicBrainz's editors chose, preferred over generated ones (see latin.py)
+    kind text not null, original text not null,  -- artist: a credited name; title: an album's or track's title
+    latin text not null, ref text not null,      -- ref: the artist's or release's MusicBrainz id
+    primary key(kind, original)
+);
+create table if not exists mb_latin_seen(ref text primary key, fetched real not null);  -- artists and releases latin.py read
 create table if not exists track_latin(  -- library tracks' names romanized and folded, for search to match romaji (see api.py)
     id text primary key, source text not null,  -- source: the names they were made from
     title text, artist text, album text, album_artist text
