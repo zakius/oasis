@@ -173,7 +173,9 @@ def test_a_torrent_added_again_after_a_failure_gets_a_new_stall_timer(downloads,
     torbox.list = [tb(71, "abcd", progress=0.3, seeds=0)]
     downloads.cycle()
     torbox.list = []
-    downloads.cycle()  # gone from TorBox: not blocked
+    for _ in range(download.GONE_AFTER):
+        downloads.cycle()  # gone from TorBox: not blocked
+    assert db.execute("select state, error from download").fetchone()[:] == ("failed", "gone from TorBox")
     now[0] += 7200
     downloads.find(db, WANT, "mb-album")
     torbox.list = [tb(72, "abcd", progress=0.3, seeds=0)]
@@ -342,3 +344,67 @@ def test_a_slow_torrent_makes_way_for_a_cached_pick_first(downloads, torbox, db,
     downloads.cycle()
     assert torbox.added[1][1] == "magnet:?xt=urn:btih:cafe"
     assert [r["infoHash"] for r in json.loads(db.execute("select picks from download where hash = 'cafe'").fetchone()[0])] == ["beef"]
+
+
+def test_a_download_torbox_leaves_out_of_its_list_is_gone_only_after_polls_in_a_row(downloads, torbox, db):
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
+    downloads.find(db, WANT, "mb-album")
+    for listed in ([], [], [tb(71, "abcd", progress=0.5)], [], []):  # an empty or short list now and then
+        torbox.list = listed
+        downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "downloading" and torbox.deleted == []
+    torbox.list = [tb(80, "other", progress=0.5)]
+    downloads.cycle()
+    assert db.execute("select state, error from download").fetchone()[:] == ("failed", "gone from TorBox")
+    assert db.execute("select count(*) from release_block").fetchone()[0] == 0
+
+
+def test_a_slow_torrent_keeps_its_picks_while_torbox_has_no_free_slot_for_the_next(downloads, torbox, db, monkeypatch):
+    now = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd", seeders=90), offer("beef", seeders=3)]
+    downloads.find(db, WANT, "mb-album")
+    now[0] += 3600
+    torbox.list, torbox.full = [tb(71, "abcd", progress=0.01, seeds=1)], True
+    downloads.cycle()
+    assert torbox.added[1][1] == "magnet:?xt=urn:btih:beef" and torbox.deleted == []
+    assert db.execute("select state from download").fetchone()[0] == "downloading" and db.execute("select picks from download").fetchone()[0]
+    torbox.full = False
+    downloads.cycle()
+    assert torbox.added[2][1] == "magnet:?xt=urn:btih:beef" and torbox.deleted == [71]
+
+
+def keep(db, hash="abcd", groups=None, tried=()):
+    """A remembered bundle (bundle_kept) holding the album 'g-album', TorBox having it cached."""
+    groups = groups or {"g-album": ["Disco/Album/01.flac", "Disco/Album/02.flac"]}
+    db.execute("insert into bundle_kept values (?, 'Artist - Discography', 'mb-artist', '[]', ?, ?, ?)", (hash, json.dumps(groups), time.time(), json.dumps(list(tried))))
+
+
+def test_a_remembered_bundle_torbox_had_no_free_slot_for_still_serves_the_album(downloads, torbox, db):
+    keep(db)
+    torbox.have, torbox.full = {"abcd"}, True
+    assert downloads.find(db, WANT, "g-album") is False and downloads.prowlarr.asked == []
+    assert db.execute("select tried from bundle_kept").fetchone()[0] == "[]"
+    torbox.full = False
+    assert downloads.find(db, WANT, "g-album") is True
+    assert json.loads(db.execute("select tried from bundle_kept").fetchone()[0]) == ["g-album"]
+
+
+def test_a_remembered_bundle_whose_files_changed_is_forgotten_not_blocked(downloads, torbox, db, tmp_path):
+    keep(db)
+    torbox.have = {"abcd"}
+    assert downloads.find(db, WANT, "g-album")
+    torbox.list = [finished(71, "abcd", ["Disco/Album (2001)/01.flac", "Disco/Album (2001)/02.flac"], tmp_path)]
+    downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "failed" and torbox.deleted == [71]
+    assert db.execute("select count(*) from release_block").fetchone()[0] == db.execute("select count(*) from bundle_kept").fetchone()[0] == 0
+
+
+def test_a_bundle_downloaded_again_keeps_what_it_was_tried_for_before(downloads, db):
+    keep(db, tried=["g-old"])
+    db.execute("insert into download(hash, album_id, title, torbox_id, state, created, updated, catalogue) values "
+               "('abcd', 0, 'Artist - Discography', 71, 'done', 0, 0, ?)", (json.dumps({"want": WANT, "groups": []}),))
+    db.execute("insert into download_target(hash, rg, files, state) values ('abcd', 'g-album', ?, 'done')", (json.dumps(["Disco/Album/01.flac"]),))
+    downloads.map_kept = lambda *args: None
+    downloads.remember(db, {"hash": "abcd"}, [{"name": "Disco/Album/01.flac", "size": 1}])
+    assert json.loads(db.execute("select tried from bundle_kept").fetchone()[0]) == ["g-album", "g-old"]

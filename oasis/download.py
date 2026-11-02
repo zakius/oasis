@@ -42,6 +42,7 @@ PACE = 3                 # seconds between file download requests: bursts of the
 PARALLEL = 2             # files fetched at once
 PAUSE = 300              # seconds without file downloads after a 429
 FETCH_TRIES = 5          # polls in a row a file may fail to download before the release counts as broken
+GONE_AFTER = 3           # polls in a row TorBox may leave a download out of its list before it counts as gone: the list comes back empty or short now and then
 KEEP_FAILED = 2 * 86400  # seconds a failed download's files stay for inspection
 KEPT_UNSEEN = 90 * 86400 # seconds a remembered bundle stays unused; TorBox's cache check when one is used is its real expiry
 GRAB_TRIES = 5           # picks tried in turn when TorBox won't take one
@@ -154,6 +155,7 @@ class Downloads:
         self.client = None
         self.seen = {}       # hash -> (progress, since when)
         self.failures = {}   # hash -> polls in a row its files failed to download
+        self.missing = {}    # hash -> polls in a row TorBox's list left it out
         self.copying = {}    # hash -> [(path, size)]: the files being fetched here, for copied()
         self.crowded = False  # TorBox's slots are all taken and albums wait: see step
         self.added = 0.0     # when send last asked TorBox to add a torrent, for acquire's gap between searches
@@ -250,10 +252,12 @@ class Downloads:
                 continue
             release = {"title": title, "infoHash": hash, "magnetUrl": f"magnet:?xt=urn:btih:{hash}"}
             # Its remembered paths: TorBox lists the files of one of 100 or more as one zip till it is added.
-            if (sent := self.send(db, [release], avoid, None, f"{label}: {len(held)} albums from a remembered bundle", held, kept=True)) is not None:
+            if (sent := self.send(db, [release], avoid, None, f"{label}: {len(held)} albums from a remembered bundle", held, kept=True)) is None:
+                continue
+            if sent:  # not when TorBox had no free slot: the albums come from it next time
                 db.execute("update bundle_kept set seen = ?, tried = (select json_group_array(value) from (select value from json_each(tried) union "
                            "select value from json_each(?))) where hash = ?", (time.time(), json.dumps(list(held)), hash))
-                return sent
+            return sent
         return None
 
     def remember(self, db, row, files: list[dict]):
@@ -269,7 +273,9 @@ class Downloads:
             db.execute("update bundle_kept set seen = ? where hash = ?", (time.time(), row["hash"]))
             return
         artist = db.execute(f"select artist_mbid from want_album where rg in ({','.join('?' * len(targets))}) and artist_mbid is not null", list(targets)).fetchone()
-        tried = [rg for (rg,) in db.execute("select rg from download_target where hash = ?", (row["hash"],))]
+        # Sent before from memory too: what it was tried for then still counts.
+        tried = sorted({rg for (rg,) in db.execute("select rg from download_target where hash = ?", (row["hash"],))}
+                       | {rg for (t,) in db.execute("select tried from bundle_kept where hash = ?", (row["hash"],)) for rg in json.loads(t)})
         db.execute("insert or replace into bundle_kept values (?, ?, ?, ?, ?, ?, ?)", (row["hash"], row["title"], artist and artist[0],
                    json.dumps([{"name": f["name"], "size": f.get("size")} for f in files]), json.dumps(targets), time.time(), json.dumps(tried)))
         # The rest of its groups: a MusicBrainz lookup or more each, at one a second, so not in the downloads' poll.
@@ -340,6 +346,7 @@ class Downloads:
                                                                                 catalogue and json.dumps(catalogue), int(kept)))
             self.seen.pop(added["hash"].lower(), None)  # added again after a failure: its stall timer starts anew
             self.failures.pop(added["hash"].lower(), None)
+            self.missing.pop(added["hash"].lower(), None)
             db.execute("delete from download_target where hash = ?", (added["hash"].lower(),))
             db.executemany("insert into download_target(hash, rg, files, state) values (?, ?, ?, 'pending')",
                            [(added["hash"].lower(), rg, json.dumps(files)) for rg, files in (targets or {}).items()])
@@ -373,10 +380,10 @@ class Downloads:
             db.close()
 
     def step(self, db, row, torrent):
-        state = row["state"]
+        state, gone = row["state"], self.gone(row["hash"], torrent)
         if state in ("added", "downloading"):
             if torrent is None:
-                return self.fail(db, row, "gone from TorBox", block=False)
+                return self.fail(db, row, "gone from TorBox", block=False) if gone else None
             if "error" in torrent["download_state"].lower():
                 return self.fail(db, row, f"TorBox: {torrent['download_state']}")
             if row["bundle"] and torrent.get("files"):
@@ -415,7 +422,7 @@ class Downloads:
             state = self.set(db, row, "fetching")
         if state == "fetching":
             if torrent is None:
-                return self.fail(db, row, "gone from TorBox before its files were fetched", block=False)
+                return self.fail(db, row, "gone from TorBox before its files were fetched", block=False) if gone else None
             if not self.fetch(db, row, torrent):
                 return
             state = self.set(db, row, "importing")
@@ -424,14 +431,20 @@ class Downloads:
             if torrent:
                 self.remember(db, row, torrent.get("files") or [])
 
+    def gone(self, hash: str, torrent: dict | None) -> bool:
+        """Whether TorBox's list has left the download out GONE_AFTER polls in a row."""
+        self.missing[hash] = 0 if torrent else self.missing.get(hash, 0) + 1
+        return self.missing[hash] >= GONE_AFTER
+
     def switch(self, db, row, why: str) -> bool:
         """Sends the next of the album's search's picks in place of a slow download, cached ones first, and blocks the
-        slow one as too slow. The picks are tried once: False, and they're dropped, when none went."""
+        slow one as too slow. False when none went: the picks are dropped, unless TorBox had no free slot (next poll)."""
         avoid = self.blocked(db) | self.slow(db) | {row["hash"]}
         picks = [r for r in json.loads(row["picks"]) if not {hash_of(r), r.get("guid")} & avoid]
         cached = self.torbox().cached([h for r in picks if (h := hash_of(r))]) if picks else set()
-        if not self.send(db, sorted(picks, key=lambda r: hash_of(r) not in cached), avoid, row["album_mbid"], f"{row['title']} (too slow)"):
-            db.execute("update download set picks = null where hash = ?", (row["hash"],))
+        if not (sent := self.send(db, sorted(picks, key=lambda r: hash_of(r) not in cached), avoid, row["album_mbid"], f"{row['title']} (too slow)")):
+            if sent is None:
+                db.execute("update download set picks = null where hash = ?", (row["hash"],))
             return False
         self.delete(row)
         self.block_release(db, row, why)
@@ -490,7 +503,10 @@ class Downloads:
         if time.time() < self.paused_until:
             return False
         if (todo := self.chosen(db, row, torrent)) is None:
-            self.fail(db, row, "a bundle's files differ from what TorBox had cached")
+            # From memory: the remembered paths are out of date, not the release at fault. It is forgotten, not blocked.
+            db.execute("delete from bundle_kept where hash = ? and ?", (row["hash"], row["kept"]))
+            self.fail(db, row, "a remembered bundle's files differ from TorBox's" if row["kept"] else "a bundle's files differ from what TorBox had cached",
+                      block=not row["kept"])
             return False
         if not any(f["name"].rsplit(".", 1)[-1].lower() in (*AUDIO, *ARCHIVES) for f, _ in todo):
             self.fail(db, row, "no audio files in the torrent")
