@@ -134,7 +134,8 @@ class Params:
 
 
 SONG_COLUMNS = """t.*, s.starred, s.rating, s.play_count, s.played"""
-SONGS = f"select {SONG_COLUMNS} from track t left join stat s on s.id = t.id"
+# Stars, ratings and plays are the requesting user's: me() (db.connect) names them for each request.
+SONGS = f"select {SONG_COLUMNS} from track t left join stat s on s.id = t.id and s.user = me()"
 ALBUMS = """
 select t.album_id as id, t.album as name, t.album_artist as artist, t.artist_id,
        count(*) as song_count, sum(t.duration) as duration, min(t.created) as created,
@@ -142,13 +143,13 @@ select t.album_id as id, t.album as name, t.album_artist as artist, t.artist_id,
        max(t.genre) as genre, max(t.cover is not null) as has_cover,
        s.starred as album_starred, s.rating as album_rating,
        coalesce(sum(ps.play_count), 0) as plays, max(ps.played) as last_played, wi.state as want_state, wi.error as want_error
-from track t left join stat s on s.id = t.album_id left join stat ps on ps.id = t.id
+from track t left join stat s on s.id = t.album_id and s.user = me() left join stat ps on ps.id = t.id and ps.user = me()
 left join want_item wi on wi.kind = 'album' and wi.ref = t.album_id
 """
 ARTISTS = """
 select t.artist_id as id, t.album_artist as name, count(distinct t.album_id) as album_count,
        max(t.cover is not null) as has_cover, s.starred, s.rating, wi.state as want_state, wi.error as want_error
-from track t left join stat s on s.id = t.artist_id left join want_item wi on wi.kind = 'artist' and wi.ref = t.artist_id
+from track t left join stat s on s.id = t.artist_id and s.user = me() left join want_item wi on wi.kind = 'artist' and wi.ref = t.artist_id
 """
 
 
@@ -660,7 +661,7 @@ class Api:
         """The album's own songs, and the songs its YouTube Music listing shares with another album, in its order."""
         return [clean(song(r) | {"track": r["no"], "discNumber": r["disc"]}) for r in db.execute(
             f"select {SONG_COLUMNS}, coalesce(at.disc_no, t.disc_no) as disc, coalesce(at.track_no, t.track_no) as no "
-            "from track t left join stat s on s.id = t.id left join album_track at on at.track_id = t.id and at.album_id = ? "
+            "from track t left join stat s on s.id = t.id and s.user = me() left join album_track at on at.track_id = t.id and at.album_id = ? "
             "where t.album_id = ? or at.album_id is not null order by disc, no is null, no, title", (album_id, album_id))]
 
     def getArtist(self, db, p, user):
@@ -914,7 +915,7 @@ class Api:
 
     def _wanted(self, db, kind, id) -> dict:
         """Starred and oasisWanted of an artist or album, as album() and artist() give them."""
-        starred = db.execute("select starred from stat where id = ?", (id,)).fetchone()
+        starred = db.execute("select starred from stat where id = ? and user = me()", (id,)).fetchone()
         item = db.execute("select state, error from want_item where kind = ? and ref = ?", (kind, id)).fetchone()
         state = WANTED_STATES.get(item and item["state"])
         return {"starred": iso(starred and starred[0]), "oasisWanted": state, "oasisWantedError": item["error"] if state else None}
@@ -944,7 +945,7 @@ class Api:
             r = db.execute("select ref, library from track where id = ? and source = 'ytm'", (id,)).fetchone()
             if r is None:
                 continue
-            starred = db.execute("select 1 from stat where id = ? and starred is not null", (id,)).fetchone()
+            starred = db.execute("select 1 from stat where id = ? and starred is not null", (id,)).fetchone()  # by anyone
             playlists = db.execute("select p.mix from playlist_entry e join playlist p on p.id = e.playlist_id "
                                    "where e.track_id = ? and p.radio = 0", (id,)).fetchall()
             db.execute("update track set library = ? where id = ?", (int(bool(starred or playlists)), id))
@@ -967,7 +968,7 @@ class Api:
 
     def _starred(self, db):
         def ids(prefix):
-            return db.execute("select id from stat where starred is not null and id like ? order by starred desc", (prefix + "%",)).fetchall()
+            return db.execute("select id from stat where user = me() and starred is not null and id like ? order by starred desc", (prefix + "%",)).fetchall()
         return {
             "artist": [a for r in ids("ar-") for a in ([artist(self._one(db, ARTISTS + " where t.artist_id = ? group by t.artist_id", r["id"]))]
                                                       if db.execute("select 1 from track where artist_id = ?", (r["id"],)).fetchone()
@@ -999,7 +1000,7 @@ class Api:
 
     def _set_starred(self, db, p, value, user):
         for id in p.all("id"):
-            db.execute("insert into stat(id, starred) values (?, ?) on conflict(id) do update set starred = excluded.starred", (id, value))
+            db.execute("insert into stat(user, id, starred) values (?, ?, ?) on conflict(user, id) do update set starred = excluded.starred", (user, id, value))
         self._touch(db, p.all("id"))
         self._want(db, user, "album", p.all("albumId"), value)
         self._want(db, user, "artist", p.all("artistId"), value)
@@ -1009,7 +1010,7 @@ class Api:
         """Stars albums or artists, or takes the star back (value None): a starred album or artist is one the user
         wants in the library (see acquire.py). The dashboard's want and follow are stars too."""
         for id in ids:
-            db.execute("insert into stat(id, starred) values (?, ?) on conflict(id) do update set starred = excluded.starred", (id, value))
+            db.execute("insert into stat(user, id, starred) values (?, ?, ?) on conflict(user, id) do update set starred = excluded.starred", (user, id, value))
             if value:
                 db.execute("insert or ignore into wanted values (?, ?, ?)", (user, kind, id))
             else:
@@ -1025,7 +1026,7 @@ class Api:
 
     def setRating(self, db, p, user):
         rating = p.int("rating", 0) or None
-        db.execute("insert into stat(id, rating) values (?, ?) on conflict(id) do update set rating = excluded.rating", (p.need("id"), rating))
+        db.execute("insert into stat(user, id, rating) values (?, ?, ?) on conflict(user, id) do update set rating = excluded.rating", (user, p.need("id"), rating))
         return {}
 
     def scrobble(self, db, p, user):
@@ -1042,8 +1043,8 @@ class Api:
         for id, _ in set(plays) - set(known):
             log.info("scrobble for unknown song %s skipped", id)
         for id, played in known:
-            db.execute("insert into stat(id, play_count, played) values (?, 1, ?) on conflict(id) do update "
-                       "set play_count = play_count + 1, played = excluded.played", (id, played))
+            db.execute("insert into stat(user, id, play_count, played) values (?, ?, 1, ?) on conflict(user, id) do update "
+                       "set play_count = play_count + 1, played = excluded.played", (user, id, played))
             db.execute("insert into play values (?, ?, ?)", (user, id, played))
             self.forwarder.enqueue(db, user, id, played)
         self.recommender.played(db, user, [id for id, _ in known])
@@ -1171,7 +1172,7 @@ class Api:
 
     def getTopSongs(self, db, p, user):
         name, count = p.need("artist"), min(p.int("count", 50), 200)
-        ids = [r[0] for r in db.execute("select t.id from track t left join stat s on s.id = t.id where t.library = 1 and "
+        ids = [r[0] for r in db.execute("select t.id from track t left join stat s on s.id = t.id and s.user = me() where t.library = 1 and "
                                         "t.album_artist = ? collate nocase order by coalesce(s.play_count, 0) desc limit ?", (name, count))]
         if self.ytm and len(ids) < count:
             try:
@@ -1514,6 +1515,7 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
             db = api._db()
             try:
                 user = api._authenticate(db, p)
+                db.create_function("me", 0, lambda: user, deterministic=True)
                 p.follow_moves(db)
                 result = handler(api, db, p, user)
                 return result if isinstance(result, Response) else respond(fmt, romanized(describe(db, result), p.get("romanization")))

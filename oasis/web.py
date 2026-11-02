@@ -907,8 +907,8 @@ def routes(api) -> list[Route]:
 
     def library_album(db, request, user, form):
         album_id = request.path_params["id"]
-        tracks = db.execute("select t.*, s.play_count plays, s.played, s.starred, s.rating from track t left join stat s on s.id = t.id "
-                            "where t.album_id = ? order by t.disc_no, t.track_no, t.title", (album_id,)).fetchall()
+        tracks = db.execute("select t.*, s.play_count plays, s.played, s.starred, s.rating from track t left join stat s on s.id = t.id and s.user = ? "
+                            "where t.album_id = ? order by t.disc_no, t.track_no, t.title", (user["name"], album_id)).fetchall()
         if not tracks:
             return back("/music/library", error="That album isn't here.")
         t = tracks[0]
@@ -948,8 +948,8 @@ def routes(api) -> list[Route]:
         return page(t["album"], body, wide=True, tab="library", heading=False)
 
     def library_song(db, request, user, form):
-        r = db.execute("select t.*, s.play_count plays, s.played, s.starred, s.rating from track t left join stat s on s.id = t.id where t.id = ?",
-                       (request.path_params["id"],)).fetchone()
+        r = db.execute("select t.*, s.play_count plays, s.played, s.starred, s.rating from track t left join stat s on s.id = t.id and s.user = ? where t.id = ?",
+                       (user["name"], request.path_params["id"])).fetchone()
         if r is None:
             return back("/music/library", error="That song isn't here.")
         from .api import credits_of  # api imports this module

@@ -71,8 +71,8 @@ class Recommender:
     def from_artist(self, db, seed, count: int) -> list[str]:
         """The artist's other library songs, most played first."""
         return [r[0] for r in db.execute(
-            "select t.id from track t left join stat s on s.id = t.id where t.library = 1 and t.id != ? "
-            "and (t.artist_id = ? or t.artist = ? collate nocase) order by coalesce(s.play_count, 0) desc, random() limit ?",
+            "select t.id from track t where t.library = 1 and t.id != ? and (t.artist_id = ? or t.artist = ? collate nocase) "
+            "order by (select coalesce(sum(play_count), 0) from stat s where s.id = t.id) desc, random() limit ?",
             (seed["id"], seed["artist_id"], seed["artist"], count))]
 
     def from_plays(self, db, seed, count: int) -> list[str]:
@@ -154,13 +154,13 @@ class Recommender:
         if missing <= 0:
             return
         if playlist["radio"] == 2:
-            seed_ids = [r[0] for r in db.execute("select id from stat where played is not null order by played desc limit 3")]
+            seed_ids = [r[0] for r in db.execute("select id from stat where user = ? and played is not null order by played desc limit 3", (playlist["owner"],))]
         else:
             seed_ids = list(reversed(entries[max(0, played_pos - 2):played_pos + 1])) or entries[:3]
         seeds = [r for id in seed_ids if (r := db.execute("select * from track where id = ?", (id,)).fetchone())]
         if not seeds:
             return
-        skip = set(entries) | {r[0] for r in db.execute("select id from stat where played is not null order by played desc limit ?", (RECENT,))}
+        skip = set(entries) | {r[0] for r in db.execute("select id from stat where user = ? and played is not null order by played desc limit ?", (playlist["owner"], RECENT))}
         added = []
         for seed in seeds:
             for id in self.similar(db, seed, AHEAD + 20, deep=True):

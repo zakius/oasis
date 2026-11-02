@@ -131,3 +131,22 @@ def test_get_user_reports_lastfm_forwarding(client):
     db.execute("update user set lastfm_session = 'sk' where name = 'admin'")
     db.commit()
     assert call(client, "getUser")["user"]["scrobblingEnabled"] is True
+
+
+def test_stars_ratings_and_plays_are_each_users(client):
+    call(client, "createUser", username="bob", password="pw")
+    song = call(client, "getRandomSongs", size=1)["randomSongs"]["song"][0]
+    album_id = song["albumId"]
+    call(client, "star", id=song["id"], albumId=album_id)
+    call(client, "setRating", id=song["id"], rating=4)
+    call(client, "scrobble", id=song["id"])
+    mine, bobs = call(client, "getSong", id=song["id"])["song"], call(client, "getSong", id=song["id"], u="bob", p="pw")["song"]
+    assert mine["starred"] and mine["userRating"] == 4 and mine["playCount"] == 1
+    assert "starred" not in bobs and "userRating" not in bobs and bobs["playCount"] == 0
+    assert call(client, "getStarred2", u="bob", p="pw")["starred2"] == {"artist": [], "album": [], "song": []}
+    assert [a["id"] for a in call(client, "getStarred2")["starred2"]["album"]] == [album_id]
+    call(client, "star", albumId=album_id, u="bob", p="pw")
+    call(client, "unstar", albumId=album_id)
+    db = client.app.state.api._db()
+    assert [tuple(r) for r in db.execute("select user, kind, ref from wanted")] == [("bob", "album", album_id)]  # acquisition wants bob's star
+    assert [a["id"] for a in call(client, "getStarred2", u="bob", p="pw")["starred2"]["album"]] == [album_id]

@@ -39,7 +39,7 @@ def client_for(tmp_path, **settings):
     # Seen before MusicBrainz said whose name it is: a starred stream under the English spelling.
     remember(db, {"id": "yt-v1", "source": "ytm", "ref": "v1", "title": "Lemon", "artist": "Kenshi Yonezu", "album_artist": "Kenshi Yonezu",
                   "album": "Lemon", "artist_id": make_id("ar-", "Kenshi Yonezu"), "album_id": make_id("al-", "Kenshi Yonezu", "Lemon"), "duration": 250})
-    db.execute("insert into stat(id, starred) values (?, 1)", (make_id("ar-", "Kenshi Yonezu"),))
+    db.execute("insert into stat(user, id, starred) values ('admin', ?, 1)", (make_id("ar-", "Kenshi Yonezu"),))
     return TestClient(create_app(config, background=False, services={}))
 
 

@@ -49,10 +49,11 @@ create table if not exists artist_link(  -- separate artists close to each other
 );
 create index if not exists artist_link_other on artist_link(other_id);
 create table if not exists setting(key text primary key, value text);  -- settings made on the dashboard
-create table if not exists stat(
-    id text primary key,            -- any track, album or artist id
-    starred real, rating int, play_count int not null default 0, played real
+create table if not exists stat(  -- each user's stars, ratings and plays, as Subsonic keeps them
+    user text not null, id text not null,  -- id: any track, album or artist id
+    starred real, rating int, play_count int not null default 0, played real, primary key(user, id)
 );
+create index if not exists stat_id on stat(id);
 create table if not exists playlist(
     id integer primary key, name text not null, owner text not null, comment text,
     created real not null, changed real not null,
@@ -216,10 +217,12 @@ def connect(path: Path) -> sqlite3.Connection:
     db.row_factory = sqlite3.Row
     db.execute("pragma journal_mode=wal")
     db.execute("pragma foreign_keys=on")
+    db.create_function("me", 0, lambda: None, deterministic=True)  # the user a request is for: api.py sets it, nobody elsewhere
     if path not in migrated:
         rename(db)
         db.executescript(SCHEMA)
         migrate(db)
+        own_stats(db)
         db.execute("create index if not exists track_release on track(mb_release)")  # on columns migrate may add
         db.execute("create index if not exists track_group on track(mb_release_group)")
         # One radio that follows all listening per user (recommend.played): a race once made two; the extra stays as a plain radio.
@@ -235,6 +238,19 @@ def rename(db: sqlite3.Connection):
     if "lidarr_item" in tables and "want_item" not in tables:  # named from when Lidarr kept the stars and follows
         db.execute("alter table lidarr_item rename to want_item")
         db.execute("alter table want_item drop column lidarr_id")
+    if "stat" in tables and "user" not in {row[1] for row in db.execute("pragma table_info(stat)")}:  # from when stats were global
+        db.execute("alter table stat rename to stat_global")
+
+
+def own_stats(db: sqlite3.Connection):
+    """Stars, ratings and plays from when they were global go to every admin, or every user when there is no admin,
+    so whoever had them keeps them; with no users yet they wait in stat_global."""
+    if not db.execute("select 1 from sqlite_master where name = 'stat_global'").fetchone():
+        return
+    users = [r[0] for r in db.execute("select name from user where admin = 1")] or [r[0] for r in db.execute("select name from user")]
+    if users:
+        db.executemany("insert or ignore into stat select ?, id, starred, rating, play_count, played from stat_global", [(u,) for u in users])
+        db.execute("drop table stat_global")
 
 
 def migrate(db: sqlite3.Connection):
@@ -286,9 +302,9 @@ def move_track(db, old: str, new: str):
 
 
 def move_stat(db, old: str, new: str):
-    """Stars, ratings and plays of one id added to another's."""
-    db.execute("insert into stat(id, starred, rating, play_count, played) select ?, starred, rating, play_count, played "
-               "from stat where id = ? on conflict(id) do update set starred = coalesce(stat.starred, excluded.starred), "
+    """Each user's stars, ratings and plays of one id added to their own of another."""
+    db.execute("insert into stat(user, id, starred, rating, play_count, played) select user, ?, starred, rating, play_count, played "
+               "from stat where id = ? on conflict(user, id) do update set starred = coalesce(stat.starred, excluded.starred), "
                "rating = coalesce(stat.rating, excluded.rating), play_count = stat.play_count + excluded.play_count, "
                "played = max(coalesce(stat.played, 0), coalesce(excluded.played, 0))", (new, old))
     db.execute("delete from stat where id = ?", (old,))

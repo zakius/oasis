@@ -53,7 +53,7 @@ def test_files_move_to_their_musicbrainz_names_and_keep_their_ids_and_stats(libr
     one = db.execute("select id from track where ref like '%Kiedy%'").fetchone()[0]
     two = db.execute("select id from track where ref like '%Niepotrzebny%'").fetchone()[0]
     old_one, old_two = str(root / "o.n.a/Modlishka (1995)/01 - Kiedy powiem sobie dość.flac"), str(root / "o.n.a/Modlishka (1995)/02 - Niepotrzebny.mp3")
-    db.execute("insert into stat(id, starred, play_count) values (?, 1, 3)", (one,))
+    db.execute("insert into stat(user, id, starred, play_count) values ('admin', ?, 1, 3)", (one,))
     db.execute("insert into audio_pair values (?, ?, 1, 2, 1)", sorted((old_one, old_two)))
     db.execute("insert into audio_shared values (?, ?, 2, 1)", (old_two, old_one))
     result = relocate.run(db, root, root / ".oasis-renames.tsv", apply=True)
