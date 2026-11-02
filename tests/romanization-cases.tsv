@@ -29,7 +29,7 @@ name	βίος		Bios
 name	Αθηνα		Athena
 name	Daft Punk		Daft Punk
 name	Beyoncé		Beyoncé
-name	米津玄師		Yonetsu Genshi
+name	米津玄師		Yonezu Kenshi
 name	椎名林檎		Shiina Ringo
 name	倖田來未		Kōda Kumi
 name	山﨑		Yamazaki
@@ -131,7 +131,9 @@ name	モーニング娘。'24		Mōningu Musume.'24
 name	晴天	周杰倫	Qíng Tiān
 name	晴天	周杰倫|あいみょん	Seiten
 name	紅蓮華	LiSA|紅蓮華 (ぐれんげ)	Gurenka
-name	米津玄師	Lemon	Yonetsu Genshi
+name	米津玄師	Lemon	Yonezu Kenshi
+name	幾田りら		Ikuta Rira
+name	椎名もた		Shiina Mota
 name	田馥甄	小幸运	Tián Fù Zhēn
 title	スピカ - Spica		Spica
 title	アイドル - Idol		Idol
@@ -271,8 +273,9 @@ parts	大|き|い		Ō|ki|i
 parts	学校|へ|行こう		Gakkō| e| ikō
 parts	キ|ミ|と|ボ|ク		Ki|mi| to| bo|ku
 parts	ハロー| |グッバイ		Harō| |gubbai
-parts	你|好	周杰倫	Nǐ|hǎo
-parts	晴|天	周杰倫	Qíng|tiān
+parts	你|好	周杰倫	Nǐ| hǎo
+parts	晴|天	周杰倫	Qíng| tiān
+parts	故事|的|小|黄花	周杰倫	Gù shì| de| xiǎo| huáng huā
 pieces	君に、会いたい		君|に、|会いたい
 pieces	食べますか？		食べます|か？
 pieces	「夜に駆ける」 私は		「夜|に|駆ける」 |私|は

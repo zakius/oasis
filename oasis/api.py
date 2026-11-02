@@ -1103,14 +1103,14 @@ class Api:
         kinds = (p.get("kinds") or "main,pronunciation,translation").split(",")
         texts, siblings = [text for _, text in found.lines], [x for x in (r["artist"], r["album"]) if x]
         words = found.words if found.synced and found.words else [[] for _ in texts]
-        latin = romanize.lyrics(texts, siblings) if any(map(romanize.has_non_latin, texts)) else None
+        latin = romanize.lyrics(texts, siblings, found.lang) if any(map(romanize.has_non_latin, texts)) else None
         entries = [{**main, "kind": "main", **cue_lines(texts, words)}] if "main" in kinds or "pronunciation" in kinds and latin is None else []
         if latin and "pronunciation" in kinds:
             # A line with karaoke words reads as its words' romaji, each word keeping its timing (roma's romanizeLyrics).
-            word_latin = romanize.lyric_words(texts, [[w[2] for w in ws] for ws in words], siblings)
+            word_latin = romanize.lyric_words(texts, [[w[2] for w in ws] for ws in words], siblings, found.lang)
             latin = ["".join(wl).strip() if wl else l for l, wl in zip(latin, word_latin)]
             words = [[[a, b, t] for (a, b, _), t in zip(ws, wl)] for ws, wl in zip(words, word_latin)]
-            entries.append({**main, "kind": "pronunciation", "lang": romanize.language(texts, siblings) + "-Latn",
+            entries.append({**main, "kind": "pronunciation", "lang": romanize.language(texts, siblings, found.lang) + "-Latn",
                             "line": [clean({"start": start, "value": l}) for (start, _), l in zip(found.lines, latin)], **cue_lines(latin, words)})
         return {"lyricsList": clean({"structuredLyrics": entries or None})}
 

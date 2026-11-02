@@ -237,10 +237,38 @@ O_ROW = "オコソトノホモヨロゴゾドボポョォ"
 U_ROW = "ウクスツヌフムユルグズヅブプュゥ"
 
 
+# Names Sudachi reads wrong, by their tokens: the reading their MusicBrainz sort name gives (Yonezu, Kenshi).
+NAME_READINGS = {("米津", "玄師"): ("ヨネヅ", "ケンシ")}
+NAME_FRAGMENTS = {"助詞", "助動詞", "感動詞", "接尾辞"}
+
+
+def names(found: list[Token], title: bool) -> list[Token]:
+    """NAME_READINGS applied; in title case also kana after a surname that Sudachi split into function words and that
+    runs to the end of the name (幾田|り|ら, 椎名|も|た) made one given name, as a name has no grammar to split."""
+    out, i = [], 0
+    while i < len(found):
+        key = next((k for k in NAME_READINGS if tuple(t.surface for t in found[i:i + len(k)]) == k), None)
+        if key:
+            out += [t._replace(reading=r) for t, r in zip(found[i:i + len(key)], NAME_READINGS[key])]
+            i += len(key)
+            continue
+        out.append(found[i])
+        j = i + 1
+        while title and found[i].pos[3] == "姓" and j < len(found) and all(map(is_kana, found[j].surface)) and found[j].pos[0] in NAME_FRAGMENTS:
+            j += 1
+        if j - i > 2 and found[i + 1].pos[0] != "接尾辞" and (j == len(found) or not has_kana(found[j].surface) and not has_han(found[j].surface)):
+            run = found[i + 1:j]
+            out.append(Token("".join(t.surface for t in run), "".join(t.reading for t in run), ("名詞", "固有名詞", "人名", "名", "*", "*"), run[0].begin, run[-1].end))
+            i = j
+        else:
+            i += 1
+    return out
+
+
 def japanese(s: str, title: bool) -> list[tuple[str, str, str | None]]:
     """(surface, romaji with its leading space, reading) per token. In title case every word but a particle is
     capitalized."""
-    result, found = [], tokens(s)
+    result, found = [], names(tokens(s), title)
     prev_word, prev, sokuon, stray = False, None, False, False
     prev_close = False  # the previous token was closing punctuation (」, ）, ”): a word after it starts a new one
     for i, t in enumerate(found):
@@ -593,6 +621,10 @@ def parts(items: list[str], siblings=(), cyr_lang: str | None = None) -> list[st
     if not is_japanese(joined, siblings):
         lang = cyr_lang or cyrillic_language(joined)
         out = [raw(p, is_japanese(p, siblings), False, lang) if has_non_latin(p) else p for p in norm]
+        # Chinese words are one or two syllables apart ("gù shì de"); Hangul syllables join into their word.
+        for k in range(1, len(out)):
+            if out[k] and alnum(out[k][0]) and script(norm[k][0]) == U.HAN and (done := "".join(out[:k])) and alnum(done[-1]):
+                out[k] = " " + out[k]
     else:
         found, pos, last_part = [""] * len(norm), 0, len(norm) - 1
         for surface, romaji, reading in japanese(joined, False):
@@ -649,31 +681,39 @@ def pieces(line: str, siblings=()) -> list[str]:
     return out + [cur] if cur else out
 
 
-def lyrics(lines: list[str], siblings=()) -> list[str]:
+def lyrics(lines: list[str], siblings=(), lang: str | None = None) -> list[str]:
     """Lyric lines in sentence case. The language is decided once per song: kana in any line makes every line
     Japanese, else Chinese evidence in any line makes every Han line Chinese; the Cyrillic language comes from the whole
-    lyrics, unless a line has a letter that language lacks."""
-    sib, song = song_context(lines, siblings)
+    lyrics, unless a line has a letter that language lacks. lang is the song's language tag, if it has one."""
+    sib, song = song_context(lines, siblings, lang)
     return ["".join(parts(pieces(line, sib), sib, cyrillic_language_of_line(line, song))).strip() for line in lines]
 
 
-def song_context(lines: list[str], siblings=()) -> tuple[list[str], str]:
-    hint = next((t for t in lines if has_kana(t)), None) or next((t for t in lines if looks_chinese(t)), None)
+CHINESE_TAGS = ("zh", "zho", "chi", "cmn", "yue")
+CHINESE_HINT = "们"  # a simplified character outside JIS X 0208: Chinese evidence as a sibling
+
+
+def song_context(lines: list[str], siblings=(), lang: str | None = None) -> tuple[list[str], str]:
+    """Siblings plus a line that decides the song's Han reading: kana in any line, else Chinese evidence in any line,
+    else the song's language tag (lang: ISO 639, as lyrics carry it) when it is Chinese, for Han text no clue settles."""
+    chinese_tag = (lang or "").lower().split("-")[0] in CHINESE_TAGS
+    hint = (next((t for t in lines if has_kana(t)), None) or next((t for t in lines if looks_chinese(t)), None)
+            or (CHINESE_HINT if chinese_tag else None))
     return [*siblings, *([hint] if hint else [])], cyrillic_language("\n".join(lines))
 
 
-def lyric_words(lines: list[str], words: list[list[str]], siblings=()) -> list[list[str]]:
+def lyric_words(lines: list[str], words: list[list[str]], siblings=(), lang: str | None = None) -> list[list[str]]:
     """Each line's karaoke words romanized, one result per word (roma's wordLatin); [] for a line without words."""
-    sib, song = song_context(lines, siblings)
+    sib, song = song_context(lines, siblings, lang)
     return [parts(w, sib, cyrillic_language_of_line(line, song)) if w else [] for line, w in zip(lines, words)]
 
 
-def language(lines: list[str], siblings=()) -> str:
+def language(lines: list[str], siblings=(), lang: str | None = None) -> str:
     """The language lyrics are romanized from, as romanize.lyrics decides it: ja, zh, ko, el, a Cyrillic one or und."""
     text = "\n".join(lines)
     scripts = {script(c) for c in text}
     if has_kana(text) or U.HAN in scripts:
-        return "ja" if is_japanese(text, siblings) else "zh"
+        return "ja" if is_japanese(text, song_context(lines, siblings, lang)[0]) else "zh"
     if U.CYRILLIC in scripts:
         return cyrillic_language(text)
     return "ko" if U.HANGUL in scripts else "el" if U.GREEK in scripts else "und"

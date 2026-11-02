@@ -61,7 +61,7 @@ def test_both_adds_only_differing_fields(client):
     assert not latin_keys(found["One"]) and not latin_keys(found["Lemon"]) - {"artistLatin", "displayArtistLatin", "nameLatin"}
     index = call(client, "getArtists", romanization="both")["artists"]["index"]
     artists = {a["name"]: a for i in index for a in i["artist"]}
-    assert artists["米津玄師"]["nameLatin"] == "Yonetsu Genshi" and "nameLatin" not in artists["YOASOBI"]
+    assert artists["米津玄師"]["nameLatin"] == "Yonezu Kenshi" and "nameLatin" not in artists["YOASOBI"]
     album = call(client, "getAlbum", id=yoru["albumId"], romanization="both")["album"]
     assert "nameLatin" not in album and album["song"][0]["titleLatin"] == "Yoru ni Kakeru"
     album = call(client, "getAlbum", id=found["晴天"]["albumId"], romanization="both")["album"]
@@ -71,10 +71,10 @@ def test_both_adds_only_differing_fields(client):
 def test_latin_replaces_names(client, tmp_path):
     found = songs(client, romanization="latin")
     assert "Yoru ni Kakeru" in found and "Qíng Tiān" in found and not latin_keys(found)
-    assert found["Lemon"]["artist"] == "Yonetsu Genshi"
+    assert found["Lemon"]["artist"] == "Yonezu Kenshi"
     index = call(client, "getArtists", romanization="latin")["artists"]["index"]
     assert {i["name"]: [a["name"] for a in i["artist"]] for i in index} == \
-        {"B": ["Beta"], "Y": ["YOASOBI", "Yonetsu Genshi"], "Z": ["Zhōu Jié Lún"]}
+        {"B": ["Beta"], "Y": ["YOASOBI", "Yonezu Kenshi"], "Z": ["Zhōu Jié Lún"]}
     album = call(client, "getAlbum", id=found["Qíng Tiān"]["albumId"], romanization="latin")["album"]
     assert album["name"] == album["title"] == album["album"] == "Yè Huì Měi"
 
@@ -149,3 +149,14 @@ def test_lyrics_cue_lines(karaoke):
         for l in entry["cueLine"]:
             assert all(l["value"].encode()[c["byteStart"]:c["byteEnd"] + 1].decode() == c["value"] for c in l["cue"])
     assert "cueLine" in lyrics(enhanced="true", kinds="pronunciation")[0]
+
+
+def test_chinese_karaoke_words_by_language_tag(tmp_path):
+    root = tmp_path / "lib"
+    make_track(root / "a/1.flac", title="声音", artist="X", album="Y", language="zho")
+    (root / "a/1.lrc").write_text("[00:01.00]<00:01.00>声音<00:01.50>小<00:02.00>黄花\n")
+    with make_client(root, tmp_path / "oasis.db") as c:
+        id = songs(c)["声音"]["id"]
+        pronunciation = call(c, "getLyricsBySongId", id=id, enhanced="true")["lyricsList"]["structuredLyrics"][1]
+    assert pronunciation["lang"] == "zh-Latn" and pronunciation["line"][0]["value"] == "Shēng yīn xiǎo huáng huā"
+    assert [cue["value"] for cue in pronunciation["cueLine"][0]["cue"]] == ["Shēng yīn", " xiǎo", " huáng huā"]

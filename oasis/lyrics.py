@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import mutagen
@@ -34,6 +34,7 @@ class Lyrics:
     synced: bool
     word_level: bool = False
     words: list[list[list]] | None = None
+    lang: str | None = None  # a file's language tag for its lyrics (ISO 639: "jpn", "zho"); providers give none
 
     def text(self) -> str:
         return "\n".join(text for _, text in self.lines)
@@ -100,19 +101,22 @@ def parse(text: str, source: str = "file") -> Lyrics:
 
 
 def local(path: str) -> Lyrics | None:
-    """Lyrics from a sidecar .lrc file, synced ID3 SYLT, or embedded lyrics tags."""
+    """Lyrics from a sidecar .lrc file, synced ID3 SYLT, or embedded lyrics tags. Their language is the file's language
+    tag (ID3 TLAN, Vorbis LANGUAGE: Picard writes the release's), else the ID3 lyrics frame's, often a default "eng"."""
     sidecar = Path(path).with_suffix(".lrc")
-    if sidecar.exists():
-        return parse(sidecar.read_text(errors="replace"))
     tags = getattr(mutagen.File(path), "tags", None) or {}
+    language = tags.get("TLAN") or tags.get("language")
+    lang = str(language[0]) if language else None
+    if sidecar.exists():
+        return replace(parse(sidecar.read_text(errors="replace")), lang=lang)
     for key in tags.keys():
         if key.startswith("SYLT") and tags[key].format == 2:  # timestamps in milliseconds
-            return Lyrics("file", [(start, text) for text, start in tags[key].text], True)
+            return Lyrics("file", [(start, text) for text, start in tags[key].text], True, lang=lang or tags[key].lang)
     for key in tags.keys():
         if key.startswith("USLT"):
-            return parse(tags[key].text)
+            return replace(parse(tags[key].text), lang=lang or tags[key].lang)
         if key.lower() in ("lyrics", "unsyncedlyrics", "©lyr"):
-            return parse(str(tags[key][0]))
+            return replace(parse(str(tags[key][0])), lang=lang)
     return None
 
 

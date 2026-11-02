@@ -27,3 +27,11 @@ def test_latin_needs_no_romanizing():
     assert romanize.is_latin("you to the monster （Yeah）", romanize.text("you to the monster （Yeah）"))
     assert romanize.is_latin("ＬＯＶＥ", "LOVE")
     assert not romanize.is_latin("君の声", romanize.text("君の声"))
+
+
+def test_language_tag_reads_han_as_chinese_when_the_text_cannot_tell():
+    assert romanize.lyrics(["声音"]) == ["Kowane"] and romanize.language(["声音"]) == "ja"
+    assert romanize.lyrics(["声音"], lang="zho") == ["Shēng yīn"] and romanize.language(["声音"], lang="zh-Hans") == "zh"
+    assert romanize.lyric_words(["声音"], [["声", "音"]], lang="chi") == [["Shēng", " yīn"]]
+    assert romanize.lyrics(["声音", "こころ"], lang="zho") == ["Kowane", "Kokoro"]  # kana outweighs the tag
+    assert romanize.lyrics(["声音"], lang="eng") == ["Kowane"]
