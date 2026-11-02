@@ -1104,6 +1104,12 @@ class Api:
         return {}
 
     def _lyrics(self, db, r) -> lyrics.Lyrics | None:
+        """The song's lines, with the translations a file or provider merged into them taken out (lyrics.separate):
+        files, and lyrics cached before oasis did that, still have them in."""
+        found = self._found_lyrics(db, r)
+        return lyrics.separate(found) if found else None
+
+    def _found_lyrics(self, db, r) -> lyrics.Lyrics | None:
         """The track's own lyrics first; otherwise the providers' pick, cached (misses for a day)."""
         if r["source"] == "local" and (found := lyrics.local(r["ref"])):
             return found
@@ -1132,8 +1138,8 @@ class Api:
                 "line": [clean({"start": start, "value": text}) for start, text in found.lines]}
         if p.get("enhanced") != "true":
             return {"lyricsList": {"structuredLyrics": [main]}}
-        # songLyrics v2, with the romanization extension's kinds. oasis keeps no word timing (so no cueLine) and no
-        # translations; lyrics already in Latin script have no pronunciation, and main stands in for one.
+        # songLyrics v2, with the romanization extension's kinds: main is the song's own lines, pronunciation their
+        # reading (none for lyrics in Latin script, where main stands in), translation the providers' translations.
         kinds = (p.get("kinds") or "main,pronunciation,translation").split(",")
         texts, siblings = [text for _, text in found.lines], [x for x in (r["artist"], r["album"]) if x]
         words = found.words if found.synced and found.words else [[] for _ in texts]
@@ -1146,6 +1152,9 @@ class Api:
             words = [[[a, b, t] for (a, b, _), t in zip(ws, wl)] for ws, wl in zip(words, word_latin)]
             entries.append({**main, "kind": "pronunciation", "lang": romanize.language(texts, siblings, found.lang) + "-Latn",
                             "line": [clean({"start": start, "value": l}) for (start, _), l in zip(found.lines, readings)], **cue_lines(readings, words)})
+        if "translation" in kinds:  # one line per main line, "" where the provider has none
+            entries += [{**main, "kind": "translation", "lang": lang, "line": [{**clean({"start": start}), "value": v} for (start, _), v in zip(found.lines, values)]}
+                        for lang, values in (found.translations or {}).items()]
         return {"lyricsList": clean({"structuredLyrics": entries or None})}
 
     def getLyrics(self, db, p, user):

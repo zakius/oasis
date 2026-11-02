@@ -60,6 +60,19 @@ Alignment, so clients can pair the layers: the `pronunciation` (and `translation
 lines as its `main` entry, in the same order, with the same `start` times when synced; its cues fall inside the
 matching main line's time span. If a server breaks this and the counts differ, clients pair by line index.
 
+Translations: Chinese providers (NetEase, KuGou, QQ through LyricsPlus) and some LRCLIB uploads put a translation
+under each line, with the line's start time. oasis takes such lines out of the lyrics:
+
+- A line with the same start as the line before, written in a script other than both that line's and the song's, is
+  a translation of that line. A backing line in the song's own script stays.
+- Latin lines that read as their line (romaji, pinyin) are dropped, as `pronunciation` gives oasis's own reading.
+- NetEase's separate translation (`tlyric`) and a KuGou KRC file's `[language:]` translation are translations too.
+
+Each one becomes a `translation` entry with `lang` from its script: `zh` for Han without kana, `ja`, `ko`, `en` for
+Latin, a Cyrillic language, `el`, `ar`, `he`, `th`, `hi`, else `und`. It has one line per `main` line, in order, with
+the same `start`; `value` is `""` where the provider has no translation for that line. With songLyrics v1 (no
+`enhanced=true`), `getLyrics` and `kinds` without `translation`, clients get the song's lines only.
+
 `offset` has the OpenSubsonic meaning: positive shows the lyrics sooner, so a line displays at `start - offset`.
 oasis applies an LRC file's `[offset:]` tag to the start times and always sends `offset: 0`.
 
@@ -79,7 +92,8 @@ Servers that don't know `kinds` ignore it and send everything, which clients mus
   romanizer generates. It sends `cueLine` on `main` and `pronunciation` for lines with karaoke words (enhanced LRC,
   NetEase, KuGou, LyricsPlus): a pronunciation line is its words' romaji joined, each word keeping the main word's
   timing, as roma's romanizeLyrics does. A romaji word that went to the word before is left out, so a pronunciation
-  line can have fewer cues than its main line. No `translation` entries yet.
+  line can have fewer cues than its main line. `translation` entries hold the translations providers send (see
+  Translations below); `main` is only the song's own lines, and only those are romanized.
 - roma (Subsonic app): with the extension, never downloads or asks for the Japanese dictionary; syncs its index
   with `romanization=both` so switching the display is instant; asks lyrics with `enhanced=true` and `kinds`
   matching the display. Without it, on-device romanization with the dictionary, as today.

@@ -11,11 +11,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import mutagen
+
+from . import romanize
+from .romanize import U
 
 log = logging.getLogger(__name__)
 
@@ -35,12 +39,101 @@ class Lyrics:
     word_level: bool = False
     words: list[list[list]] | None = None
     lang: str | None = None  # a file's language tag for its lyrics (ISO 639: "jpn", "zho"); providers give none
+    translations: dict[str, list[str]] | None = None  # language ("zh", "en") -> a translation of each line, "" for none
 
     def text(self) -> str:
         return "\n".join(text for _, text in self.lines)
 
     def subset(self, keep: list[int]) -> "Lyrics":
-        return Lyrics(self.source, [self.lines[i] for i in keep], self.synced, self.word_level, [self.words[i] for i in keep] if self.words else None)
+        return Lyrics(self.source, [self.lines[i] for i in keep], self.synced, self.word_level, [self.words[i] for i in keep] if self.words else None,
+                      self.lang, self.translations and {lang: [t[i] for i in keep] for lang, t in self.translations.items()})
+
+
+# Translations providers merge into the lyrics: a line with the same start as the line before, in another script
+
+FAMILIES = ((U.HAN, "han"), (U.HANGUL, "hangul"), (U.CYRILLIC, "cyrillic"), (U.GREEK, "greek"), (U.ARABIC, "arabic"), (U.HEBREW, "hebrew"),
+            (U.THAI, "thai"), (U.DEVANAGARI, "devanagari"))
+LANGS = {"kana": "ja", "han": "zh", "hangul": "ko", "greek": "el", "arabic": "ar", "hebrew": "he", "thai": "th", "devanagari": "hi", "latin": "en"}
+READING = 0.5  # Latin lines this like the generated reading of their lines are a reading, not a translation
+
+
+def family(text: str) -> str | None:
+    """A line's writing: kana (Japanese), han, hangul, cyrillic, ..., latin; None without letters."""
+    if romanize.has_kana(text):
+        return "kana"
+    scripts = {romanize.script(c) for c in text if c.isalpha()}
+    return next((name for code, name in FAMILIES if code in scripts), "latin" if scripts else None)
+
+
+def language_of(texts: list[str]) -> str:
+    """The language of a translation, from its writing: Chinese providers translate to Chinese, rarely to English."""
+    found = Counter(f for t in texts if (f := family(t))).most_common(1)
+    if not found:
+        return "und"
+    return romanize.cyrillic_language("\n".join(texts)) if found[0][0] == "cyrillic" else LANGS.get(found[0][0], "und")
+
+
+def separate(found: Lyrics) -> Lyrics:
+    """Takes out the translation lines a provider merged into the lyrics (NetEase, KuGou, QQ and LRCLIB uploads do),
+    each becoming the translation of the song's line it follows:
+    - a line with the same start as the line before, written in a script other than both that line's and the song's;
+    - a script that interleaves with the song's: its lines come one at a time after a line in another script (80% of
+      them), about as many as the song's own lines (60%), and the lyrics don't start with it.
+    Latin lines that read as the line they follow are a reading (romaji, pinyin) and go, as oasis makes its own."""
+    lines = found.lines
+    if len(lines) < 2:
+        return found
+    families = [family(text) for _, text in lines]
+    owner = {}  # a translation line -> the song's line it translates
+    # Same start as the line before
+    first = []  # each line's first line of its start time
+    for i, (start, _) in enumerate(lines):
+        first.append(first[-1] if found.synced and i and start is not None and start == lines[i - 1][0] else i)
+    later = [i for i in range(len(lines)) if first[i] != i]
+    song = Counter(families[i] for i in set(first) if families[i]).most_common(1)
+    song = song[0][0] if song else None
+    other = {families[i] for i in later if families[i] and families[i] not in (song, families[first[i]])}
+    owner |= {i: first[i] for i in later if families[i] in other}
+    # Interleaved: each line after a song line
+    worded = [i for i, f in enumerate(families) if f]
+    before = {i: worded[n - 1] for n, i in enumerate(worded) if n}
+    for f in {families[i] for i in worded} - {families[worded[0]] if worded else None}:
+        rows = [i for i in worded if families[i] == f]
+        after = [i for i in rows if i in before and families[before[i]] != f and i not in owner]
+        if len(rows) >= 2 and len(after) >= 0.8 * len(rows) and len(rows) >= 0.6 * (len(worded) - len(rows)):
+            owner |= {i: before[i] for i in after}
+            other.add(f)
+    if not owner:
+        return found
+    gone = set(owner) | {i for i in later if families[i] is None}  # empty lines under a translated one go with them
+    keep = [i for i in range(len(lines)) if i not in gone]
+    result = found.subset(keep)
+    translations = dict(result.translations or {})
+    for f in other:
+        rows = [i for i in owner if families[i] == f]
+        if f == "latin" and sum(similarity(romanize.text(lines[owner[i]][1]), lines[i][1]) for i in rows) / len(rows) >= READING:
+            continue  # a reading
+        by_line = {}
+        for i in sorted(rows):
+            by_line[owner[i]] = " ".join(x for x in (by_line.get(owner[i]), lines[i][1].strip()) if x)
+        translations.setdefault(language_of(list(by_line.values())), [by_line.get(i, "") for i in keep])
+    result.translations = translations or None
+    return result
+
+
+def attach(found: Lyrics, starts_texts: list[tuple[int, str]], near: int = 0) -> Lyrics:
+    """found with a provider's separate translation (start, text) rows as a translation, each on the line starting
+    within near ms of it."""
+    rows = [(start, text.strip()) for start, text in starts_texts if text.strip() and text.strip() != "//"]
+    if not rows or not found.synced:
+        return found
+    values = []
+    for start, _ in found.lines:
+        best = min(rows, key=lambda r: abs(r[0] - (start or 0)))
+        values.append(best[1] if abs(best[0] - (start or 0)) <= near else "")
+    if any(values):
+        found.translations = {**(found.translations or {}), language_of([v for v in values if v]): values}
+    return found
 
 
 def timed(source: str, rows: list, word_level: bool) -> Lyrics:
@@ -132,9 +225,11 @@ def cleaned(found: Lyrics, query: "Query") -> Lyrics:
     (KuGou starts with one): they aren't sung."""
     def unescape(text):
         return re.sub(r"\\(['\"])", r"\1", html.unescape(text))
+    found = separate(found)
     found = found.subset([i for i, (_, text) in enumerate(found.lines)
                           if not CREDIT.search(text) and not (i < 3 and " - " in text and same_title(text.split(" - ", 1)[1], query.title))])
     found.lines = [(start, unescape(text)) for start, text in found.lines]
+    found.translations = found.translations and {lang: [unescape(t) for t in values] for lang, values in found.translations.items()}
     found.words = found.words and [[[a, b, unescape(t)] for a, b, t in words] for words in found.words]
     return found
 
@@ -226,7 +321,27 @@ def parse_timed(text: str, word: re.Pattern, source: str, relative=False) -> Lyr
         base = int(head[1]) if relative else 0
         words = [[base + int(m[1]), base + int(m[1]) + int(m[2]), m[3]] for m in word.finditer(raw[head.end():]) if m[3]]
         rows.append((int(head[1]), "".join(w[2] for w in words).strip(), words))
-    return timed(source, rows, True) if rows else None
+    if not rows:
+        return None
+    found = timed(source, rows, True)
+    translation = krc_translation(text)
+    if translation and len(translation) == len(rows) and [r[0] for r in rows] == sorted(r[0] for r in rows) and any(translation):
+        found.translations = {language_of([t for t in translation if t]): translation}
+    return found
+
+
+def krc_translation(text: str) -> list[str] | None:
+    """A KRC file's translation, one per line: its [language:] block is base64 JSON whose type 1 content is the
+    translation (type 0 is a reading, which oasis makes itself)."""
+    if not (m := re.search(r"^\[language:([^\]]*)\]", text, re.M)) or not m[1].strip():
+        return None
+    try:
+        content = json.loads(base64.b64decode(m[1]))["content"]
+    except (ValueError, KeyError, TypeError) as e:
+        log.info("KRC language block unreadable: %s", e)
+        return None
+    found = next((c.get("lyricContent") for c in content if c.get("type") == 1), None)
+    return ["".join(x for x in line if x).strip() for line in found] if found else None
 
 
 YRC_WORD = re.compile(r"\((\d+),(\d+),\d+\)(.*?)(?=\(\d+,\d+,\d+\)|$)")
@@ -242,14 +357,16 @@ def netease(query: Query) -> Lyrics | None:
     if not song:
         return None
     lyric = json.loads(get(f"https://music.163.com/api/song/lyric?id={song['id']}&lv=-1&tv=-1&yv=-1", referer))
+    translation = (lyric.get("tlyric") or {}).get("lyric")  # LRC with the lrc's start times
+    translation = parse(translation).lines if translation else []
     if (yrc := (lyric.get("yrc") or {}).get("lyric")) and (timed := parse_timed(yrc, YRC_WORD, "NetEase")):
-        return timed
+        return attach(timed, translation, near=1000)  # word timing starts lines a little off the lrc's
     lrc = (lyric.get("lrc") or {}).get("lyric")
     if not lrc:
         return None
     result = parse(lrc, "NetEase")
     result = result.subset([i for i, (_, text) in enumerate(result.lines) if " : " not in text and "：" not in text])  # credits like "作词 : X"
-    return result if result.lines else None
+    return attach(result, translation) if result.lines else None
 
 
 KUGOU_KEY = bytes([64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105])

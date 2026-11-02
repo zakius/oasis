@@ -160,3 +160,20 @@ def test_chinese_karaoke_words_by_language_tag(tmp_path):
         pronunciation = call(c, "getLyricsBySongId", id=id, enhanced="true")["lyricsList"]["structuredLyrics"][1]
     assert pronunciation["lang"] == "zh-Latn" and pronunciation["line"][0]["value"] == "Shēng yīn xiǎo huáng huā"
     assert [cue["value"] for cue in pronunciation["cueLine"][0]["cue"]] == ["Shēng yīn", " xiǎo", " huáng huā"]
+
+
+def test_merged_translations_are_a_translation_entry_and_never_romanized(tmp_path):
+    root = tmp_path / "lib"
+    make_track(root / "a/1.flac", title="Faint", artist="Linkin Park", album="Meteora")
+    (root / "a/1.lrc").write_text("[00:01.00]I am a little bit of loneliness\n[00:01.00]我是一点点孤独\n[00:04.00]Don't turn your back on me\n")
+    with make_client(root, tmp_path / "oasis.db") as c:
+        id = songs(c)["Faint"]["id"]
+        lyrics = lambda **params: call(c, "getLyricsBySongId", id=id, **params)["lyricsList"]["structuredLyrics"]
+        plain = lyrics()
+        assert len(plain) == 1 and [l["value"] for l in plain[0]["line"]] == ["I am a little bit of loneliness", "Don't turn your back on me"]
+        main, translation = lyrics(enhanced="true")  # no pronunciation: the song is in Latin script
+        assert main == {**plain[0], "kind": "main"}
+        assert translation["kind"] == "translation" and translation["lang"] == "zh"
+        assert translation["line"] == [{"start": 1000, "value": "我是一点点孤独"}, {"start": 4000, "value": ""}]
+        assert [l["kind"] for l in lyrics(enhanced="true", kinds="main,pronunciation")] == ["main"]
+        assert call(c, "getLyrics", artist="Linkin Park", title="Faint")["lyrics"]["value"] == "I am a little bit of loneliness\nDon't turn your back on me"
