@@ -150,6 +150,7 @@ def test_radio_playlist_grows_as_it_is_played(api, client):
 def test_first_play_creates_a_radio_that_follows_listening(api, client):
     call(client, "scrobble", id=song_id(client, "One"))
     radio = next(p for p in call(client, "getPlaylists")["playlists"]["playlist"] if p["name"] == "Radio")
+    assert radio["readonly"] is True  # oasis keeps it, so clients show it as a list rather than an editable playlist
     db = api._db()
     api.recommender.top_up(db, db.execute("select * from playlist where id = ?", (radio["id"],)).fetchone())
     queued = entries(client, radio["id"])

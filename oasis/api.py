@@ -1235,7 +1235,7 @@ class Api:
         result = clean({
             "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": MIX_OWNER if r["mix"] else r["owner"], "public": False,
             "coverArt": f"pl-{r['id']}" if r["cover"] else None,
-            "readonly": True if r["mix"] else None,  # OpenSubsonic: clients offer no edits
+            "readonly": True if r["mix"] or r["radio"] else None,  # OpenSubsonic: clients offer no edits; oasis keeps mixes and radios
             "oasisMix": True if (r["mix"] or "").startswith("RDTMAK") else None, "youtubeId": r["mix"],
             "songCount": len(songs), "duration": sum(s.get("duration", 0) for s in songs),
             "created": iso(r["created"]), "changed": iso(r["changed"]),
