@@ -254,3 +254,18 @@ def test_search_for_artists_and_albums_alone_still_asks_youtube(client):
     found = call(client, "search3", query="gamma", songCount=0)["searchResult3"]
     assert [a["name"] for a in found["artist"]] == ["Gamma"] and [a["name"] for a in found["album"]] == ["Far Away"]
     assert not found.get("song")
+
+
+def test_one_automatic_radio_per_user_even_when_two_plays_race(tmp_path):
+    from oasis import db as oasis_db
+    path = tmp_path / "race.db"
+    db = oasis_db.connect(path)
+    db.execute("drop index one_radio")  # a database from before the index, where a race made two
+    for _ in range(2):
+        db.execute("insert into playlist(name, owner, created, changed, radio) values ('Radio', 'admin', 0, 0, 2)")
+    oasis_db.migrated.discard(path)
+    db = oasis_db.connect(path)
+    assert [tuple(r) for r in db.execute("select id, radio from playlist order by id")] == [(1, 2), (2, 1)]  # the extra stays, as a plain radio
+    # Both racing plays found no radio: the second insert is ignored.
+    db.execute("insert or ignore into playlist(name, owner, comment, created, changed, radio) values ('Radio', 'admin', '', 0, 0, 2)")
+    assert db.execute("select count(*) from playlist where radio = 2").fetchone()[0] == 1

@@ -135,8 +135,8 @@ class Recommender:
     def played(self, db, owner: str, track_ids: list[str]):
         """Moves radios past the played tracks and makes sure the owner has a radio that follows all listening."""
         if not db.execute("select 1 from playlist where owner = ? and radio = 2", (owner,)).fetchone():
-            now = time.time()
-            db.execute("insert into playlist(name, owner, comment, created, changed, radio) values (?, ?, ?, ?, ?, 2)",
+            now = time.time()  # or ignore: two plays at once both find none, and the index one_radio keeps one
+            db.execute("insert or ignore into playlist(name, owner, comment, created, changed, radio) values (?, ?, ?, ?, ?, 2)",
                        ("Radio", owner, "Grows from what you play", now, now))
         for id in track_ids:
             db.execute("update playlist set played_pos = max(played_pos, (select max(pos) from playlist_entry e "

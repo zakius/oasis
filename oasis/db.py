@@ -213,6 +213,9 @@ def connect(path: Path) -> sqlite3.Connection:
         migrate(db)
         db.execute("create index if not exists track_release on track(mb_release)")  # on columns migrate may add
         db.execute("create index if not exists track_group on track(mb_release_group)")
+        # One radio that follows all listening per user (recommend.played): a race once made two; the extra stays as a plain radio.
+        db.execute("update playlist set radio = 1 where radio = 2 and id not in (select min(id) from playlist where radio = 2 group by owner)")
+        db.execute("create unique index if not exists one_radio on playlist(owner) where radio = 2")
         migrated.add(path)
     return db
 
