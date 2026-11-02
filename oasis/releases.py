@@ -47,6 +47,7 @@ KEEP_ALIASES = 30 * 86400
 NATIVE_QUERIES = 2     # searches by the artist's names in other scripts
 OTHER_TITLE_QUERIES = 2  # searches by the album's other titles (romanised, translated)
 DISC = re.compile(r"^(?:cd|disc|disk)\s*(\d+)\b", re.I)  # a disc's folder inside its album's
+LEAD = re.compile(r"(\s*(\[[^]]*]|\([^)]*\)|\{[^}]*}|(19|20)\d\d)[\s\-–—_.:|/]*)*")  # years and bracketed tags opening a name
 YEAR = re.compile(r"^(19|20)\d\d$")
 IMAGES = ("jpg", "jpeg", "png", "webp", "gif")
 NUMBERS = {w: str(n) for n, w in enumerate("one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
@@ -55,6 +56,7 @@ ROMAN = re.compile(r"x{0,3}(ix|iv|v?i{0,3})")
 RELEASES = re.compile(r"\b(\d+) (releases|релиз)")  # '(126 Releases)': a bundle's own count
 BUNDLE_WORDS = {"singles", "anthology", "demo", "demos", "live", "bonustrack", "bonustracks", "deluxe", "expanded"}  # variants a discography holds besides the albums
 BUNDLE_SEEDERS = 3       # seeders an uncached bundle needs: it downloads whole, gigabytes, from them
+METADATA = 5            # magnets' metadata asked of TorBox per bundle search, best seeded first: each may take METADATA_WAIT (download.py)
 TORRENTS = 20            # .torrent files read through Prowlarr per bundle search for hashes, as many for file lists, best seeded first: each asks an indexer
 
 
@@ -83,6 +85,15 @@ def spans(tokens: list[str], phrase: list[str]) -> list[tuple[int, int]]:
                 found.append((i, j + 1))
                 break
     return found
+
+
+def leads(title: str, want: dict) -> list[tuple[int, int]]:
+    """Where the artist's names are in a release's name when one opens it: only years and bracketed tags ('[2010]',
+    '(Pol)') may come first, never another word ('Tab Hunter', 'Demon Hunter' aren't Hunter). The spans count in the
+    name's words, as spans()."""
+    tokens, lead = words(title), words(LEAD.match(title)[0])
+    found = [s for n in want["names"] for s in spans(tokens, words(n))]
+    return found if any(a == len(lead) for a, _ in found) else []
 
 
 def hits(pattern, text: str) -> set[str]:
@@ -259,10 +270,9 @@ def find(prowlarr, want: dict, blocked: set, cached, unreliable: frozenset = fro
 
 
 def is_bundle(release: dict, want: dict) -> bool:
-    """A discography or bundle of the artist: its name says so, or holds two of the artist's album titles.
+    """A discography or bundle of the artist, whose name opens it (leads): its name says so, or holds two of the artist's album titles.
     want: artist, names, native, albums (the artist's album and EP titles)."""
-    tokens = words(release["title"])
-    artists = [s for n in want["names"] for s in spans(tokens, words(n))]
+    tokens, artists = words(release["title"]), leads(release["title"], want)
     if not artists or VIDEO.search(" ".join(tokens)):
         return False
     names = {"".join(words(n)) for n in want["names"]}
@@ -448,9 +458,8 @@ def expected(release: dict, want: dict, groups: list[dict], wanted: set[str]) ->
     collection, the albums and EPs of the years it spans (all without years), and singles too when it counts more
     releases than the artist has albums and EPs; a singles collection, the singles. None when the artist doesn't open
     the name ('Mike Shinoda (from Linkin Park) - Discography') or it is a variant (instrumentals, a tribute)."""
-    tokens = words(release["title"])
-    artists = [s for n in want["names"] for s in spans(tokens, words(n))]
-    if not artists or min(a for a, _ in artists) > 1 or hits(VARIANTS, " ".join(tokens)) - BUNDLE_WORDS:
+    tokens, artists = words(release["title"]), leads(release["title"], want)
+    if not artists or hits(VARIANTS, " ".join(tokens)) - BUNDLE_WORDS:
         return set()
     names = {"".join(words(n)) for n in want["names"]}
     found = {g["id"] for g in groups if g["id"] in wanted and len(j := "".join(words(g["title"]))) >= 4 and j not in names
@@ -465,18 +474,20 @@ def expected(release: dict, want: dict, groups: list[dict], wanted: set[str]) ->
 
 
 def bundles(prowlarr, want: dict, groups: list[dict], wanted: set[str], blocked: set, cached_files, editions, uncached: bool = False,
-            slow: frozenset = frozenset(), torrent=lambda release: None) -> list[tuple[dict, dict | None, set[str]]]:
+            slow: frozenset = frozenset(), torrent=lambda release: None, metadata=lambda release: []) -> list[tuple[dict, dict | None, set[str]]]:
     """The artist's bundles that hold wanted release groups, best first, each with its targets when TorBox's file list
     gives them (to fetch only theirs), else None (resolve, in download.py, reads them once TorBox has it), and the
     groups it holds or likely holds. What it holds is read from a file list: TorBox's when it has it cached file by
     file (it lists a cached torrent of 100 files or more as one zip), else the .torrent's through Prowlarr
     (torrent(release): {hash, files}, or None for a magnet link), which also gives the hash of a release listed without;
-    else its name tells (expected). Cached ones come first: they download at once. With uncached, while slots are free,
+    else, for a magnet link, the metadata TorBox fetches from its peers (metadata(release): files, [] when none arrives:
+    no live peers; METADATA a search). Only a cached one, which TorBox lists as one archive, goes by its name (expected):
+    an uncached one with no file list isn't sent. Cached ones come first: they download at once. With uncached, while slots are free,
     those with BUNDLE_SEEDERS follow: they download whole and hold a slot for long. Then known before likely, the most
     groups, quality and seeders; slow ones (see rank) last."""
     found = unique([r for q in bundle_queries(want) for r in prowlarr.search(q)], lambda r: hash_of(r) or r["guid"])
     candidates = sorted((r for r in found if not {hash_of(r), r.get("guid")} & blocked and is_bundle(r, want)), key=lambda r: r.get("seeders") or 0, reverse=True)
-    read, budget = {}, [TORRENTS]
+    read, budget, lookups = {}, [TORRENTS], [METADATA]
 
     def listing(r):  # the .torrent's hash and files, within the budget
         if not (budget[0] and r.get("downloadUrl")):
@@ -501,6 +512,11 @@ def bundles(prowlarr, want: dict, groups: list[dict], wanted: set[str], blocked:
         elif cached and music(listed[h], ARCHIVES) or not cached and seeded(r):
             if h not in read:
                 listing(r)
+            if not cached and not read.get(h) and lookups[0]:
+                lookups[0] -= 1
+                read[h] = metadata(r)
+            if not cached and not read.get(h):
+                continue  # downloading whole, it goes on what it holds, never on its name alone
             got, known = None, bool(read.get(h))
             holds = set(targets(read[h], want, groups, wanted, editions)) if known else expected(r, want, groups, wanted)
         else:

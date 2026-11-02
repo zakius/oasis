@@ -378,23 +378,26 @@ def test_uncached_bundles_come_after_cached_ones_and_only_while_slots_are_free()
                                                      result("Linkin Park - Complete [FLAC]", "cc", seeders=0), result("Linkin Park - Box Set [FLAC]", "dd", seeders=90)]})
     cached = lambda hashes: {"aa": DISCOGRAPHY}
     found = lambda **more: [(r["infoHash"], t and sorted(t)) for r, t, _ in releases.bundles(prowlarr, LP, LP_GROUPS, {"g-ht"}, set(), cached, editions, **more)]
-    assert found() == [("aa", ["g-ht"])]
-    assert found(uncached=True) == [("aa", ["g-ht"]), ("dd", None), ("bb", None)]  # lossless, then seeders; cc has no seeder
-    assert found(uncached=True, slow=frozenset({"dd"})) == [("aa", ["g-ht"]), ("bb", None), ("dd", None)]
+    assert found() == found(uncached=True) == [("aa", ["g-ht"])]  # uncached ones with no file list don't go by their names
+    looked = []
+    metadata = lambda r: looked.append(r["infoHash"]) or DISCOGRAPHY
+    assert found(uncached=True, metadata=metadata) == [("aa", ["g-ht"]), ("dd", None), ("bb", None)]  # lossless, then seeders; cc has no seeder
+    assert looked == ["dd", "bb"]
+    assert found(uncached=True, slow=frozenset({"dd"}), metadata=metadata) == [("aa", ["g-ht"]), ("bb", None), ("dd", None)]
 
 
 def test_an_uncached_bundles_albums_are_found_once_torbox_lists_its_files(downloads, torbox, db, tmp_path, monkeypatch):
     placed, downloads.own.place = {}, lambda folder, group: placed.setdefault(group, sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file()))
     monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
     downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
-    torbox.cached_files = lambda hashes: {}
+    torbox.cached_files, torbox.files = lambda hashes: {}, lambda hash, wait: DISCOGRAPHY  # the metadata TorBox fetches for the magnet
     db.executemany("insert into want_album(rg, artist_mbid, title, reason, state) values (?, 'mb-lp', ?, 'followed', 'missing')",
                    [("g-ht", "Hybrid Theory"), ("g-mtm", "Minutes to Midnight"), ("g-met", "Meteora")])
     downloads.crowded = True
     assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm"}) is None  # slots all needed: cached bundles only
     downloads.crowded = False
     assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm"})
-    # Till TorBox lists its files, the albums its name says it holds count as downloading.
+    # Till TorBox lists its files, the albums its metadata says it holds count as downloading.
     assert db.execute("select state, bundle is not null from download").fetchone()[:] == ("added", 1) and downloads.groups(db) == {"g-ht", "g-mtm"}
 
     torbox.list = [tb(71, "abcd", progress=0.5)]  # TorBox lists no files while it downloads
@@ -407,13 +410,13 @@ def test_an_uncached_bundles_albums_are_found_once_torbox_lists_its_files(downlo
     assert db.execute("select state, bundle from download").fetchone()[:] == ("done", None)
     assert placed == {"g-ht": ["01. Papercut.flac", "02. One Step Closer.flac", "03. In the End.flac", "cover.jpg"]}
 
-    # One that holds no wanted album fails and is blocked.
+    # One whose metadata shows no wanted album, or whose metadata doesn't arrive (no live peers), isn't sent: asked once.
     downloads.prowlarr.results["Linkin Park discography"][0].update(infoHash="bcde", magnetUrl="magnet:?xt=urn:btih:bcde")
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met"})
-    torbox.list = [finished(72, "bcde", ["LP/Meteora (2003)/01 Foreword.flac"], tmp_path)]  # a track short
-    downloads.cycle()
-    assert db.execute("select state, error from download where hash = 'bcde'").fetchone()[:] == ("failed", "the bundle holds no wanted album")
-    assert "bcde" in downloads.blocked(db) and 72 in torbox.deleted
+    asked, torbox.files = [], lambda hash, wait: asked.append(hash) or [{"name": "LP/Meteora (2003)/01 Foreword.flac", "size": 30e6}]  # a track short
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met"}) is None and downloads.bundle(db, LP, LP_GROUPS, {"g-met"}) is None and asked == ["bcde"]
+    downloads.prowlarr.results["Linkin Park discography"][0].update(infoHash="cdef", magnetUrl="magnet:?xt=urn:btih:cdef")
+    torbox.files = lambda hash, wait: (_ for _ in ()).throw(OSError("TorBox torrents/torrentinfo: 500 Could not download full metadata"))
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-oml"}) is None and len(torbox.added) == 1
 
 
 def test_a_bundles_disc_image_arrives_with_its_cue_sheet_for_the_importer_to_split(downloads, torbox, db, tmp_path, monkeypatch):
@@ -453,6 +456,26 @@ def test_a_torrents_files_are_read_with_their_folders():
     assert download.torrent_files(data) == [{"name": "LP/Meteora (2003)/01 Foreword.flac", "size": 7}, {"name": "LP/cover.jpg", "size": 7}]
     assert download.torrent_files(bencode({"info": {"name": "Album.zip", "length": 9}})) == [{"name": "Album.zip", "size": 9}]
     assert download.torrent_files(b"<html>") == []
+
+
+HUNTER = {"artist": "Hunter", "names": ["Hunter"], "native": [], "albums": ["Imperium", "Medeis", "Arachne", "Królestwo"]}
+HUNTER_GROUPS = [{"id": "g-med", "title": "Medeis", "first-release-date": "2003"}, {"id": "g-imp", "title": "Imperium", "first-release-date": "2013"},
+                 {"id": "g-ara", "title": "Arachne", "first-release-date": "2019"}]
+
+
+def test_a_bundle_is_the_artists_only_when_their_name_opens_it():
+    others = ["Ian Hunter (ex Mott the Hoople) - Discography 1975-2021 FLAC (Jamal The Moroccan",
+              "Blizzard Hunter - Discography (10 releases) - 2014 - 2026, MP3, 320 kbps", "Tab Hunter - Discography (9 Releases) - 1958-2023, MP3, 320 kbps",
+              "Bakuretsu Hunter OST I and Vocal Collection", "Demon Hunter - Discography - 2002-2025, (26 CD), FLAC (tracks+cue, tracks), lossless",
+              "Alberta Hunter (with Lucille Hegamin, Victoria Spivey and Lovie Austin) - Discography (16 albums) - 1961-2000, MP3, 64-320 kbps",
+              "Galaxy Hunter - Discography (17 Releases) - 2008-2022, MP3, 256-320 kbps", "Sonya Hunter - Discography 1991-2002 (6 releases), MP3, 192-320 kbps"]
+    wanted = {g["id"] for g in HUNTER_GROUPS}
+    for title in others:
+        assert not releases.is_bundle(result(title), HUNTER) and releases.expected(result(title), HUNTER, HUNTER_GROUPS, wanted) == set(), title
+    for title in ["Hunter (Poland) - Imperium + Medeis", "Hunter - Medeis + Imperium", "[FLAC] Hunter - Discography", "(Pol) Hunter - Discography",
+                  "2003-2019 - Hunter - Discography"]:
+        assert releases.is_bundle(result(title), HUNTER) and releases.expected(result(title), HUNTER, HUNTER_GROUPS, wanted), title
+    assert releases.expected(result("Hunter (Poland) - Imperium + Medeis"), HUNTER, HUNTER_GROUPS, wanted) == {"g-imp", "g-med"}
 
 
 def test_what_a_bundle_holds_is_guessed_from_its_name_when_no_file_list_tells():
@@ -508,14 +531,14 @@ def test_an_uncached_bundle_needs_seeders_holds_its_albums_while_it_downloads_an
     now = [time.time()]
     monkeypatch.setattr(time, "time", lambda: now[0])
     monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
-    torbox.cached_files = lambda hashes: {}
-    db.executemany("insert into want_album(rg, artist_mbid, title, reason, state) values (?, 'mb-lp', ?, 'followed', 'missing')", [("g-met", "Meteora"), ("g-mtm", "Minutes to Midnight")])
+    torbox.cached_files, torbox.files = lambda hashes: {}, lambda hash, wait: DISCOGRAPHY
+    db.executemany("insert into want_album(rg, artist_mbid, title, reason, state) values (?, 'mb-lp', ?, 'followed', 'missing')", [("g-oml", "One More Light"), ("g-mtm", "Minutes to Midnight")])
     db.execute("insert into bundle_search values ('mb-lp', ?)", (now[0],))
     offer = lambda seeders: [result("Linkin Park - Discography (2000-2010) [FLAC]", "abcd", seeders=seeders, magnetUrl="magnet:?xt=urn:btih:abcd")]
     downloads.prowlarr = Prowlarr({"Linkin Park discography": offer(releases.BUNDLE_SEEDERS - 1)})
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-mtm"}) is None and not torbox.added  # too few to fetch gigabytes from
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-oml", "g-mtm"}) is None and not torbox.added  # too few to fetch gigabytes from
     downloads.kept, downloads.prowlarr = {}, Prowlarr({"Linkin Park discography": offer(releases.BUNDLE_SEEDERS)})
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-mtm"}) and downloads.groups(db) == {"g-met", "g-mtm"}
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-oml", "g-mtm"}) and downloads.groups(db) == {"g-oml", "g-mtm"}
     torbox.list = [tb(71, "abcd", progress=0, seeds=0, peers=0)]
     downloads.cycle()
     now[0] += download.PATIENT + 60
