@@ -106,7 +106,8 @@ create table if not exists bundle_kept(  -- bundles oasis has had, to fetch albu
     hash text primary key, title text not null, artist_mbid text,
     files text not null,                    -- the torrent's files (JSON: [{name, size}])
     groups text not null,                   -- every release group its folders hold, wanted or not (JSON: {group: [paths]})
-    seen real not null                      -- when TorBox last had it cached
+    seen real not null,                     -- when TorBox last had it cached
+    tried text not null default '[]'        -- the groups fetched from it, imported or failed: never again from it (JSON)
 );
 create table if not exists bundle_search(artist_mbid text primary key, searched real not null);  -- see acquire.py
 create table if not exists mb_cache(url text primary key, body text not null, fetched real not null);  -- see musicbrainz.py

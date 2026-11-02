@@ -237,21 +237,22 @@ class Downloads:
 
     def remembered(self, db, wanted: set[str], label: str) -> bool | None:
         """Sends the remembered bundle (bundle_kept) that holds the most of these albums, when TorBox still has it
-        cached, to fetch only theirs; see send. One TorBox no longer has is forgotten: None when none went, and the
+        cached, to fetch only theirs; see send. Not for an album it was tried for already. One TorBox no longer has is forgotten: None when none went, and the
         albums are searched as usual."""
         avoid = self.blocked(db) | {r[0] for r in db.execute("select hash from download where state not in ('done', 'failed')")}
-        found = [(r["hash"], r["title"], held) for r in db.execute("select * from bundle_kept order by seen desc")
-                 if r["hash"] not in avoid and (held := {rg: f for rg, f in json.loads(r["groups"]).items() if rg in wanted})][:100]
+        found = [(r["hash"], r["title"], held) for r in db.execute("select * from bundle_kept order by seen desc") if r["hash"] not in avoid
+                 and (held := {rg: f for rg, f in json.loads(r["groups"]).items() if rg in wanted and rg not in json.loads(r["tried"])})][:100]
         listed = self.torbox().cached([h for h, _, _ in found]) if found else set()
         for hash, title, held in sorted(found, key=lambda k: len(k[2]), reverse=True):
             if hash not in listed:
                 db.execute("delete from bundle_kept where hash = ?", (hash,))
                 log.info("remembered bundle %s is no longer cached on TorBox: forgotten", title)
                 continue
-            db.execute("update bundle_kept set seen = ? where hash = ?", (time.time(), hash))
             release = {"title": title, "infoHash": hash, "magnetUrl": f"magnet:?xt=urn:btih:{hash}"}
             # Its remembered paths: TorBox lists the files of one of 100 or more as one zip till it is added.
             if (sent := self.send(db, [release], avoid, None, f"{label}: {len(held)} albums from a remembered bundle", held, kept=True)) is not None:
+                db.execute("update bundle_kept set seen = ?, tried = (select json_group_array(value) from (select value from json_each(tried) union "
+                           "select value from json_each(?))) where hash = ?", (time.time(), json.dumps(list(held)), hash))
                 return sent
         return None
 
@@ -268,8 +269,9 @@ class Downloads:
             db.execute("update bundle_kept set seen = ? where hash = ?", (time.time(), row["hash"]))
             return
         artist = db.execute(f"select artist_mbid from want_album where rg in ({','.join('?' * len(targets))}) and artist_mbid is not null", list(targets)).fetchone()
-        db.execute("insert or replace into bundle_kept values (?, ?, ?, ?, ?, ?)", (row["hash"], row["title"], artist and artist[0],
-                   json.dumps([{"name": f["name"], "size": f.get("size")} for f in files]), json.dumps(targets), time.time()))
+        tried = [rg for (rg,) in db.execute("select rg from download_target where hash = ?", (row["hash"],))]
+        db.execute("insert or replace into bundle_kept values (?, ?, ?, ?, ?, ?, ?)", (row["hash"], row["title"], artist and artist[0],
+                   json.dumps([{"name": f["name"], "size": f.get("size")} for f in files]), json.dumps(targets), time.time(), json.dumps(tried)))
         # The rest of its groups: a MusicBrainz lookup or more each, at one a second, so not in the downloads' poll.
         threading.Thread(target=self.map_kept, args=(row["hash"], row["title"], files, json.loads(row["catalogue"])), daemon=True).start()
 

@@ -702,6 +702,12 @@ def test_a_bundle_imported_is_remembered_and_later_albums_come_from_it_while_tor
     downloads.cycle()
     assert placed["g-oml"] == ["01 Nobody Can Save Me.flac", "02 Heavy.flac"] and db.execute("select count(*) from bundle_kept").fetchone()[0] == 1
 
+    # An album it was tried for already isn't fetched from it again: searched as usual.
+    db.execute("update download set state = 'done' where hash = 'abcd'")
+    added, asked = len(torbox.added), len(downloads.prowlarr.asked)
+    assert downloads.find(db, want("Hybrid Theory", "Linkin Park"), "g-ht") is None
+    assert len(torbox.added) == added and len(downloads.prowlarr.asked) > asked
+    assert json.loads(db.execute("select tried from bundle_kept").fetchone()[0]) == ["g-ht", "g-oml"]
     # TorBox no longer has it: it is forgotten and the album searched as usual.
     torbox.cached = torbox.cached_files = lambda hashes: {}
     downloads.find(db, want("Minutes to Midnight", "Linkin Park"), "g-mtm")
