@@ -1,5 +1,7 @@
 from urllib.parse import parse_qs
 
+import pytest
+
 from oasis.prowlarr import Prowlarr, music_categories
 
 
@@ -32,3 +34,10 @@ def test_search_asks_each_indexer_in_its_own_categories(monkeypatch):
     monkeypatch.setattr(Prowlarr, "call", call)
     assert len(Prowlarr("http://p", "k").search("Linkin Park")) == 2
     assert asked == {32: [3000], 35: [8000, 100003]}  # anime's tag and a paused indexer stay out
+
+
+def test_a_search_with_every_indexer_paused_or_disabled_fails(monkeypatch):
+    monkeypatch.setattr(Prowlarr, "call", lambda self, path: [{"indexerId": 32, "disabledTill": "9999"}] if path == "indexerstatus" else
+                        [BIGFAN, indexer(35, (3000, "Audio"), enable=False)] if path == "indexer" else [{"title": "x", "protocol": "torrent"}])
+    with pytest.raises(OSError, match="no music indexer"):
+        Prowlarr("http://p", "k").search("Linkin Park")

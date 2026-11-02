@@ -52,7 +52,7 @@ EARLY_GAP, BUNDLE_EARLY, SINGLE_EARLY = 5 * 60, 86400, 86400
 MAP_RELEASES = 20                    # files tagged with a release but no release group, looked up per pass
 CLIENT_STATES = {"missing": "wanted", "downloading": "downloading", "have": "have"}  # want_item's, which clients see
 RETRY_NO_MATCH = 1800     # seconds before looking an unmatched name up again
-RETRY_ERROR = 300         # seconds before retrying after MusicBrainz errors
+RETRY_ERROR = 300         # seconds before retrying after MusicBrainz or Prowlarr errors
 SEARCH_GAP = 60           # seconds between searches, so a burst of stars doesn't trip TorBox's rate limit
 MISS_GAP = 15             # seconds after a search that asked TorBox to add nothing: only Prowlarr had work
 RETRY_FULL = 600          # seconds before an album TorBox had no free slot for is searched again
@@ -433,7 +433,7 @@ class Acquire:
                          (time.time() - again,)).fetchone()
         if row is None:
             return False
-        mbid, sent, failed, started = row["artist_mbid"], None, False, time.time()
+        mbid, sent, failed, started = row["artist_mbid"], None, None, time.time()
         try:
             alternatives, queued = other_titles(db, mbid), self.downloads.groups(db)
             wanted = {rg for (rg,) in db.execute("select rg from want_album where artist_mbid = ? and state = 'missing'", (mbid,)) if rg not in queued}
@@ -445,24 +445,29 @@ class Acquire:
                                          groups, wanted)
         except (OSError, LookupError) as e:
             log.warning("bundle search for %s failed: %s", row["artist"], e)
-            failed = True
+            failed = e
         now = self.searched(started, sent, failed)
-        # One sent: the next pass, for the rest. TorBox had no free slot: soon again.
-        db.execute("insert or replace into bundle_search values (?, ?)", (mbid, now - BUNDLE_AGAIN if sent else now - BUNDLE_AGAIN + RETRY_FULL if sent is False else now))
+        # One sent: the next pass, for the rest. TorBox had no free slot, or Prowlarr or MusicBrainz failed: soon again.
+        db.execute("insert or replace into bundle_search values (?, ?)", (mbid, now - BUNDLE_AGAIN if sent else now - BUNDLE_AGAIN + RETRY_FULL if sent is False
+                                                                          else now - BUNDLE_AGAIN + RETRY_ERROR if isinstance(failed, OSError) else now))
         return True
 
     def search(self, db, row, early=False):
-        """Never raises: a search that fails still counts, so the next one moves on to another album. An early one
-        leaves the album's backoff (tries, next_search) as it was."""
-        error, failed, started = "searched, no release found yet", False, time.time()
+        """Never raises: a search Prowlarr or MusicBrainz couldn't answer (OSError) is due again after RETRY_ERROR, not
+        counted as a try; the next one moves on to another album meanwhile. An early one leaves the album's backoff
+        (tries, next_search) as it was."""
+        error, failed, started = "searched, no release found yet", None, time.time()
         try:
             sent = self.downloads.find(db, self.target(db, row), row["rg"])
         except (OSError, LookupError) as e:
             log.warning("search for %s - %s failed: %s", row["artist"], row["title"], e)
-            sent, error, failed = None, f"search failed: {e}"[:300], True
+            sent, error, failed = None, f"search failed: {e}"[:300], e
         now = self.searched(started, sent, failed)
         if early:
             db.execute("update want_album set searched = ?, error = ? where rg = ?", (now, None if sent else error, row["rg"]))
+            return
+        if isinstance(failed, OSError):  # unreachable, or no indexer to ask: not the album's fault
+            db.execute("update want_album set next_search = ?, error = ? where rg = ?", (now + RETRY_ERROR, error, row["rg"]))
             return
         if sent is False:  # TorBox had no free slot
             db.execute("update want_album set next_search = ? where rg = ?", (now + RETRY_FULL, row["rg"]))
@@ -471,7 +476,7 @@ class Acquire:
         db.execute("update want_album set searched = ?, tries = tries + 1, next_search = ?, error = ? where rg = ?",
                    (now, now + min(first * 2 ** row["tries"], most), None if sent else error, row["rg"]))
 
-    def searched(self, started: float, sent: bool | None, failed: bool) -> float:
+    def searched(self, started: float, sent: bool | None, failed: Exception | None) -> float:
         """Sets the gap to the next search: SEARCH_GAP after one that asked TorBox to add a torrent (or failed), for its
         rate limit; MISS_GAP after one that found nothing to add. Returns the time."""
         self.last_search = now = time.time()

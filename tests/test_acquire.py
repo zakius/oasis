@@ -73,6 +73,8 @@ class FakeDownloads:
             self.added = time.time()
         self.found.append(group)
         self.wants = getattr(self, "wants", []) + [want]
+        if isinstance(self.result, Exception):
+            raise self.result
         return self.result
 
     def bundle(self, db, want, groups, wanted):
@@ -195,6 +197,22 @@ def test_missing_albums_are_searched_in_order_and_again_ever_further_apart(clien
     assert wants(client)[db.execute("select title from want_album where rg = ?", (sent,)).fetchone()[0]][0] == "downloading"
     want = acq.downloads.wants[-1]
     assert want["artist"] == "Beta" and want["names"] == ["Beta"] and "Greatest Hits" in want["others"] and want["upgrade"] is False
+
+
+def test_a_search_prowlarr_couldnt_answer_is_due_again_soon_without_counting_as_a_try(client, mb, monkeypatch):
+    follow_beta(client, mb)
+    acq, db = client.app.state.api.library, client.app.state.api._db()
+    db.execute("update want_album set next_search = null, tries = 0")
+    acq.downloads.result, acq.last_search = OSError("Prowlarr: no music indexer enabled and unpaused"), 0
+    sync(client)
+    rg = acq.downloads.found[-1]
+    row = db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
+    assert (row["tries"], row["searched"], row["error"]) == (0, None, "search failed: Prowlarr: no music indexer enabled and unpaused")
+    assert row["next_search"] - time.time() == pytest.approx(acquire.RETRY_ERROR, abs=5)
+    acq.downloads.result, acq.last_search = LookupError("gone from MusicBrainz"), 0
+    db.execute("update want_album set next_search = 0 where rg = ?", (rg,))
+    sync(client)
+    assert db.execute("select tries from want_album where rg = ?", (acq.downloads.found[-1],)).fetchone()[0] == 1  # MusicBrainz doesn't have it: a try
 
 
 def test_after_a_search_that_added_nothing_to_torbox_the_next_may_start_sooner(client, mb, monkeypatch):

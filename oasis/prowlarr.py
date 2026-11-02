@@ -47,8 +47,10 @@ class Prowlarr:
 
     def search(self, query: str) -> list[dict]:
         """Torrents in each indexer's music categories (music_categories): title, size, seeders, infoHash, magnetUrl/downloadUrl (Prowlarr's proxy), guid, indexerId.
-        Each indexer is asked on its own, so a slow or broken one costs only its own results; OSError when all fail."""
-        ids = self.indexers()
+        Each indexer is asked on its own, so a slow or broken one costs only its own results; OSError when all fail, or
+        none is enabled and unpaused: a search that asked nobody found nothing."""
+        if not (ids := self.indexers()):
+            raise OSError("Prowlarr: no music indexer enabled and unpaused")
         ask = lambda i: self.call("search?" + urllib.parse.urlencode([("query", query), ("type", "search"), *(("categories", c) for c in ids[i]),
                                                                        ("limit", 100), ("indexerIds", i)])) or []
         found, errors = [], []
@@ -59,6 +61,6 @@ class Prowlarr:
                 except OSError as e:
                     log.info("Prowlarr indexer %s on %r: %s", i, query, " ".join(str(e).split())[:160])
                     errors.append(e)
-        if ids and len(errors) == len(ids):
+        if len(errors) == len(ids):
             raise errors[0]
         return found
