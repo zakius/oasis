@@ -42,9 +42,12 @@ Either:
   "artist", "artists"}]}` for uploads with no MusicBrainz release (single files go in as an album of one or more
   tracks; `album` may be empty for loose singles: each track then becomes its own single, so several singles go in
   one upload). `artists` is an array, preferred over the joined `artist`. `year` is a number; a numeric string is
-  accepted too. `albumArtist` may be absent when every track has an `artist` or `artists`.
+  accepted too. `albumArtist` may be absent when every track has an `artist` or `artists`. Names are strings without
+NUL characters (else 0). An artist or album name that leaves nothing once made a valid folder name, such as `..`,
+goes in as `Unknown Artist` or `Unknown Album`.
 
-With neither, error 10. An unknown `releaseId`, or a `disc` the release doesn't have, is error 70.
+With neither, error 10. An unknown `releaseId`, or a `disc` the release doesn't have, is error 70; a `disc` that
+isn't a number is 0.
 
 Response `upload`: `id`, `expires` (ISO 8601; each request about the upload moves it to 24 h later), `track[]` of
 the `disc`/`number` slots it expects.
@@ -61,7 +64,9 @@ Before resuming after any error, call `getUpload`: a file the server rejected (f
 An `offset` below `received` sends the file again from there; one above it is refused (0). A resumed file keeps its
 `suffix` and `size`; to change them, start again at offset 0. Bytes beyond `size` are refused and dropped.
 The server rejects a suffix it doesn't accept (0) and a file whose content isn't that format: checked once the last
-byte arrives, refused (0) and dropped, so `received` is 0 again.
+byte arrives, refused (0) and dropped, so `received` is 0 again. Also refused (0): a non-numeric `disc`, `number`,
+`offset` or `size`; a `size` over 4 GiB; a file the server's disk has no room for; and a request for a file that
+another request is still sending, or for an upload being committed.
 
 ### `getUpload`
 
@@ -69,17 +74,19 @@ Param `id`. Response `upload` as from `createUpload`, each `track` with `receive
 
 ### `uploadCover` (POST, optional)
 
-Query `uploadId`; body a JPEG or PNG (anything else is refused, 0). Without it the server uses the release's cover
+Query `uploadId`; body a JPEG or PNG of 50 MiB at most (anything else is refused, 0). Without it the server uses the release's cover
 from MusicBrainz / the Cover Art Archive; an upload with `tags` has none then. An album folder that already has a
 cover keeps it.
 
 ### `commitUpload`
 
 Param `uploadId`, optional `replace=true`.
-- Checks every expected track is complete and decodes. FLACs then go through the checks downloaded albums do: one
+- Checks every expected track is complete and decodes (`flac -t` for FLAC, a full ffmpeg decode without errors for
+  the rest). Refused (0) while a file of the upload is still being sent. FLACs then go through the checks downloaded albums do: one
   made from a lossy file is refused (0), and fake hi-res or badly compressed ones are converted or recompressed.
 - Tags each file (from MusicBrainz or `tags`), names and places it by the server's library scheme, adds cover
-  art, scans it in. Atomic: on any failure nothing is added and the upload stays for a retry.
+  art, scans it in. Atomic: on any failure nothing is added and the upload stays for a retry. Once the files are in,
+  the commit succeeds: a cover that can't be added is left out.
 - An album already in the library: refused with code 0, message "already in the library" and `"duplicate": true`
   in the error object (match on that, not the text), unless the upload is lossless
   and the library copy lossy, or `replace=true`. Already in the library means library tracks of the same album
@@ -124,3 +131,10 @@ Param `uploadId`. Deletes the upload and its files.
     target. Another disc of an album already there is accepted. Only the replaced tracks (same disc and number) are
     deleted; others, such as a deluxe edition's extra tracks, stay.
 13. With loose singles, `commitUpload` returns `albums` (each single) besides `album` (the first).
+14. Limits: a track has 4 GiB at most and must fit on the server's disk, a cover 50 MiB. One request at a time
+    sends a given file, none while the upload is committed, and a commit while a file is being sent is refused. An upload
+    with a request in progress is never deleted as abandoned.
+15. Tag names must be strings without NUL characters; non-numeric parameters are refused with 0. A name that cleans
+    to nothing becomes `Unknown Artist` or `Unknown Album`.
+16. Non-FLAC files must decode through ffmpeg without errors. A cover that can't be written after the files are
+    placed doesn't fail the commit.

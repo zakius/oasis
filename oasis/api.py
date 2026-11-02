@@ -1322,12 +1322,19 @@ class Api:
         self._admin(db, user)
         if not p.get("releaseId") and p.get("tags") is None:
             raise Fail(MISSING, "Required parameter 'releaseId' or 'tags' is missing")
-        return {"upload": self.uploads.create(db, user, p.get("releaseId"), p.int("disc", 1), p.get("tags"))}
+        try:
+            disc = p.int("disc", 1)
+        except ValueError:
+            raise Fail(0, "disc must be an integer") from None
+        return {"upload": self.uploads.create(db, user, p.get("releaseId"), disc, p.get("tags"))}
 
     def uploadTrack(self, db, p, user):
         self._admin(db, user)
-        return {"uploadTrack": {"received": self.uploads.receive(db, user, p.need("uploadId"), *(int(p.need(k)) for k in ("disc", "number", "offset", "size")),
-                                                                 p.need("suffix"), p.body)}}
+        try:
+            numbers = [int(p.need(k)) for k in ("disc", "number", "offset", "size")]
+        except ValueError:
+            raise Fail(0, "disc, number, offset and size must be integers") from None
+        return {"uploadTrack": {"received": self.uploads.receive(db, user, p.need("uploadId"), *numbers, p.need("suffix"), p.body)}}
 
     def getUpload(self, db, p, user):
         self._admin(db, user)

@@ -6,6 +6,7 @@ A disc image (one audio file and a cue sheet) is split into a file per track fir
 before anything is placed (see quality.py): fake hi-res becomes what it is, outliers are recompressed, and a FLAC made
 from a lossy file fails the import (LossySource), so another release is picked."""
 import fcntl
+import json
 import logging
 import os
 import re
@@ -37,7 +38,8 @@ NAMED_SLACK = 5, 0.1       # and by 10 % when the file has the track's title and
 SPLIT = ".oasis-split"     # a download's disc images, split, in <download>/.oasis-split/<image>/
 ARCHIVES = ("zip", "rar", "7z")
 UNPACKED = ".oasis-unpacked"  # a download's archives, unpacked, in <download>/.oasis-unpacked/<archive>/
-UNPACK_ROOM = 2            # free space an archive needs to unpack, in times its size: its music, then the library's copy
+UNPACK_ROOM = 2            # free space an archive needs to unpack, in times what it holds: its music, then the library's copy
+UNPACK_MOST = 20           # an archive holding more than this many times its size is a zip bomb: music hardly compresses
 LATER_PART = re.compile(r"\.part0*([2-9]|[1-9]\d+)\.rar$", re.I)  # a multi-volume RAR unpacks from its first part
 SIDE = re.compile(r"([A-H])(\d{0,2})[\s._-]+")  # a vinyl side's position opening a file's name: 'A Amerika', 'B2. Title'
 CUE_LINE = re.compile(r'\s*(FILE|TRACK|TITLE|INDEX)\s+(?:"(.*)"|(\S+))(?:\s+(\S+))?', re.I)
@@ -198,16 +200,33 @@ class NoSpace(OSError):
     """Too little disk space: the download waits for more, and its release isn't at fault."""
 
 
+def unpacked_size(archive: Path) -> int:
+    """The bytes an archive holds, as its listing says: ZIP's own, the rest's by lsar (unar's lister)."""
+    try:
+        if archive.suffix.lower() == ".zip":
+            with zipfile.ZipFile(archive) as z:
+                return sum(i.file_size for i in z.infolist())
+        listed = subprocess.run(["lsar", "-j", str(archive)], check=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=600)
+        return sum(e.get("XADFileSize", 0) for e in json.loads(listed.stdout)["lsarContents"])
+    except subprocess.CalledProcessError as e:
+        raise LookupError(f"can't list {archive.name}: {e.stderr.decode(errors='replace').strip()[-200:]}") from None
+    except (zipfile.BadZipFile, ValueError, KeyError, TypeError) as e:
+        raise LookupError(f"can't list {archive.name}: {e}") from None
+
+
 def unpack(folder: Path):
     """Unpacks the archives below folder (an album uploaded as one .zip or .rar, a discography as one .zip): ZIP itself,
-    the rest with unar. NoSpace when the disk hasn't UNPACK_ROOM for one."""
+    the rest with unar. NoSpace when the disk hasn't UNPACK_ROOM for what one holds; LookupError for a zip bomb. The
+    symbolic links an archive makes are deleted: they could point anywhere outside it."""
     for archive in sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower().lstrip(".") in ARCHIVES
                           and UNPACKED not in p.parts and not LATER_PART.search(p.name)):
         if (target := folder / UNPACKED / archive.stem).exists():
             continue
         size = sum(p.stat().st_size for p in archive.parent.iterdir() if p == archive or LATER_PART.search(p.name) and p.name.startswith(archive.name.split(".part")[0]))
-        if (free := shutil.disk_usage(folder).free) < UNPACK_ROOM * size:
-            raise NoSpace(f"too little disk space to unpack {archive.name}: {UNPACK_ROOM * size / 1e9:.1f} GB needed, {free / 1e9:.1f} GB free")
+        if (held := unpacked_size(archive)) > UNPACK_MOST * size:
+            raise LookupError(f"can't unpack {archive.name}: it holds {held / max(size, 1):.0f} times its size")
+        if (free := shutil.disk_usage(folder).free) < UNPACK_ROOM * held:
+            raise NoSpace(f"too little disk space to unpack {archive.name}: {UNPACK_ROOM * held / 1e9:.1f} GB needed, {free / 1e9:.1f} GB free")
         part = target.with_name(f"{target.name}.oasis-part")
         shutil.rmtree(part, ignore_errors=True)
         try:
@@ -221,6 +240,10 @@ def unpack(folder: Path):
             raise LookupError(f"can't unpack {archive.name}: {e.stderr.decode(errors='replace').strip()[-200:]}") from None
         except (zipfile.BadZipFile, RuntimeError, NotImplementedError) as e:  # RuntimeError: a password
             raise LookupError(f"can't unpack {archive.name}: {e}") from None
+        for top, dirs, files in os.walk(part):
+            for name in dirs + files:
+                if os.path.islink(link := os.path.join(top, name)):
+                    os.unlink(link)
         part.rename(target)
 
 
@@ -317,8 +340,9 @@ def clean(name: str) -> str:
 
 
 def album_folder(artist: str, year: str, title: str) -> Path:
-    """An album's folder in the library: "<artist>/<year> - <album>", or "<artist>/<album>" without a year."""
-    return Path(clean(artist), clean(f"{year} - {title}" if year else title))
+    """An album's folder in the library: "<artist>/<year> - <album>", or "<artist>/<album>" without a year. A name that
+    cleans to nothing (such as "..") is "Unknown Artist" or "Unknown Album", so the album never lands above its folder."""
+    return Path(clean(artist) or "Unknown Artist", clean(f"{year} - {title}" if year else title) or "Unknown Album")
 
 
 def release_folder(release: dict) -> Path:

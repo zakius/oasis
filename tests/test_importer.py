@@ -4,6 +4,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+from pathlib import Path
 
 import mutagen
 import pytest
@@ -289,21 +290,50 @@ def test_an_album_packed_in_a_zip_is_unpacked_and_imported(make, tmp_path, root)
     assert importer.LATER_PART.search("a.part2.rar") and not importer.LATER_PART.search("a.part01.rar")
 
 
-def test_an_archive_is_unpacked_only_with_twice_its_size_free(tmp_path, monkeypatch):
+def test_an_archive_is_unpacked_only_with_twice_what_it_holds_free(tmp_path, monkeypatch):
     import shutil
     import zipfile
     from types import SimpleNamespace
     with zipfile.ZipFile(tmp_path / "Discography.zip", "w") as z:
         z.writestr("First/01 One.flac", "x" * 100)
-    size, free = (tmp_path / "Discography.zip").stat().st_size, []
+    free = []
     monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=free[-1]))
-    free.append(importer.UNPACK_ROOM * size - 1)
+    free.append(importer.UNPACK_ROOM * 100 - 1)
     with pytest.raises(importer.NoSpace, match="too little disk space to unpack Discography.zip"):
         importer.unpack(tmp_path)
     assert not (tmp_path / importer.UNPACKED).exists()
-    free.append(importer.UNPACK_ROOM * size)
+    free.append(importer.UNPACK_ROOM * 100)
     importer.unpack(tmp_path)
     assert (tmp_path / importer.UNPACKED / "Discography/First/01 One.flac").read_text() == "x" * 100
+
+
+def test_a_zip_bomb_is_not_unpacked(tmp_path):
+    import zipfile
+    with zipfile.ZipFile(tmp_path / "Bomb.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("01 One.flac", bytes(10 << 20))
+    with pytest.raises(LookupError, match="can't unpack Bomb.zip: it holds .* times its size"):
+        importer.unpack(tmp_path)
+    assert not (tmp_path / importer.UNPACKED).exists()
+
+
+def test_a_rar_is_sized_by_its_listing_and_the_links_it_makes_are_deleted(tmp_path, monkeypatch):
+    (tmp_path / "Album.rar").write_bytes(b"x" * 100)
+    ran = []
+
+    def run(command, **kwargs):  # lsar lists it, unar unpacks a file and links out of the archive
+        ran.append(command[0])
+        if command[0] == "lsar":
+            return subprocess.CompletedProcess(command, 0, json.dumps({"lsarContents": [{"XADFileName": "01 One.flac", "XADFileSize": 100}, {"XADFileName": "x"}]}).encode())
+        out = Path(command[command.index("-o") + 1])
+        (out / "First").mkdir(parents=True)
+        (out / "First/01 One.flac").write_text("music")
+        (out / "First/passwd.flac").symlink_to("/etc/passwd")
+        (out / "etc").symlink_to("/etc")
+        return subprocess.CompletedProcess(command, 0, b"", b"")
+    monkeypatch.setattr(importer.subprocess, "run", run)
+    importer.unpack(tmp_path)
+    unpacked = tmp_path / importer.UNPACKED / "Album"
+    assert ran == ["lsar", "unar"] and sorted(str(p.relative_to(unpacked)) for p in unpacked.rglob("*")) == ["First", "First/01 One.flac"]
 
 
 def test_a_flac_made_from_a_lossy_file_fails_the_import_before_anything_is_placed(make, tmp_path, root):

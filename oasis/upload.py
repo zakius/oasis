@@ -6,6 +6,7 @@ in <database folder>/uploads/<id>/ until it is committed or cancelled, or KEEP a
 A commit is all or nothing: the files are tagged in a staging folder, the library files they replace are renamed
 aside, and a failure removes what was placed and puts those back. Only once all are in are the old ones deleted."""
 import json
+import logging
 import os
 import re
 import shutil
@@ -13,7 +14,7 @@ import subprocess
 import threading
 import time
 import uuid
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from urllib.parse import quote, quote_plus
 
@@ -29,7 +30,11 @@ from . import musicbrainz, quality
 from .db import make_id
 from .importer import AUDIO, KEEP_EDITIONS, Importer, album_folder, copy, joined, lossless, release_folder, tags_for, track_file, write
 
+log = logging.getLogger(__name__)
+
 KEEP = 86400  # seconds an upload stays after its last request
+MAX_TRACK = 4 << 30  # bytes a track's file may have: 24-bit/192 kHz FLAC of over an hour
+MAX_COVER = 50 << 20  # bytes a cover may have
 SUFFIXES = {"flac": (FLAC,), "opus": (OggOpus,), "mp3": (MP3,), "m4a": (MP4,), "ogg": (OggVorbis, OggOpus, OggFLAC)}
 DISC = "https://musicbrainz.org/ws/2/discid/{}?inc=artist-credits+recordings+labels&cdstubs=no&fmt=json"
 RELEASE = "https://musicbrainz.org/ws/2/release/{}?inc=media+recordings+artist-credits+labels+release-groups+isrcs&fmt=json"
@@ -50,10 +55,19 @@ def is_format(path: Path, suffix: str) -> bool:
 
 
 def decodes(path: Path) -> bool:
-    """flac -t for a FLAC when flac is installed, else whether mutagen reads it as its suffix says."""
+    """flac -t for a FLAC when flac is installed, else a decode by ffmpeg that reports no error; without ffmpeg, whether
+    mutagen reads it as its suffix says."""
     if path.suffix == ".flac" and shutil.which("flac"):
         return subprocess.run(["flac", "-t", "-s", str(path)], capture_output=True, timeout=600).returncode == 0
+    if shutil.which("ffmpeg"):
+        run = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-f", "null", "-"], capture_output=True, timeout=600)
+        return run.returncode == 0 and not run.stderr.strip()
     return is_format(path, path.suffix.lstrip("."))
+
+
+def text(value) -> bool:
+    """Whether a tag is absent or text a file name and tag can hold."""
+    return value is None or isinstance(value, str) and "\0" not in value
 
 
 def compact(d: dict) -> dict:
@@ -87,6 +101,22 @@ class Uploads:
     def __init__(self, connect, root: Path, folder: Path):
         self.connect, self.importer, self.folder = connect, Importer(connect, root), Path(folder)
         self.lock = threading.Lock()  # one commit at a time
+        self.busy, self.guard = set(), threading.Lock()  # (upload, a (disc, number), "cover" or "commit") in progress, guarded
+
+    @contextmanager
+    def holding(self, id: str, part):
+        """Holds one of an upload's files while its body arrives, or the whole upload while it is committed: a request
+        for a file held, or any while a commit is, is refused (a commit too while a file is held), and clean leaves the
+        upload alone."""
+        with self.guard:
+            if (id, part) in self.busy or (id, "commit") in self.busy or part == "commit" and any(b[0] == id for b in self.busy):
+                raise Refused("Another request is sending this file or committing the upload")
+            self.busy.add((id, part))
+        try:
+            yield
+        finally:
+            with self.guard:
+                self.busy.discard((id, part))
 
     def lookup(self, db, disc_id: str, toc: str | None) -> list[dict]:
         """MusicBrainz's releases with the disc, else (with the TOC) its fuzzy matches; exact matches first."""
@@ -119,8 +149,12 @@ class Uploads:
             try:
                 given = json.loads(tags)
                 slots = [(int(t.get("disc") or 1), int(t["number"])) for t in given["track"] if t["title"]]
-            except (ValueError, TypeError, KeyError):
+            except (ValueError, TypeError, KeyError, AttributeError):
                 raise Refused("tags must be a JSON object with track[] of disc, number and title")
+            names = [given.get(k) for k in ("album", "albumArtist", "genre")] + [v for t in given["track"] for v in (t["title"], t.get("artist"))]
+            if not all(map(text, names)) or not all(a is None or isinstance(a, list) and all(isinstance(x, str) and text(x) for x in a)
+                                                    for a in (t.get("artists") for t in given["track"])):
+                raise Refused("tags must be text without NUL characters")
             if not slots or len(set(slots)) < len(slots) or len(slots) < len(given["track"]):
                 raise Refused("tags must list each disc and number once, each with a title")
             if not (given.get("albumArtist") or all(t.get("artist") or t.get("artists") for t in given["track"])):
@@ -151,6 +185,10 @@ class Uploads:
         """Stores the body at offset of the track's file (an earlier offset sends again what follows it); returns the
         bytes stored. The whole file must be the format its suffix says, else it is dropped."""
         self.row(db, user, id)
+        with self.holding(id, (disc, number)):
+            return self.store_track(db, id, disc, number, offset, size, suffix, body)
+
+    def store_track(self, db, id: str, disc: int, number: int, offset: int, size: int, suffix: str, body) -> int:
         slot = db.execute("select * from upload_track where upload = ? and disc = ? and number = ?", (id, disc, number)).fetchone()
         if slot is None:
             raise Refused(f"The upload has no track {disc}-{number}", 70)
@@ -160,6 +198,11 @@ class Uploads:
             raise Refused(f"Offset {offset} isn't within the {slot['received']} bytes received")
         if offset and (suffix, size) != (slot["suffix"], slot["size"]):
             raise Refused("A resumed file keeps its suffix and size")
+        if size > MAX_TRACK:
+            raise Refused(f"A track may have {MAX_TRACK} bytes at most")
+        self.folder.mkdir(parents=True, exist_ok=True)
+        if (free := shutil.disk_usage(self.folder).free) < size - offset:
+            raise Refused(f"Too little disk space: {size - offset} bytes needed, {free} free")
         if slot["suffix"] and slot["suffix"] != suffix:
             (self.folder / id / f"{disc}-{number}.{slot['suffix']}").unlink(missing_ok=True)
         path, received = self.folder / id / f"{disc}-{number}.{suffix}", offset
@@ -177,6 +220,7 @@ class Uploads:
         finally:  # a client gone midway resumes from what arrived
             db.execute("update upload_track set suffix = ?, size = ?, received = ? where upload = ? and disc = ? and number = ?",
                        (suffix, size, received, id, disc, number))
+            db.execute("update upload set touched = ? where id = ?", (time.time(), id))
         if received == size and not is_format(path, suffix):
             path.unlink()
             db.execute("update upload_track set received = 0 where upload = ? and disc = ? and number = ?", (id, disc, number))
@@ -186,12 +230,20 @@ class Uploads:
     def cover(self, db, user: str, id: str, body):
         """The album's cover, JPEG or PNG; the release's from the Cover Art Archive without it."""
         self.row(db, user, id)
-        folder = self.folder / id
+        with self.holding(id, "cover"):
+            self.store_cover(self.folder / id, body)
+
+    def store_cover(self, folder: Path, body):
         folder.mkdir(parents=True, exist_ok=True)
         with open(part := folder / "cover.part", "wb") as out:
             for chunk in body:
+                if out.tell() + len(chunk) > MAX_COVER:
+                    out.close()
+                    part.unlink()
+                    raise Refused(f"A cover may have {MAX_COVER} bytes at most")
                 out.write(chunk)
-        head = part.read_bytes()[:8]
+        with open(part, "rb") as f:
+            head = f.read(8)
         suffix = ".jpg" if head.startswith(b"\xff\xd8\xff") else ".png" if head.startswith(b"\x89PNG\r\n\x1a\n") else None
         if suffix is None:
             part.unlink()
@@ -210,9 +262,12 @@ class Uploads:
         shutil.rmtree(self.folder / id, ignore_errors=True)
 
     def clean(self, db):
-        """Deletes uploads abandoned KEEP ago."""
+        """Deletes uploads abandoned KEEP ago, but none with a file being received or being committed."""
         for (id,) in db.execute("select id from upload where touched < ?", (time.time() - KEEP,)).fetchall():
-            self.remove(db, id)
+            with self.guard:
+                if any(b[0] == id for b in self.busy) or not db.execute("delete from upload where id = ? and touched < ?", (id, time.time() - KEEP)).rowcount:
+                    continue
+            shutil.rmtree(self.folder / id, ignore_errors=True)
 
     def layout(self, row) -> list[tuple[Path, str | None, dict]]:
         """The albums the upload makes: folder, release group, and per (disc, number) slot its tags and file name. One
@@ -247,57 +302,65 @@ class Uploads:
         replace or the upload is lossless and they are lossy: those files are deleted once the upload is in."""
         with self.lock:
             row = self.row(db, user, id)
-            slots = db.execute("select * from upload_track where upload = ? order by disc, number", (id,)).fetchall()
-            for s in slots:
-                if not s["size"] or s["received"] < s["size"]:
-                    raise Refused(f"Track {s['disc']}-{s['number']} isn't complete")
-                if not decodes(self.folder / id / f"{s['disc']}-{s['number']}.{s['suffix']}"):
-                    raise Refused(f"Track {s['disc']}-{s['number']} doesn't decode")
-            albums, staging = self.layout(row), self.folder / id / "staging"
-            shutil.rmtree(staging, ignore_errors=True)
-            staging.mkdir()
-            by_slot = {(s["disc"], s["number"]): s for s in slots}
-            staged, targets, old, firsts = {}, {}, set(), []
-            for i, (folder, group, tracks) in enumerate(albums):
-                album, mine = self.importer.root / folder, [by_slot[k] for k in tracks if k in by_slot]
-                (staging / str(i)).mkdir()
-                for s in mine:
-                    tags, name = tracks[s["disc"], s["number"]]
-                    copy(self.folder / id / f"{s['disc']}-{s['number']}.{s['suffix']}", source := staging / str(i) / f"{name}.{s['suffix']}")
-                    staged[source], targets[source] = tags, album / source.name
-                tags = tracks[mine[0]["disc"], mine[0]["number"]][0]
-                firsts.append(album / f"{tracks[mine[0]['disc'], mine[0]['number']][1]}.{mine[0]['suffix']}")
-                rows = db.execute(
-                    f"select ref, coalesce(disc_no, 1), track_no from track where source = 'local' and (album_id = ? or mb_release_group = ?) and "
-                    f"coalesce(disc_no, 1) in ({','.join('?' * len(mine))})",
-                    (make_id("al-", tags["albumartist"][0], tags["album"][0]), group, *(int(tags["discnumber"][0]) for _ in mine))).fetchall()
-                # Only the tracks the upload replaces go: a deluxe edition's extra tracks stay.
-                uploaded = {(int(t["discnumber"][0]), int(t["tracknumber"][0])) for t in (tracks[s["disc"], s["number"]][0] for s in mine)}
-                theirs = {Path(r[0]) for r in rows if (r[1], r[2]) in uploaded}
-                theirs |= {p for t in (targets[x] for x in staged if x.parent == staging / str(i)) if t.parent.is_dir()
-                           for p in t.parent.iterdir() if p.stem == t.stem and p.suffix.lower().lstrip(".") in AUDIO}
-                theirs = {p for p in theirs if p.is_file()}
-                present = theirs | {p for r in rows if (p := Path(r[0])).is_file()}
-                mine_staged = [x for x in staged if x.parent == staging / str(i)]
-                if present and not replace and not (all(map(lossless, mine_staged)) and not any(map(lossless, present))):
-                    raise Refused("already in the library", duplicate=True)
-                old |= theirs
-            try:
-                checked = quality.import_check(sorted(p for p in staged if p.suffix == ".flac"))
-            except quality.LossySource as e:
-                raise Refused(str(e))
-            for source, tags in staged.items():
-                write(source, tags)
-            try:
-                self.place(targets, old)
-            except OSError as e:
-                raise Refused(f"Couldn't place the upload: {e}")
+            with self.holding(id, "commit"):
+                return self.place_upload(db, id, row, replace)
+
+    def place_upload(self, db, id: str, row, replace: bool) -> list[Path]:
+        slots = db.execute("select * from upload_track where upload = ? order by disc, number", (id,)).fetchall()
+        for s in slots:
+            if not s["size"] or s["received"] < s["size"]:
+                raise Refused(f"Track {s['disc']}-{s['number']} isn't complete")
+            if not decodes(self.folder / id / f"{s['disc']}-{s['number']}.{s['suffix']}"):
+                raise Refused(f"Track {s['disc']}-{s['number']} doesn't decode")
+        albums, staging = self.layout(row), self.folder / id / "staging"
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir()
+        by_slot = {(s["disc"], s["number"]): s for s in slots}
+        staged, targets, old, firsts = {}, {}, set(), []
+        for i, (folder, group, tracks) in enumerate(albums):
+            album, mine = self.importer.root / folder, [by_slot[k] for k in tracks if k in by_slot]
+            (staging / str(i)).mkdir()
+            for s in mine:
+                tags, name = tracks[s["disc"], s["number"]]
+                copy(self.folder / id / f"{s['disc']}-{s['number']}.{s['suffix']}", source := staging / str(i) / f"{name}.{s['suffix']}")
+                staged[source], targets[source] = tags, album / source.name
+            tags = tracks[mine[0]["disc"], mine[0]["number"]][0]
+            firsts.append(album / f"{tracks[mine[0]['disc'], mine[0]['number']][1]}.{mine[0]['suffix']}")
+            uploaded = {(int(t["discnumber"][0]), int(t["tracknumber"][0])) for t in (tracks[s["disc"], s["number"]][0] for s in mine)}
+            discs = {d for d, _ in uploaded}
+            rows = db.execute(
+                f"select ref, coalesce(disc_no, 1), track_no from track where source = 'local' and (album_id = ? or mb_release_group = ?) and "
+                f"coalesce(disc_no, 1) in ({','.join('?' * len(discs))})",
+                (make_id("al-", tags["albumartist"][0], tags["album"][0]), group, *discs)).fetchall()
+            # Only the tracks the upload replaces go: a deluxe edition's extra tracks stay.
+            theirs = {Path(r[0]) for r in rows if (r[1], r[2]) in uploaded}
+            theirs |= {p for t in (targets[x] for x in staged if x.parent == staging / str(i)) if t.parent.is_dir()
+                       for p in t.parent.iterdir() if p.stem == t.stem and p.suffix.lower().lstrip(".") in AUDIO}
+            theirs = {p for p in theirs if p.is_file()}
+            present = theirs | {p for r in rows if (p := Path(r[0])).is_file()}
+            mine_staged = [x for x in staged if x.parent == staging / str(i)]
+            if present and not replace and not (all(map(lossless, mine_staged)) and not any(map(lossless, present))):
+                raise Refused("already in the library", duplicate=True)
+            old |= theirs
+        try:
+            checked = quality.import_check(sorted(p for p in staged if p.suffix == ".flac"))
+        except quality.LossySource as e:
+            raise Refused(str(e))
+        for source, tags in staged.items():
+            write(source, tags)
+        try:
+            self.place(targets, old)
+        except OSError as e:
+            raise Refused(f"Couldn't place the upload: {e}")
+        try:  # the upload is in: what's left only adds to it, and a retry would be refused as a duplicate
             for source, found in checked.items():
                 quality.store(db, targets[source], found)
             for folder, _, _ in albums:
                 self.importer.cover(json.loads(row["release"]) if row["release"] else None, {self.folder / id}, self.importer.root / folder)
-            self.remove(db, id)
-            return firsts
+        except Exception:
+            log.exception("upload %s is in the library, but its cover or quality findings aren't", id)
+        self.remove(db, id)
+        return firsts
 
     def place(self, targets: dict[Path, Path], old: set[Path]):
         """Copies each source to its target, the old files renamed aside meanwhile: deleted when all are in, else

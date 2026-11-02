@@ -269,3 +269,14 @@ def test_one_automatic_radio_per_user_even_when_two_plays_race(tmp_path):
     # Both racing plays found no radio: the second insert is ignored.
     db.execute("insert or ignore into playlist(name, owner, comment, created, changed, radio) values ('Radio', 'admin', '', 0, 0, 2)")
     assert db.execute("select count(*) from playlist where radio = 2").fetchone()[0] == 1
+
+
+def test_a_failing_chore_leaves_the_radios_and_the_other_chores_be(api):
+    import threading
+    from oasis.recommend import Recommender
+    done, recommender = threading.Event(), Recommender(api.recommender.connect, None, None)
+    recommender.top_up_all = lambda db: 1 / 0
+    recommender.chores = [lambda db: 1 / 0, lambda db: done.set()]
+    recommender.start()
+    recommender.wake.set()
+    assert done.wait(10)

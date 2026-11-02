@@ -233,3 +233,93 @@ def test_a_tracks_artists_array_wins_and_the_year_may_be_a_numeric_string(client
     assert (album["artist"], album["year"]) == ("Beta, Gamma", 2001)
     assert mutagen.File(root / "Beta, Gamma/2001 - First/01 - One.flac")["artists"] == ["Beta", "Gamma"]
     assert call(client, "createUpload", tags=json.dumps({**tags("One"), "year": "MMI"}))["error"]["message"] == "year must be a number"
+
+
+def test_a_cover_that_cant_be_added_leaves_the_upload_committed(client, root, tmp_path, monkeypatch):
+    def failing(*args):
+        raise OSError("read-only cover")
+    monkeypatch.setattr(client.app.state.api.uploads.importer, "cover", failing)
+    made = call(client, "createUpload", tags=json.dumps(tags("One")))["upload"]
+    send(client, made["id"], 1, encode(tmp_path / "one.flac"))
+    assert call(client, "commitUpload", uploadId=made["id"])["album"]["songCount"] == 1
+    assert [p.name for p in (root / "Beta/2001 - First").iterdir()] == ["01 - One.flac"] and not (tmp_path / "uploads" / made["id"]).exists()
+
+
+def test_a_two_disc_upgrade_replaces_the_lossy_copy_on_each_disc(client, root, tmp_path):
+    def two_discs(suffix, second):
+        made = call(client, "createUpload", tags=json.dumps({"album": "First", "albumArtist": "Beta", "year": 2001, "track": [
+            {"disc": 1, "number": 1, "title": "One"}, {"disc": 2, "number": 1, "title": second}]}))["upload"]
+        for d in (1, 2):
+            send(client, made["id"], 1, encode(tmp_path / f"src/{d}.{suffix}"), suffix=suffix, disc=d)
+        return call(client, "commitUpload", uploadId=made["id"])
+    two_discs("mp3", "Three")
+    assert [s["suffix"] for s in two_discs("flac", "Three (Remaster)")["album"]["song"]] == ["flac", "flac"]
+    assert sorted(p.name for p in (root / "Beta/2001 - First").iterdir()) == ["1-01 - One.flac", "2-01 - Three (Remaster).flac"]
+
+
+def test_a_track_too_big_or_without_room_for_it_is_refused(client, tmp_path, monkeypatch):
+    import shutil
+    from types import SimpleNamespace
+    made = call(client, "createUpload", tags=json.dumps(tags("One")))["upload"]
+    assert "at most" in send(client, made["id"], 1, b"x", size=(4 << 30) + 1)["error"]["message"]
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=99))
+    assert send(client, made["id"], 1, b"x", size=100)["error"] == {"code": 0, "message": "Too little disk space: 100 bytes needed, 99 free"}
+    assert call(client, "getUpload", id=made["id"])["upload"]["track"][0]["received"] == 0
+
+
+def test_a_file_being_received_or_an_upload_being_committed_takes_no_other_request_for_it(client, tmp_path):
+    uploads = client.app.state.api.uploads
+    made = call(client, "createUpload", tags=json.dumps(tags("One", "Two")))["upload"]
+    data = encode(tmp_path / "one.flac")
+    uploads.busy.add((made["id"], (1, 1)))
+    assert send(client, made["id"], 1, data)["error"]["message"] == "Another request is sending this file or committing the upload"
+    assert send(client, made["id"], 2, data)["status"] == "ok"  # another track goes meanwhile
+    assert call(client, "commitUpload", uploadId=made["id"])["error"]["message"] == "Another request is sending this file or committing the upload"
+    uploads.busy.clear()
+    uploads.busy.add((made["id"], "commit"))
+    assert send(client, made["id"], 1, data)["error"]["code"] == 0
+    assert client.post("/rest/uploadCover", params={**AUTH, "uploadId": made["id"]}, content=PNG).json()["subsonic-response"]["error"]["code"] == 0
+    uploads.busy.clear()
+    assert send(client, made["id"], 1, data)["status"] == "ok"
+
+
+def test_a_cover_over_the_cap_is_refused(client, tmp_path, monkeypatch):
+    monkeypatch.setattr("oasis.upload.MAX_COVER", len(PNG) - 1)
+    made = call(client, "createUpload", tags=json.dumps(tags("One")))["upload"]
+    refused = client.post("/rest/uploadCover", params={**AUTH, "uploadId": made["id"]}, content=PNG).json()["subsonic-response"]
+    assert refused["error"]["code"] == 0 and "at most" in refused["error"]["message"] and not list((tmp_path / "uploads" / made["id"]).iterdir())
+
+
+def test_names_that_clean_to_nothing_land_in_a_folder_of_their_own(client, root, tmp_path):
+    upload(client, tmp_path, {**tags("One", album=".."), "albumArtist": "..", "year": None})
+    assert [str(p.relative_to(root)) for p in root.rglob("*.flac")] == ["Unknown Artist/Unknown Album/01 - One.flac"]
+
+
+def test_bad_tags_and_numbers_are_refused_not_failed(client, tmp_path):
+    for given in ({**tags("One"), "album": "Fir\0st"}, {**tags("One"), "albumArtist": ["Beta"]}, {**tags("One"), "track": [{"number": 1, "title": 5}]},
+                  {**tags("One"), "track": [{"number": 1, "title": "One", "artists": ["Beta", None]}]}, {**tags("One"), "track": ["One"]}, ["One"]):
+        assert call(client, "createUpload", tags=json.dumps(given))["error"]["code"] == 0, given
+    assert call(client, "createUpload", releaseId="rel-1", disc="two")["error"] == {"code": 0, "message": "disc must be an integer"}
+    made = call(client, "createUpload", tags=json.dumps(tags("One")))["upload"]
+    assert send(client, made["id"], 1, b"x", offset="x", size=1)["error"] == {"code": 0, "message": "disc, number, offset and size must be integers"}
+
+
+def test_cleaning_spares_an_upload_with_a_request_in_progress(client, tmp_path):
+    uploads = client.app.state.api.uploads
+    made = [call(client, "createUpload", tags=json.dumps(tags("One")))["upload"]["id"] for _ in range(2)]
+    db = connect(tmp_path / "oasis.db")
+    db.execute("update upload set touched = ?", (time.time() - 25 * 3600,))
+    uploads.busy.add((made[0], (1, 1)))
+    uploads.clean(db)
+    assert sorted(r[0] for r in db.execute("select id from upload")) == [made[0]]
+    uploads.busy.clear()
+    uploads.clean(db)
+    assert not db.execute("select id from upload").fetchall()
+
+
+def test_a_lossy_file_that_doesnt_decode_is_refused(client, tmp_path):
+    made = call(client, "createUpload", tags=json.dumps(tags("One")))["upload"]
+    data = bytearray(encode(tmp_path / "one.mp3", 5))
+    data[len(data) // 3:len(data) // 3 + 3000] = bytes(3000)  # a header intact, frames gone
+    assert send(client, made["id"], 1, bytes(data), suffix="mp3")["status"] == "ok"
+    assert call(client, "commitUpload", uploadId=made["id"])["error"] == {"code": 0, "message": "Track 1-1 doesn't decode"}

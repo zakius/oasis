@@ -123,14 +123,17 @@ class Recommender:
             self.wake.clear()
             db = self.connect()
             try:
-                for playlist in db.execute("select * from playlist where radio > 0").fetchall():
-                    self.top_up(db, playlist)
-                for chore in self.chores:
-                    chore(db)
-            except Exception:
-                log.exception("radio update failed")
+                for job in [self.top_up_all, *self.chores]:  # each on its own: one failing leaves the others be
+                    try:
+                        job(db)
+                    except Exception:
+                        log.exception("%s failed", getattr(job, "__qualname__", job))
             finally:
                 db.close()
+
+    def top_up_all(self, db):
+        for playlist in db.execute("select * from playlist where radio > 0").fetchall():
+            self.top_up(db, playlist)
 
     def played(self, db, owner: str, track_ids: list[str]):
         """Moves radios past the played tracks and makes sure the owner has a radio that follows all listening."""
