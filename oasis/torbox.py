@@ -16,12 +16,12 @@ class TorBox:
     def __init__(self, key: str):
         self.key = key
 
-    def call(self, path: str, body=None, form: dict | None = None, timeout: float = 60):
+    def call(self, path: str, body=None, form: dict | None = None):
         data, kind = (multipart(form, boundary := uuid.uuid4().hex), f"multipart/form-data; boundary={boundary}") if form else \
             (json.dumps(body).encode() if body else None, "application/json")
         request = urllib.request.Request(API + path, data, {"Authorization": "Bearer " + self.key, "Content-Type": kind, "User-Agent": "oasis/0.1"})
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=60) as response:
                 answer = json.loads(response.read())
         except urllib.error.HTTPError as e:
             raise (RateLimited if e.code == 429 else OSError)(f"TorBox {path.split('?')[0]}: {e.code} {e.read()[:200].decode(errors='replace')}") from e
@@ -41,11 +41,6 @@ class TorBox:
         """Of these hashes (at most 100), the ones TorBox has cached, with their files: {hash: [{name, size}]}."""
         found = self.call("torrents/checkcached?format=list&list_files=true&hash=" + ",".join(hashes)) if hashes else None
         return {c["hash"].lower(): c.get("files") or [] for c in found or []}
-
-    def files(self, hash: str, wait: int) -> list[dict]:
-        """A torrent's files, {name, size} under its name's folder, from the metadata TorBox fetches from its peers (BEP 9)
-        without downloading or adding it; OSError when none arrives in wait seconds."""
-        return (self.call("torrents/torrentinfo?" + urllib.parse.urlencode({"hash": hash, "timeout": wait}), timeout=wait + 30) or {}).get("files") or []
 
     def add(self, name: str, magnet: str | None = None, torrent: bytes | None = None) -> dict:
         """Adds a magnet link or .torrent file: {torrent_id, hash}, or {queued_id, hash} when no active slot was free.

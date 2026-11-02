@@ -56,7 +56,6 @@ ROMAN = re.compile(r"x{0,3}(ix|iv|v?i{0,3})")
 RELEASES = re.compile(r"\b(\d+) (releases|релиз)")  # '(126 Releases)': a bundle's own count
 BUNDLE_WORDS = {"singles", "anthology", "demo", "demos", "live", "bonustrack", "bonustracks", "deluxe", "expanded"}  # variants a discography holds besides the albums
 BUNDLE_SEEDERS = 3       # seeders an uncached bundle needs: it downloads whole, gigabytes, from them
-METADATA = 5            # magnets' metadata asked of TorBox per bundle search, best seeded first: each may take METADATA_WAIT (download.py)
 TORRENTS = 20            # .torrent files read through Prowlarr per bundle search for hashes, as many for file lists, best seeded first: each asks an indexer
 
 
@@ -94,6 +93,15 @@ def leads(title: str, want: dict) -> list[tuple[int, int]]:
     tokens, lead = words(title), words(LEAD.match(title)[0])
     found = [s for n in want["names"] for s in spans(tokens, words(n))]
     return found if any(a == len(lead) for a, _ in found) else []
+
+
+def alone(title: str, want: dict) -> bool:
+    """Whether the artist's name, opening a release's name (leads), stands alone: a separator, bracket or bundle word
+    follows, not another word ('Hunter - Discography', 'Hunter (Poland) Discography', but not 'Hunter Tom - Discography',
+    'Hunter x Hunter OST'). For a name guess with no file list to check it."""
+    rest = plain(title[len(LEAD.match(title)[0]):])
+    return any(re.match(r"[\W_]*".join(map(re.escape, words(n))) + r"(?![^\W_])[\s.]*($|[-–—(\[{:|/,+]|discograph|дискограф|complete|collection|box|anthology|singles)", rest)
+               for n in want["names"]) and bool(leads(title, want))
 
 
 def hits(pattern, text: str) -> set[str]:
@@ -222,14 +230,16 @@ def site(guid: str) -> str:
 
 
 def rank(releases: list[dict], have: set[str], upgrade: bool = False, unreliable: frozenset = frozenset(), slow: frozenset = frozenset()) -> list[dict]:
-    """Best first: what will download (cached on TorBox, or seeded per an indexer whose seed counts held up), then
-    lossless, then a file per track over a disc image, then cached, then quality, then seeders.
+    """Best first: what oasis can read before it goes (cached on TorBox, or a .torrent through Prowlarr) before every
+    magnet link, which goes only when nothing readable is left; then what will download (cached, or seeded per an
+    indexer whose seed counts held up), then lossless, then a file per track over a disc image, then cached, then
+    quality, then seeders.
     A release TorBox hasn't cached needs a seeder. The same torrent from several indexers is tried once. Slow ones,
     which made way for others before, come last."""
     usable = [r for r in releases if hash_of(r) in have or (r.get("seeders") or 0) >= 1]
     if upgrade:
         usable = [r for r in usable if quality(r["title"]) == 3]
-    usable.sort(key=lambda r: (hash_of(r) not in slow, hash_of(r) in have or site(r.get("guid") or "") not in unreliable, quality(r["title"]) == 3, not IMAGE.search(" ".join(words(r["title"]))), hash_of(r) in have, quality(r["title"]),
+    usable.sort(key=lambda r: (hash_of(r) in have or bool(r.get("downloadUrl")), hash_of(r) not in slow, hash_of(r) in have or site(r.get("guid") or "") not in unreliable, quality(r["title"]) == 3, not IMAGE.search(" ".join(words(r["title"]))), hash_of(r) in have, quality(r["title"]),
                                r.get("seeders") or 0), reverse=True)
     return unique(usable, lambda r: hash_of(r) or r["guid"])
 
@@ -474,20 +484,19 @@ def expected(release: dict, want: dict, groups: list[dict], wanted: set[str]) ->
 
 
 def bundles(prowlarr, want: dict, groups: list[dict], wanted: set[str], blocked: set, cached_files, editions, uncached: bool = False,
-            slow: frozenset = frozenset(), torrent=lambda release: None, metadata=lambda release: []) -> list[tuple[dict, dict | None, set[str]]]:
+            slow: frozenset = frozenset(), torrent=lambda release: None) -> list[tuple[dict, dict | None, set[str]]]:
     """The artist's bundles that hold wanted release groups, best first, each with its targets when TorBox's file list
     gives them (to fetch only theirs), else None (resolve, in download.py, reads them once TorBox has it), and the
     groups it holds or likely holds. What it holds is read from a file list: TorBox's when it has it cached file by
     file (it lists a cached torrent of 100 files or more as one zip), else the .torrent's through Prowlarr
     (torrent(release): {hash, files}, or None for a magnet link), which also gives the hash of a release listed without;
-    else, for a magnet link, the metadata TorBox fetches from its peers (metadata(release): files, [] when none arrives:
-    no live peers; METADATA a search). Only a cached one, which TorBox lists as one archive, goes by its name (expected):
-    an uncached one with no file list isn't sent. Cached ones come first: they download at once. With uncached, while slots are free,
-    those with BUNDLE_SEEDERS follow: they download whole and hold a slot for long. Then known before likely, the most
-    groups, quality and seeders; slow ones (see rank) last."""
+    else its name tells (expected); a magnet link's only when the artist's name stands alone (alone). Those whose files
+    oasis read come before every one it couldn't: what they hold is sure. Then cached ones: they download at once. With
+    uncached, while slots are free, those with BUNDLE_SEEDERS follow: they download whole and hold a slot for long. Then
+    the most groups, quality and seeders; slow ones (see rank) last."""
     found = unique([r for q in bundle_queries(want) for r in prowlarr.search(q)], lambda r: hash_of(r) or r["guid"])
     candidates = sorted((r for r in found if not {hash_of(r), r.get("guid")} & blocked and is_bundle(r, want)), key=lambda r: r.get("seeders") or 0, reverse=True)
-    read, budget, lookups = {}, [TORRENTS], [METADATA]
+    read, budget = {}, [TORRENTS]
 
     def listing(r):  # the .torrent's hash and files, within the budget
         if not (budget[0] and r.get("downloadUrl")):
@@ -512,17 +521,14 @@ def bundles(prowlarr, want: dict, groups: list[dict], wanted: set[str], blocked:
         elif cached and music(listed[h], ARCHIVES) or not cached and seeded(r):
             if h not in read:
                 listing(r)
-            if not cached and not read.get(h) and lookups[0]:
-                lookups[0] -= 1
-                read[h] = metadata(r)
-            if not cached and not read.get(h):
-                continue  # downloading whole, it goes on what it holds, never on its name alone
             got, known = None, bool(read.get(h))
+            if not cached and not known and not alone(r["title"], want):
+                continue
             holds = set(targets(read[h], want, groups, wanted, editions)) if known else expected(r, want, groups, wanted)
         else:
             continue
         if holds:
-            picks.append(((h not in slow, cached, known, len(holds), quality(r["title"]), r.get("seeders") or 0), r, got, holds))
+            picks.append(((cached or known, h not in slow, cached, len(holds), quality(r["title"]), r.get("seeders") or 0), r, got, holds))
     log.info("bundles of %s: %d results, %d bundles, %d cached, %d hold wanted albums (%d cached)", want["artist"], len(found), len(candidates),
-             len(listed), len(picks), sum(p[0][1] for p in picks))
+             len(listed), len(picks), sum(p[0][2] for p in picks))
     return [(r, got, holds) for _, r, got, holds in sorted(picks, key=lambda p: p[0], reverse=True)]

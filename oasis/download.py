@@ -43,7 +43,6 @@ PAUSE = 300              # seconds without file downloads after a 429
 FETCH_TRIES = 5          # polls in a row a file may fail to download before the release counts as broken
 KEEP_FAILED = 2 * 86400  # seconds a failed download's files stay for inspection
 GRAB_TRIES = 5           # picks tried in turn when TorBox won't take one
-METADATA_WAIT = 30       # seconds TorBox may take to fetch a magnet's metadata from its peers; none by then is no live peers
 FRESH = 3600             # seconds Prowlarr's answers to an artist's bundle searches and the .torrents read stay: its bundles go a pass apart
 
 
@@ -205,16 +204,6 @@ class Downloads:
             return {"hash": info_hash(found), "files": torrent_files(found.get("torrent") or b"")}
         return self.recall("torrent", release.get("guid") or release["downloadUrl"], read)
 
-    def metadata(self, release: dict) -> list[dict]:
-        """A magnet's files, from the metadata TorBox fetches for it (see TorBox.files); [] when it can't: no live peers."""
-        def read():
-            try:
-                return self.torbox().files(releases.hash_of(release), METADATA_WAIT)
-            except OSError as e:
-                log.info("no metadata for %s: %s", release["title"], e)
-                return []
-        return self.recall("metadata", releases.hash_of(release), read)
-
     def find(self, db, want: dict, group: str) -> bool | None:
         """Searches Prowlarr for an album of oasis's own catalogue (acquire.py); see send."""
         blocked = self.blocked(db)
@@ -230,7 +219,7 @@ class Downloads:
         blocked = self.blocked(db) | {r[0] for r in db.execute("select hash from download where state not in ('done', 'failed')")}
         prowlarr = SimpleNamespace(search=lambda query: self.recall("search", query, lambda: self.prowlarr.search(query)))
         picks = releases.bundles(prowlarr, want, groups, wanted, blocked, self.torbox().cached_files, lambda rg: editions(db, rg),
-                                 not self.crowded, self.slow(db), self.torrent, self.metadata)
+                                 not self.crowded, self.slow(db), self.torrent)
         search = {"want": want, "wanted": sorted(wanted), "groups": [{k: g[k] for k in ("id", "title", "other_titles", "first-release-date", "primary-type")
                                                                        if k in g} for g in groups]}
         for release, targets, holds in picks[:GRAB_TRIES]:
