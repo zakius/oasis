@@ -211,7 +211,7 @@ def test_uploads_abandoned_a_day_ago_are_deleted(client, tmp_path):
 
 def test_the_extension_is_advertised_and_other_requests_are_as_they_were(client):
     extensions = {e["name"]: e["versions"] for e in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]}
-    assert extensions == {"formPost": [1], "songLyrics": [1, 2], "transcodeOffset": [1], "romanization": [1], "upload": [1]}
+    assert extensions == {"formPost": [1], "songLyrics": [1, 2], "transcodeOffset": [1], "romanization": [1], "upload": [1], "oasis": [1]}
     form = client.post("/rest/getUser", data={**AUTH, "username": "admin"}).json()["subsonic-response"]
     assert form["status"] == "ok" and form["user"]["username"] == "admin"
     assert client.post("/rest/getUser", params={"f": "json"}, data={**AUTH}).json()["subsonic-response"]["user"]["adminRole"] is True

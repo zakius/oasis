@@ -145,15 +145,15 @@ def test_unsatisfiable_range(client, ytm, monkeypatch):
 
 def test_songs_carry_their_youtube_id(client, ytm, monkeypatch):
     call(client, "search3", query="remote")
-    assert call(client, "getSong", id="yt-vid1")["song"]["youtubeId"] == "vid1"
+    assert call(client, "getSong", id="yt-vid1", oasis="1")["song"]["youtubeId"] == "vid1"
     local = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song A")
     assert "youtubeId" not in local
     asked = []
     monkeypatch.setattr(ytm, "match", lambda track: asked.append(track["title"]) or "vidA", raising=False)
-    assert call(client, "getSong", id=local["id"])["song"]["youtubeId"] == "vidA"
+    assert call(client, "getSong", id=local["id"], oasis="1")["song"]["youtubeId"] == "vidA"
     monkeypatch.setattr(ytm, "match", lambda track: asked.append(track["title"]) or None, raising=False)
     other = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song B")
-    assert "youtubeId" not in call(client, "getSong", id=other["id"])["song"]
+    assert "youtubeId" not in call(client, "getSong", id=other["id"], oasis="1")["song"]
     call(client, "getSong", id=other["id"])
     assert asked == ["Song A", "Song B"]  # a missing match is looked up once
 

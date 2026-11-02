@@ -59,8 +59,8 @@ def client(library, tmp_path, ytm):
         yield c
 
 
-def playlists(client):
-    return {p["name"]: p for p in call(client, "getPlaylists")["playlists"]["playlist"]}
+def playlists(client, **params):
+    return {p["name"]: p for p in call(client, "getPlaylists", oasis="1", **params)["playlists"]["playlist"]}
 
 
 def library_titles(client):
@@ -78,6 +78,7 @@ def test_mixes_are_read_only_playlists_in_the_library(client, ytm):
     assert set(mixes) == {"My Supermix", "My Mix 1", "Road trip"} and {m["owner"] for m in mixes.values()} == {"YouTube Music"}
     assert mixes["My Supermix"]["oasisMix"] is True and "oasisMix" not in mixes["Road trip"]
     assert mixes["My Supermix"]["youtubeId"] == "RDTMAK_super" and mixes["Road trip"]["youtubeId"] == "PLmine"
+    assert not {"oasisMix", "youtubeId"} & {k for p in call(client, "getPlaylists")["playlists"]["playlist"] for k in p}  # plain clients
     entries = call(client, "getPlaylist", id=mixes["My Supermix"]["id"])["playlist"]["entry"]
     assert [e["title"] for e in entries] == ["Song m1", "Song m2"]
     assert {"Song m1", "Song m2", "Song m3"} <= library_titles(client)

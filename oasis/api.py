@@ -105,6 +105,7 @@ class Params:
     def __init__(self, request: Request, body: bytes):
         self.multi = [*request.query_params.multi_items(), *parse_qsl(body.decode())]
         self.range = request.headers.get("range")
+        self.oasis = self.get("oasis") == "1"  # the oasis extension (docs/oasis-extension.md)
 
     def get(self, key: str, default=None):
         return next((v for k, v in self.multi if k == key), default)
@@ -191,6 +192,17 @@ def artist(r) -> dict:
         "oasisWanted": WANTED_STATES.get(r["want_state"]),
         "oasisWantedError": r["want_error"] if WANTED_STATES.get(r["want_state"]) else None,
     })
+
+
+# The oasis extension's fields (docs/oasis-extension.md): sent only to clients asking with oasis=1.
+OASIS_FIELDS = {"oasisWanted", "oasisWantedError", "oasisMix", "oasisLink", "youtubeId"}
+
+
+def plain(value):
+    """value without the oasis extension's fields, for clients that didn't ask for them."""
+    if isinstance(value, dict):
+        return {k: plain(v) for k, v in value.items() if k not in OASIS_FIELDS}
+    return [plain(v) for v in value] if isinstance(value, list) else value
 
 
 def describe(db, payload: dict) -> dict:
@@ -544,7 +556,7 @@ class Api:
 
     def getOpenSubsonicExtensions(self, db, p, user):
         return {"openSubsonicExtensions": [{"name": name, "versions": versions} for name, versions in (
-            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]))]}
+            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]), ("oasis", [1]))]}
 
     def _user(self, row) -> dict:
         roles = ("scrobbling", "settings", "download", "playlist", "coverArt", "comment", "stream", "share")
@@ -876,8 +888,9 @@ class Api:
                 ids = [i for i in dict.fromkeys(s["albumId"] for s in found if s.get("albumId")) if i not in {a["id"] for a in albums}]
                 albums += [a for a in self._in_order(db, ALBUMS, "t.album_id", ids, album) if named(a["name"], a.get("artist"))][:room]
         text = " ".join(terms)
-        if self.library and len(text) >= FIND_FROM:
+        if self.library and p.oasis and len(text) >= FIND_FROM:
             # MusicBrainz last, for what neither the library nor YouTube Music has: these can be starred like any other.
+            # Only for the oasis extension: they have no songs until they arrive, which other clients don't expect.
             names = {ytm.fold(x) for x in [*(a["name"] for a in artists), *(s.get("artist") for s in songs)] if x}
             titles = {ytm.fold(x) for x in [*(a["name"] for a in albums), *(s.get("album") for s in songs)] if x}
             if p.int("artistOffset", 0) == 0 and (room := p.int("artistCount", 20) - len(artists)) > 0:
@@ -966,16 +979,17 @@ class Api:
     def search2(self, db, p, user):
         return {"searchResult2": self._search(db, p)}
 
-    def _starred(self, db):
+    def _starred(self, db, p):
+        """The user's stars; MusicBrainz-only artists and albums only for the oasis extension, as search finds them."""
         def ids(prefix):
             return db.execute("select id from stat where user = me() and starred is not null and id like ? order by starred desc", (prefix + "%",)).fetchall()
         return {
             "artist": [a for r in ids("ar-") for a in ([artist(self._one(db, ARTISTS + " where t.artist_id = ? group by t.artist_id", r["id"]))]
                                                       if db.execute("select 1 from track where artist_id = ?", (r["id"],)).fetchone()
-                                                      else self._starred_mb(db, "artist", r["id"]))],
+                                                      else self._starred_mb(db, "artist", r["id"]) if p.oasis else [])],
             "album": [a for r in ids("al-") for a in ([album(self._one(db, ALBUMS + " where t.album_id = ? group by t.album_id", r["id"]))]
                                                      if db.execute("select 1 from track where album_id = ?", (r["id"],)).fetchone()
-                                                     else self._starred_mb(db, "album", r["id"]))],
+                                                     else self._starred_mb(db, "album", r["id"]) if p.oasis else [])],
             "song": [song(r) for r in db.execute(SONGS + " where s.starred is not null order by s.starred desc")],
         }
 
@@ -993,10 +1007,10 @@ class Api:
             return []
 
     def getStarred2(self, db, p, user):
-        return {"starred2": self._starred(db)}
+        return {"starred2": self._starred(db, p)}
 
     def getStarred(self, db, p, user):
-        return {"starred": self._starred(db)}
+        return {"starred": self._starred(db, p)}
 
     def _set_starred(self, db, p, value, user):
         for id in p.all("id"):
@@ -1518,7 +1532,9 @@ def create_app(config: Config, background: bool = True, ytm=None, services=None)
                 db.create_function("me", 0, lambda: user, deterministic=True)
                 p.follow_moves(db)
                 result = handler(api, db, p, user)
-                return result if isinstance(result, Response) else respond(fmt, romanized(describe(db, result), p.get("romanization")))
+                if isinstance(result, Response):
+                    return result
+                return respond(fmt, romanized(describe(db, result if p.oasis else plain(result)), p.get("romanization")))
             except Fail as e:
                 return respond(fmt, {}, e)
             except upload.Refused as e:

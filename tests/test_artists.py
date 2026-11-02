@@ -77,14 +77,14 @@ def test_one_musicbrainz_artist_is_one_page_and_namesakes_are_two(tmp_path):
 def test_personas_related_artists_and_members_come_first_among_similar_artists(tmp_path):
     with client_for(tmp_path, related=[["Mori Calliope", "DEMONDICE"]]) as client:
         fill(client)
-        similar = call(client, "getArtistInfo2", id=make_id("ar-", "米津玄師"))["artistInfo2"]["similarArtist"]
+        similar = call(client, "getArtistInfo2", id=make_id("ar-", "米津玄師"), oasis="1")["artistInfo2"]["similarArtist"]
         assert [(a["name"], a["oasisLink"]) for a in similar] == [("ハチ", "persona")]
-        similar = call(client, "getArtistInfo2", id=make_id("ar-", "DEMONDICE"))["artistInfo2"]["similarArtist"]
+        similar = call(client, "getArtistInfo2", id=make_id("ar-", "DEMONDICE"), oasis="1")["artistInfo2"]["similarArtist"]
         assert [(a["name"], a["oasisLink"]) for a in similar] == [("Mori Calliope", "related")]
-        band = call(client, "getArtistInfo2", id=make_id("ar-", "Band"))["artistInfo2"]["similarArtist"]
+        band = call(client, "getArtistInfo2", id=make_id("ar-", "Band"), oasis="1")["artistInfo2"]["similarArtist"]
         assert [(a["name"], a["oasisLink"]) for a in band] == [("John Bender", "member")]  # tributes aren't links
         member = client.app.state.api._db().execute("select artist_id from mb_artist where mbid = 'jb-2'").fetchone()[0]
-        assert [(a["name"], a["oasisLink"]) for a in call(client, "getArtistInfo2", id=member)["artistInfo2"]["similarArtist"]] == [("Band", "member")]
+        assert [(a["name"], a["oasisLink"]) for a in call(client, "getArtistInfo2", id=member, oasis="1")["artistInfo2"]["similarArtist"]] == [("Band", "member")]
         radio = call(client, "getSimilarSongs2", id=make_id("ar-", "Mori Calliope"))["similarSongs2"]["song"]
         assert "DEMONDICE" in [s["artist"] for s in radio]
 
@@ -104,7 +104,7 @@ def test_artist_settings_on_the_dashboard_apply_at_once_and_merges_can_be_taken_
         assert "Mori Calliope; DEMONDICE" in page  # oasis.toml's groups until saved here
         saved = client.post("/admin/artists", data={"related": "Gawr Gura; Senzawa\nlonely", "merge": "Beta; Beta Band", "separate": ""}).text
         assert "Saved" in saved and "Gawr Gura; Senzawa" in saved and "lonely" not in saved
-        assert "similarArtist" not in call(client, "getArtistInfo2", id=make_id("ar-", "DEMONDICE"))["artistInfo2"]
+        assert "similarArtist" not in call(client, "getArtistInfo2", id=make_id("ar-", "DEMONDICE"), oasis="1")["artistInfo2"]
         assert len(call(client, "getArtist", id=make_id("ar-", "Beta"))["artist"]["album"]) == 2
 
         client.post("/admin/artists", data={"related": "", "merge": "", "separate": ""})

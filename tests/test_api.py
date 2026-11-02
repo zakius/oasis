@@ -118,3 +118,18 @@ def test_rescan_picks_up_changes(client, library, tmp_path):
         extra.unlink()
     assert scan(db, [library]) == 1
     assert "Three" not in ids_by_title(client)
+
+
+def test_oasis_fields_only_with_the_oasis_extension(client):
+    album = call(client, "getAlbumList2", type="alphabeticalByName")["albumList2"]["album"][0]
+    db = client.app.state.api._db()
+    db.execute("insert into want_item(kind, ref, state, error, updated) values ('album', ?, 'failed', 'nothing found', 0)", (album["id"],))
+    db.execute("insert into want_item(kind, ref, state, updated) values ('artist', ?, 'wanted', 0)", (album["artistId"],))
+    db.execute("update track set ytm_id = 'vid' where album_id = ?", (album["id"],))
+    assert {"name": "oasis", "versions": [1]} in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]
+    for params in ({}, {"oasis": "0"}, {"oasis": "1"}):
+        got = call(client, "getAlbum", id=album["id"], **params)["album"]
+        artist = call(client, "getArtist", id=album["artistId"], **params)["artist"]
+        fields = {k for x in (got, *got["song"], artist) for k in x}
+        oasis = {"oasisWanted", "oasisWantedError", "youtubeId"}
+        assert fields & oasis == (oasis if params == {"oasis": "1"} else set())

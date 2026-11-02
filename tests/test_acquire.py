@@ -583,23 +583,24 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     kenshi(mb)
     mb.artists.append({"id": "mb-beta", "name": "Beta"})  # in the library: left out
     client.app.state.api._db().execute("insert into mb_artist(mbid, artist_id, name) values ('mb-beta', ?, 'Beta')", (artist_id(client, "Beta"),))
-    found = call(client, "search3", query="Kenshi Yonezu")["searchResult3"]
+    assert call(client, "search3", query="Kenshi Yonezu")["searchResult3"] == {"artist": [], "album": [], "song": []}  # only for oasis=1
+    found = call(client, "search3", query="Kenshi Yonezu", oasis="1")["searchResult3"]
     assert [a["id"] for a in found["artist"]] == ["ar-mb-" + KENSHI] and [a["id"] for a in found["album"]] == ["al-mb-" + STRAY]
     db = client.app.state.api._db()
     db.execute("update track set album_artist = 'Kenshi Yonezu' where album = 'Second'")  # by another name: left out
-    assert call(client, "search3", query="Kenshi Yonezu")["searchResult3"]["artist"][0]["name"] == "Kenshi Yonezu"
-    assert len(call(client, "search3", query="Kenshi Yonezu")["searchResult3"]["artist"]) == 1
+    assert call(client, "search3", query="Kenshi Yonezu", oasis="1")["searchResult3"]["artist"][0]["name"] == "Kenshi Yonezu"
+    assert len(call(client, "search3", query="Kenshi Yonezu", oasis="1")["searchResult3"]["artist"]) == 1
     db.execute("update track set album_artist = 'The Alpha' where album = 'Second'")
     assert found["album"][0]["artistId"] == "ar-mb-" + KENSHI and found["album"][0]["year"] == 2020
     asked = len(mb.asked)
-    assert call(client, "search3", query="Ke")["searchResult3"]["artist"] == [] and len(mb.asked) == asked  # too short to ask
+    assert call(client, "search3", query="Ke", oasis="1")["searchResult3"]["artist"] == [] and len(mb.asked) == asked  # too short to ask
 
     artist = call(client, "getArtist", id="ar-mb-" + KENSHI)["artist"]
     assert artist["name"] == "米津玄師" and [a["name"] for a in artist["album"]] == ["BOOTLEG", "Lemon", "STRAY SHEEP"]
     call(client, "star", albumId="al-mb-" + STRAY)
     call(client, "star", artistId="ar-mb-" + KENSHI)
     sync(client)
-    album = call(client, "getAlbum", id="al-mb-" + STRAY)["album"]
+    album = call(client, "getAlbum", id="al-mb-" + STRAY, oasis="1")["album"]
     assert album["song"] == [] and album["oasisWanted"] == "wanted" and album["starred"]
     assert album["coverArt"] == "al-mb-" + STRAY
     covers = []
@@ -621,7 +622,8 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     assert client.get("/rest/getCoverArt", params={**params, "id": "al-mb-" + LEMON, "f": "json"}).status_code == 404  # none there
     assert wants(client)["STRAY SHEEP"][:2] == ("missing", "starred") and wants(client)["BOOTLEG"][1] == "followed"
     for method, key in (("getStarred2", "starred2"), ("getStarred", "starred")):
-        starred = call(client, method)[key]
+        assert call(client, method)[key] == {"artist": [], "album": [], "song": []}  # only for oasis=1
+        starred = call(client, method, oasis="1")[key]
         assert [(a["id"], a["name"]) for a in starred["artist"]] == [("ar-mb-" + KENSHI, "米津玄師")]
         assert [(a["id"], a["name"], a["artistId"], a["oasisWanted"]) for a in starred["album"]] == \
                [("al-mb-" + STRAY, "STRAY SHEEP", "ar-mb-" + KENSHI, "wanted")] and starred["album"][0]["starred"]
@@ -637,7 +639,7 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     assert len(covers) == asked and response.status_code == 200 and \
            response.content == client.get("/rest/getCoverArt", params={**params, "id": local}).content  # the library's now
     assert call(client, "getAlbum", id="al-mb-" + STRAY)["album"]["id"] == local and call(client, "getArtist", id="ar-mb-" + KENSHI)["artist"]["id"] == beta
-    assert album_of(client, "First")["starred"] and call(client, "search3", query="Kenshi Yonezu")["searchResult3"]["artist"] == []
+    assert album_of(client, "First")["starred"] and call(client, "search3", query="Kenshi Yonezu", oasis="1")["searchResult3"]["artist"] == []
     call(client, "unstar", albumId="al-mb-" + STRAY)
     assert db.execute("select count(*) from wanted where kind = 'album'").fetchone()[0] == 0
 

@@ -84,9 +84,9 @@ def test_oasis_fields_stay(client, tmp_path):
     db = connect(tmp_path / "oasis.db")
     db.execute("insert into want_item(kind, ref, state, error, updated) values ('album', ?, 'failed', 'nothing found', 0)", (album,))
     db.execute("insert into playlist(name, owner, created, changed, mix) values ('マイミックス', 'admin', 0, 0, 'RDTMAK5uy_kset8DisdE7LSD4TNjEVvrKRTmG7a56sY')")
-    got = call(client, "getAlbum", id=album, romanization="both")["album"]
+    got = call(client, "getAlbum", id=album, romanization="both", oasis="1")["album"]
     assert got["oasisWanted"] == "failed" and got["oasisWantedError"] == "nothing found"
-    playlist = call(client, "getPlaylists", romanization="both")["playlists"]["playlist"][0]
+    playlist = call(client, "getPlaylists", romanization="both", oasis="1")["playlists"]["playlist"][0]
     assert playlist["oasisMix"] is True and playlist["nameLatin"] == "Maimikkusu" and playlist["name"] == "マイミックス"
     assert "scrobblingEnabled" in call(client, "getUser", username="admin", romanization="both")["user"]
 
