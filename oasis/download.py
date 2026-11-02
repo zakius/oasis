@@ -5,7 +5,8 @@ record of which hash is which album. A bundle serves several albums: only their 
 <hash>/<release group>/, and each is imported on its own (download_target). A bundle whose files TorBox doesn't list
 yet (uncached, or cached as one zip) holds the albums it likely holds till it does (resolve); one whose music is packed
 is fetched whole and unpacked here first (unpacked). TorBox downloads a torrent whole, but hands out its files one by
-one. Nothing seeds from here."""
+one. Nothing seeds from here. A bundle imported is remembered with all it holds (bundle_kept): an album searched
+later, one starred since too, comes from it again while TorBox has it cached, before any Prowlarr search."""
 import hashlib
 import json
 import logging
@@ -42,6 +43,7 @@ PARALLEL = 2             # files fetched at once
 PAUSE = 300              # seconds without file downloads after a 429
 FETCH_TRIES = 5          # polls in a row a file may fail to download before the release counts as broken
 KEEP_FAILED = 2 * 86400  # seconds a failed download's files stay for inspection
+KEPT_UNSEEN = 90 * 86400 # seconds a remembered bundle stays unused; TorBox's cache check when one is used is its real expiry
 GRAB_TRIES = 5           # picks tried in turn when TorBox won't take one
 FRESH = 3600             # seconds Prowlarr's answers to an artist's bundle searches and the .torrents read stay: its bundles go a pass apart
 
@@ -205,7 +207,10 @@ class Downloads:
         return self.recall("torrent", release.get("guid") or release["downloadUrl"], read)
 
     def find(self, db, want: dict, group: str) -> bool | None:
-        """Searches Prowlarr for an album of oasis's own catalogue (acquire.py); see send."""
+        """Searches Prowlarr for an album of oasis's own catalogue (acquire.py), after the bundles oasis has had (remembered);
+        see send."""
+        if not want["upgrade"] and (sent := self.remembered(db, {group}, f"{want['artist']} - {want['title']}")) is not None:
+            return sent
         blocked = self.blocked(db)
         return self.send(db, releases.find(self.prowlarr, want, blocked, self.torbox().cached, self.unreliable(db), self.slow(db)), blocked, group,
                          f"{want['artist']} - {want['title']}")
@@ -216,6 +221,8 @@ class Downloads:
         search: its albums count as downloading, so the next search (acquire.py) sends the bundle that holds the most
         of the rest, until none holds any; their albums' own searches come after. A bundle whose files TorBox doesn't
         list yet is resolved once it does; see send."""
+        if (sent := self.remembered(db, wanted, want["artist"])) is not None:
+            return sent
         blocked = self.blocked(db) | {r[0] for r in db.execute("select hash from download where state not in ('done', 'failed')")}
         prowlarr = SimpleNamespace(search=lambda query: self.recall("search", query, lambda: self.prowlarr.search(query)))
         picks = releases.bundles(prowlarr, want, groups, wanted, blocked, self.torbox().cached_files, lambda rg: editions(db, rg),
@@ -224,9 +231,50 @@ class Downloads:
                                                                        if k in g} for g in groups]}
         for release, targets, holds in picks[:GRAB_TRIES]:
             label = f"{want['artist']}: {len(targets)} albums" if targets else f"{want['artist']}: a bundle that may hold {len(holds)} albums"
-            if (sent := self.send(db, [release], blocked, None, label, targets, None if targets else search, holds)) is not None:
+            if (sent := self.send(db, [release], blocked, None, label, targets, None if targets else search, holds, catalogue=search)) is not None:
                 return sent
         return None
+
+    def remembered(self, db, wanted: set[str], label: str) -> bool | None:
+        """Sends the remembered bundle (bundle_kept) that holds the most of these albums, when TorBox still has it
+        cached, to fetch only theirs; see send. One TorBox no longer has is forgotten: None when none went, and the
+        albums are searched as usual."""
+        avoid = self.blocked(db) | {r[0] for r in db.execute("select hash from download where state not in ('done', 'failed')")}
+        found = [(r["hash"], r["title"], held) for r in db.execute("select * from bundle_kept order by seen desc")
+                 if r["hash"] not in avoid and (held := {rg: f for rg, f in json.loads(r["groups"]).items() if rg in wanted})][:100]
+        listed = self.torbox().cached_files([h for h, _, _ in found]) if found else {}
+        for hash, title, held in sorted(found, key=lambda k: len(k[2]), reverse=True):
+            if hash not in listed:
+                db.execute("delete from bundle_kept where hash = ?", (hash,))
+                log.info("remembered bundle %s is no longer cached on TorBox: forgotten", title)
+                continue
+            names = {f["name"] for f in listed[hash]}
+            if not (targets := {rg: files for rg, files in held.items() if all(n in names for n in files)}):
+                continue  # cached, but listed otherwise (as one zip, past 100 files): searched as usual
+            db.execute("update bundle_kept set seen = ? where hash = ?", (time.time(), hash))
+            release = {"title": title, "infoHash": hash, "magnetUrl": f"magnet:?xt=urn:btih:{hash}"}
+            if (sent := self.send(db, [release], avoid, None, f"{label}: {len(targets)} albums from a remembered bundle", targets, kept=True)) is not None:
+                return sent
+        return None
+
+    def remember(self, db, row, files: list[dict]):
+        """A bundle imported, with its files and every release group its folders hold (releases.targets, over all the
+        artist's groups), wanted or not; one sent from memory is just seen again. Not one whose music came packed: its
+        albums can't be fetched alone."""
+        row = db.execute("select * from download where hash = ?", (row["hash"],)).fetchone()
+        targets = {rg: json.loads(f) for rg, f in db.execute("select rg, files from download_target where hash = ? and state = 'done'", (row["hash"],))}
+        names = {f["name"] for f in files}
+        if row["state"] != "done" or not targets or not all(n in names for t in targets.values() for n in t):
+            return
+        if row["kept"] or not row["catalogue"]:
+            db.execute("update bundle_kept set seen = ? where hash = ?", (time.time(), row["hash"]))
+            return
+        search = json.loads(row["catalogue"])
+        held = releases.targets(files, search["want"], search["groups"], {g["id"] for g in search["groups"]}, lambda rg: editions(db, rg)) | targets
+        artist = db.execute(f"select artist_mbid from want_album where rg in ({','.join('?' * len(targets))}) and artist_mbid is not null", list(targets)).fetchone()
+        db.execute("insert or replace into bundle_kept values (?, ?, ?, ?, ?, ?)", (row["hash"], row["title"], artist and artist[0],
+                   json.dumps([{"name": f["name"], "size": f.get("size")} for f in files]), json.dumps(held), time.time()))
+        log.info("remembered bundle %s: it holds %d of the artist's release groups", row["title"], len(held))
 
     def unreliable(self, db) -> frozenset:
         """Indexers whose seed counts don't hold up: a third or more of what oasis took from them was dead."""
@@ -244,11 +292,12 @@ class Downloads:
         return frozenset(r[0] for r in db.execute("select hash from release_block where reason like 'too slow%'"))
 
     def send(self, db, picks: list[dict], blocked: set, group: str | None, label: str, targets: dict | None = None,
-             search: dict | None = None, holds: set = frozenset()) -> bool | None:
+             search: dict | None = None, holds: set = frozenset(), catalogue: dict | None = None, kept: bool = False) -> bool | None:
         """Sends the first pick TorBox takes. True when one went, None when none would, False when TorBox had no free
         slot and queued it: the queued copy goes, the release isn't at fault, and the album is due again soon.
         group: the album's release group. targets: a bundle's albums, {group: files}. search: a bundle's whose files
-        TorBox doesn't list yet, for resolve; holds: the albums it likely holds, which count as downloading till then."""
+        TorBox doesn't list yet, for resolve; holds: the albums it likely holds, which count as downloading till then.
+        catalogue: a bundle's artist search, for remember. kept: sent from a remembered bundle."""
         tb = self.torbox()
         for i, release in enumerate(picks[:GRAB_TRIES]):
             try:
@@ -273,10 +322,11 @@ class Downloads:
                 return False
             now = time.time()
             later = [{k: r[k] for k in ("title", "guid", "infoHash", "magnetUrl", "downloadUrl", "seeders") if k in r} for r in picks[i + 1:i + 1 + GRAB_TRIES]]
-            db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated, bundle, picks) "
-                       "values (?, ?, 0, ?, ?, ?, 'added', ?, ?, ?, ?)", (added["hash"].lower(), release.get("guid"), group, release["title"],
-                                                                          added["torrent_id"], now, now, search and json.dumps(search),
-                                                                          json.dumps(later) if group and later else None))
+            db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated, bundle, picks, catalogue, kept) "
+                       "values (?, ?, 0, ?, ?, ?, 'added', ?, ?, ?, ?, ?, ?)", (added["hash"].lower(), release.get("guid"), group, release["title"],
+                                                                                added["torrent_id"], now, now, search and json.dumps(search),
+                                                                                json.dumps(later) if group and later else None,
+                                                                                catalogue and json.dumps(catalogue), int(kept)))
             self.seen.pop(added["hash"].lower(), None)  # added again after a failure: its stall timer starts anew
             self.failures.pop(added["hash"].lower(), None)
             db.execute("delete from download_target where hash = ?", (added["hash"].lower(),))
@@ -293,6 +343,7 @@ class Downloads:
         try:
             for (hash,) in db.execute("select hash from download where state = 'failed' and updated < ?", (time.time() - KEEP_FAILED,)).fetchall():
                 shutil.rmtree(self.folder / hash, ignore_errors=True)
+            db.execute("delete from bundle_kept where seen < ?", (time.time() - KEPT_UNSEEN,))
             rows = db.execute("select * from download where state not in ('done', 'failed') order by created").fetchall()
             if not rows:
                 return
@@ -359,6 +410,8 @@ class Downloads:
             state = self.set(db, row, "importing")
         if state == "importing":
             self.finish(db, row)
+            if torrent:
+                self.remember(db, row, torrent.get("files") or [])
 
     def switch(self, db, row, why: str) -> bool:
         """Sends the next of the album's search's picks in place of a slow download, cached ones first, and blocks the

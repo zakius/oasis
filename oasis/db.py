@@ -92,13 +92,21 @@ create table if not exists download(  -- releases oasis downloads through TorBox
     state text not null,                    -- added, downloading, fetching, importing, done, failed
     error text, created real not null, updated real not null,
     bundle text,                            -- an uncached bundle's search (JSON: want, groups, wanted) until its targets are known
-    picks text                              -- an album's search's next picks (JSON), for a slow download to make way for (see download.py)
+    picks text,                             -- an album's search's next picks (JSON), for a slow download to make way for (see download.py)
+    catalogue text,                         -- a bundle's artist search (JSON: want, groups), to remember all it holds (bundle_kept)
+    kept int not null default 0             -- 1: sent from a remembered bundle (bundle_kept)
 );
 create table if not exists download_target(  -- a bundle's albums, fetched and imported from one download (see download.py)
     hash text not null, rg text not null,   -- the download; the album's release group
     files text not null,                    -- its paths inside the torrent (JSON)
     state text not null,                    -- pending, done, failed; expected: one it likely holds, till its files are known
     primary key(hash, rg)
+);
+create table if not exists bundle_kept(  -- bundles oasis has had, to fetch albums from again while TorBox has them cached (see download.py)
+    hash text primary key, title text not null, artist_mbid text,
+    files text not null,                    -- the torrent's files (JSON: [{name, size}])
+    groups text not null,                   -- every release group its folders hold, wanted or not (JSON: {group: [paths]})
+    seen real not null                      -- when TorBox last had it cached
 );
 create table if not exists bundle_search(artist_mbid text primary key, searched real not null);  -- see acquire.py
 create table if not exists mb_cache(url text primary key, body text not null, fetched real not null);  -- see musicbrainz.py

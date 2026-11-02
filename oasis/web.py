@@ -508,9 +508,10 @@ def routes(api) -> list[Route]:
         tiles = [(songs, "songs"), (albums, "albums"), (artists, "artists"), *finding]
         html = '<div class="stats">' + "".join(f'<div><b>{n}</b><span>{label}</span></div>' for n, label in tiles) + '</div>'
         html += f'<p class="muted">{waits}</p>' if waits else ""
-        active = db.execute("select hash, title, state, created from download where state not in ('done', 'failed') order by created").fetchall()
+        active = db.execute("select hash, title, state, created, kept from download where state not in ('done', 'failed') order by created").fetchall()
         html += (f'<section><h2>Downloading <span class="count">{len(active)}</span></h2><ul class="rows">' + "".join(
-            f'<li><div class="grow">{escape(r["title"])}{progress(r["hash"], r["state"], r["created"])}</div></li>'
+            f'<li><div class="grow">{escape(r["title"])}{" <span class=\"muted\">from a remembered bundle</span>" if r["kept"] else ""}'
+            f'{progress(r["hash"], r["state"], r["created"])}</div></li>'
             for r in active) + '</ul></section>' if active else '<section><h2>Downloading</h2><p class="muted">Nothing downloading.</p></section>')
         recent = db.execute("select title, state, error, updated from download where state in ('done', 'failed') "
                             "order by updated desc limit 5").fetchall()

@@ -670,3 +670,36 @@ def test_other_peoples_mixtapes_of_an_album_are_not_it():
 def test_music_videos_and_vocal_free_tracks_are_not_the_single():
     assert reject(result("Metallica - Whiskey In The Jar.MPG (uncensored)"), want("Whiskey in the Jar", "Metallica")) == "video"
     assert reject(result("Foo Fighters  Everlong (No Vocal Original Track) flac"), want("Everlong", "Foo Fighters")) == "variant: novocal"
+
+
+def test_a_bundle_imported_is_remembered_and_later_albums_come_from_it_while_torbox_has_it_cached(downloads, torbox, db, tmp_path, monkeypatch):
+    placed = {}
+    downloads.own.place = lambda folder, group: placed.setdefault(group, sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file()))
+    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
+    torbox.cached_files = lambda hashes: {"abcd": DISCOGRAPHY} if "abcd" in hashes else {}
+    db.execute("insert into want_album(rg, artist_mbid, title, reason, state) values ('g-ht', 'mb-lp', 'Hybrid Theory', 'followed', 'missing')")
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht"})
+    torbox.list = [finished(71, "abcd", [f["name"] for f in DISCOGRAPHY], tmp_path)]
+    downloads.cycle()
+    assert set(placed) == {"g-ht"} and torbox.deleted == [71]
+    kept = db.execute("select * from bundle_kept").fetchone()
+    assert (kept["hash"], kept["artist_mbid"], len(json.loads(kept["files"]))) == ("abcd", "mb-lp", len(DISCOGRAPHY))
+    assert sorted(json.loads(kept["groups"])) == ["g-ht", "g-mtm", "g-oml"]  # all its folders hold, wanted or not
+
+    # An album starred since: from the remembered bundle, its files only, before any search.
+    asked = len(downloads.prowlarr.asked)
+    assert downloads.find(db, want("One More Light", "Linkin Park"), "g-oml")
+    assert torbox.added[-1][1] == "magnet:?xt=urn:btih:abcd" and len(downloads.prowlarr.asked) == asked
+    row = db.execute("select * from download where hash = 'abcd'").fetchone()
+    assert (row["state"], row["kept"]) == ("added", 1)
+    assert [tuple(r) for r in db.execute("select rg, files from download_target where hash = 'abcd'")] == [("g-oml", json.dumps(
+        ["LP Discography/One More Light (2017)/01 Nobody Can Save Me.flac", "LP Discography/One More Light (2017)/02 Heavy.flac"]))]
+    torbox.list = [finished(72, "abcd", [f["name"] for f in DISCOGRAPHY], tmp_path)]
+    downloads.cycle()
+    assert placed["g-oml"] == ["01 Nobody Can Save Me.flac", "02 Heavy.flac"] and db.execute("select count(*) from bundle_kept").fetchone()[0] == 1
+
+    # TorBox no longer has it: it is forgotten and the album searched as usual.
+    torbox.cached_files = lambda hashes: {}
+    downloads.find(db, want("Minutes to Midnight", "Linkin Park"), "g-mtm")
+    assert len(downloads.prowlarr.asked) > asked and db.execute("select count(*) from bundle_kept").fetchone()[0] == 0
