@@ -815,7 +815,7 @@ def routes(api) -> list[Route]:
                 + "".join(option(t, t, type_f) for t in ("Album", "EP", "Single"))
                 + f'</select><input type="text" name="q" value="{escape(text)}" placeholder="Title or artist" aria-label="Title or artist"><button>Filter</button>'
                 + ('<a class="button" href="/music/wanted">Clear</a>' if here != "/music/wanted" else "") + '</form>'
-                + '<p class="muted">Giving up stops the search; files already here stay, and wanting it again brings it back.</p>')
+                + '<p class="muted">Unwanting stops the search, also for a followed artist\'s album; files already here stay, and Want brings it back.</p>')
         titles = [("attention", "Failed, trying again"), ("downloading", "Downloading"), ("next", "Searched next"),
                   ("notfound", "Not found yet"), ("waiting", "Waiting for a first search")]
         for key, title in titles:
@@ -823,9 +823,9 @@ def routes(api) -> list[Route]:
             if not items:
                 continue
             bulk = (f'<form class="bulk" method="post" action="/music/wanted/give-up" '
-                    f'{confirm(f"Give up on all {len(items)} in {title}?")}><input type="hidden" name="rgs" '
+                    f'{confirm(f"Unwant all {len(items)} in {title}?")}><input type="hidden" name="rgs" '
                     f'value="{",".join(r["rg"] for r, _ in items)}"><input type="hidden" name="next" value="{escape(here)}">'
-                    f'<button class="danger">Give up on {"all " + str(len(items)) if len(items) > 1 else "it"}…</button></form>')
+                    f'<button class="danger">Unwant {"all " + str(len(items)) if len(items) > 1 else "it"}…</button></form>')
             table = "".join(
                 f'<tr id="rg-{escape(r["rg"])}"><td class="thumb">{cover_of(r["rg"])}</td><td class="lead"><b><a href="/music/library/album/{quote(acquire.library_id(db, MB_IDS["album"] + r["rg"]) or MB_IDS["album"] + r["rg"])}">{escape(r["title"])}</a></b><div class="muted">'
                 f'<a href="/music/artist/{escape(r["artist_mbid"])}">{escape(r["artist"] or "")}</a></div></td><td class="meta">{escape(r["primary_type"] or "")}'
@@ -833,7 +833,7 @@ def routes(api) -> list[Route]:
                 f'<td class="meta num">{escape((r["first_date"] or "")[:4])}</td>'
                 f'<td class="meta">{"<span class=star>★ starred</span>" if r["reason"] == "starred" else "followed"}</td><td class="state">{note}</td>'
                 f'<td class="actions">{action(r["rg"], "block", "Try another", f"Drop this download of {r['artist']} – {r['title']} and try another release?") if key == "downloading" else action(r["rg"], "search", "Search now")}'
-                f'{action(r["rg"], "give-up", "Give up", f"Give up on {r['artist']} – {r['title']}?")}</td></tr>' for r, note in items)
+                f'{action(r["rg"], "give-up", "Unwant", f"Unwant {r['artist']} – {r['title']}?")}</td></tr>' for r, note in items)
             opened = " open" if key in ("attention", "downloading", "next") or len(items) <= 30 else ""
             tone = {"attention": "bad", "downloading": "busy", "next": "accent"}.get(key, "muted")
             body += (f'<details class="group" id="group-{key}"{opened}><summary><span class="dot {tone}"></span>{title}<span class="count">{len(items)}</span>'
@@ -853,8 +853,8 @@ def routes(api) -> list[Route]:
                      'artist or album it is; it asks again later. Find it and want it from there instead.</p><table class="grid"><tbody>' + "".join(
                          f'<tr><td class="lead"><b>{escape(name(r))}</b></td><td class="meta">{escape(r["kind"])}</td><td class="state"><span class="error">'
                          f'{escape(r["error"] or "")}</span></td><td class="actions">' + (
-                             f'<form method="post" action="/music/unwant"{confirm(f"Give up on {name(r)}?")}><input type="hidden" name="kind" value="{r["kind"]}">'
-                             f'<input type="hidden" name="ref" value="{escape(r["ref"])}"><button class="danger">Give up</button></form>' if r["mine"] else "")
+                             f'<form method="post" action="/music/unwant"{confirm(f"Unwant {name(r)}?")}><input type="hidden" name="kind" value="{r["kind"]}">'
+                             f'<input type="hidden" name="ref" value="{escape(r["ref"])}"><button class="danger">Unwant</button></form>' if r["mine"] else "")
                          + '</td></tr>' for r in lost) + '</tbody></table></section>')
         return page("Wanted", body, q.get("message", ""), q.get("error", ""), wide=True, live=True, tab="wanted")
 
@@ -1024,7 +1024,7 @@ def routes(api) -> list[Route]:
                      f'<td class="num" data-unit="plays">{r["plays"] or ""}</td></tr>')
         kinds = [k.strip() for k in (t["release_types"] or "album").split(";") if k.strip()]
         line = [f'by <a href="/music/library/artist/{quote(artist_key)}">{escape(t["album_artist"])}</a>', escape(str(t["year"] or "")),
-                f"{len(tracks)} songs", length(sum(r["duration"] or 0 for r in tracks))]
+                f"{len(tracks)} song{'s' if len(tracks) != 1 else ''}", length(sum(r["duration"] or 0 for r in tracks))]
         body = (hero(picture(album_id), escape(" · ".join(kinds)), t["album"], " · ".join(filter(None, line)), f'<dl class="meta">{dl(facts)}</dl>')
                 + f'<section><table class="grid tracks"><thead><tr><th class="num">#</th><th>Title</th><th>Written by</th><th class="num">Length</th>'
                 f'<th class="num">Plays</th></tr></thead><tbody>{rows}</tbody></table></section>')
@@ -1082,7 +1082,7 @@ def routes(api) -> list[Route]:
             return back(here, message=f"{name} is searched next, in a minute or two." if action == "search" else
                         f"Blocked that release of {name}; the next search picks another.", anchor=f"rg-{rg}")
         give_up(db, user, rg)
-        return back(here, message=f"Gave up on {name}. Files already here stay.")
+        return back(here, message=f"Unwanted {name}: no longer searched for. Files already here stay; Want brings it back.")
 
     def wanted_log(db, user, rg: str, here: str) -> str:
         """An album's section on what oasis did to get it: whether and why it is wanted, its searches and downloads, and
@@ -1104,12 +1104,15 @@ def routes(api) -> list[Route]:
         act = lambda name, label, ask="": (f'<form class="inline" method="post" action="/music/wanted/{escape(rg)}/{name}"{ask and confirm(ask)}>'
                                            f'<input type="hidden" name="next" value="{escape(here)}"><button{" class=danger" if name == "give-up" else ""}>{label}</button></form>')
         name = f'{row["artist"]} – {row["title"]}' if row else "it"
+        searching = row and row["state"] != "have"
         actions = (act("block", "Try another", f"Drop this download of {name} and try another release?") if active else act("search", "Search now")) + \
-            act("give-up", "Give up", f"Give up on {name}?") if row and row["state"] != "have" else ""
+            act("give-up", "Unwant", f"Unwant {name}? Its search stops; files already here stay.") if searching else ""
         log = "".join(f'<tr><td class="meta num">{ago(d["created"])}</td><td class="lead">{escape(d["title"])}</td>'
                       f'<td class="meta">{escape("imported" if d["state"] == "done" else STATES.get(d["state"], d["state"]))}</td>'
                       f'<td class="state">{f"""<span class="error">{escape(d["error"])}</span>""" if d["error"] else ""}</td></tr>' for d in downloads)
-        return (f'<section><h2>Wanted</h2><dl class="meta">{dl(facts)}</dl><div class="row">{actions}{want_button("album", rg, not wanted, here)}</div>'
+        # Unwant drops the user's star and, for a followed artist's album, the album from the catalogue (given_up).
+        star = "" if searching else want_button("album", rg, False, here) if wanted else want_button("album", rg, True, here) if not row else ""
+        return (f'<section><h2>Wanted</h2><dl class="meta">{dl(facts)}</dl><div class="row">{actions}{star}</div>'
                 + (f'<h3>Downloads</h3><table class="grid"><tbody>{log}</tbody></table>' if log else "") + '</section>')
 
     def musicbrainz_album(db, request, user, rg: str):
@@ -1138,7 +1141,7 @@ def routes(api) -> list[Route]:
                        f'<td class="lead">{escape(t.get("title") or "")}</td><td class="num">{length((t.get("length") or 0) // 1000)}</td></tr>'
                        for m in media for t in m.get("tracks") or [])
         line = [f'by <a href="/music/artist/{escape(credit[0]["artist"]["id"])}">{escape(importer.joined(credit))}</a>' if credit else "",
-                escape((group.get("first-release-date") or "")[:4]), f"{len(tracks)} songs", length(sum(t.get("length") or 0 for t in tracks) // 1000)]
+                escape((group.get("first-release-date") or "")[:4]), f"{len(tracks)} song{'s' if len(tracks) != 1 else ''}", length(sum(t.get("length") or 0 for t in tracks) // 1000)]
         kinds = " · ".join(filter(None, [group.get("primary-type"), *(group.get("secondary-types") or [])])) or "Album"
         body = (hero(f'<img class="cover" alt="" src="/music/cover/al-mb-{escape(rg)}" {HIDE_BROKEN}>', escape(kinds), title,
                      " · ".join(filter(None, line)), f'<dl class="meta">{dl(facts)}</dl>')
@@ -1151,7 +1154,7 @@ def routes(api) -> list[Route]:
         rgs = [rg for rg in form.get("rgs", "").split(",") if MBID.fullmatch(rg)]
         for rg in rgs:
             give_up(db, user, rg)
-        return back(here, message=f"Gave up on {len(rgs)} album{'s' if len(rgs) != 1 else ''}. Files already here stay.")
+        return back(here, message=f"Unwanted {len(rgs)} album{'s' if len(rgs) != 1 else ''}. Files already here stay.")
 
     def unwant(db, request, user, form):
         if form.get("kind") in MB_IDS:

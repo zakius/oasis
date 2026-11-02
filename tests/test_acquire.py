@@ -559,6 +559,7 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     album = client.get(f"/music/library/album/al-mb-{BOOTLEG}").text
     assert "灰色と青" in album and "<h2>Wanted</h2>" in album and "the artist is followed" not in album and "its artist is followed" in album
     assert "<h3>Downloads</h3>" in album and "downloading on TorBox" in album and "Try another" in album
+    assert ">Unwant</button>" in album and ">Want</button>" not in album  # a followed artist's album can be unwanted too
     stray = client.get(f"/music/library/album/al-mb-{STRAY}").text
     assert "<h2>Wanted</h2>" in stray, stray[stray.find("<main"):][:1500]
     gone = client.get("/music/library/album/al-mb-55555555-5555-4555-8555-555555555555").text
@@ -587,14 +588,15 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     assert "Nothing is downloading" in client.post(f"/music/wanted/{BOOTLEG}/block").text
     api.library.downloads.active.clear()
 
-    assert "Gave up on 米津玄師 – BOOTLEG" in client.post(f"/music/wanted/{BOOTLEG}/give-up").text
+    assert "Unwanted 米津玄師 – BOOTLEG" in client.post(f"/music/wanted/{BOOTLEG}/give-up").text
     client.post(f"/music/wanted/{LEMON}/give-up")
-    assert "Gave up on 1 album" in client.post("/music/wanted/give-up", data={"rgs": STRAY}).text
+    assert "Unwanted 1 album" in client.post("/music/wanted/give-up", data={"rgs": STRAY}).text
     db.execute("delete from given_up where rg = ?", (STRAY,))  # wanted again
     db.execute("update want_item set catalogued = 0")
     sync(client)
     sync(client)
     assert {t: w[:2] for t, w in wants(client).items()} == {"STRAY SHEEP": ("missing", "followed")}  # given up: not wanted
+    assert ">Want</button>" in client.get(f"/music/library/album/al-mb-{BOOTLEG}").text  # unwanted: it can be wanted again
     assert db.execute("select count(*) from wanted where kind = 'album'").fetchone()[0] == 0
     client.post("/music/want", data={"kind": "album", "mbid": BOOTLEG, "on": "1"})
     sync(client)
