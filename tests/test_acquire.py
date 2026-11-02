@@ -130,17 +130,16 @@ def follow_beta(client, mb):
     sync(client)
 
 
-def test_a_followed_artists_catalogue_leaves_out_repackages_and_singles_with_nothing_new(client, mb):
+def test_a_followed_artists_catalogue_leaves_out_repackages_and_singles_with_nothing_new(client, mb, caplog):
+    caplog.set_level("INFO", "oasis.acquire")
     follow_beta(client, mb)
+    # Left out, so not wanted at all: Greatest Hits and Second (Deluxe) (repackages), Again (3 of 4 songs on earlier
+    # releases), One (its songs are on the albums), Promo (no official release); live albums aren't in the catalogue.
     assert wants(client) == {
         "First": ("have", "followed", None),  # its 2 tracks are here, as many as the smallest edition has
         "Second": ("missing", "followed", None), "Film": ("missing", "followed", "searched, no release found yet"),  # newest first
-        "Greatest Hits": ("skipped", "followed", "a repackage"),
-        "Again": ("skipped", "followed", "most of its songs are on earlier releases"),  # 3 of 4
-        "One": ("skipped", "followed", "its songs are on the artist's albums"),
-        "New Song": ("missing", "followed", None),  # a song on no album or EP kept
-        "Promo": ("skipped", "followed", "no official release"),
-        "Second (Deluxe)": ("skipped", "followed", "a repackage")}  # live albums aren't in the catalogue
+        "New Song": ("missing", "followed", None)}  # a song on no album or EP kept
+    assert "5 left out (2 a repackage, 1 its songs are on the artist's albums, 1 most of its songs are on earlier releases, 1 no official release)" in caplog.text
     db = client.app.state.api._db()
     assert db.execute("select tracks, discs from mb_group where rg = 'g-second'").fetchone()[:] == (3, 2)
     assert db.execute("select state, catalogued is not null from want_item where kind = 'artist'").fetchone()[:] == ("followed", 1)
@@ -264,6 +263,25 @@ def test_an_artist_with_gaps_gets_a_weekly_bundle_search_in_an_album_searchs_pla
     assert acq.downloads.found[2][0] == "bundle"
 
 
+def test_singles_whose_song_is_on_the_albums_or_that_are_another_version_arent_wanted(client, mb):
+    follow_beta(client, mb)
+    singles = {"g-two": ("Two", ["Two", "Drive Me Wild"]),  # wanted only for its B-side
+               "g-ab": ("Three / Four", ["Three", "Four", "Dear Lover"]),  # a double A-side
+               "g-seven": ("Seven (Acoustic)", ["Seven (Acoustic)"]), "g-dash": ("Seven - Live at Home", ["Seven"]),
+               "g-drug": ("The Drug in Me Is Reimagined", ["The Drug in Me Is Reimagined"]),
+               "g-bond": ("Live and Let Die", ["Live and Let Die"]), "g-star": ("Eight (Remix)", ["Eight (Remix)"])}
+    for id, (title, songs) in singles.items():
+        mb.catalogues["mb-beta"].append(group(id, title, "Single", "2012"))
+        mb.songs[id] = songs
+    db = client.app.state.api._db()
+    db.execute("insert into want_item(kind, ref, mbid, state, updated) values ('album', 'al-mb-g-star', 'g-star', 'wanted', 0)")
+    db.execute("insert into wanted(kind, ref, user) values ('album', 'al-mb-g-star', 'admin')")
+    db.execute("update want_item set catalogued = 0 where kind = 'artist'")
+    sync(client)
+    found = {rg for (rg,) in db.execute("select rg from want_album where rg like 'g-%'")} & set(singles)
+    assert found == {"g-bond", "g-star"}  # a song on no album, and a starred version
+
+
 def test_guest_appearances_are_skipped_unless_starred_and_joint_credits_count(client, mb):
     follow_beta(client, mb)
     credit = lambda *parts: [{"name": n, "joinphrase": j, "artist": {"id": i, "name": n}} for i, n, j in parts]
@@ -279,8 +297,7 @@ def test_guest_appearances_are_skipped_unless_starred_and_joint_credits_count(cl
     db.execute("update want_item set catalogued = 0")
     sync(client)
     found = {rg: (state, error) for rg, state, error in db.execute("select rg, state, error from want_album where rg in (%s)" % ",".join("?" * 5), list(guests))}
-    assert found["g-feat"] == found["g-with"] == ("skipped", "a guest appearance")
-    assert all(found[rg][0] != "skipped" for rg in ("g-joint", "g-slash", "g-lead"))
+    assert set(found) == {"g-joint", "g-slash", "g-lead"}  # guest appearances aren't wanted
 
     db.execute("insert into want_item(kind, ref, mbid, state, updated) values ('album', 'al-mb-g-feat', 'g-feat', 'wanted', 0)")
     db.execute("insert into wanted(kind, ref, user) values ('album', 'al-mb-g-feat', 'admin')")
@@ -294,7 +311,7 @@ def test_an_artist_missing_only_singles_gets_a_bundle_search_too(client, mb, mon
     acq, now = client.app.state.api.library, [time.time()]
     acq.bundles, acq.downloads.found = True, []
     db = client.app.state.api._db()
-    db.execute("update want_album set state = 'skipped' where primary_type != 'Single'")  # no album or EP missing
+    db.execute("delete from want_album where primary_type != 'Single'")  # no album or EP missing
     db.execute("insert into want_album(rg, artist_mbid, artist, title, primary_type, reason, state) values ('g-b', 'mb-beta', 'Beta', 'B-Side', 'Single', 'followed', 'missing')")
     monkeypatch.setattr(time, "time", lambda: now[0])
     now[0] += acquire.SEARCH_GAP
@@ -337,15 +354,14 @@ def test_one_missing_ep_or_single_gets_a_bundle_search_first_and_starred_groups_
     acq, now = client.app.state.api.library, [time.time()]
     acq.bundles, acq.downloads.found = True, []
     db = client.app.state.api._db()
-    db.execute("update want_album set state = 'skipped' where rg != 'g-new'")
+    db.execute("delete from want_album where rg != 'g-new'")
     db.execute("update want_album set searched = null, next_search = null")
-    db.execute("insert into want_album(rg, artist_mbid, artist, title, primary_type, secondary_types, reason, state) "
-               "values ('g-live', 'mb-beta', 'Beta', 'Live at Home', 'Album', 'Live', 'starred', 'skipped')")
     monkeypatch.setattr(time, "time", lambda: now[0])
     now[0] += acquire.SEARCH_GAP
     sync(client)
     assert acq.downloads.found == [("bundle", "Beta", ["g-new"])]
-    db.execute("update want_album set state = 'missing' where rg = 'g-live'")
+    db.execute("insert into want_album(rg, artist_mbid, artist, title, primary_type, secondary_types, reason, state) "
+               "values ('g-live', 'mb-beta', 'Beta', 'Live at Home', 'Album', 'Live', 'starred', 'missing')")
     db.execute("delete from bundle_search")
     now[0] += acquire.SEARCH_GAP
     sync(client)
@@ -403,7 +419,7 @@ def test_unfollowing_drops_the_catalogue_but_keeps_starred_albums_and_unstarring
     db.execute("delete from wanted where ref = 'al-x'")
     sync(client)
     sync(client)
-    assert wants(client)["Greatest Hits"] == ("skipped", "followed", "a repackage")  # back in the catalogue, left out again
+    assert "Greatest Hits" not in wants(client)  # back in the catalogue, left out again
 
 
 def test_what_lidarr_searched_and_looked_for_still_counts_once_it_is_gone(client, mb):
@@ -416,7 +432,7 @@ def test_what_lidarr_searched_and_looked_for_still_counts_once_it_is_gone(client
     assert (row["searched"], row["tries"], row["next_search"]) == (searched, 1, searched + acquire.RESEARCH)
     assert db.execute("select searched from want_album where rg = 'g-ost'").fetchone()[0] is not None  # never searched: first
     assert wants(client)["Again"] == ("missing", "followed", None)  # Lidarr looked for it: not left out
-    assert wants(client)["One"][0] == "skipped"  # singles go by the singles rule
+    assert "One" not in wants(client)  # singles go by the singles rule
 
 
 def test_catalogue_reads_keep_musicbrainzs_pace(tmp_path, monkeypatch):
@@ -494,8 +510,7 @@ def test_the_dashboard_finds_follows_and_wants_any_artist_or_album(client, mb):
     page = client.post("/music/want", data={"kind": "artist", "mbid": KENSHI, "on": "1", "next": f"/music/artist/{KENSHI}"}).text
     assert "Followed" in page and '"pill accent">followed<' in page and "Unfollow</button>" in page
     sync(client)
-    assert wants(client) == {"STRAY SHEEP": ("missing", "followed", "searched, no release found yet"), "Lemon": ("skipped", "followed",
-                             "its songs are on the artist's albums"), "BOOTLEG": ("missing", "followed", None)}
+    assert wants(client) == {"STRAY SHEEP": ("missing", "followed", "searched, no release found yet"), "BOOTLEG": ("missing", "followed", None)}
     page = client.post("/music/want", data={"kind": "album", "mbid": LEMON, "on": "1", "next": f"/music/artist/{KENSHI}"}).text
     assert "Wanted: it is searched for" in page
     sync(client)
@@ -571,9 +586,8 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     db.execute("update want_item set catalogued = 0")
     sync(client)
     sync(client)
-    assert {t: w[:2] for t, w in wants(client).items()} == {"STRAY SHEEP": ("missing", "followed"), "Lemon": ("skipped", "followed"),
-                                                            "BOOTLEG": ("skipped", "followed")}
-    assert wants(client)["BOOTLEG"][2] == "given up" and db.execute("select count(*) from wanted where kind = 'album'").fetchone()[0] == 0
+    assert {t: w[:2] for t, w in wants(client).items()} == {"STRAY SHEEP": ("missing", "followed")}  # given up: not wanted
+    assert db.execute("select count(*) from wanted where kind = 'album'").fetchone()[0] == 0
     client.post("/music/want", data={"kind": "album", "mbid": BOOTLEG, "on": "1"})
     sync(client)
     assert wants(client)["BOOTLEG"][:2] == ("missing", "starred")  # wanted again after all

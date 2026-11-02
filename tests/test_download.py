@@ -124,6 +124,18 @@ def test_a_find_sends_the_pick_to_torbox_and_the_files_are_fetched_and_placed(do
     assert torbox.deleted == [71] and not folder.exists() and downloads.groups(db) == set() and downloads.scans == [1]
 
 
+def test_dead_torrents_get_another_try_after_two_weeks_after_all_others_but_wrong_content_never(downloads, db):
+    old, fresh = time.time() - download.DEAD_AGAIN - 60, time.time()
+    db.executemany("insert into release_block(hash, reason, at) values (?, ?, ?)", [
+        ("dead-old", "dead torrent: no seeds, no progress", old), ("dead-new", "dead torrent: nobody shares it", fresh),
+        ("user", "blocked by a user", old), ("empty", "no audio files in the torrent", old), ("bad", "import failed: no edition matches", old)])
+    assert downloads.blocked(db) == {"dead-new", "user", "empty", "bad"} and downloads.slow(db) == {"dead-old"}
+    downloads.block_release(db, {"hash": "dead-old", "guid": None}, "dead torrent: its peers have only 3%")  # dead again: two weeks more
+    assert "dead-old" in downloads.blocked(db) and not downloads.slow(db)
+    assert releases.rank([{"title": "A [FLAC]", "infoHash": "dead-old", "seeders": 90}, {"title": "A [MP3]", "infoHash": "x", "seeders": 1}],
+                         set(), slow=frozenset({"dead-old"}))[0]["infoHash"] == "x"
+
+
 def test_two_same_named_files_in_different_folders_both_arrive_and_a_restart_mid_fetch_resumes(downloads, torbox, db, tmp_path):
     downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
     downloads.find(db, WANT, "mb-album")

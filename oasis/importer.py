@@ -414,8 +414,8 @@ class Importer:
         finally:
             db.close()
         self.cover(release, {f["path"].parent for f in mapping.values()} | {i.parent for i in images}, album)
-        log.info("imported %d of %d tracks as %s (%s %s, %s) into %s", placed, len(mapping), release["title"], release.get("country"),
-                 release.get("date"), release["id"], album)
+        log.info("imported %d of %d tracks as %s (%s %s, %s) into %s%s", placed, len(mapping), release["title"], release.get("country"),
+                 release.get("date"), release["id"], album, f"; {len(mapping) - placed} already here" if placed < len(mapping) else "")
         return album
 
     def put(self, source: Path, target: Path) -> int:

@@ -698,8 +698,7 @@ def routes(api) -> list[Route]:
     def album_line(db, user, g: dict, here: str, by: bool = True) -> str:
         row = db.execute("select state, error from want_album where rg = ?", (g["id"],)).fetchone()
         state = pill("in the library", "good") if acquire.library_id(db, MB_IDS["album"] + g["id"]) or row and row["state"] == "have" else \
-            {"missing": pill("wanted", "accent"), "downloading": pill("downloading", "busy"),
-             "skipped": f'<span class="muted">left out: {escape(row["error"] or "")}</span>'}[row["state"]] if row else ""
+            {"missing": pill("wanted", "accent"), "downloading": pill("downloading", "busy")}[row["state"]] if row else ""
         credit = g.get("artist-credit") or []
         artist = f' — <a href="/music/artist/{credit[0]["artist"]["id"]}">{escape(credited(g))}</a>' if by and credit else ""
         info = details(g.get("primary-type"), *(g.get("secondary-types") or []), (g.get("first-release-date") or "")[:4], g.get("disambiguation"))
@@ -807,7 +806,7 @@ def routes(api) -> list[Route]:
         option = lambda value, label, chosen: f'<option value="{escape(value)}"{" selected" if value == chosen else ""}>{escape(label)}</option>'
         counts = dict(db.execute("select state, count(*) from want_album group by state").fetchall())
         finding, waits = to_find(db)
-        tiles = [*finding, (counts.get("downloading", 0), "downloading"), (counts.get("have", 0), "arrived"), (counts.get("skipped", 0), "left out")]
+        tiles = [*finding, (counts.get("downloading", 0), "downloading"), (counts.get("have", 0), "arrived")]
         body = ('<div class="stats">' + "".join(f'<div><b>{n}</b><span>{label}</span></div>' for n, label in tiles) + '</div>'
                 + (f'<p class="muted">{waits}</p>' if waits else "") +
                 f'<form class="filters"><select name="artist" aria-label="Artist">{option("", "All artists", artist_f)}'
@@ -1063,7 +1062,7 @@ def routes(api) -> list[Route]:
     def give_up(db, user, rg: str):
         api._want(db, user["name"], "album", mine(db, user, "album", rg), None)
         db.execute("insert or replace into given_up values (?, ?)", (rg, time.time()))
-        db.execute("update want_album set state = 'skipped', error = 'given up' where rg = ? and reason = 'followed'", (rg,))
+        db.execute("delete from want_album where rg = ? and reason = 'followed'", (rg,))
 
     def wanted_action(db, request, user, form):
         rg, action = request.path_params["rg"], request.path_params["action"]

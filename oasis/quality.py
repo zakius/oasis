@@ -401,7 +401,7 @@ def purge(db, delete: bool) -> list[dict]:
 
 def want_again(db, rg: str):
     """The album searched for soon: its want_album row if the catalogue or a star has one, else a star for the first admin."""
-    if db.execute("select 1 from want_album where rg = ? and state != 'skipped'", (rg,)).fetchone():
+    if db.execute("select 1 from want_album where rg = ?", (rg,)).fetchone():
         db.execute("update want_album set state = 'missing', next_search = null where rg = ?", (rg,))
         return
     user = db.execute("select name from user order by admin desc, created limit 1").fetchone()

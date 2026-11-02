@@ -127,8 +127,9 @@ create table if not exists bundle_kept(  -- bundles oasis has had, to fetch albu
 );
 create table if not exists bundle_search(artist_mbid text primary key, searched real not null);  -- see acquire.py
 create table if not exists mb_cache(url text primary key, body text not null, fetched real not null);  -- see musicbrainz.py
-create table if not exists release_block(  -- releases that failed: never picked again, but slow ones last. hash: info hash, or guid for those listed without one
-    hash text primary key, reason text, at real not null
+create table if not exists release_block(  -- releases that failed: never picked again, but slow and long-dead ones last (see download.py). hash: info hash, or guid for those listed without one
+    hash text primary key, reason text, at real not null,
+    artist_mbid text, wanted text   -- a bundle that held no wanted album: its artist, and the albums wanted then (JSON)
 );
 create table if not exists audio_pair(  -- dedupe verdicts, valid while both files are unchanged
     a text not null, b text not null, a_mtime real not null, b_mtime real not null, level int not null, primary key(a, b)
@@ -157,9 +158,9 @@ create table if not exists want_album(  -- albums oasis looks for: starred ones 
     artist_mbid text not null, artist text, title text not null,
     primary_type text, secondary_types text, first_date text,  -- secondary types joined with '; '
     reason text not null,                   -- starred, followed
-    state text not null,                    -- missing, downloading, have, skipped
+    state text not null,                    -- missing, downloading, have
     searched real, next_search real, tries int not null default 0,
-    error text                              -- why it is skipped, or what its last search found
+    error text                              -- what its last search found
 );
 create index if not exists want_album_artist on want_album(artist_mbid);
 create table if not exists given_up(rg text primary key, at real not null);  -- albums users gave up on: followed artists' catalogues leave them out

@@ -10,6 +10,8 @@ MusicBrainz has can be wanted, under ids of its own until it arrives (see adopt)
 want_item the stars and follows."""
 import itertools
 import json
+from collections import Counter
+from collections import Counter
 import logging
 import re
 import threading
@@ -57,10 +59,15 @@ SEARCH_GAP = 60           # seconds between searches, so a burst of stars doesn'
 MISS_GAP = 15             # seconds after a search that asked TorBox to add nothing: only Prowlarr had work
 RETRY_FULL = 600          # seconds before an album TorBox had no free slot for is searched again
 UPGRADE_AGAIN = 7 * 86400  # seconds between searches for a lossless copy of an album here lossy
+# A lossless track by its file: ALAC shares .m4a with AAC, which stops at 512 kbps, and ALAC runs well above it.
+LOSSLESS_TRACK = "(t.suffix in (" + ", ".join(f"'{s}'" for s in LOSSLESS) + ") or t.suffix = 'm4a' and t.bitrate > 512)"
 REPEATS = 0.6             # share of an album's songs already on the artist's earlier releases that makes it a repackage
 GUEST = re.compile(r"feat|ft\.|\bwith\b", re.I)  # joinphrases after which artists are guests: 'Beyoncé feat. Jay-Z'
 REPACKAGE = re.compile(r"\b(best of|greatest hits|very best|the essential|anthology|collection|singles|remaster(ed)?|anniversary|"
-                       r"deluxe|bonus ?tracks?|re-?recorded|reissue|remixes|instrumentals?|karaoke)\b", re.I)
+                       r"deluxe|bonus ?tracks?|re-?recorded|reimagined|reissue|remixes|instrumentals?|karaoke)\b", re.I)
+# A single that is another version of its song, said in a bracket or after a dash: 'Song (Acoustic)', 'Song - Live',
+# not 'Live and Let Die'.
+VERSION = re.compile(r"(\([^)]*|\[[^\]]*|\s[-‐–—]\s.*)\b(re-?recorded|reimagined|acoustic|remix(es)?|live|instrumentals?)\b", re.I)
 
 
 def lucene(text: str) -> str:
@@ -163,6 +170,7 @@ class Acquire:
         db = self.connect()
         try:
             adopt(db)
+            db.execute("delete from want_album where state = 'skipped'")  # left out by an older oasis, which kept a row
             for kind, ref in db.execute("select distinct kind, ref from wanted").fetchall():
                 db.execute("insert or ignore into want_item(kind, ref, state, updated) values (?, ?, 'wanted', ?)", (kind, ref, time.time()))
             for item in db.execute("select * from want_item").fetchall():
@@ -291,7 +299,8 @@ class Acquire:
     def catalogue(self, db, item):
         """Reads the followed artist's catalogue into want_album. Left out: guest appearances (see guest), repackages
         (best-ofs, deluxe and anniversary editions, re-recordings, albums most of whose songs are on its earlier ones),
-        singles whose songs are all on its albums or EPs, what has no official release and what a user gave up on.
+        singles whose song is on its albums or EPs (B-sides and versions don't make one wanted), singles that are
+        another version or a re-release, what has no official release and what a user gave up on.
         Starred albums and albums with files never are, given up or not, and nor are albums and EPs Lidarr looked for
         unless the artist is only a guest on them."""
         groups = sorted(self.browse(db, item["mbid"]), key=lambda g: g.get("first-release-date") or "9999")
@@ -317,23 +326,28 @@ class Acquire:
                 why[g["id"]] = "no official release"
             elif editions[g["id"]]["songs"] <= on_albums:
                 why[g["id"]] = "its songs are on the artist's albums"
+            elif all(song_key(part) in on_albums for part in re.split(r"\s+/\s+", g["title"])):  # 'A / B': double A-sides
+                why[g["id"]] = "its song is on the artist's albums"
+            elif REPACKAGE.search(g["title"]) or VERSION.search(g["title"]):
+                why[g["id"]] = "another version or a re-release"
         name = (db.execute("select name from mb_artist where mbid = ?", (item["mbid"],)).fetchone() or [None])[0] or \
             next((c["artist"]["name"] for g in groups for c in g.get("artist-credit") or [] if c["artist"]["id"] == item["mbid"]), None)
         given_up = {r[0] for r in db.execute("select rg from given_up")} - starred
         why.update({rg: "given up" for rg in given_up})
         skipped = {g["id"] for g in groups if not kept(g) or g["id"] in given_up}
-        for g in groups:
-            self.put(db, g, item["mbid"], name, "starred" if g["id"] in starred else "followed", why[g["id"]] if g["id"] in skipped else None)
-        listed = {g["id"] for g in groups}
+        for g in (g for g in groups if g["id"] not in skipped):
+            self.put(db, g, item["mbid"], name, "starred" if g["id"] in starred else "followed")
+        listed = {g["id"] for g in groups} - skipped  # what's left out isn't wanted: no row
         db.executemany("delete from want_album where rg = ?", [(rg,) for (rg,) in db.execute(
             "select rg from want_album where artist_mbid = ? and reason = 'followed'", (item["mbid"],)).fetchall() if rg not in listed])
         db.execute("update want_item set catalogued = ?, error = null, retry_at = null where kind = 'artist' and ref = ?", (time.time(), item["ref"]))
-        log.info("catalogue of %s: %d release groups, %d left out", name or item["mbid"], len(groups), len(skipped))
+        log.info("catalogue of %s: %d release groups, %d left out (%s)", name or item["mbid"], len(groups), len(skipped),
+                 ", ".join(f"{n} {r}" for r, n in sorted(Counter(why[rg] for rg in skipped).items(), key=lambda x: (-x[1], x[0]))) or "none")
 
     def have_files(self, db, rg: str) -> bool:
         return bool(db.execute("select 1 from track where mb_release_group = ? and source = 'local'", (rg,)).fetchone())
 
-    def put(self, db, group: dict, artist_mbid: str, artist: str | None, reason: str, skip: str | None = None):
+    def put(self, db, group: dict, artist_mbid: str, artist: str | None, reason: str):
         """Adds or updates a release group's row. A new one carries over Lidarr's last search of it."""
         self.edition(db, group["id"])
         searched = db.execute("select max(searched) from (select searched from catalogue_search where mbid = ? union all "
@@ -342,11 +356,9 @@ class Acquire:
                    "searched, next_search, tries) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) on conflict(rg) do update set "
                    "artist_mbid = excluded.artist_mbid, artist = coalesce(excluded.artist, want_album.artist), title = excluded.title, "
                    "primary_type = excluded.primary_type, secondary_types = excluded.secondary_types, first_date = excluded.first_date, "
-                   "reason = excluded.reason, state = case when excluded.state = 'skipped' then 'skipped' "
-                   "when want_album.state = 'skipped' then 'missing' else want_album.state end, "
-                   "error = case when excluded.state = 'skipped' then excluded.error when want_album.state = 'skipped' then null else want_album.error end",
+                   "reason = excluded.reason",
                    (group["id"], artist_mbid, artist, group["title"], group.get("primary-type"), "; ".join(group.get("secondary-types") or []),
-                    group.get("first-release-date"), reason, "skipped" if skip else "missing", skip, searched,
+                    group.get("first-release-date"), reason, "missing", None, searched,
                     searched + RESEARCH if searched else None, int(bool(searched))))
 
     def map_releases(self, db):
@@ -367,7 +379,7 @@ class Acquire:
         active = self.downloads.groups(db)
         for row in db.execute("select w.rg, w.state, coalesce(g.tracks, 0) tracks, (select count(distinct coalesce(t.mb_track, t.id)) from track t "
                               "where t.mb_release_group = w.rg and t.source = 'local') n from want_album w left join mb_group g on g.rg = w.rg "
-                              "where w.state != 'skipped'").fetchall():
+                              ).fetchall():
             state = "downloading" if row["rg"] in active else "have" if row["n"] and row["n"] >= row["tracks"] else "missing"
             if state != row["state"]:
                 db.execute("update want_album set state = ? where rg = ?", (state, row["rg"]))
@@ -391,11 +403,10 @@ class Acquire:
         if self.bundles and self.bundle_next(db):
             return
         now, queued = time.time(), self.downloads.groups(db)
-        lossless = ", ".join(f"'{s}'" for s in LOSSLESS)
         bundled = f"and not ({BUNDLE_FIRST} and artist is not null and artist_mbid not in (select artist_mbid from bundle_search where searched > ?))"
         rows = db.execute(f"select * from want_album w where (state = 'missing' and coalesce(next_search, 0) <= ? {bundled if self.bundles else ''}) or (state = 'have' and "
                           "coalesce(searched, 0) < ? and not exists (select 1 from track t where t.mb_release_group = w.rg and t.source = 'local' "
-                          f"and t.suffix in ({lossless}))) order by state = 'have', searched is not null, reason != 'starred', primary_type = 'Single', "
+                          f"and {LOSSLESS_TRACK})) order by state = 'have', searched is not null, reason != 'starred', primary_type = 'Single', "
                           "first_date desc limit 50", (now, *[now - BUNDLE_AGAIN] * self.bundles, now - UPGRADE_AGAIN)).fetchall()
         if row := next((r for r in rows if r["rg"] not in queued), None):
             if self.idle:
@@ -415,9 +426,8 @@ class Acquire:
             self.idle = True
         if now - self.last_search < EARLY_GAP or self.bundles and self.bundle_next(db, BUNDLE_EARLY):
             return
-        lossless = ", ".join(f"'{s}'" for s in LOSSLESS)
         rows = db.execute("select * from want_album w where (state = 'have' and coalesce(searched, 0) < ? and not exists (select 1 from track t "
-                          f"where t.mb_release_group = w.rg and t.source = 'local' and t.suffix in ({lossless}))) or (state = 'missing' and "
+                          f"where t.mb_release_group = w.rg and t.source = 'local' and {LOSSLESS_TRACK})) or (state = 'missing' and "
                           "coalesce(searched, 0) < case when primary_type = 'Single' then ? else ? end) "
                           "order by state = 'missing', next_search limit 50", (now - RESEARCH, now - SINGLE_EARLY, now - RESEARCH)).fetchall()
         if row := next((r for r in rows if r["rg"] not in queued), None):

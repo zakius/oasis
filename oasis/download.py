@@ -43,6 +43,8 @@ PARALLEL = 2             # files fetched at once
 PAUSE = 300              # seconds without file downloads after a 429
 FETCH_TRIES = 5          # polls in a row a file may fail to download before the release counts as broken
 GONE_AFTER = 3           # polls in a row TorBox may leave a download out of its list before it counts as gone: the list comes back empty or short now and then
+DEAD_AGAIN = 14 * 86400  # seconds before a dead torrent is tried again, after all others: seeders come back
+EMPTY_BUNDLE = "the bundle holds no wanted album"
 KEEP_FAILED = 2 * 86400  # seconds a failed download's files stay for inspection
 KEPT_UNSEEN = 90 * 86400 # seconds a remembered bundle stays unused; TorBox's cache check when one is used is its real expiry
 GRAB_TRIES = 5           # picks tried in turn when TorBox won't take one
@@ -302,11 +304,25 @@ class Downloads:
         return frozenset(s for s, deaths in tally.items() if len(deaths) >= UNRELIABLE[0] and sum(deaths) >= UNRELIABLE[1] * len(deaths))
 
     def blocked(self, db) -> set[str]:
-        return {r[0] for r in db.execute("select hash from release_block where reason not like 'too slow%'")}
+        """Releases never picked: those that failed, but the last resorts (slow) and bundles looked at again (lift)."""
+        self.lift(db)
+        return {r[0] for r in db.execute("select hash from release_block where reason not like 'too slow%' and not (reason like 'dead torrent%' "
+                                         "and at < ?)", (time.time() - DEAD_AGAIN,))}
 
     def slow(self, db) -> frozenset:
-        """Releases that made way for others while slow: tried last, not never."""
-        return frozenset(r[0] for r in db.execute("select hash from release_block where reason like 'too slow%'"))
+        """Releases tried last, not never: slow ones that made way for others, and dead ones DEAD_AGAIN after they died."""
+        return frozenset(r[0] for r in db.execute("select hash from release_block where reason like 'too slow%' or reason like 'dead torrent%' "
+                                                  "and at < ?", (time.time() - DEAD_AGAIN,)))
+
+    def lift(self, db):
+        """Unblocks a bundle that held none of the artist's wanted albums once the artist has one wanted that wasn't
+        then, so its next bundle search looks at it again. One blocked by an older oasis, which didn't note what was
+        wanted, is looked at again once."""
+        for hash, artist, wanted in db.execute("select hash, artist_mbid, wanted from release_block where reason = ?", (EMPTY_BUNDLE,)).fetchall():
+            if artist is None or db.execute("select 1 from want_album where artist_mbid = ? and state = 'missing' and rg not in "
+                                            "(select value from json_each(?))", (artist, wanted)).fetchone():
+                db.execute("delete from release_block where hash = ?", (hash,))
+                log.info("bundle %s: looked at again, for albums wanted since", hash)
 
     def send(self, db, picks: list[dict], blocked: set, group: str | None, label: str, targets: dict | None = None,
              search: dict | None = None, holds: set = frozenset(), catalogue: dict | None = None, kept: bool = False) -> bool | None:
@@ -388,7 +404,7 @@ class Downloads:
                 return self.fail(db, row, f"TorBox: {torrent['download_state']}")
             if row["bundle"] and torrent.get("files"):
                 if not self.resolve(db, row, torrent["files"]):
-                    return self.fail(db, row, "the bundle holds no wanted album")
+                    return self.fail(db, row, EMPTY_BUNDLE, wanted=json.loads(row["bundle"])["wanted"])
                 row = db.execute("select * from download where hash = ?", (row["hash"],)).fetchone()
             # TorBox lists a torrent it is checking (one re-added, say) with no files, even when it calls it finished.
             if not (torrent["download_finished"] and torrent["download_present"] and torrent.get("files")):
@@ -616,12 +632,12 @@ class Downloads:
         log.info("imported %s", row["title"])
         self.imported()
 
-    def fail(self, db, row, why: str, block: bool = True):
+    def fail(self, db, row, why: str, block: bool = True, wanted: list[str] | None = None):
         """Deletes the torrent and makes the album due for another search. A blocked release is never picked again.
         The files stay KEEP_FAILED for inspection."""
         self.delete(row)
         if block:
-            self.block_release(db, row, why)
+            self.block_release(db, row, why, wanted)
         self.set(db, row, "failed", why)
         db.execute("update want_album set next_search = null, error = ? where rg = ?", (f"download failed: {why}", row["album_mbid"]))
         # A bundle's albums: the artist's next bundle search is due, for another bundle of them.
@@ -629,8 +645,11 @@ class Downloads:
                    "(select rg from download_target where hash = ?))", (row["hash"],))
         log.info("download %s failed: %s", row["title"], why)
 
-    def block_release(self, db, row, why: str):
-        db.executemany("insert or replace into release_block values (?, ?, ?)", [(k, why, time.time()) for k in (row["hash"], row["guid"]) if k])
+    def block_release(self, db, row, why: str, wanted: list[str] | None = None):
+        """wanted: a bundle's, the albums it was looked at for (lift)."""
+        artist = wanted and (db.execute(f"select artist_mbid from want_album where rg in ({','.join('?' * len(wanted))}) limit 1", wanted).fetchone() or [None])[0]
+        db.executemany("insert or replace into release_block values (?, ?, ?, ?, ?)",
+                       [(k, why, time.time(), artist, json.dumps(wanted) if wanted else None) for k in (row["hash"], row["guid"]) if k])
 
     def block(self, db, rg: str) -> bool:
         """Blocks the release TorBox is downloading for the album, so its next search picks another; a bundle's albums
