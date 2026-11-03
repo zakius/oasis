@@ -20,7 +20,7 @@ class Config:
     acquire: dict = dataclasses.field(default_factory=dict)  # secondary_types, bundles (see acquire.py)
     artists: dict = dataclasses.field(default_factory=dict)  # merge, separate and related names (see artists.py)
     dedupe: bool = False        # store each audio stream once (see dedupe.py); needs the library writable, on btrfs or XFS
-    seeding: dict = dataclasses.field(default_factory=dict)  # per login tracker (Prowlarr's name): ratio, days, min_hours, min_ratio (see download.py)
+    seeding: dict = dataclasses.field(default_factory=dict)  # per login tracker (Prowlarr's name): seed, ratio, days, min_hours, min_ratio (see download.py)
 
 
 def load(path: Path) -> Config:

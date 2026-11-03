@@ -138,7 +138,7 @@ def test_dead_torrents_get_another_try_after_two_weeks_after_all_others_but_wron
 
 
 class LoginProwlarr(Prowlarr):
-    logins = {1: "Tracker-A"}
+    logins = {1: "Some-Tracker"}
 
     def tracker(self, release):
         return self.logins.get(release.get("indexerId"))
@@ -151,7 +151,7 @@ def seeding(downloads, torbox, db, tmp_path, ratio, **more):
     torbox.list = [finished(71, "abcd", ["Album/01 Song.flac"], tmp_path)]
     downloads.cycle()
     row = db.execute("select state, seeding, tracker, finished from download").fetchone()
-    assert tuple(row)[:3] == ("done", 1, "Tracker-A") and row["finished"] and 71 not in torbox.deleted
+    assert tuple(row)[:3] == ("done", 1, "Some-Tracker") and row["finished"] and 71 not in torbox.deleted
     torbox.list = [{**torbox.list[0], "download_state": "seeding", "active": True, "ratio": ratio, "total_downloaded": 1000,
                     "total_uploaded": int(ratio * 1000), **more}]
 
@@ -167,19 +167,19 @@ def test_a_login_trackers_torrent_seeds_after_its_import_till_its_ratio_is_met_a
     downloads.cycle()
     assert 71 in torbox.deleted and "stopped seeding Artist - Album [FLAC]: ratio 1.02" in caplog.text
     assert db.execute("select seeding, downloaded, uploaded from download").fetchone()[:] == (0, 1000, 1020)
-    assert downloads.totals(db) == {"Tracker-A": (1000, 1020)}  # kept after it went
+    assert downloads.totals(db) == {"Some-Tracker": (1000, 1020)}  # kept after it went
 
 
 def test_seeding_ends_at_the_day_cap_unless_the_trackers_ratio_is_low_and_waits_its_minimum_time(downloads, torbox, db, tmp_path, caplog):
     caplog.set_level("INFO", "oasis.download")
-    downloads.rules = {"Tracker-A": {"min_hours": 72, "min_ratio": 0.6}}
+    downloads.rules = {"Some-Tracker": {"min_hours": 72, "min_ratio": 0.6}}
     seeding(downloads, torbox, db, tmp_path, 1.5)
     downloads.cycle()
     assert 71 not in torbox.deleted  # its ratio is met, but not its 72 hours
     torbox.list[0].update(ratio=0.4, total_uploaded=400)
     db.execute("update download set finished = ?", (time.time() - 8 * 86400,))
     downloads.cycle()
-    assert 71 not in torbox.deleted and "Tracker-A: our ratio is 0.40, below its 0.60" in caplog.text  # low: past the cap
+    assert 71 not in torbox.deleted and "Some-Tracker: our ratio is 0.40, below its 0.60" in caplog.text  # low: past the cap
     downloads.rules = {}
     downloads.cycle()
     assert 71 in torbox.deleted and "stopped seeding Artist - Album [FLAC]: 7 days, ratio 0.40" in caplog.text
@@ -479,6 +479,18 @@ def test_a_bundle_downloaded_again_keeps_what_it_was_tried_for_before(downloads,
     downloads.map_kept = lambda *args: None
     downloads.remember(db, {"hash": "abcd"}, [{"name": "Disco/Album/01.flac", "size": 1}])
     assert json.loads(db.execute("select tried from bundle_kept").fetchone()[0]) == ["g-album", "g-old"]
+
+
+def test_a_tracker_keeping_no_ratio_isnt_seeded_and_built_in_rules_give_way_to_oasis_toml(downloads, torbox, db, tmp_path):
+    downloads.prowlarr = LoginProwlarr({"Artist Album": [offer("abcd")]})
+    downloads.prowlarr.logins = {1: "Tracker-B"}
+    assert downloads.find(db, WANT, "mb-album") and torbox.seeded == [False]
+    torbox.list = [finished(71, "abcd", ["Album/01 Song.flac"], tmp_path)]
+    downloads.cycle()
+    assert db.execute("select state, seeding, tracker from download").fetchone()[:] == ("done", 0, None) and 71 in torbox.deleted
+    assert downloads.rule("Ratio-Tracker")["days"] == 14 and downloads.rule("Tracker-D") == download.SEEDING
+    downloads.rules = {"Ratio-Tracker": {"days": 3}, "Tracker-B": {"seed": True}}
+    assert (downloads.rule("Ratio-Tracker")["days"], downloads.rule("Ratio-Tracker")["min_ratio"], downloads.rule("Tracker-B")["seed"]) == (3, 0.7, True)
 
 
 def test_a_low_ratio_trackers_releases_come_after_other_indexers_offering_the_album():

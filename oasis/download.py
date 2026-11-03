@@ -6,7 +6,7 @@ record of which hash is which album. A bundle serves several albums: only their 
 yet (uncached, or cached as one zip) holds the albums it likely holds till it does (resolve); one whose music is packed
 is fetched whole and unpacked here first (unpacked). TorBox downloads a torrent whole, but hands out its files one by
 one. One from a login tracker (private or semi-private in Prowlarr) is seeded by TorBox once imported, till it meets
-the tracker's rules (SEEDING, oasis.toml's [seeding."<tracker>"]); nothing seeds or uploads from here. A bundle imported is remembered with all it holds (bundle_kept): an album searched
+the tracker's rules (SEEDING, TRACKERS, oasis.toml's [seeding."<tracker>"]); nothing seeds or uploads from here. A bundle imported is remembered with all it holds (bundle_kept): an album searched
 later, one starred since too, comes from it again while TorBox has it cached, before any Prowlarr search."""
 import hashlib
 import json
@@ -50,7 +50,16 @@ KEEP_FAILED = 2 * 86400  # seconds a failed download's files stay for inspection
 KEPT_UNSEEN = 90 * 86400 # seconds a remembered bundle stays unused; TorBox's cache check when one is used is its real expiry
 # A login tracker's seeding rules, unless oasis.toml sets its own: a torrent seeds till its ratio reaches ratio after
 # at least min_hours, or for days at most; while the tracker's overall ratio for us is below min_ratio, only the ratio ends it.
-SEEDING = {"ratio": 1.0, "days": 7, "min_hours": 0, "min_ratio": None}
+# seed: false for a tracker that keeps no ratio, whose torrents go from TorBox once imported, as public ones do.
+SEEDING = {"seed": True, "ratio": 1.0, "days": 7, "min_hours": 0, "min_ratio": None}
+# What each tracker's own rules ask, by Prowlarr's indexer name; oasis.toml's win.
+TRACKERS = {
+    "Tracker-A": {"seed": False}, "Tracker-B": {"seed": False},  # paid access, public open trackers, "no limits"
+    "Tracker-C": {"seed": False}, "Cookie-Tracker": {"seed": False},  # no passkey in the announce URL, no ratio rules
+    "Magnet-Tracker": {"ratio": 1.0, "days": 7, "min_ratio": 0.3},  # rule 3.5's 0.3, unenforced since 2012
+    "Ratio-Tracker": {"ratio": 1.0, "days": 14, "min_ratio": 0.7},  # a 6 GB deficit leaves 1 slot, 20 GB disables the account
+    "Strict-Tracker": {"ratio": 1.05, "days": 7},  # its "Advanced user" threshold; no minimum
+}
 TOTALS_EVERY = 86400     # seconds between log lines of each tracker's totals
 GRAB_TRIES = 5           # picks tried in turn when TorBox won't take one
 FRESH = 3600             # seconds Prowlarr's answers to an artist's bundle searches and the .torrents read stay: its bundles go a pass apart
@@ -200,7 +209,7 @@ class Downloads:
         return sum(bool(t["active"]) and t["hash"].lower() not in seeding for t in torrents)
 
     def rule(self, tracker: str) -> dict:
-        return {**SEEDING, **self.rules.get(tracker, {})}
+        return {**SEEDING, **TRACKERS.get(tracker, {}), **self.rules.get(tracker, {})}
 
     def totals(self, db) -> dict[str, tuple[int, int]]:
         """Each login tracker's bytes (downloaded, uploaded) over every torrent oasis got from it, deleted ones too."""
@@ -376,6 +385,7 @@ class Downloads:
                 log.info("%s failed before: next", release["title"])
                 continue
             tracker = getattr(self.prowlarr, "tracker", lambda r: None)(release)
+            tracker = tracker if tracker and self.rule(tracker)["seed"] else None  # one keeping no ratio is as a public one
             try:
                 self.added = time.time()
                 try:
