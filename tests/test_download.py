@@ -488,7 +488,7 @@ def test_a_tracker_keeping_no_ratio_isnt_seeded_and_built_in_rules_give_way_to_o
     torbox.list = [finished(71, "abcd", ["Album/01 Song.flac"], tmp_path)]
     downloads.cycle()
     assert db.execute("select state, seeding, tracker from download").fetchone()[:] == ("done", 0, None) and 71 in torbox.deleted
-    assert downloads.rule("Ratio-Tracker")["days"] == 14 and downloads.rule("Tracker-D") == download.SEEDING
+    assert downloads.rule("Ratio-Tracker")["days"] == 14 and downloads.rule("Tracker-D") == download.SEEDING and not downloads.rule("Local-DHT")["seed"]
     downloads.rules = {"Ratio-Tracker": {"days": 3}, "Tracker-B": {"seed": True}}
     assert (downloads.rule("Ratio-Tracker")["days"], downloads.rule("Ratio-Tracker")["min_ratio"], downloads.rule("Tracker-B")["seed"]) == (3, 0.7, True)
 

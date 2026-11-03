@@ -59,6 +59,7 @@ TRACKERS = {
     "Magnet-Tracker": {"ratio": 1.0, "days": 7, "min_ratio": 0.3},  # rule 3.5's 0.3, unenforced since 2012
     "Ratio-Tracker": {"ratio": 1.0, "days": 14, "min_ratio": 0.7},  # a 6 GB deficit leaves 1 slot, 20 GB disables the account
     "Strict-Tracker": {"ratio": 1.05, "days": 7},  # its "Advanced user" threshold; no minimum
+    "Local-DHT": {"seed": False},  # a self-hosted DHT index, public, though Prowlarr's Generic Torznab calls every indexer private
 }
 TOTALS_EVERY = 86400     # seconds between log lines of each tracker's totals
 GRAB_TRIES = 5           # picks tried in turn when TorBox won't take one
