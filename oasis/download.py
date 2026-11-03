@@ -56,7 +56,7 @@ SEEDING = {"seed": True, "ratio": 1.0, "days": 7, "min_hours": 0, "min_ratio": N
 TRACKERS = {
     "Tracker-A": {"seed": False}, "Tracker-B": {"seed": False},  # paid access, public open trackers, "no limits"
     "Tracker-C": {"seed": False}, "Cookie-Tracker": {"seed": False},  # no passkey in the announce URL, no ratio rules
-    "Magnet-Tracker": {"ratio": 1.0, "days": 7, "min_ratio": 0.3},  # rule 3.5's 0.3, unenforced since 2012
+    "Magnet-Tracker": {"seed": False},  # oasis gets magnet links from it, without the passkey: seeding counts for no account
     "Ratio-Tracker": {"ratio": 1.0, "days": 14, "min_ratio": 0.7},  # a 6 GB deficit leaves 1 slot, 20 GB disables the account
     "Strict-Tracker": {"ratio": 1.05, "days": 7},  # its "Advanced user" threshold; no minimum
     "Local-DHT": {"seed": False},  # a self-hosted DHT index, public, though Prowlarr's Generic Torznab calls every indexer private
