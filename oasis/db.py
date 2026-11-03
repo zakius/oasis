@@ -114,7 +114,11 @@ create table if not exists download(  -- releases oasis downloads through TorBox
     tracker text,                           -- the login tracker it came from (Prowlarr's name), whose ratio it counts toward; null: a public one
     finished real,                          -- when TorBox had it whole: seeding's clock
     uploaded int, downloaded int,           -- TorBox's last totals for it, kept after it is deleted: the tracker's running ratio
-    seeding int not null default 0          -- 1: imported and still seeding on TorBox (see download.py)
+    seeding int not null default 0,         -- 1: imported and still seeding on TorBox (see download.py)
+    indexer int                             -- the Prowlarr indexer it came from; null before oasis noted it (web.py goes by the guid's site then)
+);
+create table if not exists search_stat(  -- each indexer's answers to album searches, a day at a time: results, the album, usable
+    day text not null, indexer int not null, results int not null, album int not null, usable int not null, primary key(day, indexer)
 );
 create table if not exists download_target(  -- a bundle's albums, fetched and imported from one download (see download.py)
     hash text not null, rg text not null,   -- the download; the album's release group

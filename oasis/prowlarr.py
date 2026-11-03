@@ -3,6 +3,7 @@ by oasis (releases.py), not by Lidarr's parser."""
 import json
 import logging
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,6 +31,7 @@ class Prowlarr:
         """tag: the Prowlarr tag of the music indexers; anime's stay out of music searches."""
         self.url, self.key, self.tag = url.rstrip("/"), api_key, tag
         self.logins: dict[int, str] = {}  # indexer id -> name, of those needing a login (private, semi-private): see tracker
+        self.errors: dict[int, tuple[float, str]] = {}  # indexer id -> (when, what) of its last failed search, for the indexers page
 
     def call(self, path: str):
         request = urllib.request.Request(f"{self.url}/api/v1/{path}", headers={"X-Api-Key": self.key})
@@ -66,6 +68,7 @@ class Prowlarr:
                     found += [r for r in job.result() if r.get("protocol") == "torrent"]
                 except OSError as e:
                     log.info("Prowlarr indexer %s on %r: %s", i, query, " ".join(str(e).split())[:160])
+                    self.errors[i] = time.time(), " ".join(str(e).split())[:300]
                     errors.append(e)
         if len(errors) == len(ids):
             raise errors[0]

@@ -292,13 +292,18 @@ def queries(want: dict) -> list[str]:
 
 
 def find(prowlarr, want: dict, blocked: set, cached, unreliable: frozenset = frozenset(), slow: frozenset = frozenset(),
-         low: frozenset = frozenset()) -> list[dict]:
-    """The releases to try, best first, from the first query that finds a usable one; unreliable, slow, low: see rank."""
+         low: frozenset = frozenset(), tally: dict | None = None) -> list[dict]:
+    """The releases to try, best first, from the first query that finds a usable one; unreliable, slow, low: see rank.
+    tally: indexer id -> [results, the album, usable], added to for each query asked."""
     for query in queries(want):
         found = prowlarr.search(query)
         fits = [r for r in found if not {hash_of(r), r.get("guid")} & blocked and not reject(r, want)]
         hashes = list(dict.fromkeys(h for r in fits if (h := hash_of(r))))[:100]
         picks = rank(fits, cached(hashes) if hashes else set(), want["upgrade"], unreliable, slow, low)
+        if tally is not None:
+            for i, rows in enumerate((found, fits, picks)):
+                for r in rows:
+                    tally.setdefault(r.get("indexerId"), [0, 0, 0])[i] += 1
         log.info("Prowlarr %r: %d results, %d the album, %d usable", query, len(found), len(fits), len(picks))
         if picks:
             return picks

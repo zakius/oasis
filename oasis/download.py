@@ -258,10 +258,14 @@ class Downloads:
         see send."""
         if not want["upgrade"] and (sent := self.remembered(db, {group}, f"{want['artist']} - {want['title']}")) is not None:
             return sent
-        blocked, low = self.blocked(db), self.low(db)
+        blocked, low, tally = self.blocked(db), self.low(db), {}
         low_ids = frozenset(i for i, name in getattr(self.prowlarr, "logins", {}).items() if name in low)
-        return self.send(db, releases.find(self.prowlarr, want, blocked, self.torbox().cached, self.unreliable(db), self.slow(db), low_ids), blocked, group,
-                         f"{want['artist']} - {want['title']}")
+        try:
+            picks = releases.find(self.prowlarr, want, blocked, self.torbox().cached, self.unreliable(db), self.slow(db), low_ids, tally)
+        finally:
+            db.executemany("insert into search_stat values (date('now'), ?, ?, ?, ?) on conflict(day, indexer) do update set results = results + excluded.results, "
+                           "album = album + excluded.album, usable = usable + excluded.usable", [(i, *n) for i, n in tally.items() if i is not None])
+        return self.send(db, picks, blocked, group, f"{want['artist']} - {want['title']}")
 
     def bundle(self, db, want: dict, groups: list[dict], wanted: set[str]) -> bool | None:
         """Sends the artist's bundle that holds the most wanted albums (release group ids) to TorBox: a cached one,
@@ -411,10 +415,11 @@ class Downloads:
             now = time.time()
             later = [{k: r[k] for k in ("title", "guid", "infoHash", "magnetUrl", "downloadUrl", "seeders") if k in r} for r in picks[i + 1:i + 1 + GRAB_TRIES]]
             db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated, bundle, picks, catalogue, kept, "
-                       "tracker) values (?, ?, 0, ?, ?, ?, 'added', ?, ?, ?, ?, ?, ?, ?)", (added["hash"].lower(), release.get("guid"), group, release["title"],
+                       "tracker, indexer) values (?, ?, 0, ?, ?, ?, 'added', ?, ?, ?, ?, ?, ?, ?, ?)", (added["hash"].lower(), release.get("guid"), group, release["title"],
                                                                                             added["torrent_id"], now, now, search and json.dumps(search),
                                                                                             json.dumps(later) if group and later else None,
-                                                                                            catalogue and json.dumps(catalogue), int(kept), tracker))
+                                                                                            catalogue and json.dumps(catalogue), int(kept), tracker,
+                                                                                            release.get("indexerId")))
             self.seen.pop(added["hash"].lower(), None)  # added again after a failure: its stall timer starts anew
             self.failures.pop(added["hash"].lower(), None)
             self.missing.pop(added["hash"].lower(), None)

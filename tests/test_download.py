@@ -498,3 +498,11 @@ def test_a_low_ratio_trackers_releases_come_after_other_indexers_offering_the_al
              {"title": "A [FLAC]", "infoHash": "bb", "seeders": 5, "indexerId": 32, "downloadUrl": "u"}]
     assert [r["infoHash"] for r in releases.rank(picks, set())] == ["aa", "bb"]
     assert [r["infoHash"] for r in releases.rank(picks, set(), low=frozenset({40}))] == ["bb", "aa"]
+
+
+def test_album_searches_count_each_indexers_results_and_downloads_note_the_indexer(downloads, torbox, db):
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd", indexerId=22), result("Other - Thing [FLAC]", "ffff", indexerId=22),
+                                                  offer("bcde", indexerId=35, seeders=0)]
+    assert downloads.find(db, WANT, "mb-album")
+    assert [tuple(r) for r in db.execute("select indexer, results, album, usable from search_stat order by indexer")] == [(22, 2, 1, 1), (35, 1, 1, 0)]
+    assert db.execute("select indexer from download").fetchone()[0] == 22

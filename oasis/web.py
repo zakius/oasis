@@ -9,14 +9,14 @@ import threading
 import time
 import urllib.request
 from html import escape
-from urllib.parse import parse_qsl, quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from . import accounts, acquire, importer, musicbrainz, releases
+from . import accounts, acquire, download, importer, musicbrainz, releases
 from .acquire import MB_IDS, TYPES
 from .artists import linked
 from .forward import LastFm
@@ -619,6 +619,7 @@ def routes(api) -> list[Route]:
         known = count("select count(*) from track where source = 'local' and mb_release is not null")
         artists_done = count("select count(*) from mb_artist where fetched is not null and mbid in (select mbid from credit)")
         artists_all = count("select count(*) from mb_artist where mbid in (select mbid from credit)")
+        html += ('<p class="muted"><a href="/music/indexers">Indexers</a>: each one\'s health, searches, downloads and seeding.</p>' if api.library else "")
         html += (f'<section><h2>Background</h2><p class="muted">MusicBrainz: credits for {filled} of {known} songs, names and links for '
                  f'{artists_done} of {artists_all} artists.</p>')
         shared = db.execute("select count(*), coalesce(sum(t.size), 0) from audio_shared a join track t on t.ref = a.path").fetchone()
@@ -1162,6 +1163,80 @@ def routes(api) -> list[Route]:
                 + wanted_log(db, user, rg, f"/music/library/album/{MB_IDS['album']}{rg}"))
         return page(title, body, request.query_params.get("message", ""), request.query_params.get("error", ""), wide=True, tab="wanted", heading=False)
 
+    def indexers(db, request, user, form):
+        """Every Prowlarr indexer: Prowlarr's view of it (settings, health, counts), what oasis got from it, and for a
+        login tracker its seeding rule and running ratio."""
+        prowlarr = api.downloads.prowlarr if api.downloads else None
+        try:
+            found = prowlarr.call("indexer")
+            status = {s["indexerId"]: s for s in prowlarr.call("indexerstatus")}
+            stats = {s["indexerId"]: s for s in (prowlarr.call("indexerstats") or {}).get("indexers") or []}
+            tags = {t["id"]: t["label"] for t in prowlarr.call("tag")}
+        except (OSError, AttributeError) as e:
+            return page("Indexers", f'<section><p class="error">Prowlarr didn\'t answer: {escape(str(e))}</p></section>', tab="wanted")
+        label = lambda host: (parts := (host or "").split("."))[-2 if len(parts) > 1 else 0]  # 'example' for example.org and example.net alike
+        # A site several indexers share (an anime site and its music twin) goes to an enabled music one: oasis searches only those.
+        by_site = {label(urlparse(u).hostname): i["id"] for i in sorted(found, key=lambda i: (i["enable"], prowlarr.tag in i.get("tags", [])))
+                   for u in [*(i.get("indexerUrls") or []), *(i.get("legacyUrls") or [])] if urlparse(u).hostname}
+        rows = db.execute("select hash, guid, indexer, state, error, album_mbid, updated from download").fetchall()
+        targets = {}
+        for h, rg in db.execute("select hash, rg from download_target where state = 'done'"):
+            targets.setdefault(h, set()).add(rg)
+        have = {r[0] for r in db.execute("select rg from want_album where state = 'have'")}
+        of = lambda r: r["indexer"] or by_site.get(label(urlparse(r["guid"] or "").hostname) if (r["guid"] or "").startswith("http") else None)
+        mine = {}
+        for r in rows:
+            m = mine.setdefault(of(r), {"sent": 0, "done": 0, "failed": Counter(), "albums": set(), "last": None})
+            m["sent"] += 1
+            if r["state"] == "done":
+                m["done"] += 1
+                if supplied := ({r["album_mbid"]} if r["album_mbid"] else targets.get(r["hash"], set())) & have:
+                    m["albums"] |= supplied
+                    m["last"] = max(m["last"] or 0, r["updated"])
+            elif r["state"] == "failed":
+                m["failed"][(r["error"] or "unknown").split(":")[0]] += 1
+        hits = {i: n for i, *n in db.execute("select indexer, sum(results), sum(album), sum(usable) from search_stat where day >= date('now', '-30 days') group by indexer")}
+        totals = api.downloads.totals(db)
+        errors = getattr(prowlarr, "errors", {})
+        cell = lambda *parts: '<br>'.join(p for p in parts if p)
+        body = ""
+        for i in sorted(found, key=lambda i: (not i["enable"], i["name"].casefold())):
+            id, name, login = i["id"], i["name"], (i.get("privacy") or "public") != "public" and i.get("protocol") == "torrent"
+            st, pr, m = status.get(id) or {}, stats.get(id) or {}, mine.get(id) or {}
+            when, what = errors.get(id, (None, ""))
+            if login and "login" in what.lower():
+                health = '<span class="error">login expired, needs a new cookie</span>'
+            elif (st.get("disabledTill") or "") > time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()):
+                health = f'<span class="error">paused by Prowlarr till {escape(st["disabledTill"][:16].replace("T", " "))} UTC</span>'
+            elif not i["enable"]:
+                health = '<span class="muted">disabled</span>'
+            else:
+                health = pill("healthy", "good")
+            health = cell(health, f'<span class="muted">last failure {escape(st["mostRecentFailure"][:16].replace("T", " "))} UTC</span>' if st.get("mostRecentFailure") else "",
+                          f'<span class="muted">last error {ago(when)}: {escape(what[:140])}</span>' if when else "")
+            counts = (f'{pr.get("numberOfQueries", 0)} queries ({pr.get("numberOfFailedQueries", 0)} failed) · {pr.get("numberOfGrabs", 0)} grabs '
+                      f'({pr.get("numberOfFailedGrabs", 0)} failed) · {pr.get("averageResponseTime", 0) / 1000:.1f} s a query' if pr else "")
+            searched = f'{hits[id][0]} results, {hits[id][1]} the album, {hits[id][2]} usable' if id in hits else ""
+            failed = ", ".join(f"{n} {why}" for why, n in m["failed"].most_common()) if m else ""
+            ours = cell(f'{m["sent"]} sent, {m["done"]} imported' + (f'; failed: {escape(failed)}' if failed else "") if m else "",
+                        f'{len(m["albums"])} wanted album{"s" if len(m["albums"]) != 1 else ""} arrived, last {ago(m["last"])}' if m and m["albums"] else "")
+            seeding = ""
+            if login:
+                rule, source = api.downloads.rule(name), "oasis.toml" if name in api.config.seeding else "built in" if name in download.TRACKERS else "default"
+                seeding = ("seed = false" if not rule["seed"] else f'ratio {rule["ratio"]:g} · {rule["days"]:g} days' + (f' · at least {rule["min_hours"]:g} h' if rule["min_hours"] else "")
+                           + (f' · min_ratio {rule["min_ratio"]:g}' if rule["min_ratio"] is not None else "")) + f' <span class="muted">({source})</span>'
+                if name in totals:
+                    down, up = totals[name]
+                    seeding += f'<br>{size(down)} down, {size(up)} up, ratio {f"{up / down:.2f}" if down else "–"}'
+            kind = cell(escape(i.get("privacy") or "public") + (" · " + escape(", ".join(tags.get(t, str(t)) for t in i.get("tags") or [])) if i.get("tags") else ""),
+                        f'<span class="muted">{escape(i.get("definitionName") or i.get("implementationName") or "")} · {escape(i.get("protocol") or "")}</span>')
+            body += (f'<tr><td class="lead"><b>{escape(name)}</b> <span class="muted">#{id}</span><div class="muted">{kind}</div></td><td class="state">{health}</td>'
+                     f'<td class="meta">{counts}</td><td class="meta">{searched}</td><td class="meta">{ours}</td><td class="meta">{seeding}</td></tr>')
+        body = ('<section><p class="muted">Prowlarr\'s counts are its own, over all apps; searches are oasis\'s album searches over the last 30 days; downloads count '
+                'oasis\'s, by the indexer it noted, or before it did by the release\'s site.</p><table class="grid"><thead><tr><th>Indexer</th><th>Health</th>'
+                f'<th>Prowlarr</th><th>Searches</th><th>Downloads</th><th>Seeding</th></tr></thead><tbody>{body}</tbody></table></section>')
+        return page("Indexers", body, wide=True, tab="wanted")
+
     def wanted_give_up(db, request, user, form):
         here = form.get("next", "") if form.get("next", "").startswith(("/music/wanted", "/music/library/album/")) else "/music/wanted"
         rgs = [rg for rg in form.get("rgs", "").split(",") if MBID.fullmatch(rg)]
@@ -1197,6 +1272,7 @@ def routes(api) -> list[Route]:
         Route("/music/want", catalogue(set_want), methods=["POST"]),
         Route("/music/unwant", catalogue(unwant), methods=["POST"]),
         Route("/music/wanted", catalogue(wanted)),
+        Route("/music/indexers", catalogue(indexers)),
         Route("/music/library", catalogue(music_library)),
         Route("/music/library/artist/{key}", catalogue(library_artist)),
         Route("/music/library/album/{id}", catalogue(library_album)),
