@@ -1,4 +1,5 @@
-"""The few TorBox API calls oasis needs. TorBox downloads torrents on its own servers, so nothing seeds from here."""
+"""The few TorBox API calls oasis needs. TorBox downloads torrents on its own servers, and seeds there the ones oasis
+asks it to (login trackers'); nothing seeds or uploads from here."""
 import json
 import urllib.error
 import urllib.parse
@@ -42,10 +43,11 @@ class TorBox:
         found = self.call("torrents/checkcached?format=list&list_files=true&hash=" + ",".join(hashes)) if hashes else None
         return {c["hash"].lower(): c.get("files") or [] for c in found or []}
 
-    def add(self, name: str, magnet: str | None = None, torrent: bytes | None = None) -> dict:
+    def add(self, name: str, magnet: str | None = None, torrent: bytes | None = None, seed: bool = False) -> dict:
         """Adds a magnet link or .torrent file: {torrent_id, hash}, or {queued_id, hash} when no active slot was free.
-        TorBox doesn't seed it, so it leaves the active slots once downloaded; it doesn't zip it, so files stay separate."""
-        return self.call("torrents/createtorrent", form={"name": name, "seed": "3", "allow_zip": "false",
+        seed: TorBox seeds it once downloaded (2), else never (3), so it leaves the active slots then. It doesn't zip
+        it, so files stay separate."""
+        return self.call("torrents/createtorrent", form={"name": name, "seed": "2" if seed else "3", "allow_zip": "false",
                                                          **({"magnet": magnet} if magnet else {"file": torrent})})
 
     def link(self, torrent_id: int, file_id: int) -> str:

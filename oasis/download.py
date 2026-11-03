@@ -5,7 +5,8 @@ record of which hash is which album. A bundle serves several albums: only their 
 <hash>/<release group>/, and each is imported on its own (download_target). A bundle whose files TorBox doesn't list
 yet (uncached, or cached as one zip) holds the albums it likely holds till it does (resolve); one whose music is packed
 is fetched whole and unpacked here first (unpacked). TorBox downloads a torrent whole, but hands out its files one by
-one. Nothing seeds from here. A bundle imported is remembered with all it holds (bundle_kept): an album searched
+one. One from a login tracker (private or semi-private in Prowlarr) is seeded by TorBox once imported, till it meets
+the tracker's rules (SEEDING, oasis.toml's [seeding."<tracker>"]); nothing seeds or uploads from here. A bundle imported is remembered with all it holds (bundle_kept): an album searched
 later, one starred since too, comes from it again while TorBox has it cached, before any Prowlarr search."""
 import hashlib
 import json
@@ -47,6 +48,10 @@ DEAD_AGAIN = 14 * 86400  # seconds before a dead torrent is tried again, after a
 EMPTY_BUNDLE = "the bundle holds no wanted album"
 KEEP_FAILED = 2 * 86400  # seconds a failed download's files stay for inspection
 KEPT_UNSEEN = 90 * 86400 # seconds a remembered bundle stays unused; TorBox's cache check when one is used is its real expiry
+# A login tracker's seeding rules, unless oasis.toml sets its own: a torrent seeds till its ratio reaches ratio after
+# at least min_hours, or for days at most; while the tracker's overall ratio for us is below min_ratio, only the ratio ends it.
+SEEDING = {"ratio": 1.0, "days": 7, "min_hours": 0, "min_ratio": None}
+TOTALS_EVERY = 86400     # seconds between log lines of each tracker's totals
 GRAB_TRIES = 5           # picks tried in turn when TorBox won't take one
 FRESH = 3600             # seconds Prowlarr's answers to an artist's bundle searches and the .torrents read stay: its bundles go a pass apart
 
@@ -149,9 +154,11 @@ class Downloads:
     """Sends searches' picks to TorBox and walks each download through added -> downloading -> fetching ->
     importing -> done, or failed. The state is in the download table, so a restart resumes where it was."""
 
-    def __init__(self, connect, torbox, importer, prowlarr, downloads: str, max_active: int = 8, stall_hours: float = 1, imported=lambda: None):
+    def __init__(self, connect, torbox, importer, prowlarr, downloads: str, max_active: int = 8, stall_hours: float = 1, imported=lambda: None,
+                 seeding: dict | None = None):
         """torbox: makes the TorBox client (the doctor's, with the key rdtclient holds). importer: importer.py's.
-        imported: called after each import."""
+        imported: called after each import. seeding: oasis.toml's rules per login tracker (SEEDING)."""
+        self.rules, self.said_low, self.totals_said = seeding or {}, set(), 0.0
         self.connect, self.torbox_for, self.own, self.prowlarr, self.folder, self.imported = connect, torbox, importer, prowlarr, Path(downloads), imported
         self.max_active, self.stall = max_active, stall_hours * 3600
         self.client = None
@@ -181,8 +188,34 @@ class Downloads:
 
     def room(self) -> bool:
         """Whether another download may start. Every active torrent of the account takes one of the plan's slots,
-        anime's and seeding ones too; max_active of them leaves the rest for anime."""
-        return sum(bool(t["active"]) for t in self.torbox().torrents()) < self.max_active
+        anime's too; max_active of them leaves the rest for anime. oasis's seeding ones don't count."""
+        db = self.connect()
+        try:
+            return self.active(db, self.torbox().torrents()) < self.max_active
+        finally:
+            db.close()
+
+    def active(self, db, torrents: list[dict]) -> int:
+        seeding = {r[0] for r in db.execute("select hash from download where seeding = 1")}
+        return sum(bool(t["active"]) and t["hash"].lower() not in seeding for t in torrents)
+
+    def rule(self, tracker: str) -> dict:
+        return {**SEEDING, **self.rules.get(tracker, {})}
+
+    def totals(self, db) -> dict[str, tuple[int, int]]:
+        """Each login tracker's bytes (downloaded, uploaded) over every torrent oasis got from it, deleted ones too."""
+        return {t: (down, up) for t, down, up in db.execute("select tracker, coalesce(sum(downloaded), 0), coalesce(sum(uploaded), 0) from download "
+                                                            "where tracker is not null group by tracker")}
+
+    def low(self, db) -> set[str]:
+        """The login trackers whose overall ratio for us is below their min_ratio; each logged once while it is."""
+        found = {t for t, (down, up) in self.totals(db).items() if (floor := self.rule(t)["min_ratio"]) is not None and down and up / down < floor}
+        for t in found - self.said_low:
+            down, up = self.totals(db)[t]
+            log.info("%s: our ratio is %.2f, below its %.2f: its torrents seed till their own ratio is met, and other indexers come first",
+                     t, up / down, self.rule(t)["min_ratio"])
+        self.said_low = found
+        return found
 
     def groups(self, db, but: str = "") -> set[str]:
         """The release groups being downloaded, a bundle's expected ones too; but: of downloads other than that one."""
@@ -215,8 +248,9 @@ class Downloads:
         see send."""
         if not want["upgrade"] and (sent := self.remembered(db, {group}, f"{want['artist']} - {want['title']}")) is not None:
             return sent
-        blocked = self.blocked(db)
-        return self.send(db, releases.find(self.prowlarr, want, blocked, self.torbox().cached, self.unreliable(db), self.slow(db)), blocked, group,
+        blocked, low = self.blocked(db), self.low(db)
+        low_ids = frozenset(i for i, name in getattr(self.prowlarr, "logins", {}).items() if name in low)
+        return self.send(db, releases.find(self.prowlarr, want, blocked, self.torbox().cached, self.unreliable(db), self.slow(db), low_ids), blocked, group,
                          f"{want['artist']} - {want['title']}")
 
     def bundle(self, db, want: dict, groups: list[dict], wanted: set[str]) -> bool | None:
@@ -341,9 +375,16 @@ class Downloads:
             if info_hash(found) in blocked:  # listed without its hash, it is one that failed before
                 log.info("%s failed before: next", release["title"])
                 continue
+            tracker = getattr(self.prowlarr, "tracker", lambda r: None)(release)
             try:
                 self.added = time.time()
-                added = tb.add(release["title"], **found)
+                try:
+                    added = tb.add(release["title"], **found, seed=bool(tracker))
+                except OSError as e:
+                    if not tracker:
+                        raise
+                    log.warning("TorBox won't take %s for seeding (%s): added without", release["title"], e)
+                    added = tb.add(release["title"], **found)
             except OSError as e:
                 log.info("couldn't add %s to TorBox: %s", release["title"], e)
                 continue
@@ -355,11 +396,11 @@ class Downloads:
                 return False
             now = time.time()
             later = [{k: r[k] for k in ("title", "guid", "infoHash", "magnetUrl", "downloadUrl", "seeders") if k in r} for r in picks[i + 1:i + 1 + GRAB_TRIES]]
-            db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated, bundle, picks, catalogue, kept) "
-                       "values (?, ?, 0, ?, ?, ?, 'added', ?, ?, ?, ?, ?, ?)", (added["hash"].lower(), release.get("guid"), group, release["title"],
-                                                                                added["torrent_id"], now, now, search and json.dumps(search),
-                                                                                json.dumps(later) if group and later else None,
-                                                                                catalogue and json.dumps(catalogue), int(kept)))
+            db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated, bundle, picks, catalogue, kept, "
+                       "tracker) values (?, ?, 0, ?, ?, ?, 'added', ?, ?, ?, ?, ?, ?, ?)", (added["hash"].lower(), release.get("guid"), group, release["title"],
+                                                                                            added["torrent_id"], now, now, search and json.dumps(search),
+                                                                                            json.dumps(later) if group and later else None,
+                                                                                            catalogue and json.dumps(catalogue), int(kept), tracker))
             self.seen.pop(added["hash"].lower(), None)  # added again after a failure: its stall timer starts anew
             self.failures.pop(added["hash"].lower(), None)
             self.missing.pop(added["hash"].lower(), None)
@@ -379,12 +420,16 @@ class Downloads:
                 shutil.rmtree(self.folder / hash, ignore_errors=True)
             db.execute("delete from bundle_kept where seen < ?", (time.time() - KEPT_UNSEEN,))
             rows = db.execute("select * from download where state not in ('done', 'failed') order by created").fetchall()
-            if not rows:
+            seeds = db.execute("select * from download where seeding = 1").fetchall()
+            self.say_totals(db)
+            if not rows and not seeds:
                 return
             listed = self.torbox().torrents()
             torrents = {t["id"]: t for t in listed}
+            for row in seeds:
+                self.seed(db, row, torrents.get(row["torbox_id"]))
             # Slots all taken while albums wait for a search: slow downloads make way.
-            self.crowded = sum(bool(t["active"]) for t in listed) >= self.max_active and bool(db.execute(
+            self.crowded = self.active(db, listed) >= self.max_active and bool(db.execute(
                 "select 1 from want_album where state = 'missing' and coalesce(next_search, 0) <= ? limit 1", (time.time(),)).fetchone())
             for row in rows:
                 try:
@@ -397,6 +442,8 @@ class Downloads:
 
     def step(self, db, row, torrent):
         state, gone = row["state"], self.gone(row["hash"], torrent)
+        if row["tracker"] and torrent:
+            self.snapshot(db, row, torrent)
         if state in ("added", "downloading"):
             if torrent is None:
                 return self.fail(db, row, "gone from TorBox", block=False) if gone else None
@@ -436,6 +483,7 @@ class Downloads:
                         return
                 return self.set(db, row, "downloading")
             state = self.set(db, row, "fetching")
+            db.execute("update download set finished = coalesce(finished, ?) where hash = ?", (time.time(), row["hash"]))
         if state == "fetching":
             if torrent is None:
                 return self.fail(db, row, "gone from TorBox before its files were fetched", block=False) if gone else None
@@ -626,11 +674,51 @@ class Downloads:
             self.fail(db, row, "import failed: no album of the bundle matched")
 
     def done(self, db, row, folder: Path):
-        self.delete(row)
+        """An import done: the torrent goes from TorBox, or a login tracker's seeds on (seed)."""
+        if row["tracker"]:
+            db.execute("update download set seeding = 1 where hash = ?", (row["hash"],))
+        else:
+            self.delete(row)
         shutil.rmtree(folder, ignore_errors=True)
         self.set(db, row, "done")
-        log.info("imported %s", row["title"])
+        log.info("imported %s%s", row["title"], f"; seeding it for {row['tracker']}" if row["tracker"] else "")
         self.imported()
+
+    def snapshot(self, db, row, torrent):
+        db.execute("update download set downloaded = ?, uploaded = ? where hash = ?",
+                   (torrent.get("total_downloaded") or 0, torrent.get("total_uploaded") or 0, row["hash"]))
+
+    def seed(self, db, row, torrent):
+        """A seeding torrent stops once its ratio meets the tracker's after its minimum time, or at the day cap unless
+        the tracker's overall ratio is low; at once when TorBox isn't seeding it (its plan may not allow it) or lost it."""
+        rule, now = self.rule(row["tracker"]), time.time()
+        if torrent is not None:
+            self.snapshot(db, row, torrent)
+        took, ratio = now - (row["finished"] or row["updated"]), (torrent or {}).get("ratio") or 0
+        if torrent is None:
+            if not self.gone(row["hash"], torrent):
+                return
+            why = "gone from TorBox"
+        elif not (torrent.get("active") or torrent.get("seed_torrent") or "seed" in (torrent.get("download_state") or "").lower()):
+            why = f"TorBox isn't seeding it ({torrent.get('download_state')})"
+        elif ratio >= rule["ratio"] and took >= rule["min_hours"] * 3600:
+            why = f"ratio {ratio:.2f}"
+        elif took >= rule["days"] * 86400 and row["tracker"] not in self.low(db):
+            why = f"{rule['days']:g} days, ratio {ratio:.2f}"
+        else:
+            return
+        if torrent is not None:
+            self.delete(row)
+        db.execute("update download set seeding = 0 where hash = ?", (row["hash"],))
+        log.info("stopped seeding %s: %s", row["title"], why)
+
+    def say_totals(self, db):
+        """Each login tracker's totals and ratio, in the log once every TOTALS_EVERY."""
+        if time.time() - self.totals_said < TOTALS_EVERY or not (found := self.totals(db)):
+            return
+        self.totals_said = time.time()
+        for tracker, (down, up) in sorted(found.items()):
+            log.info("%s: %.1f GB down, %.1f GB up, ratio %s", tracker, down / 1e9, up / 1e9, f"{up / down:.2f}" if down else "–")
 
     def fail(self, db, row, why: str, block: bool = True, wanted: list[str] | None = None):
         """Deletes the torrent and makes the album due for another search. A blocked release is never picked again.

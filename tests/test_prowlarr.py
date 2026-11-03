@@ -41,3 +41,12 @@ def test_a_search_with_every_indexer_paused_or_disabled_fails(monkeypatch):
                         [BIGFAN, indexer(35, (3000, "Audio"), enable=False)] if path == "indexer" else [{"title": "x", "protocol": "torrent"}])
     with pytest.raises(OSError, match="no music indexer"):
         Prowlarr("http://p", "k").search("Linkin Park")
+
+
+def test_results_from_private_and_semi_private_indexers_name_their_tracker(monkeypatch):
+    found = [{**indexer(40, (3000, "Audio")), "name": "Tracker-A", "privacy": "semiPrivate"},
+             {**indexer(41, (3000, "Audio")), "name": "Tracker-D", "privacy": "private"}, {**BIGFAN, "name": "Open-Index-2", "privacy": "public"}]
+    monkeypatch.setattr(Prowlarr, "call", lambda self, path: [] if path == "indexerstatus" else found if path == "indexer" else [])
+    p = Prowlarr("http://p", "k")
+    p.indexers()
+    assert [p.tracker({"indexerId": i}) for i in (40, 41, 32)] == ["Tracker-A", "Tracker-D", None]

@@ -20,6 +20,7 @@ class Config:
     acquire: dict = dataclasses.field(default_factory=dict)  # secondary_types, bundles (see acquire.py)
     artists: dict = dataclasses.field(default_factory=dict)  # merge, separate and related names (see artists.py)
     dedupe: bool = False        # store each audio stream once (see dedupe.py); needs the library writable, on btrfs or XFS
+    seeding: dict = dataclasses.field(default_factory=dict)  # per login tracker (Prowlarr's name): ratio, days, min_hours, min_ratio (see download.py)
 
 
 def load(path: Path) -> Config:
@@ -38,6 +39,7 @@ def load(path: Path) -> Config:
         artists=data.get("artists", {}),
         acquire=data.get("acquire", {}),
         dedupe=data.get("library", {}).get("dedupe", False),
+        seeding=data.get("seeding", {}),
         torbox=data["torbox"] if data.get("torbox", {}).get("rdt_db") else None,
         prowlarr=data["prowlarr"] if data.get("prowlarr", {}).get("url") and data["prowlarr"].get("api_key") else None,
     )

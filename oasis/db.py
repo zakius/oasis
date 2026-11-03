@@ -110,7 +110,11 @@ create table if not exists download(  -- releases oasis downloads through TorBox
     bundle text,                            -- an uncached bundle's search (JSON: want, groups, wanted) until its targets are known
     picks text,                             -- an album's search's next picks (JSON), for a slow download to make way for (see download.py)
     catalogue text,                         -- a bundle's artist search (JSON: want, groups), to remember all it holds (bundle_kept)
-    kept int not null default 0             -- 1: sent from a remembered bundle (bundle_kept)
+    kept int not null default 0,            -- 1: sent from a remembered bundle (bundle_kept)
+    tracker text,                           -- the login tracker it came from (Prowlarr's name), whose ratio it counts toward; null: a public one
+    finished real,                          -- when TorBox had it whole: seeding's clock
+    uploaded int, downloaded int,           -- TorBox's last totals for it, kept after it is deleted: the tracker's running ratio
+    seeding int not null default 0          -- 1: imported and still seeding on TorBox (see download.py)
 );
 create table if not exists download_target(  -- a bundle's albums, fetched and imported from one download (see download.py)
     hash text not null, rg text not null,   -- the download; the album's release group

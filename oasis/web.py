@@ -595,6 +595,19 @@ def routes(api) -> list[Route]:
             f'<li><div class="grow">{escape(r["title"])}{" <span class=\"muted\">from a remembered bundle</span>" if r["kept"] else ""}'
             f'{progress(r["hash"], r["state"], r["created"])}</div></li>'
             for r in active) + '</ul></section>' if active else '<section><h2>Downloading</h2><p class="muted">Nothing downloading.</p></section>')
+        trackers = db.execute("select tracker, coalesce(sum(downloaded), 0) down, coalesce(sum(uploaded), 0) up, sum(seeding) n from download "
+                              "where tracker is not null group by tracker order by tracker").fetchall()
+        if trackers:
+            seeding = db.execute("select title, tracker, finished, downloaded, uploaded from download where seeding = 1 order by finished").fetchall()
+            ratio = lambda down, up: f"{up / down:.2f}" if down else "–"
+            html += ('<section><h2>Seeding</h2><table class="grid"><thead><tr><th>Tracker</th><th class="num">Down</th><th class="num">Up</th>'
+                     '<th class="num">Ratio</th><th class="num">Seeding</th></tr></thead><tbody>' + "".join(
+                         f'<tr><td class="lead">{escape(r["tracker"])}</td><td class="num">{size(r["down"])}</td><td class="num">{size(r["up"])}</td>'
+                         f'<td class="num">{ratio(r["down"], r["up"])}</td><td class="num">{r["n"] or ""}</td></tr>' for r in trackers) + '</tbody></table>'
+                     + ('<ul class="rows">' + "".join(
+                         f'<li><div class="grow">{escape(r["title"])}<div class="muted">{escape(r["tracker"])} · ratio {ratio(r["downloaded"] or 0, r["uploaded"] or 0)}'
+                         f' · seeding {ago(r["finished"]).removesuffix(" ago") if r["finished"] else ""}</div></div></li>' for r in seeding) + '</ul>' if seeding else "")
+                     + '</section>')
         recent = db.execute("select title, state, error, updated from download where state in ('done', 'failed') "
                             "order by updated desc limit 5").fetchall()
         if recent:

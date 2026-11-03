@@ -514,7 +514,7 @@ class Api:
         self.doctor = Doctor(self._db, **{k: v for k, v in torbox.items() if k in DOCTOR_KEYS}) if torbox else None
         # oasis's search, download and import: all three, or no acquisition.
         self.downloads = Downloads(self._db, self.doctor.torbox, Importer(self._db, config.library[0]), Prowlarr(**config.prowlarr),
-                                   torbox["downloads"], torbox.get("max_active", 8), torbox.get("stall_hours", 1), self._start_scan) \
+                                   torbox["downloads"], torbox.get("max_active", 8), torbox.get("stall_hours", 1), self._start_scan, config.seeding) \
             if torbox and torbox.get("downloads") and config.prowlarr else None
         self.library = Acquire(self._db, self.downloads, config.acquire.get("secondary_types", SECONDARY),
                                config.acquire.get("bundles", True)) if self.downloads else None

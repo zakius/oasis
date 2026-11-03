@@ -14,8 +14,9 @@ class TorBox(FakeTorBox):
         super().__init__()
         self.tmp, self.added, self.full, self.links = tmp_path, [], False, []
 
-    def add(self, name, magnet=None, torrent=None):
+    def add(self, name, magnet=None, torrent=None, seed=False):
         self.added.append((name, magnet, torrent))
+        self.seeded = getattr(self, "seeded", []) + [seed]
         hash = magnet.split("btih:")[1][:4] if magnet else "file"
         if self.full:
             self.waiting.append({"id": 90, "hash": hash})
@@ -134,6 +135,64 @@ def test_dead_torrents_get_another_try_after_two_weeks_after_all_others_but_wron
     assert "dead-old" in downloads.blocked(db) and not downloads.slow(db)
     assert releases.rank([{"title": "A [FLAC]", "infoHash": "dead-old", "seeders": 90}, {"title": "A [MP3]", "infoHash": "x", "seeders": 1}],
                          set(), slow=frozenset({"dead-old"}))[0]["infoHash"] == "x"
+
+
+class LoginProwlarr(Prowlarr):
+    logins = {1: "Tracker-A"}
+
+    def tracker(self, release):
+        return self.logins.get(release.get("indexerId"))
+
+
+def seeding(downloads, torbox, db, tmp_path, ratio, **more):
+    """An album from a login tracker, downloaded and imported; TorBox then seeding it at ratio."""
+    downloads.prowlarr = LoginProwlarr({"Artist Album": [offer("abcd")]})
+    assert downloads.find(db, WANT, "mb-album") and torbox.seeded == [True]
+    torbox.list = [finished(71, "abcd", ["Album/01 Song.flac"], tmp_path)]
+    downloads.cycle()
+    row = db.execute("select state, seeding, tracker, finished from download").fetchone()
+    assert tuple(row)[:3] == ("done", 1, "Tracker-A") and row["finished"] and 71 not in torbox.deleted
+    torbox.list = [{**torbox.list[0], "download_state": "seeding", "active": True, "ratio": ratio, "total_downloaded": 1000,
+                    "total_uploaded": int(ratio * 1000), **more}]
+
+
+def test_a_login_trackers_torrent_seeds_after_its_import_till_its_ratio_is_met_and_not_in_a_slot(downloads, torbox, db, tmp_path, caplog):
+    caplog.set_level("INFO", "oasis.download")
+    seeding(downloads, torbox, db, tmp_path, 0.5)
+    downloads.cycle()
+    assert 71 not in torbox.deleted and downloads.groups(db) == set()  # the album is done; the torrent seeds on
+    downloads.max_active = 1
+    assert downloads.room()  # seeding takes none of oasis's slots
+    torbox.list[0].update(ratio=1.02, total_uploaded=1020)
+    downloads.cycle()
+    assert 71 in torbox.deleted and "stopped seeding Artist - Album [FLAC]: ratio 1.02" in caplog.text
+    assert db.execute("select seeding, downloaded, uploaded from download").fetchone()[:] == (0, 1000, 1020)
+    assert downloads.totals(db) == {"Tracker-A": (1000, 1020)}  # kept after it went
+
+
+def test_seeding_ends_at_the_day_cap_unless_the_trackers_ratio_is_low_and_waits_its_minimum_time(downloads, torbox, db, tmp_path, caplog):
+    caplog.set_level("INFO", "oasis.download")
+    downloads.rules = {"Tracker-A": {"min_hours": 72, "min_ratio": 0.6}}
+    seeding(downloads, torbox, db, tmp_path, 1.5)
+    downloads.cycle()
+    assert 71 not in torbox.deleted  # its ratio is met, but not its 72 hours
+    torbox.list[0].update(ratio=0.4, total_uploaded=400)
+    db.execute("update download set finished = ?", (time.time() - 8 * 86400,))
+    downloads.cycle()
+    assert 71 not in torbox.deleted and "Tracker-A: our ratio is 0.40, below its 0.60" in caplog.text  # low: past the cap
+    downloads.rules = {}
+    downloads.cycle()
+    assert 71 in torbox.deleted and "stopped seeding Artist - Album [FLAC]: 7 days, ratio 0.40" in caplog.text
+
+
+def test_seeding_stops_at_once_when_torbox_doesnt_seed_and_public_trackers_never_seed(downloads, torbox, db, tmp_path, caplog):
+    caplog.set_level("INFO", "oasis.download")
+    seeding(downloads, torbox, db, tmp_path, 0, active=False, download_state="completed")
+    downloads.cycle()
+    assert 71 in torbox.deleted and "TorBox isn't seeding it (completed)" in caplog.text
+    downloads.prowlarr = Prowlarr({"Artist Album": [offer("bcde", indexerId=2)]})
+    db.execute("delete from release_block")
+    assert downloads.find(db, WANT, "mb-other") and torbox.seeded[-1] is False
 
 
 def test_two_same_named_files_in_different_folders_both_arrive_and_a_restart_mid_fetch_resumes(downloads, torbox, db, tmp_path):
@@ -420,3 +479,10 @@ def test_a_bundle_downloaded_again_keeps_what_it_was_tried_for_before(downloads,
     downloads.map_kept = lambda *args: None
     downloads.remember(db, {"hash": "abcd"}, [{"name": "Disco/Album/01.flac", "size": 1}])
     assert json.loads(db.execute("select tried from bundle_kept").fetchone()[0]) == ["g-album", "g-old"]
+
+
+def test_a_low_ratio_trackers_releases_come_after_other_indexers_offering_the_album():
+    picks = [{"title": "A [FLAC]", "infoHash": "aa", "seeders": 90, "indexerId": 40, "downloadUrl": "u"},
+             {"title": "A [FLAC]", "infoHash": "bb", "seeders": 5, "indexerId": 32, "downloadUrl": "u"}]
+    assert [r["infoHash"] for r in releases.rank(picks, set())] == ["aa", "bb"]
+    assert [r["infoHash"] for r in releases.rank(picks, set(), low=frozenset({40}))] == ["bb", "aa"]
