@@ -1,7 +1,9 @@
 """Account pages: sign in with the Subsonic user, link YouTube Music, Last.fm and ListenBrainz, manage users. Music
 pages: find any artist or album on MusicBrainz, follow or want it, and see what oasis is looking for."""
+import functools
 import hmac
 import json
+import logging
 from collections import Counter
 from pathlib import Path
 import re
@@ -24,6 +26,8 @@ from .prowlarr import privacy as prowlarr_privacy
 from .recommend import SOURCES
 from .translate import LANGUAGES
 from .ytm import LIKED, MIX
+
+log = logging.getLogger(__name__)
 
 COOKIE = "oasis_session"
 
@@ -63,7 +67,7 @@ section { background: var(--surface); border: 1px solid var(--line); border-radi
 section.plain { background: none; border: 0; border-radius: 0; padding: 0; margin: 0 0 2.5rem; box-shadow: none; }
 .split { display: grid; grid-template-columns: minmax(0, 1fr) 22rem; gap: 0 1.5rem; align-items: start; }
 input, select, textarea, button { font: inherit; color: inherit; }
-input[type=text], input[type=password], select, textarea { display: block; width: 100%; min-height: 2.75rem; margin: .35rem 0 0; padding: .55rem .8rem;
+input[type=text], input[type=password], input[type=number], select, textarea { display: block; width: 100%; min-height: 2.75rem; margin: .35rem 0 0; padding: .55rem .8rem;
   border: 1px solid var(--line); border-radius: 10px; background: var(--bg); color: var(--text); font-size: 1rem; font-weight: 400; }
 textarea { min-height: 8rem; resize: vertical; line-height: 1.45; }
 select { appearance: none; padding-right: 2.25rem; cursor: pointer; background: var(--bg) no-repeat right .8rem center / .75rem
@@ -114,6 +118,17 @@ table.indexers td:not(:first-child) { color: var(--muted); } table.indexers .pil
 table.indexers :is(th, td):nth-child(1) { width: 16%; } table.indexers :is(th, td):nth-child(2) { width: 15%; }
 table.indexers :is(th, td):nth-child(3) { width: 16%; } table.indexers :is(th, td):nth-child(4) { width: 10%; }
 table.indexers :is(th, td):nth-child(5) { width: 25%; } table.indexers :is(th, td):nth-child(6) { width: 18%; }
+.split-roles { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); gap: 0 1.5rem; } .split-roles > p { grid-column: 1 / -1; }
+table.indexers tr.manage td { padding-top: 0; border-top: 0; color: var(--text); } table.indexers tbody tr.manage:hover { background: none; }
+details.manage > summary { display: inline-block; color: var(--link); font-size: .875rem; font-weight: 600; }
+details.manage[open] > summary { margin-bottom: .75rem; }
+.sides { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(20rem, 100%), 1fr)); gap: 1rem 2rem; padding: 1rem; border-radius: 10px; background: var(--bg); }
+.sides h3 { margin: 0 0 .6rem; font-size: .8rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.sides form { margin: 0 0 .8rem; } .sides fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+.sides legend { padding: 0; margin: 0 0 .4rem; font-weight: 600; font-size: .9rem; } .sides label { margin: 0 0 .6rem; }
+.sides .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(8.5rem, 100%), 1fr)); gap: 0 .75rem; } .sides > div { min-width: 0; }
+.sides details > summary { margin: 0 0 .6rem; } .sides details p { white-space: pre-line; overflow-wrap: anywhere; }
+button.toggle { min-height: 1.9rem; padding: .2rem .7rem; } button.toggle[aria-pressed=true] { border-color: var(--accent); color: var(--link); }
 td.meta { color: var(--muted); font-size: .9rem; white-space: nowrap; } a.stretch::after { content: ""; position: absolute; inset: 0; }
 a.stretch, table.tracks td.lead > a { color: var(--text); }
 table.thumbs tr { position: relative; } table.tracks td:first-child { width: 2.5rem; color: var(--muted); }
@@ -213,6 +228,20 @@ FAVICON = "data:image/svg+xml," + quote(LOGO.replace("<svg", '<svg xmlns="http:/
 def length(seconds) -> str:
     seconds = int(seconds or 0)
     return f"{seconds // 3600}:{seconds // 60 % 60:02}:{seconds % 60:02}" if seconds >= 3600 else f"{seconds // 60}:{seconds % 60:02}"
+
+
+# Prowlarr's tags as the indexers page shows them: what each does, and what removing it costs.
+TAG_NOTES = {"music": "oasis searches it", "anime": "Prowlarr syncs it to Sonarr", "flaresolverr": "Prowlarr sends its searches through FlareSolverr (Cloudflare)"}
+TAG_LOSS = {"music": "oasis stops searching it.", "anime": "Prowlarr's next sync removes it from Sonarr.",
+            "flaresolverr": "Its searches stop going through FlareSolverr; a site behind Cloudflare then fails."}
+SECRET = re.compile(r"cookie|pass|key|token|user|uid|hash|2fa|secret|session|agent", re.I)
+
+
+def credential(field: dict) -> bool:
+    """A login field of an indexer's definition, shown write-only: Prowlarr masks only its password-type fields, and a
+    Cardigann cookie comes back as plain text."""
+    return field.get("type") not in ("info", "checkbox", "select") and (field.get("privacy") in ("password", "apiKey", "userName") or field.get("type") == "password"
+                                                                         or bool(SECRET.search(field["name"].rsplit(".", 1)[-1])))
 
 
 def plural(n: int, one: str, many: str = "") -> str:
@@ -381,7 +410,7 @@ def routes(api) -> list[Route]:
                 if user is None:
                     return RedirectResponse("/login", status_code=303)
                 if admin and not user["admin"]:
-                    return back("/", error="Only admins can manage users.")
+                    return back("/", error="Only admins can do that.")
                 return handler(db, request, user, form)
             return await run_in_threadpool(with_db(run))
         return endpoint
@@ -698,6 +727,11 @@ def routes(api) -> list[Route]:
                 return page("Find music", "", error="Acquisition is off: it needs [torbox] with downloads and [prowlarr] in oasis.toml.", tab="find")
             return handler(db, request, user, form)
         return signed_in(run)
+
+    def acquiring(handler):
+        def run(db, request, user, form):
+            return handler(db, request, user, form) if api.downloads else back("/music/indexers", error="Acquisition is off.")
+        return run
 
     def mine(db, user, kind: str, mbid: str) -> list[str]:
         """The ids the user wants the artist or album under."""
@@ -1175,9 +1209,83 @@ def routes(api) -> list[Route]:
                 + wanted_log(db, user, rg, f"/music/library/album/{MB_IDS['album']}{rg}"))
         return page(title, body, request.query_params.get("message", ""), request.query_params.get("error", ""), wide=True, tab="wanted", heading=False)
 
+    def attribution(found: list[dict], tag: int):
+        """The indexer a download came from: the one oasis noted, or before it did, the one of the release's site. A site
+        several indexers share (an anime site and its music twin) goes to an enabled music one: oasis searches only those."""
+        label = lambda host: (parts := (host or "").split("."))[-2 if len(parts) > 1 else 0]  # 'example' for example.org and example.net alike
+        by_site = {label(urlparse(u).hostname): i["id"] for i in sorted(found, key=lambda i: (i["enable"], tag in i.get("tags", [])))
+                   for u in [*(i.get("indexerUrls") or []), *(i.get("legacyUrls") or [])] if urlparse(u).hostname}
+        return lambda r: r["indexer"] or by_site.get(label(urlparse(r["guid"] or "").hostname) if (r["guid"] or "").startswith("http") else None)
+
+    def blocks_of(db, found: list[dict], tag: int, id: int) -> list[str]:
+        """The release_block keys (info hash or guid) of the indexer's downloads."""
+        of = attribution(found, tag)
+        mine = {k for r in db.execute("select hash, guid, indexer from download").fetchall() if of(r) == id for k in (r["hash"], r["guid"]) if k}
+        return [k for (k,) in db.execute("select hash from release_block").fetchall() if k in mine]
+
+    def manage(i: dict, tags: dict[int, str], login: bool, blocks: int, saved: bool) -> str:
+        """An admin's controls for one indexer: what Prowlarr stores, then what oasis does."""
+        id, name, action = i["id"], i["name"], f'/music/indexers/{i["id"]}'
+        post = lambda what, inner, ask="", cls="": (f'<form class="{cls}" method="post" action="{action}/{what}"{ask and confirm(ask)}>{inner}</form>')
+        legend = lambda text, where: f'<legend>{text} <span class="pill">{where}</span></legend>'
+        force = '<label class="check"><input type="checkbox" name="force" value="1"> Save without Prowlarr\'s test (forceSave)</label>'
+        fields = {f["name"]: f for f in i.get("fields") or []}
+        on = i["enable"]
+        prowlarr_side = post("enable", f'<input type="hidden" name="on" value="{"" if on else "1"}"><button{" class=danger" if on else ""}>{"Disable" if on else "Enable"}</button>'
+                             f' <span class="muted">{"Enabled" if on else "Disabled"}: {"oasis searches it" if on else "nobody searches it"}</span>',
+                             f"Disable {name} in Prowlarr? oasis, Sonarr and every other app stop searching it." if on else "", "row")
+        number = lambda key, label, value, lo="0", hi="": (f'<label>{label}<input type="number" name="{key}" min="{lo}"{f" max={hi}" if hi else ""} '
+                                                           f'value="{"" if value is None else escape(str(value))}" placeholder="none"></label>')
+        limits = number("priority", "Priority (1 first, 50 last)", i.get("priority"), "1", "50")
+        for key, label in (("baseSettings.queryLimit", "Queries"), ("baseSettings.grabLimit", "Grabs")):
+            if key in fields:
+                limits += number(key, f"{label} a {'day' if (fields.get('baseSettings.limitsUnit') or {}).get('value', 0) == 0 else 'hour'}", fields[key].get("value"))
+        if unit := fields.get("baseSettings.limitsUnit"):
+            limits += (f'<label>Limits per<select name="baseSettings.limitsUnit">' + "".join(
+                f'<option value="{o["value"]}"{" selected" if o["value"] == unit.get("value") else ""}>{escape(str(o["name"]))}</option>' for o in unit.get("selectOptions") or [])
+                + '</select></label>')
+        prowlarr_side += post("limits", f'<fieldset>{legend("Priority and limits", "Prowlarr")}<div class="fields">{limits}</div>{force}<button>Save to Prowlarr</button></fieldset>')
+        toggles = ""
+        for t, label in sorted(tags.items()):
+            has, note = t in (i.get("tags") or []), TAG_NOTES.get(label.casefold(), "")
+            ask = f"Remove the {label} tag from {name}?" + (" " + TAG_LOSS[label.casefold()] if label.casefold() in TAG_LOSS else "") if has else ""
+            toggles += post("tag", f'<input type="hidden" name="tag" value="{t}"><input type="hidden" name="on" value="{"" if has else "1"}">'
+                            f'<button class="toggle" aria-pressed="{"true" if has else "false"}">{"✓ " if has else ""}{escape(label)}</button>'
+                            f' <span class="muted">{escape(note)}</span>', ask, "row")
+        prowlarr_side += f'<fieldset>{legend("Tags", "Prowlarr")}{toggles}</fieldset>'
+        if secrets := [f for f in fields.values() if credential(f)]:
+            rows = "".join(f'<label>{escape(f.get("label") or f["name"])} {pill("set", "good") if f.get("value") not in (None, "") else pill("not set")}'
+                           f'<input type="password" name="field.{escape(f["name"])}" autocomplete="off" placeholder="new value; empty keeps it"></label>' for f in secrets)
+            notes = "".join(f'<p class="muted">{escape(str(f.get("value") or ""))}</p>' for f in fields.values() if f.get("type") == "info" and f.get("value"))
+            prowlarr_side += post("credentials", f'<fieldset>{legend("Login", "Prowlarr")}<p class="muted">Write-only: oasis never shows what is stored, '
+                                  f'only whether it is set.</p>{rows}{f"<details><summary class=muted>How to get them (Prowlarr)</summary>{notes}</details>" if notes else ""}'
+                                  f'{force}<button>Save to Prowlarr</button></fieldset>')
+        prowlarr_side += post("test", '<button>Test</button> <span class="muted">Prowlarr tests it as it is saved there</span>', cls="row")
+        oasis_side = ""
+        if login:
+            rule, source = api.downloads.rule(name), api.downloads.rule_source(name)
+            value = lambda v: "" if v is None else f"{v:g}"
+            oasis_side += post("seeding", f'<fieldset>{legend("Seeding on TorBox", "oasis database")}<p class="muted">Now: {escape(source)}.</p>'
+                               f'<label class="check"><input type="checkbox" name="seed" value="1"{" checked" if rule["seed"] else ""}> Seed what comes from it</label>'
+                               f'<div class="fields"><label>Ratio<input type="number" step="any" min="0" name="ratio" value="{value(rule["ratio"])}"></label>'
+                               f'<label>Days at most<input type="number" step="any" min="0" name="days" value="{value(rule["days"])}"></label>'
+                               f'<label>Hours at least<input type="number" step="any" min="0" name="min_hours" value="{value(rule["min_hours"])}"></label>'
+                               f'<label>Lowest total ratio<input type="number" step="any" min="0" name="min_ratio" value="{value(rule["min_ratio"])}" placeholder="none"></label></div>'
+                               '<button>Save in oasis</button></fieldset>')
+            if saved:
+                oasis_side += post("reset-seeding", f'<button>Reset to default</button> <span class="muted">back to the {"oasis.toml" if name in api.downloads.rules else "built-in" if name in download.TRACKERS else "default"} rule</span>',
+                                   f"Reset {name}'s seeding rule?", "row")
+        elif i.get("protocol") == "torrent":
+            oasis_side += f'<p class="muted">{"A local index" if prowlarr_privacy(i) == "local" else "A public tracker"}: oasis never seeds what comes from it.</p>'
+        oasis_side += post("unblock", f'<button{" disabled" if not blocks else ""}>Clear {plural(blocks, "block")}</button> <span class="muted">releases from it oasis '
+                           'blocked after they failed: cleared, they can be picked again (after a login fix, say)</span>',
+                           f"Clear {plural(blocks, 'block')} from {name}?", "row")
+        return (f'<details class="manage" id="manage-{id}"><summary>Manage</summary><div class="sides"><div><h3>Stored in Prowlarr</h3>{prowlarr_side}</div>'
+                f'<div><h3>Stored in oasis</h3>{oasis_side}</div></div></details>')
+
     def indexers(db, request, user, form):
         """Every Prowlarr indexer: Prowlarr's view of it (settings, health, counts), what oasis got from it, and for a
-        login tracker its seeding rule and running ratio."""
+        login tracker its seeding rule and running ratio; for an admin, the controls to change them (manage)."""
         prowlarr = api.downloads.prowlarr if api.downloads else None
         try:
             found = prowlarr.call("indexer")
@@ -1186,20 +1294,17 @@ def routes(api) -> list[Route]:
             tags = {t["id"]: t["label"] for t in prowlarr.call("tag")}
         except (OSError, AttributeError) as e:
             return page("Indexers", f'<section><p class="error">Prowlarr didn\'t answer: {escape(str(e))}</p></section>', tab="wanted")
-        label = lambda host: (parts := (host or "").split("."))[-2 if len(parts) > 1 else 0]  # 'example' for example.org and example.net alike
-        # A site several indexers share (an anime site and its music twin) goes to an enabled music one: oasis searches only those.
-        by_site = {label(urlparse(u).hostname): i["id"] for i in sorted(found, key=lambda i: (i["enable"], prowlarr.tag in i.get("tags", [])))
-                   for u in [*(i.get("indexerUrls") or []), *(i.get("legacyUrls") or [])] if urlparse(u).hostname}
+        of = attribution(found, prowlarr.tag)
         rows = db.execute("select hash, guid, indexer, state, error, album_mbid, updated from download").fetchall()
         targets = {}
         for h, rg in db.execute("select hash, rg from download_target where state = 'done'"):
             targets.setdefault(h, set()).add(rg)
         have = {r[0] for r in db.execute("select rg from want_album where state = 'have'")}
-        of = lambda r: r["indexer"] or by_site.get(label(urlparse(r["guid"] or "").hostname) if (r["guid"] or "").startswith("http") else None)
-        mine = {}
+        mine, keys = {}, {}
         for r in rows:
             m = mine.setdefault(of(r), {"sent": 0, "done": 0, "failed": Counter(), "albums": set(), "last": None})
             m["sent"] += 1
+            keys.update({k: of(r) for k in (r["hash"], r["guid"]) if k})
             if r["state"] == "done":
                 m["done"] += 1
                 if supplied := ({r["album_mbid"]} if r["album_mbid"] else targets.get(r["hash"], set())) & have:
@@ -1207,13 +1312,23 @@ def routes(api) -> list[Route]:
                     m["last"] = max(m["last"] or 0, r["updated"])
             elif r["state"] == "failed":
                 m["failed"][(r["error"] or "unknown").split(":")[0]] += 1
+        blocks = Counter(keys.get(k) for (k,) in db.execute("select hash from release_block"))
         hits = {i: n for i, *n in db.execute("select indexer, sum(results), sum(album), sum(usable) from search_stat where day >= date('now', '-30 days') group by indexer")}
         totals = api.downloads.totals(db)
+        saved = {r[0] for r in db.execute("select tracker from seed_rule")}
         errors = getattr(prowlarr, "errors", {})
         cell = lambda *parts: '<br>'.join(p for p in parts if p)
-        body = ""
+        body, unused = "", ""
         for i in sorted(found, key=lambda i: (not i["enable"], i["name"].casefold())):
             id, name, login = i["id"], i["name"], prowlarr_privacy(i) not in ("public", "local") and i.get("protocol") == "torrent"
+            kind = cell(escape(prowlarr_privacy(i)) + (" · " + escape(", ".join(tags.get(t, str(t)) for t in i.get("tags") or [])) if i.get("tags") else ""),
+                        f'<span class="muted">{escape(i.get("definitionName") or i.get("implementationName") or "")} · {escape(i.get("protocol") or "")} · #{id}</span>')
+            if prowlarr.tag not in (i.get("tags") or []):
+                use = (f'<form method="post" action="/music/indexers/{id}/tag"><input type="hidden" name="tag" value="{prowlarr.tag}"><input type="hidden" name="on" value="1">'
+                       '<button>Use for music</button></form>' if i.get("protocol") == "torrent" else '<span class="muted">usenet: oasis searches torrents only</span>')
+                unused += (f'<li id="indexer-{id}"><div class="grow"><b>{escape(name)}</b>{"" if i["enable"] else " <span class=muted>(disabled)</span>"}'
+                           f'<div class="muted">{kind}</div></div>{use if user["admin"] else ""}</li>')
+                continue
             st, pr, m = status.get(id) or {}, stats.get(id) or {}, mine.get(id) or {}
             when, what = errors.get(id, (None, ""))
             if login and "login" in what.lower():
@@ -1232,23 +1347,100 @@ def routes(api) -> list[Route]:
             searched = cell(plural(hits[id][0], "result"), f'{hits[id][1]} the album', f'{hits[id][2]} usable') if id in hits else ""
             failed = ", ".join(f"{n} {why}" for why, n in m["failed"].most_common()) if m else ""
             ours = cell(f'{m["sent"]} sent, {m["done"]} imported' if m else "", f'failed: {escape(failed)}' if failed else "",
-                        f'{plural(len(m["albums"]), "wanted album")} arrived, last {ago(m["last"])}' if m and m["albums"] else "")
+                        f'{plural(len(m["albums"]), "wanted album")} arrived, last {ago(m["last"])}' if m and m["albums"] else "",
+                        f'{plural(blocks[id], "release")} blocked' if blocks[id] else "")
             seeding = '<span class="muted">not seeded: a local index</span>' if prowlarr_privacy(i) == "local" else ""
             if login:
-                rule, source = api.downloads.rule(name), "oasis.toml" if name in api.config.seeding else "built in" if name in download.TRACKERS else "default"
+                rule, source = api.downloads.rule(name), api.downloads.rule_source(name)
                 seeding = ("seed = false" if not rule["seed"] else f'ratio {rule["ratio"]:g} · {rule["days"]:g} days' + (f' · at least {rule["min_hours"]:g} h' if rule["min_hours"] else "")
                            + (f' · min_ratio {rule["min_ratio"]:g}' if rule["min_ratio"] is not None else "")) + f' <span class="muted">({source})</span>'
                 if name in totals:
                     down, up = totals[name]
                     seeding += f'<br>{size(down)} down, {size(up)} up, ratio {f"{up / down:.2f}" if down else "–"}'
-            kind = cell(escape(prowlarr_privacy(i)) + (" · " + escape(", ".join(tags.get(t, str(t)) for t in i.get("tags") or [])) if i.get("tags") else ""),
-                        f'<span class="muted">{escape(i.get("definitionName") or i.get("implementationName") or "")} · {escape(i.get("protocol") or "")} · #{id}</span>')
-            body += (f'<tr><td class="lead"><b>{escape(name)}</b><div class="muted">{kind}</div></td><td class="state">{health}</td>'
+            body += (f'<tr id="indexer-{id}"><td class="lead"><b>{escape(name)}</b><div class="muted">{kind}</div></td><td class="state">{health}</td>'
                      f'<td>{counts}</td><td>{searched}</td><td>{ours}</td><td>{seeding}</td></tr>')
-        body = ('<section><p class="muted">Prowlarr\'s counts are its own, over all apps; searches are oasis\'s album searches over the last 30 days; downloads count '
+            if user["admin"]:
+                body += f'<tr class="manage"><td colspan="6">{manage(i, tags, login, blocks[id], name in saved)}</td></tr>'
+        ui = (api.config.prowlarr or {}).get("ui_url") or f"{request.url.scheme}://{request.url.hostname}:{urlparse(prowlarr.url).port or 9696}/"
+        body = ('<section class="split-roles"><div><h2>Prowlarr does</h2><p class="muted">the indexer definitions, logins and cookies, Cloudflare (through '
+                'FlareSolverr), running each search, query and grab limits, health and backing off after failures, and syncing indexers to Sonarr.</p></div>'
+                '<div><h2>oasis does</h2><p class="muted">the queries for each wanted album, matching results to albums, ranking them (cached on TorBox, seeders), '
+                'blocking failed releases and retrying, sending to TorBox, seeding rules, importing, and WAV to FLAC.</p></div>'
+                f'<p class="muted">Indexers are added in Prowlarr: <a href="{escape(ui)}" target="_blank" rel="noopener">Add in Prowlarr</a>. oasis uses each one tagged '
+                f'{escape(tags.get(prowlarr.tag, "music"))}, from its next search on.</p></section>'
+                '<section><p class="muted">Prowlarr\'s counts are its own, over all apps; searches are oasis\'s album searches over the last 30 days; downloads count '
                 'oasis\'s, by the indexer it noted, or before it did by the release\'s site.</p><div class="scroll"><table class="grid indexers"><thead><tr><th>Indexer</th><th>Health</th>'
-                f'<th>Prowlarr</th><th>Searches</th><th>Downloads</th><th>Seeding</th></tr></thead><tbody>{body}</tbody></table></div></section>')
-        return page("Indexers", body, wide=True, tab="wanted")
+                f'<th>Prowlarr</th><th>Searches</th><th>Downloads</th><th>Seeding</th></tr></thead><tbody>{body}</tbody></table></div></section>'
+                + (f'<details class="group" id="unused"><summary>Not used by oasis <span class="count">{unused.count("<li")}</span></summary>'
+                   f'<ul class="rows">{unused}</ul></details>' if unused else ""))
+        return page("Indexers", body, request.query_params.get("message", ""), request.query_params.get("error", ""), wide=True, tab="wanted")
+
+    def indexer_action(db, request, user, form):
+        """One change to one indexer: to Prowlarr's copy (enable, limits, tag, credentials) through its API, a test there,
+        or to oasis's own (seeding, reset-seeding, unblock)."""
+        id, what = request.path_params["id"], request.path_params["action"]
+        prowlarr = api.downloads.prowlarr
+        try:
+            i = prowlarr.call(f"indexer/{id}")
+        except OSError as e:
+            return back("/music/indexers", error=f"Prowlarr didn't answer: {e}")
+        name, here = i["name"], lambda **kw: back("/music/indexers", anchor=f"indexer-{id}", **kw)
+        hide = lambda text: functools.reduce(lambda t, v: t.replace(v, "•••"), [str(f["value"]) for f in i.get("fields") or [] if credential(f) and len(str(f.get("value") or "")) >= 4], text)
+        fields = {f["name"]: f for f in i.get("fields") or []}
+        number = lambda key, cast=float: None if (form.get(key) or "").strip() == "" else cast(form[key])
+        try:
+            if what == "test":
+                prowlarr.test(i)
+                return here(message=f"{name}: Prowlarr's test passed.")
+            if what == "seeding":
+                rule = {"seed": form.get("seed") == "1", "ratio": number("ratio"), "days": number("days"), "min_hours": number("min_hours") or 0, "min_ratio": number("min_ratio")}
+                if rule["ratio"] is None or rule["days"] is None or min(v for v in rule.values() if not isinstance(v, bool) and v is not None) < 0:
+                    return here(error="Ratio and days need a number, none below 0.")
+                api.downloads.save_rule(db, name, rule)
+                return here(message=f"Saved {name}'s seeding rule in oasis.")
+            if what == "reset-seeding":
+                api.downloads.save_rule(db, name, None)
+                return here(message=f"{name} seeds by its {api.downloads.rule_source(name)} rule again.")
+            if what == "unblock":
+                gone = blocks_of(db, prowlarr.call("indexer"), prowlarr.tag, id)
+                db.executemany("delete from release_block where hash = ?", [(k,) for k in gone])
+                db.commit()
+                return here(message=f"Cleared {plural(len(gone), 'block')} from {name}.")
+            if what == "enable":
+                i["enable"], done = form.get("on") == "1", "enabled" if form.get("on") == "1" else "disabled"
+            elif what == "limits":
+                priority = number("priority", int)
+                if priority is None or not 1 <= priority <= 50:
+                    return here(error="Priority is a number from 1 to 50.")
+                i["priority"], done = priority, "priority and limits saved"
+                for key in ("baseSettings.queryLimit", "baseSettings.grabLimit"):
+                    if key in fields:  # an emptied box isn't sent at all: no limit
+                        if (value := number(key, int)) is not None and value < 0:
+                            return here(error="Limits can't be below 0.")
+                        fields[key]["value"] = value
+                if "baseSettings.limitsUnit" in fields and "baseSettings.limitsUnit" in form:
+                    fields["baseSettings.limitsUnit"]["value"] = int(form["baseSettings.limitsUnit"])
+            elif what == "tag":
+                tag = int(form.get("tag", ""))
+                on = form.get("on") == "1"
+                i["tags"] = sorted(set(i.get("tags") or []) | {tag}) if on else [t for t in i.get("tags") or [] if t != tag]
+                done = f"tag {'added' if on else 'removed'}"
+            elif what == "credentials":
+                changed = [f for f in i.get("fields") or [] if credential(f) and form.get(f"field.{f['name']}")]
+                if not changed:
+                    return here(error="Nothing to save: every field was left empty, so each keeps what Prowlarr has.")
+                for f in changed:
+                    f["value"] = form[f"field.{f['name']}"]
+                done = f"{', '.join(f.get('label') or f['name'] for f in changed)} saved"
+            else:
+                return here(error="No such change.")
+            prowlarr.save(i, force=form.get("force") == "1")
+        except ValueError:
+            return here(error="That isn't a number.")
+        except OSError as e:
+            return here(error=f"{name}: {hide(str(e))}")
+        log.info("indexers: %s (#%s) %s in Prowlarr by %s", name, id, done, user["name"])
+        return here(message=f"{name}: {done} in Prowlarr.")
 
     def wanted_give_up(db, request, user, form):
         here = form.get("next", "") if form.get("next", "").startswith(("/music/wanted", "/music/library/album/")) else "/music/wanted"
@@ -1286,6 +1478,7 @@ def routes(api) -> list[Route]:
         Route("/music/unwant", catalogue(unwant), methods=["POST"]),
         Route("/music/wanted", catalogue(wanted)),
         Route("/music/indexers", catalogue(indexers)),
+        Route("/music/indexers/{id:int}/{action:str}", signed_in(acquiring(indexer_action), admin=True), methods=["POST"]),
         Route("/music/library", catalogue(music_library)),
         Route("/music/library/artist/{key}", catalogue(library_artist)),
         Route("/music/library/album/{id}", catalogue(library_album)),

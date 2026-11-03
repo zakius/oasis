@@ -1,3 +1,4 @@
+import json
 from urllib.parse import parse_qs
 
 import pytest
@@ -52,3 +53,25 @@ def test_results_from_private_and_semi_private_indexers_name_their_tracker(monke
     p = Prowlarr("http://p", "k")
     p.indexers()
     assert [p.tracker({"indexerId": i}) for i in (40, 41, 32, 36, 39)] == ["Tracker-A", "Tracker-D", None, None, None]  # a local index: no login, no seeding
+
+
+def test_a_failed_write_reports_prowlarrs_messages_but_never_the_values_it_echoes(monkeypatch, caplog):
+    import io
+    import urllib.error
+    import urllib.request
+    answer = json.dumps([{"propertyName": "cookie", "errorMessage": "Unable to connect to indexer", "attemptedValue": "uid=1; pass=topsecret"},
+                         {"propertyName": "", "errorMessage": "Unable to connect to indexer", "attemptedValue": "uid=1; pass=topsecret"}]).encode()
+    sent = []
+
+    def urlopen(request, timeout):
+        sent.append((request.get_method(), request.full_url, json.loads(request.data)))
+        raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", {}, io.BytesIO(answer))
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    p = Prowlarr("http://p", "k")
+    with pytest.raises(OSError) as e:
+        p.save({"id": 9, "name": "Public-Index", "fields": [{"name": "cookie", "value": "uid=1; pass=topsecret"}]}, force=True)
+    assert str(e.value) == "Prowlarr: Unable to connect to indexer" and "topsecret" not in caplog.text
+    assert sent[0][:2] == ("PUT", "http://p/api/v1/indexer/9?forceSave=true")
+    with pytest.raises(OSError, match="Unable to connect"):
+        p.test({"id": 9})
+    assert sent[1][:2] == ("POST", "http://p/api/v1/indexer/test")

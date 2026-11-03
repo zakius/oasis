@@ -135,6 +135,9 @@ create table if not exists bundle_kept(  -- bundles oasis has had, to fetch albu
 );
 create table if not exists bundle_search(artist_mbid text primary key, searched real not null);  -- see acquire.py
 create table if not exists mb_cache(url text primary key, body text not null, fetched real not null);  -- see musicbrainz.py
+create table if not exists seed_rule(  -- a login tracker's seeding rule set on the indexers page: over oasis.toml's and the built-in one (download.py)
+    tracker text primary key, seed int not null, ratio real not null, days real not null, min_hours real not null, min_ratio real
+);
 create table if not exists release_block(  -- releases that failed: never picked again, but slow and long-dead ones last (see download.py). hash: info hash, or guid for those listed without one
     hash text primary key, reason text, at real not null,
     artist_mbid text, wanted text   -- a bundle that held no wanted album: its artist, and the albums wanted then (JSON)

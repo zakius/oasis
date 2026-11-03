@@ -46,6 +46,16 @@ def privacy(indexer: dict) -> str:
     return "local" if local(indexer) else indexer.get("privacy") or "public"
 
 
+def failures(text: bytes) -> str:
+    """The error messages of a Prowlarr validation answer, without the attemptedValue each also holds."""
+    try:
+        found = json.loads(text)
+    except ValueError:
+        return ""
+    found = found if isinstance(found, list) else [found]
+    return "; ".join(dict.fromkeys(m for f in found if isinstance(f, dict) and (m := str(f.get("errorMessage") or f.get("message") or ""))))
+
+
 class Prowlarr:
     def __init__(self, url: str, api_key: str, tag: int = 2):
         """tag: the Prowlarr tag of the music indexers; anime's stay out of music searches."""
@@ -53,13 +63,28 @@ class Prowlarr:
         self.logins: dict[int, str] = {}  # indexer id -> name, of those needing a login (private, semi-private): see tracker
         self.errors: dict[int, tuple[float, str]] = {}  # indexer id -> (when, what) of its last failed search, for the indexers page
 
-    def call(self, path: str):
-        request = urllib.request.Request(f"{self.url}/api/v1/{path}", headers={"X-Api-Key": self.key})
+    def call(self, path: str, body=None, method: str | None = None):
+        """A write (body) that fails raises OSError of Prowlarr's error messages only: its validation answer also echoes
+        the values sent, credentials among them, which must reach neither the page nor the log."""
+        request = urllib.request.Request(f"{self.url}/api/v1/{path}", method=method, data=None if body is None else json.dumps(body).encode(),
+                                         headers={"X-Api-Key": self.key, **({"Content-Type": "application/json"} if body is not None else {})})
         try:
             with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-                return json.loads(response.read())
+                return json.loads(response.read() or b"null")
         except urllib.error.HTTPError as e:
-            raise OSError(f"Prowlarr {path.split('?')[0]}: {e.code} {e.read()[:200].decode(errors='replace')}") from e
+            text = e.read()
+            if body is None:
+                raise OSError(f"Prowlarr {path.split('?')[0]}: {e.code} {text[:200].decode(errors='replace')}") from None
+            raise OSError(f"Prowlarr: {failures(text) or e.code}") from None
+
+    def save(self, indexer: dict, force: bool = False) -> dict:
+        """PUTs the indexer back as GET gave it, with the changes made: masked values go back as they came, which
+        Prowlarr reads as unchanged. Prowlarr tests the indexer first unless force (its forceSave)."""
+        return self.call(f"indexer/{indexer['id']}{'?forceSave=true' if force else ''}", indexer, "PUT")
+
+    def test(self, indexer: dict):
+        """Prowlarr's own test of the indexer as it is; OSError of why it fails."""
+        self.call("indexer/test", indexer, "POST")
 
     def indexers(self) -> dict[int, list[int]]:
         """The enabled music indexers Prowlarr hasn't paused after failures, with the categories to search them in."""

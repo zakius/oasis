@@ -169,6 +169,7 @@ class Downloads:
         """torbox: makes the TorBox client (the doctor's, with the key rdtclient holds). importer: importer.py's.
         imported: called after each import. seeding: oasis.toml's rules per login tracker (SEEDING)."""
         self.rules, self.said_low, self.totals_said = seeding or {}, set(), 0.0
+        self.saved = None    # the seed_rule rows, tracker -> rule, read once: see rule, and forget after a change
         self.connect, self.torbox_for, self.own, self.prowlarr, self.folder, self.imported = connect, torbox, importer, prowlarr, Path(downloads), imported
         self.max_active, self.stall = max_active, stall_hours * 3600
         self.client = None
@@ -210,7 +211,28 @@ class Downloads:
         return sum(bool(t["active"]) and t["hash"].lower() not in seeding for t in torrents)
 
     def rule(self, tracker: str) -> dict:
-        return {**SEEDING, **TRACKERS.get(tracker, {}), **self.rules.get(tracker, {})}
+        if self.saved is None:
+            db = self.connect()
+            try:
+                self.saved = {r["tracker"]: {k: r[k] if k != "seed" else bool(r[k]) for k in SEEDING} for r in db.execute("select * from seed_rule")}
+            finally:
+                db.close()
+        return {**SEEDING, **TRACKERS.get(tracker, {}), **self.rules.get(tracker, {}), **self.saved.get(tracker, {})}
+
+    def rule_source(self, tracker: str) -> str:
+        """Where the tracker's rule comes from: the indexers page (oasis's database), oasis.toml, built in, or the default."""
+        self.rule(tracker)
+        return "oasis database" if tracker in self.saved else "oasis.toml" if tracker in self.rules else "built in" if tracker in TRACKERS else "default"
+
+    def save_rule(self, db, tracker: str, rule: dict | None):
+        """Sets the tracker's rule, or with None drops it back to oasis.toml's, built-in or default one."""
+        if rule is None:
+            db.execute("delete from seed_rule where tracker = ?", (tracker,))
+        else:
+            db.execute("insert or replace into seed_rule values (?, ?, ?, ?, ?, ?)",
+                       (tracker, int(rule["seed"]), rule["ratio"], rule["days"], rule["min_hours"], rule["min_ratio"]))
+        db.commit()
+        self.saved = None
 
     def totals(self, db) -> dict[str, tuple[int, int]]:
         """Each login tracker's bytes (downloaded, uploaded) over every torrent oasis got from it, deleted ones too."""

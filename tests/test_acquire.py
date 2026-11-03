@@ -10,7 +10,7 @@ import pytest
 
 from conftest import call, make_client
 from test_accounts import sign_in
-from oasis import acquire, cover, musicbrainz
+from oasis import accounts, acquire, cover, musicbrainz
 from oasis.acquire import Acquire, artist_names
 from oasis.db import connect
 from oasis.download import Downloads
@@ -717,7 +717,7 @@ def test_the_indexers_page_shows_prowlarrs_view_oasiss_downloads_and_seeding_rul
     api = client.app.state.api
 
     class Prowlarr:
-        tag, logins = 2, {38: "Cookie-Tracker", 40: "Ratio-Tracker"}
+        tag, logins, url = 2, {38: "Cookie-Tracker", 40: "Ratio-Tracker"}, "http://prowlarr:9696"
         errors = {38: (time.time(), "Prowlarr search: 400 redirected to https://cookie-tracker.example/login.php")}
 
         def call(self, path):
@@ -751,3 +751,125 @@ def test_the_indexers_page_shows_prowlarrs_view_oasiss_downloads_and_seeding_rul
     assert "login expired, needs a new cookie" in page and "seed = false <span class=\"muted\">(built in)</span>" in page
     assert "ratio 1 · 14 days · min_ratio 0.7 <span class=\"muted\">(built in)</span>" in page and "ratio 0.50" in page
     assert 'href="/music/indexers"' in client.get("/").text
+
+
+class ManagedProwlarr:
+    """Prowlarr's indexer API as the indexers page uses it: each save replaces the stored indexer."""
+    tag, logins, errors, url = 2, {}, {}, "http://prowlarr:9696"
+
+    def __init__(self):
+        cookie = {"name": "cookie", "type": "textbox", "privacy": "normal", "label": "Cookie", "value": "uid=291; pass=storedsecret"}
+        self.stored = [
+            {"id": 50, "name": "Public Index 2", "enable": True, "privacy": "public", "tags": [2, 3], "protocol": "torrent", "priority": 25, "indexerUrls": ["https://public-index.example/"],
+             "fields": [{"name": "baseSettings.queryLimit", "type": "number", "value": None}, {"name": "baseSettings.grabLimit", "type": "number", "value": 10},
+                        {"name": "baseSettings.limitsUnit", "type": "select", "value": 0, "selectOptions": [{"value": 0, "name": "Day"}, {"value": 1, "name": "Hour"}]}]},
+            {"id": 51, "name": "Some-Tracker", "enable": True, "privacy": "semiPrivate", "tags": [1, 2], "protocol": "torrent", "priority": 25, "indexerUrls": ["https://some.example/"],
+             "fields": [cookie, {"name": "password", "type": "password", "privacy": "password", "label": "Password", "value": "********"},
+                        {"name": "useragent", "type": "textbox", "privacy": "normal", "label": "User-Agent", "value": ""},
+                        {"name": "info_cookie", "type": "info", "label": "How to get the cookie", "value": "Copy it from your browser."}]},
+            {"id": 52, "name": "Anime Only", "enable": True, "privacy": "public", "tags": [1], "protocol": "torrent", "indexerUrls": []},
+            {"id": 53, "name": "Usenet Index", "enable": False, "privacy": "private", "tags": [1], "protocol": "usenet", "indexerUrls": []}]
+        self.saved, self.tested, self.failing = [], [], None
+
+    def call(self, path, body=None, method=None):
+        if path.startswith("indexer/"):
+            return json.loads(json.dumps(next(i for i in self.stored if i["id"] == int(path.split("/")[1]))))
+        return {"indexer": json.loads(json.dumps(self.stored)), "indexerstatus": [], "indexerstats": {"indexers": []},
+                "tag": [{"id": 1, "label": "anime"}, {"id": 2, "label": "music"}, {"id": 3, "label": "flaresolverr"}]}[path]
+
+    def save(self, indexer, force=False):
+        if self.failing:
+            raise OSError(self.failing)
+        self.saved.append((indexer, force))
+        self.stored = [indexer if i["id"] == indexer["id"] else i for i in self.stored]
+
+    def test(self, indexer):
+        self.tested.append(indexer)
+        if self.failing:
+            raise OSError(self.failing)
+
+
+@pytest.fixture
+def managed(client, tmp_path):
+    sign_in(client)
+    api = client.app.state.api
+    api.downloads = Downloads(api._db, None, None, ManagedProwlarr(), str(tmp_path / "dl"))
+    return api.downloads.prowlarr
+
+
+def post(client, id, action, **form):
+    response = client.post(f"/music/indexers/{id}/{action}", data=form, follow_redirects=False)
+    assert response.status_code == 303
+    return urllib.parse.unquote(response.headers["location"])
+
+
+def test_the_indexers_page_shows_who_stores_what_and_never_a_credential(client, mb, managed):
+    page = client.get("/music/indexers").text
+    assert "Prowlarr does" in page and "oasis does" in page and 'href="http://testserver:9696/"' in page and "Add in Prowlarr" in page
+    assert "Stored in Prowlarr" in page and "Stored in oasis" in page and '<span class="pill">oasis database</span>' in page
+    assert "storedsecret" not in page and "********" not in page and "uid=291" not in page
+    assert 'Cookie <span class="pill good">set</span>' in page and 'User-Agent <span class="pill">not set</span>' in page and "Copy it from your browser." in page
+    assert "Prowlarr&#x27;s next sync removes it from Sonarr." in page and "Disable Public Index 2 in Prowlarr?" in page and "forceSave" in page
+    unused = page[page.find('id="unused"'):]
+    assert "Anime Only" in unused and "Use for music" in unused and "usenet: oasis searches torrents only" in unused and "Public Index 2" not in unused
+    assert "A public tracker: oasis never seeds what comes from it." in page and "Seed what comes from it" in page
+
+
+def test_only_admins_manage_indexers(client, mb, managed):
+    db = client.app.state.api._db()
+    accounts.create(db, "guest", "pw")
+    db.commit()
+    client.post("/logout")
+    sign_in(client, "guest", "pw")
+    assert "Manage" not in client.get("/music/indexers").text
+    assert "Only admins" in post(client, 50, "enable", on="")
+    assert managed.saved == []
+
+
+def test_indexer_changes_go_to_prowlarr_as_it_stored_them(client, mb, managed):
+    assert "Public Index 2: disabled in Prowlarr." in post(client, 50, "enable", on="")
+    assert managed.saved[-1][0]["enable"] is False and managed.saved[-1][1] is False
+    post(client, 50, "limits", priority="10", **{"baseSettings.queryLimit": "100", "baseSettings.grabLimit": "", "baseSettings.limitsUnit": "1"}, force="1")
+    saved, force = managed.saved[-1]
+    assert force and saved["priority"] == 10 and [f["value"] for f in saved["fields"]] == [100, None, 1]
+    assert "Priority is a number from 1 to 50." in post(client, 50, "limits", priority="99")
+    post(client, 52, "tag", tag="2", on="1")
+    post(client, 50, "tag", tag="3", on="")
+    assert [i["tags"] for i, _ in managed.saved[-2:]] == [[1, 2], [2]]
+    assert "Anime Only" in client.get("/music/indexers").text.split('id="unused"')[0]  # tagged music: oasis uses it
+
+
+def test_credentials_are_write_only_and_only_new_values_replace_prowlarrs(client, mb, managed, caplog):
+    assert "Nothing to save" in post(client, 51, "credentials", **{"field.cookie": "", "field.password": ""})
+    assert "Cookie saved" in post(client, 51, "credentials", **{"field.cookie": "uid=291; pass=newsecret", "field.password": ""})
+    fields = {f["name"]: f["value"] for f in managed.saved[-1][0]["fields"]}
+    assert fields["cookie"] == "uid=291; pass=newsecret" and fields["password"] == "********"  # masked: Prowlarr keeps its own
+    assert "newsecret" not in caplog.text and "newsecret" not in client.get("/music/indexers").text
+    managed.failing = "Prowlarr: Unable to connect to indexer with uid=291; pass=newsecret"
+    message = post(client, 51, "test")
+    assert "Unable to connect to indexer" in message and "newsecret" not in message and "•••" in message
+    managed.failing = None
+    assert "Prowlarr's test passed" in post(client, 51, "test")
+
+
+def test_seeding_rules_set_in_oasis_win_till_reset(client, mb, managed):
+    downloads = client.app.state.api.downloads
+    assert downloads.rule_source("Some-Tracker") == "default"
+    assert "Saved Some-Tracker" in post(client, 51, "seeding", ratio="2", days="3", min_hours="1", min_ratio="")
+    assert downloads.rule("Some-Tracker") == {"seed": False, "ratio": 2.0, "days": 3.0, "min_hours": 1.0, "min_ratio": None}
+    assert downloads.rule_source("Some-Tracker") == "oasis database" and "Reset to default" in client.get("/music/indexers").text
+    assert "Ratio and days need a number" in post(client, 51, "seeding", seed="1", ratio="", days="3")
+    post(client, 51, "reset-seeding")
+    assert downloads.rule("Some-Tracker")["seed"] is True and downloads.rule_source("Some-Tracker") == "default"
+    assert managed.saved == []  # oasis's own: nothing went to Prowlarr
+
+
+def test_clearing_an_indexers_blocks_lifts_only_its_releases(client, mb, managed):
+    db = client.app.state.api._db()
+    db.executemany("insert into download(hash, guid, album_id, title, state, created, updated, indexer) values (?, ?, 0, ?, 'failed', 0, 0, ?)",
+                   [("a", None, "A", 51), ("b", "https://some.example/t/2", "B", None), ("c", None, "C", 50)])
+    db.executemany("insert into release_block(hash, reason, at) values (?, 'dead torrent', 0)", [("a",), ("https://some.example/t/2",), ("c",)])
+    db.commit()
+    assert "2 releases blocked" in client.get("/music/indexers").text
+    assert "Cleared 2 blocks from Some-Tracker." in post(client, 51, "unblock")
+    assert [r[0] for r in db.execute("select hash from release_block")] == ["c"]
