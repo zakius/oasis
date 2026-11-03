@@ -429,16 +429,26 @@ LATIN_SOURCE = "coalesce(t.title, '') || char(31) || coalesce(t.artist, '') || c
 
 def latin_index(db):
     """Fills track_latin for library tracks new or renamed since, as the songs show their names romanized."""
-    rows = db.execute(f"select t.*, {LATIN_SOURCE} as source from track t left join track_latin l on l.id = t.id "
+    # latin_source, not source: track has a source column of its own (local, ytm), which a row would give instead,
+    # and then no track would ever match and each search would romanize the whole library again.
+    rows = db.execute(f"select t.*, {LATIN_SOURCE} as latin_source from track t left join track_latin l on l.id = t.id "
                       f"where t.library = 1 and l.source is not {LATIN_SOURCE}").fetchall()
-
-    known = latin.curated(db) if rows else None
+    if not rows:
+        return
+    known = latin.curated(db)
 
     def folded(s, *siblings, title_of=False):
         return " ".join(filter(None, map(ytm.fold, (latin_of(s, siblings, title_of, known) or "").split())))  # words kept apart
-    db.executemany("insert or replace into track_latin values (?, ?, ?, ?, ?, ?)", [(
-        r["id"], r["source"], folded(r["title"], r["artist"], r["album"], title_of=True), folded(r["artist"], r["title"], r["album"]),
-        folded(r["album"], r["title"], r["artist"], title_of=True), folded(r["album_artist"], r["title"], r["album"])) for r in rows])
+    values = [(
+        r["id"], r["latin_source"], folded(r["title"], r["artist"], r["album"], title_of=True), folded(r["artist"], r["title"], r["album"]),
+        folded(r["album"], r["title"], r["artist"], title_of=True), folded(r["album_artist"], r["title"], r["album"])) for r in rows]
+    db.execute("begin")  # one commit, not one per row: the connection autocommits
+    try:
+        db.executemany("insert or replace into track_latin values (?, ?, ?, ?, ?, ?)", values)
+        db.execute("commit")
+    except BaseException:
+        db.execute("rollback")
+        raise
 
 
 def cue_lines(values: list[str], words: list[list]) -> dict:
