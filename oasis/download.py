@@ -5,8 +5,7 @@ record of which hash is which album. A bundle serves several albums: only their 
 <hash>/<release group>/, and each is imported on its own (download_target). A bundle whose files TorBox doesn't list
 yet (uncached, or cached as one zip) holds the albums it likely holds till it does (resolve); one whose music is packed
 is fetched whole and unpacked here first (unpacked). TorBox downloads a torrent whole, but hands out its files one by
-one. One from a login tracker (private or semi-private in Prowlarr) is seeded by TorBox once imported, till it meets
-the tracker's rules (SEEDING, TRACKERS, oasis.toml's [seeding."<tracker>"]); nothing seeds or uploads from here. A bundle imported is remembered with all it holds (bundle_kept): an album searched
+one. Each is seeded by TorBox once imported as its indexer's rule says (SEEDING); nothing seeds or uploads from here. A bundle imported is remembered with all it holds (bundle_kept): an album searched
 later, one starred since too, comes from it again while TorBox has it cached, before any Prowlarr search."""
 import hashlib
 import json
@@ -48,22 +47,21 @@ DEAD_AGAIN = 14 * 86400  # seconds before a dead torrent is tried again, after a
 EMPTY_BUNDLE = "the bundle holds no wanted album"
 KEEP_FAILED = 2 * 86400  # seconds a failed download's files stay for inspection
 KEPT_UNSEEN = 90 * 86400 # seconds a remembered bundle stays unused; TorBox's cache check when one is used is its real expiry
-# A login tracker's seeding rules, unless oasis.toml sets its own: a torrent seeds till its ratio reaches ratio after
-# at least min_hours, or for days at most; while the tracker's overall ratio for us is below min_ratio, only the ratio ends it.
-# seed: false for a tracker that keeps no ratio, whose torrents go from TorBox once imported, as public ones do.
-SEEDING = {"seed": True, "ratio": 1.0, "days": 7, "min_hours": 0, "min_ratio": None}
-# What each tracker's own rules ask, by Prowlarr's indexer name; oasis.toml's win.
-TRACKERS = {
-    "Tracker-A": {"seed": False}, "Tracker-B": {"seed": False},  # paid access, public open trackers, "no limits"
-    "Tracker-C": {"seed": False}, "Cookie-Tracker": {"seed": False},  # no passkey in the announce URL, no ratio rules
-    "Magnet-Tracker": {"seed": False},  # oasis gets magnet links from it, without the passkey: seeding counts for no account
-    "Ratio-Tracker": {"ratio": 1.0, "days": 14, "min_ratio": 0.7},  # a 6 GB deficit leaves 1 slot, 20 GB disables the account
-    "Strict-Tracker": {"ratio": 1.05, "days": 7},  # its "Advanced user" threshold; no minimum
-    "Local-DHT": {"seed": False},  # a self-hosted DHT index, public, though Prowlarr's Generic Torznab calls every indexer private
-}
+# Seeding, per indexer: torbox leaves it to the TorBox account's setting (oasis neither keeps nor stops it, and drops
+# the torrent once TorBox stops); seed is oasis's own: a torrent seeds till its ratio reaches ratio after at least
+# min_hours, or for days at most, but while the indexer's overall ratio for us is below min_ratio only the ratio ends
+# it; off never seeds. Each indexer's rule is our config's (the indexers page's, else oasis.toml's [seeding."<name>"]),
+# else a login tracker's (private, semi-private) is LOGIN, any other's OPEN.
+SEEDING = {"ratio": 1.0, "days": 7, "min_hours": 0, "min_ratio": None}
+LOGIN, OPEN = "seed", "torbox"
 TOTALS_EVERY = 86400     # seconds between log lines of each tracker's totals
 GRAB_TRIES = 5           # picks tried in turn when TorBox won't take one
 FRESH = 3600             # seconds Prowlarr's answers to an artist's bundle searches and the .torrents read stay: its bundles go a pass apart
+
+
+def mode_of(row) -> str:
+    """How a download was sent to TorBox: as noted, or from before oasis noted it, seed when from a login tracker."""
+    return row["mode"] or ("seed" if row["tracker"] else "off")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -167,7 +165,7 @@ class Downloads:
     def __init__(self, connect, torbox, importer, prowlarr, downloads: str, max_active: int = 8, stall_hours: float = 1, imported=lambda: None,
                  seeding: dict | None = None):
         """torbox: makes the TorBox client (the doctor's, with the key rdtclient holds). importer: importer.py's.
-        imported: called after each import. seeding: oasis.toml's rules per login tracker (SEEDING)."""
+        imported: called after each import. seeding: oasis.toml's rules per indexer (SEEDING)."""
         self.rules, self.said_low, self.totals_said = seeding or {}, set(), 0.0
         self.saved = None    # the seed_rule rows, tracker -> rule, read once: see rule, and forget after a change
         self.connect, self.torbox_for, self.own, self.prowlarr, self.folder, self.imported = connect, torbox, importer, prowlarr, Path(downloads), imported
@@ -210,37 +208,41 @@ class Downloads:
         seeding = {r[0] for r in db.execute("select hash from download where seeding = 1")}
         return sum(bool(t["active"]) and t["hash"].lower() not in seeding for t in torrents)
 
-    def rule(self, tracker: str) -> dict:
+    def rule(self, tracker: str, login: bool | None = None) -> dict:
+        """The indexer's seeding rule: its mode (torbox, seed, off) with seed's limits. login: whether it is a login
+        tracker, for its default mode; by Prowlarr's word when not given."""
         if self.saved is None:
             db = self.connect()
             try:
-                self.saved = {r["tracker"]: {k: r[k] if k != "seed" else bool(r[k]) for k in SEEDING} for r in db.execute("select * from seed_rule")}
+                self.saved = {r["tracker"]: {k: r[k] for k in ("mode", *SEEDING)} for r in db.execute("select * from seed_rule")}
             finally:
                 db.close()
-        return {**SEEDING, **TRACKERS.get(tracker, {}), **self.rules.get(tracker, {}), **self.saved.get(tracker, {})}
+        if login is None:
+            login = tracker in getattr(self.prowlarr, "logins", {}).values()
+        return {"mode": LOGIN if login else OPEN, **SEEDING, **self.rules.get(tracker, {}), **self.saved.get(tracker, {})}
 
     def rule_source(self, tracker: str) -> str:
-        """Where the tracker's rule comes from: the indexers page (oasis's database), oasis.toml, built in, or the default."""
+        """Where the indexer's rule comes from: the indexers page (oasis's database), oasis.toml, or the default."""
         self.rule(tracker)
-        return "oasis database" if tracker in self.saved else "oasis.toml" if tracker in self.rules else "built in" if tracker in TRACKERS else "default"
+        return "oasis database" if tracker in self.saved else "oasis.toml" if tracker in self.rules else "default"
 
     def save_rule(self, db, tracker: str, rule: dict | None):
-        """Sets the tracker's rule, or with None drops it back to oasis.toml's, built-in or default one."""
+        """Sets the indexer's rule, or with None drops it back to oasis.toml's or the default."""
         if rule is None:
             db.execute("delete from seed_rule where tracker = ?", (tracker,))
         else:
             db.execute("insert or replace into seed_rule values (?, ?, ?, ?, ?, ?)",
-                       (tracker, int(rule["seed"]), rule["ratio"], rule["days"], rule["min_hours"], rule["min_ratio"]))
+                       (tracker, rule["mode"], rule["ratio"], rule["days"], rule["min_hours"], rule["min_ratio"]))
         db.commit()
         self.saved = None
 
     def totals(self, db) -> dict[str, tuple[int, int]]:
-        """Each login tracker's bytes (downloaded, uploaded) over every torrent oasis got from it, deleted ones too."""
+        """Each indexer's bytes (downloaded, uploaded) over every torrent oasis got from it, deleted ones too."""
         return {t: (down, up) for t, down, up in db.execute("select tracker, coalesce(sum(downloaded), 0), coalesce(sum(uploaded), 0) from download "
                                                             "where tracker is not null group by tracker")}
 
     def low(self, db) -> set[str]:
-        """The login trackers whose overall ratio for us is below their min_ratio; each logged once while it is."""
+        """The indexers whose overall ratio for us is below their min_ratio; each logged once while it is."""
         found = {t for t, (down, up) in self.totals(db).items() if (floor := self.rule(t)["min_ratio"]) is not None and down and up / down < floor}
         for t in found - self.said_low:
             down, up = self.totals(db)[t]
@@ -281,7 +283,7 @@ class Downloads:
         if not want["upgrade"] and (sent := self.remembered(db, {group}, f"{want['artist']} - {want['title']}")) is not None:
             return sent
         blocked, low, tally = self.blocked(db), self.low(db), {}
-        low_ids = frozenset(i for i, name in getattr(self.prowlarr, "logins", {}).items() if name in low)
+        low_ids = frozenset(i for i, name in getattr(self.prowlarr, "names", {}).items() if name in low)
         try:
             picks = releases.find(self.prowlarr, want, blocked, self.torbox().cached, self.unreliable(db), self.slow(db), low_ids, tally)
         finally:
@@ -415,16 +417,16 @@ class Downloads:
                 log.info("%s failed before: next", release["title"])
                 continue
             tracker = getattr(self.prowlarr, "tracker", lambda r: None)(release)
-            tracker = tracker if tracker and self.rule(tracker)["seed"] else None  # one keeping no ratio is as a public one
+            mode = self.rule(tracker)["mode"] if tracker else OPEN
             try:
                 self.added = time.time()
                 try:
-                    added = tb.add(release["title"], **found, seed=bool(tracker))
+                    added = tb.add(release["title"], **found, mode=mode)
                 except OSError as e:
-                    if not tracker:
+                    if mode == "off":
                         raise
-                    log.warning("TorBox won't take %s for seeding (%s): added without", release["title"], e)
-                    added = tb.add(release["title"], **found)
+                    log.warning("TorBox won't take %s to seed (%s, %s): added without", release["title"], mode, e)
+                    added, mode = tb.add(release["title"], **found), "off"
             except OSError as e:
                 log.info("couldn't add %s to TorBox: %s", release["title"], e)
                 continue
@@ -437,11 +439,11 @@ class Downloads:
             now = time.time()
             later = [{k: r[k] for k in ("title", "guid", "infoHash", "magnetUrl", "downloadUrl", "seeders") if k in r} for r in picks[i + 1:i + 1 + GRAB_TRIES]]
             db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated, bundle, picks, catalogue, kept, "
-                       "tracker, indexer) values (?, ?, 0, ?, ?, ?, 'added', ?, ?, ?, ?, ?, ?, ?, ?)", (added["hash"].lower(), release.get("guid"), group, release["title"],
+                       "tracker, indexer, mode) values (?, ?, 0, ?, ?, ?, 'added', ?, ?, ?, ?, ?, ?, ?, ?, ?)", (added["hash"].lower(), release.get("guid"), group, release["title"],
                                                                                             added["torrent_id"], now, now, search and json.dumps(search),
                                                                                             json.dumps(later) if group and later else None,
                                                                                             catalogue and json.dumps(catalogue), int(kept), tracker,
-                                                                                            release.get("indexerId")))
+                                                                                            release.get("indexerId"), mode))
             self.seen.pop(added["hash"].lower(), None)  # added again after a failure: its stall timer starts anew
             self.failures.pop(added["hash"].lower(), None)
             self.missing.pop(added["hash"].lower(), None)
@@ -715,14 +717,14 @@ class Downloads:
             self.fail(db, row, "import failed: no album of the bundle matched")
 
     def done(self, db, row, folder: Path):
-        """An import done: the torrent goes from TorBox, or a login tracker's seeds on (seed)."""
-        if row["tracker"]:
+        """An import done: the torrent goes from TorBox, or seeds on (seed) unless its mode is off."""
+        if (mode := mode_of(row)) != "off":
             db.execute("update download set seeding = 1 where hash = ?", (row["hash"],))
         else:
             self.delete(row)
         shutil.rmtree(folder, ignore_errors=True)
         self.set(db, row, "done")
-        log.info("imported %s%s", row["title"], f"; seeding it for {row['tracker']}" if row["tracker"] else "")
+        log.info("imported %s%s", row["title"], "" if mode == "off" else f"; seeding it for {row['tracker']}" if mode == "seed" else "; TorBox's setting decides its seeding")
         self.imported()
 
     def snapshot(self, db, row, torrent):
@@ -730,8 +732,9 @@ class Downloads:
                    (torrent.get("total_downloaded") or 0, torrent.get("total_uploaded") or 0, row["hash"]))
 
     def seed(self, db, row, torrent):
-        """A seeding torrent stops once its ratio meets the tracker's after its minimum time, or at the day cap unless
-        the tracker's overall ratio is low; at once when TorBox isn't seeding it (its plan may not allow it) or lost it."""
+        """A seeding torrent stops once its ratio meets the indexer's after its minimum time, or at the day cap unless
+        the indexer's overall ratio is low; at once when TorBox isn't seeding it (its plan may not allow it) or lost it.
+        One in torbox mode only goes once TorBox stops seeding it, as the account's setting says."""
         rule, now = self.rule(row["tracker"]), time.time()
         if torrent is not None:
             self.snapshot(db, row, torrent)
@@ -742,6 +745,8 @@ class Downloads:
             why = "gone from TorBox"
         elif not (torrent.get("active") or torrent.get("seed_torrent") or "seed" in (torrent.get("download_state") or "").lower()):
             why = f"TorBox isn't seeding it ({torrent.get('download_state')})"
+        elif mode_of(row) == "torbox":
+            return
         elif ratio >= rule["ratio"] and took >= rule["min_hours"] * 3600:
             why = f"ratio {ratio:.2f}"
         elif took >= rule["days"] * 86400 and row["tracker"] not in self.low(db):
@@ -754,8 +759,8 @@ class Downloads:
         log.info("stopped seeding %s: %s", row["title"], why)
 
     def say_totals(self, db):
-        """Each login tracker's totals and ratio, in the log once every TOTALS_EVERY."""
-        if time.time() - self.totals_said < TOTALS_EVERY or not (found := self.totals(db)):
+        """The totals and ratio of each indexer oasis seeds for (mode seed), in the log once every TOTALS_EVERY."""
+        if time.time() - self.totals_said < TOTALS_EVERY or not (found := {t: v for t, v in self.totals(db).items() if self.rule(t)["mode"] == "seed"}):
             return
         self.totals_said = time.time()
         for tracker, (down, up) in sorted(found.items()):

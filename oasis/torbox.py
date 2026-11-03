@@ -1,5 +1,5 @@
-"""The few TorBox API calls oasis needs. TorBox downloads torrents on its own servers, and seeds there the ones oasis
-asks it to (login trackers'); nothing seeds or uploads from here."""
+"""The few TorBox API calls oasis needs. TorBox downloads torrents on its own servers, and seeds there as oasis asks
+(each indexer's seeding mode, see download.py); nothing seeds or uploads from here."""
 import json
 import urllib.error
 import urllib.parse
@@ -11,6 +11,9 @@ API = "https://api.torbox.app/v1/api/"
 
 class RateLimited(OSError):
     """TorBox answered 429: wait before asking again."""
+
+
+SEED = {"torbox": "1", "seed": "2", "off": "3"}  # createtorrent's seed: auto (the account's setting), always, never
 
 
 class TorBox:
@@ -43,11 +46,11 @@ class TorBox:
         found = self.call("torrents/checkcached?format=list&list_files=true&hash=" + ",".join(hashes)) if hashes else None
         return {c["hash"].lower(): c.get("files") or [] for c in found or []}
 
-    def add(self, name: str, magnet: str | None = None, torrent: bytes | None = None, seed: bool = False) -> dict:
+    def add(self, name: str, magnet: str | None = None, torrent: bytes | None = None, mode: str = "off") -> dict:
         """Adds a magnet link or .torrent file: {torrent_id, hash}, or {queued_id, hash} when no active slot was free.
-        seed: TorBox seeds it once downloaded (2), else never (3), so it leaves the active slots then. It doesn't zip
-        it, so files stay separate."""
-        return self.call("torrents/createtorrent", form={"name": name, "seed": "2" if seed else "3", "allow_zip": "false",
+        mode: torbox leaves seeding to the account's setting (1), seed seeds it once downloaded (2), off never (3). It
+        doesn't zip it, so files stay separate."""
+        return self.call("torrents/createtorrent", form={"name": name, "seed": SEED[mode], "allow_zip": "false",
                                                          **({"magnet": magnet} if magnet else {"file": torrent})})
 
     def link(self, torrent_id: int, file_id: int) -> str:

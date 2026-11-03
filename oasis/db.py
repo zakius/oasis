@@ -111,10 +111,11 @@ create table if not exists download(  -- releases oasis downloads through TorBox
     picks text,                             -- an album's search's next picks (JSON), for a slow download to make way for (see download.py)
     catalogue text,                         -- a bundle's artist search (JSON: want, groups), to remember all it holds (bundle_kept)
     kept int not null default 0,            -- 1: sent from a remembered bundle (bundle_kept)
-    tracker text,                           -- the login tracker it came from (Prowlarr's name), whose ratio it counts toward; null: a public one
+    tracker text,                           -- the indexer it came from (Prowlarr's name), whose seeding rule and totals it counts toward; null before oasis noted it
     finished real,                          -- when TorBox had it whole: seeding's clock
     uploaded int, downloaded int,           -- TorBox's last totals for it, kept after it is deleted: the tracker's running ratio
     seeding int not null default 0,         -- 1: imported and still seeding on TorBox (see download.py)
+    mode text,                              -- seeding as sent to TorBox: torbox (its account's setting), seed (oasis stops it), off; null: seed if tracker, else off
     indexer int                             -- the Prowlarr indexer it came from; null before oasis noted it (web.py goes by the guid's site then)
 );
 create table if not exists search_stat(  -- each indexer's answers to album searches, a day at a time: results, the album, usable
@@ -135,8 +136,8 @@ create table if not exists bundle_kept(  -- bundles oasis has had, to fetch albu
 );
 create table if not exists bundle_search(artist_mbid text primary key, searched real not null);  -- see acquire.py
 create table if not exists mb_cache(url text primary key, body text not null, fetched real not null);  -- see musicbrainz.py
-create table if not exists seed_rule(  -- a login tracker's seeding rule set on the indexers page: over oasis.toml's and the built-in one (download.py)
-    tracker text primary key, seed int not null, ratio real not null, days real not null, min_hours real not null, min_ratio real
+create table if not exists seed_rule(  -- an indexer's seeding rule (Prowlarr's name), as the indexers page sets it: over oasis.toml's and the default (download.py)
+    tracker text primary key, mode text not null, ratio real not null, days real not null, min_hours real not null, min_ratio real
 );
 create table if not exists release_block(  -- releases that failed: never picked again, but slow and long-dead ones last (see download.py). hash: info hash, or guid for those listed without one
     hash text primary key, reason text, at real not null,
@@ -288,6 +289,9 @@ def rename(db: sqlite3.Connection):
     if "lidarr_item" in tables and "want_item" not in tables:  # named from when Lidarr kept the stars and follows
         db.execute("alter table lidarr_item rename to want_item")
         db.execute("alter table want_item drop column lidarr_id")
+    if "seed_rule" in tables and "seed" in {row[1] for row in db.execute("pragma table_info(seed_rule)")}:  # from when a rule only seeded or not
+        db.execute("alter table seed_rule rename column seed to mode")
+        db.execute("update seed_rule set mode = case mode when 1 then 'seed' else 'off' end")
     if "stat" in tables and "user" not in {row[1] for row in db.execute("pragma table_info(stat)")}:  # from when stats were global
         db.execute("alter table stat rename to stat_global")
 

@@ -395,8 +395,10 @@ def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloa
     assert placed == {"g-ht": ["01. Papercut.flac", "02. One Step Closer.flac", "03. In the End.flac", "cover.jpg"],
                       "g-mtm": ["CD1/01 Wake.flac", "CD1/02 Given Up.flac", "CD2/01 Leave Out All the Rest.flac", "folder.jpg"]}
     assert dict(db.execute("select rg, state from download_target").fetchall()) == {"g-ht": "done", "g-mtm": "failed"}
-    assert db.execute("select state from download").fetchone()[0] == "done" and torbox.deleted == [71] and not (tmp_path / "dl/abcd").exists()
+    assert db.execute("select state from download").fetchone()[0] == "done" and torbox.deleted == [] and not (tmp_path / "dl/abcd").exists()
     assert downloads.groups(db) == set() and downloads.scans == [1]
+    downloads.cycle()
+    assert torbox.deleted == [71]  # torbox mode: it goes once TorBox isn't seeding it
     assert bool(db.execute("select 1 from release_block where hash = 'abcd'").fetchone()) == blocked
     if blocked:
         return  # the rest searches the same release again
@@ -723,7 +725,9 @@ def test_a_bundle_imported_is_remembered_and_later_albums_come_from_it_while_tor
     torbox.list = [finished(71, "abcd", [f["name"] for f in DISCOGRAPHY], tmp_path)]
     downloads.cycle()
     [t.join(10) for t in threading.enumerate() if t.name != "MainThread" and "map_kept" in repr(getattr(t, "_target", None))]
-    assert set(placed) == {"g-ht"} and torbox.deleted == [71]
+    assert set(placed) == {"g-ht"} and torbox.deleted == []
+    downloads.cycle()
+    assert torbox.deleted == [71]  # torbox mode: it goes once TorBox isn't seeding it
     kept = db.execute("select * from bundle_kept").fetchone()
     assert (kept["hash"], kept["artist_mbid"], len(json.loads(kept["files"]))) == ("abcd", "mb-lp", len(DISCOGRAPHY))
     assert sorted(json.loads(kept["groups"])) == ["g-ht", "g-mtm", "g-oml"]  # all its folders hold, wanted or not

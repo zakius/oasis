@@ -14,9 +14,9 @@ class TorBox(FakeTorBox):
         super().__init__()
         self.tmp, self.added, self.full, self.links = tmp_path, [], False, []
 
-    def add(self, name, magnet=None, torrent=None, seed=False):
+    def add(self, name, magnet=None, torrent=None, mode="off"):
         self.added.append((name, magnet, torrent))
-        self.seeded = getattr(self, "seeded", []) + [seed]
+        self.seeded = getattr(self, "seeded", []) + [mode]
         hash = magnet.split("btih:")[1][:4] if magnet else "file"
         if self.full:
             self.waiting.append({"id": 90, "hash": hash})
@@ -121,8 +121,10 @@ def test_a_find_sends_the_pick_to_torbox_and_the_files_are_fetched_and_placed(do
     downloads.cycle()
     assert sorted(torbox.links) == [0, 1, 3]  # no log
     assert downloads.own.placed == [(folder, "mb-album")]
-    assert db.execute("select state from download").fetchone()[0] == "done"
-    assert torbox.deleted == [71] and not folder.exists() and downloads.groups(db) == set() and downloads.scans == [1]
+    assert db.execute("select state, seeding, mode from download").fetchone()[:] == ("done", 1, "torbox")  # TorBox's setting decides its seeding
+    assert torbox.deleted == [] and not folder.exists() and downloads.groups(db) == set() and downloads.scans == [1]
+    downloads.cycle()
+    assert torbox.deleted == [71]  # TorBox isn't seeding it: it goes
 
 
 def test_dead_torrents_get_another_try_after_two_weeks_after_all_others_but_wrong_content_never(downloads, db):
@@ -138,16 +140,16 @@ def test_dead_torrents_get_another_try_after_two_weeks_after_all_others_but_wron
 
 
 class LoginProwlarr(Prowlarr):
-    logins = {1: "Some-Tracker"}
+    logins = names = {1: "Some-Tracker"}
 
     def tracker(self, release):
-        return self.logins.get(release.get("indexerId"))
+        return self.names.get(release.get("indexerId"))
 
 
 def seeding(downloads, torbox, db, tmp_path, ratio, **more):
     """An album from a login tracker, downloaded and imported; TorBox then seeding it at ratio."""
     downloads.prowlarr = LoginProwlarr({"Artist Album": [offer("abcd")]})
-    assert downloads.find(db, WANT, "mb-album") and torbox.seeded == [True]
+    assert downloads.find(db, WANT, "mb-album") and torbox.seeded == ["seed"]
     torbox.list = [finished(71, "abcd", ["Album/01 Song.flac"], tmp_path)]
     downloads.cycle()
     row = db.execute("select state, seeding, tracker, finished from download").fetchone()
@@ -185,14 +187,29 @@ def test_seeding_ends_at_the_day_cap_unless_the_trackers_ratio_is_low_and_waits_
     assert 71 in torbox.deleted and "stopped seeding Artist - Album [FLAC]: 7 days, ratio 0.40" in caplog.text
 
 
-def test_seeding_stops_at_once_when_torbox_doesnt_seed_and_public_trackers_never_seed(downloads, torbox, db, tmp_path, caplog):
+def test_seeding_stops_at_once_when_torbox_doesnt_seed_and_other_indexers_leave_it_to_torbox(downloads, torbox, db, tmp_path, caplog):
     caplog.set_level("INFO", "oasis.download")
     seeding(downloads, torbox, db, tmp_path, 0, active=False, download_state="completed")
     downloads.cycle()
     assert 71 in torbox.deleted and "TorBox isn't seeding it (completed)" in caplog.text
     downloads.prowlarr = Prowlarr({"Artist Album": [offer("bcde", indexerId=2)]})
     db.execute("delete from release_block")
-    assert downloads.find(db, WANT, "mb-other") and torbox.seeded[-1] is False
+    assert downloads.find(db, WANT, "mb-other") and torbox.seeded[-1] == "torbox"
+
+
+def test_a_torbox_mode_torrent_seeds_as_torbox_likes_however_long_and_goes_when_torbox_stops(downloads, torbox, db, tmp_path, caplog):
+    caplog.set_level("INFO", "oasis.download")
+    downloads.rules = {"Some-Tracker": {"mode": "torbox"}}
+    downloads.prowlarr = LoginProwlarr({"Artist Album": [offer("abcd")]})
+    assert downloads.find(db, WANT, "mb-album") and torbox.seeded == ["torbox"]
+    torbox.list = [{**finished(71, "abcd", ["Album/01 Song.flac"], tmp_path), "download_state": "seeding", "active": True, "ratio": 5.0}]
+    downloads.cycle()
+    db.execute("update download set finished = ?", (time.time() - 30 * 86400,))
+    downloads.cycle()
+    assert 71 not in torbox.deleted and db.execute("select seeding, mode from download").fetchone()[:] == (1, "torbox")  # neither ratio nor days end it
+    torbox.list[0].update(active=False, download_state="completed")
+    downloads.cycle()
+    assert 71 in torbox.deleted and "TorBox isn't seeding it (completed)" in caplog.text
 
 
 def test_two_same_named_files_in_different_folders_both_arrive_and_a_restart_mid_fetch_resumes(downloads, torbox, db, tmp_path):
@@ -481,16 +498,25 @@ def test_a_bundle_downloaded_again_keeps_what_it_was_tried_for_before(downloads,
     assert json.loads(db.execute("select tried from bundle_kept").fetchone()[0]) == ["g-album", "g-old"]
 
 
-def test_a_tracker_keeping_no_ratio_isnt_seeded_and_built_in_rules_give_way_to_oasis_toml(downloads, torbox, db, tmp_path):
+def test_an_indexer_set_off_is_never_seeded_and_rules_come_from_our_config_over_two_generic_defaults(downloads, torbox, db, tmp_path):
     downloads.prowlarr = LoginProwlarr({"Artist Album": [offer("abcd")]})
-    downloads.prowlarr.logins = {1: "Tracker-B"}
-    assert downloads.find(db, WANT, "mb-album") and torbox.seeded == [False]
+    downloads.rules = {"Some-Tracker": {"mode": "off"}}
+    assert downloads.find(db, WANT, "mb-album") and torbox.seeded == ["off"]
     torbox.list = [finished(71, "abcd", ["Album/01 Song.flac"], tmp_path)]
     downloads.cycle()
-    assert db.execute("select state, seeding, tracker from download").fetchone()[:] == ("done", 0, None) and 71 in torbox.deleted
-    assert downloads.rule("Ratio-Tracker")["days"] == 14 and downloads.rule("Tracker-D") == download.SEEDING and not downloads.rule("Local-DHT")["seed"] and not downloads.rule("Magnet-Tracker")["seed"]
-    downloads.rules = {"Ratio-Tracker": {"days": 3}, "Tracker-B": {"seed": True}}
-    assert (downloads.rule("Ratio-Tracker")["days"], downloads.rule("Ratio-Tracker")["min_ratio"], downloads.rule("Tracker-B")["seed"]) == (3, 0.7, True)
+    assert db.execute("select state, seeding, mode from download").fetchone()[:] == ("done", 0, "off") and 71 in torbox.deleted
+    assert downloads.rule("Unknown Login", login=True) == {"mode": "seed", **download.SEEDING}
+    assert downloads.rule("Unknown Open", login=False) == {"mode": "torbox", **download.SEEDING}
+    downloads.rules = {"Tracker K": {"mode": "seed", "days": 14, "min_ratio": 0.7}}
+    assert (downloads.rule("Tracker K", login=False)["mode"], downloads.rule("Tracker K")["days"], downloads.rule_source("Tracker K")) == ("seed", 14, "oasis.toml")
+    downloads.save_rule(db, "Tracker K", {"mode": "seed", "ratio": 1.05, "days": 7, "min_hours": 0, "min_ratio": None})
+    assert (downloads.rule("Tracker K")["ratio"], downloads.rule("Tracker K")["min_ratio"], downloads.rule_source("Tracker K")) == (1.05, None, "oasis database")
+
+
+def test_downloads_sent_before_modes_keep_how_they_were_sent(downloads, db):
+    db.executemany("insert into download(hash, album_id, title, state, created, updated, tracker) values (?, 0, ?, 'done', 0, 0, ?)",
+                   [("a", "A", "Some-Tracker"), ("b", "B", None)])
+    assert [download.mode_of(r) for r in db.execute("select * from download order by hash")] == ["seed", "off"]
 
 
 def test_a_low_ratio_trackers_releases_come_after_other_indexers_offering_the_album():

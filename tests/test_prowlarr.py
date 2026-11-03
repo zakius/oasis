@@ -44,15 +44,16 @@ def test_a_search_with_every_indexer_paused_or_disabled_fails(monkeypatch):
         Prowlarr("http://p", "k").search("Linkin Park")
 
 
-def test_results_from_private_and_semi_private_indexers_name_their_tracker(monkeypatch):
-    found = [{**indexer(40, (3000, "Audio")), "name": "Tracker-A", "privacy": "semiPrivate"},
-             {**indexer(41, (3000, "Audio")), "name": "Tracker-D", "privacy": "private"}, {**BIGFAN, "name": "Open-Index-2", "privacy": "public"},
-             {**indexer(36, (3000, "Audio")), "name": "Local-DHT", "privacy": "private", "indexerUrls": ["http://local-dht:3333/torznab"]},
+def test_results_name_their_indexer_and_only_login_trackers_count_as_logins(monkeypatch):
+    found = [{**indexer(40, (3000, "Audio")), "name": "Tracker One", "privacy": "semiPrivate"},
+             {**indexer(41, (3000, "Audio")), "name": "Tracker Two", "privacy": "private"}, {**BIGFAN, "name": "Open Index", "privacy": "public"},
+             {**indexer(36, (3000, "Audio")), "name": "Local DHT", "privacy": "private", "indexerUrls": ["http://dht:3333/torznab"]},
              {**indexer(39, (3000, "Audio")), "name": "LAN", "privacy": "private", "indexerUrls": ["http://192.168.1.5:9117/"]}]
     monkeypatch.setattr(Prowlarr, "call", lambda self, path: [] if path == "indexerstatus" else found if path == "indexer" else [])
     p = Prowlarr("http://p", "k")
     p.indexers()
-    assert [p.tracker({"indexerId": i}) for i in (40, 41, 32, 36, 39)] == ["Tracker-A", "Tracker-D", None, None, None]  # a local index: no login, no seeding
+    assert [p.tracker({"indexerId": i}) for i in (40, 41, 32, 36, 39)] == ["Tracker One", "Tracker Two", "Open Index", "Local DHT", "LAN"]
+    assert sorted(p.logins.values()) == ["Tracker One", "Tracker Two"]  # a local index needs no login, whatever Prowlarr calls it
 
 
 def test_a_failed_write_reports_prowlarrs_messages_but_never_the_values_it_echoes(monkeypatch, caplog):

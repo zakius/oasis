@@ -230,6 +230,8 @@ def length(seconds) -> str:
     return f"{seconds // 3600}:{seconds // 60 % 60:02}:{seconds % 60:02}" if seconds >= 3600 else f"{seconds // 60}:{seconds % 60:02}"
 
 
+MODES = {"torbox": "torbox: TorBox's account setting decides; oasis doesn't stop it", "seed": "seed: oasis seeds till the ratio or days below",
+         "off": "off: never seeds"}  # seeding modes (download.py)
 # Prowlarr's tags as the indexers page shows them: what each does, and what removing it costs.
 TAG_NOTES = {"music": "oasis searches it", "anime": "Prowlarr syncs it to Sonarr", "flaresolverr": "Prowlarr sends its searches through FlareSolverr (Cloudflare)"}
 TAG_LOSS = {"music": "oasis stops searching it.", "anime": "Prowlarr's next sync removes it from Sonarr.",
@@ -1262,21 +1264,21 @@ def routes(api) -> list[Route]:
                                   f'{force}<button>Save to Prowlarr</button></fieldset>')
         prowlarr_side += post("test", '<button>Test</button> <span class="muted">Prowlarr tests it as it is saved there</span>', cls="row")
         oasis_side = ""
-        if login:
-            rule, source = api.downloads.rule(name), api.downloads.rule_source(name)
+        if i.get("protocol") == "torrent":
+            rule, source = api.downloads.rule(name, login), api.downloads.rule_source(name)
             value = lambda v: "" if v is None else f"{v:g}"
-            oasis_side += post("seeding", f'<fieldset>{legend("Seeding on TorBox", "oasis database")}<p class="muted">Now: {escape(source)}.</p>'
-                               f'<label class="check"><input type="checkbox" name="seed" value="1"{" checked" if rule["seed"] else ""}> Seed what comes from it</label>'
+            modes = "".join(f'<option value="{m}"{" selected" if m == rule["mode"] else ""}>{escape(text)}</option>' for m, text in MODES.items())
+            oasis_side += post("seeding", f'<fieldset>{legend("Seeding on TorBox", "oasis database")}<p class="muted">Now: {escape(source)}'
+                               f'{" (a login tracker: seed)" if source == "default" and login else " (torbox)" if source == "default" else ""}. The limits count in seed mode only.</p>'
+                               f'<label>Mode<select name="mode">{modes}</select></label>'
                                f'<div class="fields"><label>Ratio<input type="number" step="any" min="0" name="ratio" value="{value(rule["ratio"])}"></label>'
                                f'<label>Days at most<input type="number" step="any" min="0" name="days" value="{value(rule["days"])}"></label>'
                                f'<label>Hours at least<input type="number" step="any" min="0" name="min_hours" value="{value(rule["min_hours"])}"></label>'
                                f'<label>Lowest total ratio<input type="number" step="any" min="0" name="min_ratio" value="{value(rule["min_ratio"])}" placeholder="none"></label></div>'
                                '<button>Save in oasis</button></fieldset>')
             if saved:
-                oasis_side += post("reset-seeding", f'<button>Reset to default</button> <span class="muted">back to the {"oasis.toml" if name in api.downloads.rules else "built-in" if name in download.TRACKERS else "default"} rule</span>',
+                oasis_side += post("reset-seeding", f'<button>Reset to default</button> <span class="muted">back to the {"oasis.toml" if name in api.downloads.rules else "default"} rule</span>',
                                    f"Reset {name}'s seeding rule?", "row")
-        elif i.get("protocol") == "torrent":
-            oasis_side += f'<p class="muted">{"A local index" if prowlarr_privacy(i) == "local" else "A public tracker"}: oasis never seeds what comes from it.</p>'
         oasis_side += post("unblock", f'<button{" disabled" if not blocks else ""}>Clear {plural(blocks, "block")}</button> <span class="muted">releases from it oasis '
                            'blocked after they failed: cleared, they can be picked again (after a login fix, say)</span>',
                            f"Clear {plural(blocks, 'block')} from {name}?", "row")
@@ -1285,7 +1287,7 @@ def routes(api) -> list[Route]:
 
     def indexers(db, request, user, form):
         """Every Prowlarr indexer: Prowlarr's view of it (settings, health, counts), what oasis got from it, and for a
-        login tracker its seeding rule and running ratio; for an admin, the controls to change them (manage)."""
+        torrent indexer its seeding rule and running ratio; for an admin, the controls to change them (manage)."""
         prowlarr = api.downloads.prowlarr if api.downloads else None
         try:
             found = prowlarr.call("indexer")
@@ -1349,12 +1351,13 @@ def routes(api) -> list[Route]:
             ours = cell(f'{m["sent"]} sent, {m["done"]} imported' if m else "", f'failed: {escape(failed)}' if failed else "",
                         f'{plural(len(m["albums"]), "wanted album")} arrived, last {ago(m["last"])}' if m and m["albums"] else "",
                         f'{plural(blocks[id], "release")} blocked' if blocks[id] else "")
-            seeding = '<span class="muted">not seeded: a local index</span>' if prowlarr_privacy(i) == "local" else ""
-            if login:
-                rule, source = api.downloads.rule(name), api.downloads.rule_source(name)
-                seeding = ("seed = false" if not rule["seed"] else f'ratio {rule["ratio"]:g} · {rule["days"]:g} days' + (f' · at least {rule["min_hours"]:g} h' if rule["min_hours"] else "")
-                           + (f' · min_ratio {rule["min_ratio"]:g}' if rule["min_ratio"] is not None else "")) + f' <span class="muted">({source})</span>'
-                if name in totals:
+            seeding = ""
+            if i.get("protocol") == "torrent":
+                rule, source = api.downloads.rule(name, login), api.downloads.rule_source(name)
+                seeding = (f'seed · ratio {rule["ratio"]:g} · {rule["days"]:g} days' + (f' · at least {rule["min_hours"]:g} h' if rule["min_hours"] else "")
+                           + (f' · min_ratio {rule["min_ratio"]:g}' if rule["min_ratio"] is not None else "") if rule["mode"] == "seed" else
+                           "torbox: TorBox's setting" if rule["mode"] == "torbox" else "off") + f' <span class="muted">({source})</span>'
+                if name in totals and any(totals[name]):
                     down, up = totals[name]
                     seeding += f'<br>{size(down)} down, {size(up)} up, ratio {f"{up / down:.2f}" if down else "–"}'
             body += (f'<tr id="indexer-{id}"><td class="lead"><b>{escape(name)}</b><div class="muted">{kind}</div></td><td class="state">{health}</td>'
@@ -1393,8 +1396,10 @@ def routes(api) -> list[Route]:
                 prowlarr.test(i)
                 return here(message=f"{name}: Prowlarr's test passed.")
             if what == "seeding":
-                rule = {"seed": form.get("seed") == "1", "ratio": number("ratio"), "days": number("days"), "min_hours": number("min_hours") or 0, "min_ratio": number("min_ratio")}
-                if rule["ratio"] is None or rule["days"] is None or min(v for v in rule.values() if not isinstance(v, bool) and v is not None) < 0:
+                rule = {"mode": form.get("mode"), "ratio": number("ratio"), "days": number("days"), "min_hours": number("min_hours") or 0, "min_ratio": number("min_ratio")}
+                if rule["mode"] not in MODES:
+                    return here(error="Mode is torbox, seed or off.")
+                if rule["ratio"] is None or rule["days"] is None or min(v for k, v in rule.items() if k != "mode" and v is not None) < 0:
                     return here(error="Ratio and days need a number, none below 0.")
                 api.downloads.save_rule(db, name, rule)
                 return here(message=f"Saved {name}'s seeding rule in oasis.")

@@ -733,7 +733,7 @@ def test_the_indexers_page_shows_prowlarrs_view_oasiss_downloads_and_seeding_rul
                                                    "numberOfFailedGrabs": 0, "averageResponseTime": 1500},
                                                   {"indexerId": 38, "numberOfQueries": 1, "numberOfFailedQueries": 0, "numberOfGrabs": 1,
                                                    "numberOfFailedGrabs": 0, "averageResponseTime": 900}]}}[path]
-    api.downloads = Downloads(api._db, None, None, Prowlarr(), str(tmp_path / "dl"))
+    api.downloads = Downloads(api._db, None, None, Prowlarr(), str(tmp_path / "dl"), seeding={"Ratio-Tracker": {"mode": "seed", "days": 14, "min_ratio": 0.7}})
     db = api._db()
     db.execute("insert into want_album(rg, artist_mbid, title, reason, state) values ('g-1', 'a', 'One', 'followed', 'have')")
     db.executemany("insert into download(hash, guid, album_id, album_mbid, title, state, error, created, updated, indexer, tracker, downloaded, uploaded) "
@@ -746,16 +746,17 @@ def test_the_indexers_page_shows_prowlarrs_view_oasiss_downloads_and_seeding_rul
     assert "50 queries (2 failed)<br>4 grabs (0 failed)<br>1.5 s a query" in page and "30 results<br>4 the album<br>2 usable" in page
     assert "1 query (0 failed)<br>1 grab (0 failed)" in page and "1 result<br>" in page
     assert "2 sent, 1 imported<br>failed: 1 dead torrent" in page and "1 wanted album arrived" in page
-    assert "<b>Local-DHT</b><div class=\"muted\">local · music" in page and "not seeded: a local index" in page and "#36</span>" in page
+    assert "<b>Local-DHT</b><div class=\"muted\">local · music" in page and "#36</span>" in page
+    assert page.count("torbox: TorBox's setting <span class=\"muted\">(default)</span>") == 2  # the public and the local one
     assert '<div class="scroll"><table class="grid indexers">' in page
-    assert "login expired, needs a new cookie" in page and "seed = false <span class=\"muted\">(built in)</span>" in page
-    assert "ratio 1 · 14 days · min_ratio 0.7 <span class=\"muted\">(built in)</span>" in page and "ratio 0.50" in page
+    assert "login expired, needs a new cookie" in page and "seed · ratio 1 · 7 days <span class=\"muted\">(default)</span>" in page
+    assert "seed · ratio 1 · 14 days · min_ratio 0.7 <span class=\"muted\">(oasis.toml)</span>" in page and "ratio 0.50" in page
     assert 'href="/music/indexers"' in client.get("/").text
 
 
 class ManagedProwlarr:
     """Prowlarr's indexer API as the indexers page uses it: each save replaces the stored indexer."""
-    tag, logins, errors, url = 2, {}, {}, "http://prowlarr:9696"
+    tag, logins, errors, url = 2, {51: "Some-Tracker"}, {}, "http://prowlarr:9696"
 
     def __init__(self):
         cookie = {"name": "cookie", "type": "textbox", "privacy": "normal", "label": "Cookie", "value": "uid=291; pass=storedsecret"}
@@ -812,7 +813,8 @@ def test_the_indexers_page_shows_who_stores_what_and_never_a_credential(client, 
     assert "Prowlarr&#x27;s next sync removes it from Sonarr." in page and "Disable Public Index 2 in Prowlarr?" in page and "forceSave" in page
     unused = page[page.find('id="unused"'):]
     assert "Anime Only" in unused and "Use for music" in unused and "usenet: oasis searches torrents only" in unused and "Public Index 2" not in unused
-    assert "A public tracker: oasis never seeds what comes from it." in page and "Seed what comes from it" in page
+    assert page.count('<select name="mode">') == 2 and "torbox: TorBox&#x27;s account setting decides" in page  # each one oasis uses, login or not
+    assert "Now: default (torbox)" in page and "Now: default (a login tracker: seed)" in page
 
 
 def test_only_admins_manage_indexers(client, mb, managed):
@@ -855,12 +857,13 @@ def test_credentials_are_write_only_and_only_new_values_replace_prowlarrs(client
 def test_seeding_rules_set_in_oasis_win_till_reset(client, mb, managed):
     downloads = client.app.state.api.downloads
     assert downloads.rule_source("Some-Tracker") == "default"
-    assert "Saved Some-Tracker" in post(client, 51, "seeding", ratio="2", days="3", min_hours="1", min_ratio="")
-    assert downloads.rule("Some-Tracker") == {"seed": False, "ratio": 2.0, "days": 3.0, "min_hours": 1.0, "min_ratio": None}
+    assert "Saved Some-Tracker" in post(client, 51, "seeding", mode="off", ratio="2", days="3", min_hours="1", min_ratio="")
+    assert downloads.rule("Some-Tracker") == {"mode": "off", "ratio": 2.0, "days": 3.0, "min_hours": 1.0, "min_ratio": None}
     assert downloads.rule_source("Some-Tracker") == "oasis database" and "Reset to default" in client.get("/music/indexers").text
-    assert "Ratio and days need a number" in post(client, 51, "seeding", seed="1", ratio="", days="3")
+    assert "Ratio and days need a number" in post(client, 51, "seeding", mode="seed", ratio="", days="3")
+    assert "Mode is torbox, seed or off" in post(client, 51, "seeding", mode="sometimes", ratio="1", days="3")
     post(client, 51, "reset-seeding")
-    assert downloads.rule("Some-Tracker")["seed"] is True and downloads.rule_source("Some-Tracker") == "default"
+    assert downloads.rule("Some-Tracker")["mode"] == "seed" and downloads.rule_source("Some-Tracker") == "default"
     assert managed.saved == []  # oasis's own: nothing went to Prowlarr
 
 

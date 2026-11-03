@@ -60,7 +60,8 @@ class Prowlarr:
     def __init__(self, url: str, api_key: str, tag: int = 2):
         """tag: the Prowlarr tag of the music indexers; anime's stay out of music searches."""
         self.url, self.key, self.tag = url.rstrip("/"), api_key, tag
-        self.logins: dict[int, str] = {}  # indexer id -> name, of those needing a login (private, semi-private): see tracker
+        self.names: dict[int, str] = {}   # indexer id -> name: see tracker
+        self.logins: dict[int, str] = {}  # the same, of those needing a login (private, semi-private): their default seeding differs
         self.errors: dict[int, tuple[float, str]] = {}  # indexer id -> (when, what) of its last failed search, for the indexers page
 
     def call(self, path: str, body=None, method: str | None = None):
@@ -91,12 +92,13 @@ class Prowlarr:
         now = datetime.now(timezone.utc).isoformat()
         paused = {s["indexerId"] for s in self.call("indexerstatus") if (s.get("disabledTill") or "") > now}
         found = [i for i in self.call("indexer") if i["enable"] and self.tag in i["tags"] and i["protocol"] == "torrent"]
+        self.names |= {i["id"]: i.get("name") for i in found}
         self.logins |= {i["id"]: i["name"] for i in found if privacy(i) not in ("public", "local")}
         return {i["id"]: music_categories(i) for i in found if i["id"] not in paused}
 
     def tracker(self, release: dict) -> str | None:
-        """The name of the login tracker a search result comes from, which counts its users' ratios; None for a public one."""
-        return self.logins.get(release.get("indexerId"))
+        """The name of the indexer a search result comes from, whose seeding rule it follows (see download.py)."""
+        return self.names.get(release.get("indexerId"))
 
     def search(self, query: str) -> list[dict]:
         """Torrents in each indexer's music categories (music_categories): title, size, seeders, infoHash, magnetUrl/downloadUrl (Prowlarr's proxy), guid, indexerId.
