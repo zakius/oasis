@@ -169,6 +169,7 @@ def song(r) -> dict:
         "albumId": r["album_id"], "artistId": r["artist_id"], "type": "music", "mediaType": "song",
         "created": iso(r["created"]), "starred": iso(r["starred"]), "userRating": r["rating"],
         "playCount": r["play_count"] or 0, "played": iso(r["played"]), "youtubeId": r["ytm_id"] or None,
+        "shareUrl": f"https://music.youtube.com/watch?v={r['ytm_id']}" if r["ytm_id"] else None,  # the shareUrl extension
     })
 
 
@@ -634,7 +635,7 @@ class Api:
 
     def getOpenSubsonicExtensions(self, db, p, user):
         return {"openSubsonicExtensions": [{"name": name, "versions": versions} for name, versions in (
-            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]), ("oasis", [1, 2, 3]))]}
+            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]), ("shareUrl", [1]), ("oasis", [1, 2, 3]))]}
 
     def _user(self, row) -> dict:
         roles = ("scrobbling", "settings", "download", "playlist", "coverArt", "comment", "stream", "share")

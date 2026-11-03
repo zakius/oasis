@@ -191,3 +191,17 @@ def test_mix_tracks_come_from_the_playlist_not_its_watch_queue(tmp_path):
     assert [r["ref"] for r in music.playlist_tracks(client, "RDTMAK5uy_mix")] == ["wrong"]  # still better than nothing
     with pytest.raises(KeyError):
         music.playlist_tracks(client, "PLsaved")
+
+
+def test_songs_with_a_youtube_music_copy_carry_a_share_url_for_every_client(client, ytm, monkeypatch):
+    assert {"name": "shareUrl", "versions": [1]} in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]
+    call(client, "search3", query="remote")
+    local = {s["title"]: s for s in call(client, "search3", query="")["searchResult3"]["song"]}
+    monkeypatch.setattr(ytm, "match", lambda track: "vidA" if track["title"] == "Song A" else None, raising=False)
+    for params in ({}, {"oasis": "1"}):
+        assert call(client, "getSong", id="yt-vid1", **params)["song"]["shareUrl"] == "https://music.youtube.com/watch?v=vid1"
+        matched = call(client, "getSong", id=local["Song A"]["id"], **params)["song"]
+        assert matched["shareUrl"] == "https://music.youtube.com/watch?v=vidA"
+        album = call(client, "getAlbum", id=matched["albumId"], **params)["album"]["song"]
+        assert next(s for s in album if s["id"] == matched["id"])["shareUrl"] == matched["shareUrl"]
+        assert "shareUrl" not in call(client, "getSong", id=local["Song B"]["id"], **params)["song"]

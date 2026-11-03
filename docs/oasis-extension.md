@@ -30,7 +30,9 @@ clients that know them, and other clients get plain OpenSubsonic.
     albums in the library and for followed artists, which need no badge.
   - `oasisWantedError`: with `oasisWanted`, why it isn't downloading (for `failed`, the last search's result).
 - Song (`Child`): `youtubeId`: the YouTube Music video id of a streaming song, or of the YouTube Music copy of a
-  library song once oasis found one (for share links). `getSong` looks for one the first time it is asked.
+  library song once oasis found one. `getSong` looks for one the first time it is asked. The link to share is
+  `shareUrl`, from the separate extension `shareUrl` ([share-url-extension.md](share-url-extension.md)), sent to every
+  client.
 - Playlist:
   - `oasisMix`: `true` for a YouTube Music home mix (My Supermix, My Mix 1-7, Discover Mix, New Release Mix,
     Replay Mix). Absent for other playlists.

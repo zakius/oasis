@@ -105,7 +105,7 @@ Point a Subsonic client at `http://<host>:4533`. `oasis scan` runs a scan withou
 
 Browsing (`getArtists`, `getArtist`, `getAlbum`, `getSong`, `getIndexes`, `getMusicDirectory`), album lists, random songs, genres, `search2`/`search3` (an empty query lists everything, for clients that sync the whole library), stars, ratings, scrobbles, playlists, cover art (embedded or `cover`/`folder`/`front` images), and `stream`/`download` with HTTP range requests. Responses are XML or JSON (`f=json`), over GET or form POST.
 
-With `oasis=1`, songs carry `youtubeId`, the YouTube video of the same song, when oasis knows it: always for YouTube Music tracks, and for local files once they're matched. `getSong` looks a local song up on YouTube Music the first time it's asked. Clients can build share links from it (`https://music.youtube.com/watch?v=<id>`, `https://youtu.be/<id>`).
+With `oasis=1`, songs carry `youtubeId`, the YouTube video of the same song, when oasis knows it: always for YouTube Music tracks, and for local files once they're matched. `getSong` looks a local song up on YouTube Music the first time it's asked. Every client, with or without `oasis=1`, also gets the link to share as `shareUrl`, through the OpenSubsonic extension `shareUrl` ([docs/share-url-extension.md](docs/share-url-extension.md)).
 
 Methods for podcasts, shares, bookmarks and internet radio return empty results.
 
