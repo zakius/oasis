@@ -8,6 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+import ipaddress
 from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
@@ -24,6 +25,25 @@ def music_categories(indexer: dict) -> list[int]:
     if any(c["id"] == AUDIO for c in found):
         return [AUDIO]
     return [c["id"] for c in found if not (2000 <= c["id"] < 3000 or 5000 <= c["id"] < 7000 or VIDEO.search(c["name"]))]
+
+
+def local(indexer: dict) -> bool:
+    """Whether the indexer runs on this network (Local-DHT's own DHT index at http://local-dht:3333): no tracker, no login,
+    though Prowlarr's Generic Torznab reports every indexer private."""
+    for url in indexer.get("indexerUrls") or []:
+        host = urllib.parse.urlparse(url).hostname or ""
+        try:
+            if ipaddress.ip_address(host).is_private:
+                return True
+        except ValueError:
+            if host == "localhost" or host and "." not in host:
+                return True
+    return False
+
+
+def privacy(indexer: dict) -> str:
+    """public, semiPrivate, private (a login), or local (see local)."""
+    return "local" if local(indexer) else indexer.get("privacy") or "public"
 
 
 class Prowlarr:
@@ -46,7 +66,7 @@ class Prowlarr:
         now = datetime.now(timezone.utc).isoformat()
         paused = {s["indexerId"] for s in self.call("indexerstatus") if (s.get("disabledTill") or "") > now}
         found = [i for i in self.call("indexer") if i["enable"] and self.tag in i["tags"] and i["protocol"] == "torrent"]
-        self.logins |= {i["id"]: i["name"] for i in found if (i.get("privacy") or "public") != "public"}
+        self.logins |= {i["id"]: i["name"] for i in found if privacy(i) not in ("public", "local")}
         return {i["id"]: music_categories(i) for i in found if i["id"] not in paused}
 
     def tracker(self, release: dict) -> str | None:

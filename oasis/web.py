@@ -20,6 +20,7 @@ from . import accounts, acquire, download, importer, musicbrainz, releases
 from .acquire import MB_IDS, TYPES
 from .artists import linked
 from .forward import LastFm
+from .prowlarr import privacy as prowlarr_privacy
 from .recommend import SOURCES
 from .translate import LANGUAGES
 from .ytm import LIKED, MIX
@@ -107,6 +108,12 @@ table.grid :is(td, th):first-child { padding-left: var(--pad); } table.grid :is(
 table.grid tbody tr:hover { background: color-mix(in srgb, var(--raised) 50%, transparent); } td.lead b { font-weight: 600; }
 tr:target { background: color-mix(in srgb, var(--accent) 16%, transparent) !important; } tr[id] { scroll-margin-top: 30vh; }
 .num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; } td.thumb { width: 1px; padding-right: .2rem !important; }
+.scroll { overflow-x: auto; margin: 0 calc(-1 * var(--pad)) -.5rem; } .scroll > table.grid { width: 100%; }
+table.indexers { table-layout: fixed; min-width: 58rem; } table.indexers td { overflow-wrap: anywhere; vertical-align: top; font-size: .9rem; }
+table.indexers td:not(:first-child) { color: var(--muted); } table.indexers .pill { white-space: normal; }
+table.indexers :is(th, td):nth-child(1) { width: 16%; } table.indexers :is(th, td):nth-child(2) { width: 15%; }
+table.indexers :is(th, td):nth-child(3) { width: 16%; } table.indexers :is(th, td):nth-child(4) { width: 10%; }
+table.indexers :is(th, td):nth-child(5) { width: 25%; } table.indexers :is(th, td):nth-child(6) { width: 18%; }
 td.meta { color: var(--muted); font-size: .9rem; white-space: nowrap; } a.stretch::after { content: ""; position: absolute; inset: 0; }
 a.stretch, table.tracks td.lead > a { color: var(--text); }
 table.thumbs tr { position: relative; } table.tracks td:first-child { width: 2.5rem; color: var(--muted); }
@@ -176,6 +183,7 @@ a.card:hover b { text-decoration: underline; } .card .muted { font-size: .8rem; 
   td.actions { display: flex !important; justify-content: space-between; gap: 1rem; margin-top: .65rem; } table.thumbs td.actions { margin-left: -3.6rem; }
   table.wanted td.lead { display: inline; } table.wanted td.lead b { display: block; } table.wanted td.lead div { display: inline; }
   table.wanted td.meta { display: inline; margin: 0; font-size: .875rem; } table.wanted td.meta::before { content: " · "; } table.wanted td.state { margin-top: .3rem; }
+  table.indexers { min-width: 0; } table.indexers td { display: block; width: auto !important; margin: .2rem 0 0; }
   table.tracks tr { display: grid; grid-template-columns: 1.75rem minmax(0, 1fr) auto; column-gap: .6rem; align-items: baseline; }
   table.tracks td { margin: 0; } table.tracks td:nth-child(1) { grid-row: 1 / 3; } table.tracks td:nth-child(4) { grid-area: 1 / 3; }
   table.tracks td:nth-child(3) { grid-area: 2 / 2; font-size: .8rem; } table.tracks td:nth-child(5) { grid-area: 2 / 3; font-size: .8rem; text-align: right; }
@@ -205,6 +213,10 @@ FAVICON = "data:image/svg+xml," + quote(LOGO.replace("<svg", '<svg xmlns="http:/
 def length(seconds) -> str:
     seconds = int(seconds or 0)
     return f"{seconds // 3600}:{seconds // 60 % 60:02}:{seconds % 60:02}" if seconds >= 3600 else f"{seconds // 60}:{seconds % 60:02}"
+
+
+def plural(n: int, one: str, many: str = "") -> str:
+    return f"{n} {one if n == 1 else many or one + 's'}"
 
 
 def size(n) -> str:
@@ -1201,7 +1213,7 @@ def routes(api) -> list[Route]:
         cell = lambda *parts: '<br>'.join(p for p in parts if p)
         body = ""
         for i in sorted(found, key=lambda i: (not i["enable"], i["name"].casefold())):
-            id, name, login = i["id"], i["name"], (i.get("privacy") or "public") != "public" and i.get("protocol") == "torrent"
+            id, name, login = i["id"], i["name"], prowlarr_privacy(i) not in ("public", "local") and i.get("protocol") == "torrent"
             st, pr, m = status.get(id) or {}, stats.get(id) or {}, mine.get(id) or {}
             when, what = errors.get(id, (None, ""))
             if login and "login" in what.lower():
@@ -1214,13 +1226,14 @@ def routes(api) -> list[Route]:
                 health = pill("healthy", "good")
             health = cell(health, f'<span class="muted">last failure {escape(st["mostRecentFailure"][:16].replace("T", " "))} UTC</span>' if st.get("mostRecentFailure") else "",
                           f'<span class="muted">last error {ago(when)}: {escape(what[:140])}</span>' if when else "")
-            counts = (f'{pr.get("numberOfQueries", 0)} queries ({pr.get("numberOfFailedQueries", 0)} failed) · {pr.get("numberOfGrabs", 0)} grabs '
-                      f'({pr.get("numberOfFailedGrabs", 0)} failed) · {pr.get("averageResponseTime", 0) / 1000:.1f} s a query' if pr else "")
-            searched = f'{hits[id][0]} results, {hits[id][1]} the album, {hits[id][2]} usable' if id in hits else ""
+            counts = cell(f'{plural(pr.get("numberOfQueries", 0), "query", "queries")} ({pr.get("numberOfFailedQueries", 0)} failed)',
+                          f'{plural(pr.get("numberOfGrabs", 0), "grab")} ({pr.get("numberOfFailedGrabs", 0)} failed)',
+                          f'{pr.get("averageResponseTime", 0) / 1000:.1f} s a query') if pr else ""
+            searched = cell(plural(hits[id][0], "result"), f'{hits[id][1]} the album', f'{hits[id][2]} usable') if id in hits else ""
             failed = ", ".join(f"{n} {why}" for why, n in m["failed"].most_common()) if m else ""
-            ours = cell(f'{m["sent"]} sent, {m["done"]} imported' + (f'; failed: {escape(failed)}' if failed else "") if m else "",
-                        f'{len(m["albums"])} wanted album{"s" if len(m["albums"]) != 1 else ""} arrived, last {ago(m["last"])}' if m and m["albums"] else "")
-            seeding = ""
+            ours = cell(f'{m["sent"]} sent, {m["done"]} imported' if m else "", f'failed: {escape(failed)}' if failed else "",
+                        f'{plural(len(m["albums"]), "wanted album")} arrived, last {ago(m["last"])}' if m and m["albums"] else "")
+            seeding = '<span class="muted">not seeded: a local index</span>' if prowlarr_privacy(i) == "local" else ""
             if login:
                 rule, source = api.downloads.rule(name), "oasis.toml" if name in api.config.seeding else "built in" if name in download.TRACKERS else "default"
                 seeding = ("seed = false" if not rule["seed"] else f'ratio {rule["ratio"]:g} · {rule["days"]:g} days' + (f' · at least {rule["min_hours"]:g} h' if rule["min_hours"] else "")
@@ -1228,13 +1241,13 @@ def routes(api) -> list[Route]:
                 if name in totals:
                     down, up = totals[name]
                     seeding += f'<br>{size(down)} down, {size(up)} up, ratio {f"{up / down:.2f}" if down else "–"}'
-            kind = cell(escape(i.get("privacy") or "public") + (" · " + escape(", ".join(tags.get(t, str(t)) for t in i.get("tags") or [])) if i.get("tags") else ""),
-                        f'<span class="muted">{escape(i.get("definitionName") or i.get("implementationName") or "")} · {escape(i.get("protocol") or "")}</span>')
-            body += (f'<tr><td class="lead"><b>{escape(name)}</b> <span class="muted">#{id}</span><div class="muted">{kind}</div></td><td class="state">{health}</td>'
-                     f'<td class="meta">{counts}</td><td class="meta">{searched}</td><td class="meta">{ours}</td><td class="meta">{seeding}</td></tr>')
+            kind = cell(escape(prowlarr_privacy(i)) + (" · " + escape(", ".join(tags.get(t, str(t)) for t in i.get("tags") or [])) if i.get("tags") else ""),
+                        f'<span class="muted">{escape(i.get("definitionName") or i.get("implementationName") or "")} · {escape(i.get("protocol") or "")} · #{id}</span>')
+            body += (f'<tr><td class="lead"><b>{escape(name)}</b><div class="muted">{kind}</div></td><td class="state">{health}</td>'
+                     f'<td>{counts}</td><td>{searched}</td><td>{ours}</td><td>{seeding}</td></tr>')
         body = ('<section><p class="muted">Prowlarr\'s counts are its own, over all apps; searches are oasis\'s album searches over the last 30 days; downloads count '
-                'oasis\'s, by the indexer it noted, or before it did by the release\'s site.</p><table class="grid"><thead><tr><th>Indexer</th><th>Health</th>'
-                f'<th>Prowlarr</th><th>Searches</th><th>Downloads</th><th>Seeding</th></tr></thead><tbody>{body}</tbody></table></section>')
+                'oasis\'s, by the indexer it noted, or before it did by the release\'s site.</p><div class="scroll"><table class="grid indexers"><thead><tr><th>Indexer</th><th>Health</th>'
+                f'<th>Prowlarr</th><th>Searches</th><th>Downloads</th><th>Seeding</th></tr></thead><tbody>{body}</tbody></table></div></section>')
         return page("Indexers", body, wide=True, tab="wanted")
 
     def wanted_give_up(db, request, user, form):

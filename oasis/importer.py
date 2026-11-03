@@ -2,7 +2,7 @@
 numbers and durations), writes that edition's tags into them the way Picard does, and places them in the library as
 "Artist/Year - Album/NN - Title.ext" (see album_folder and track_file). Library files are never overwritten: a
 lossless copy of a track the library has only lossy replaces it, the lossy file deleted once the new one is in place.
-A disc image (one audio file and a cue sheet) is split into a file per track first. The download's FLACs are checked
+A disc image (one audio file and a cue sheet) is split into a file per track first, and WAV and AIFF become FLAC (pcm.py). The download's FLACs are checked
 before anything is placed (see quality.py): fake hi-res becomes what it is, outliers are recompressed, and a FLAC made
 from a lossy file fails the import (LossySource), so another release is picked."""
 import fcntl
@@ -20,7 +20,7 @@ from pathlib import Path
 import mutagen
 from mutagen._vorbis import VCommentDict
 
-from . import musicbrainz, quality
+from . import musicbrainz, pcm, quality
 from .dedupe import FICLONE
 from .scan import COVER_NAMES, COVER_SUFFIXES
 from .ytm import fold
@@ -388,6 +388,7 @@ class Importer:
         LookupError when no edition matches, LossySource (one) when a FLAC of it was made from a lossy file."""
         unpack(folder)
         images = split(folder)
+        pcm.convert_all([p for p in sorted(folder.rglob("*")) if p.is_file() and p not in images])
         db = self.connect()
         try:
             releases = editions(db, group)

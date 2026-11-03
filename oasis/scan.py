@@ -8,6 +8,7 @@ import mutagen
 from mutagen.easyid3 import EasyID3
 from mutagen.easymp4 import EasyMP4Tags
 
+from . import pcm
 from .credits import store, tag_credits
 from .db import adopt_local_copies, artist_id, make_id
 
@@ -99,6 +100,13 @@ def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
                 path = Path(directory, name)
                 if path.suffix.lower().lstrip(".") not in CONTENT_TYPES:
                     continue
+                if path.suffix.lower().lstrip(".") in pcm.SUFFIXES and (new := pcm.convert(path)):  # a WAV slipped in: FLAC, keeping its id
+                    from .relocate import repoint
+                    repoint(db, str(path), str(new))
+                    if old := known.pop(str(path), None):
+                        known[str(new)] = old
+                    path = new
+                    db.commit()
                 seen.add(str(path))
                 if (had := known.get(str(path))) and had["mtime"] == path.stat().st_mtime:
                     continue

@@ -725,10 +725,14 @@ def test_the_indexers_page_shows_prowlarrs_view_oasiss_downloads_and_seeding_rul
                                  "indexerUrls": ["https://open-index.example/"]},
                                 {"id": 38, "name": "Cookie-Tracker", "enable": True, "privacy": "semiPrivate", "tags": [2], "protocol": "torrent",
                                  "indexerUrls": ["https://cookie-tracker.example/"]},
-                                {"id": 40, "name": "Ratio-Tracker", "enable": True, "privacy": "semiPrivate", "tags": [2], "protocol": "torrent", "indexerUrls": []}],
+                                {"id": 40, "name": "Ratio-Tracker", "enable": True, "privacy": "semiPrivate", "tags": [2], "protocol": "torrent", "indexerUrls": []},
+                                {"id": 36, "name": "Local-DHT", "enable": True, "privacy": "private", "tags": [2], "protocol": "torrent",
+                                 "definitionName": "Torznab", "indexerUrls": ["http://local-dht:3333/torznab"]}],
                     "indexerstatus": [], "tag": [{"id": 2, "label": "music"}],
                     "indexerstats": {"indexers": [{"indexerId": 22, "numberOfQueries": 50, "numberOfFailedQueries": 2, "numberOfGrabs": 4,
-                                                   "numberOfFailedGrabs": 0, "averageResponseTime": 1500}]}}[path]
+                                                   "numberOfFailedGrabs": 0, "averageResponseTime": 1500},
+                                                  {"indexerId": 38, "numberOfQueries": 1, "numberOfFailedQueries": 0, "numberOfGrabs": 1,
+                                                   "numberOfFailedGrabs": 0, "averageResponseTime": 900}]}}[path]
     api.downloads = Downloads(api._db, None, None, Prowlarr(), str(tmp_path / "dl"))
     db = api._db()
     db.execute("insert into want_album(rg, artist_mbid, title, reason, state) values ('g-1', 'a', 'One', 'followed', 'have')")
@@ -737,10 +741,13 @@ def test_the_indexers_page_shows_prowlarrs_view_oasiss_downloads_and_seeding_rul
                        ("a", "https://open-index.example/x.html", "g-1", "A", "done", None, time.time(), None, None, None, None),  # before oasis noted it
                        ("b", None, None, "B", "failed", "dead torrent: no seeds, no progress", 0, 22, None, None, None),
                        ("c", None, None, "C", "done", None, 0, 40, "Ratio-Tracker", 1000, 500)])
-    db.execute("insert into search_stat values (date('now'), 22, 30, 4, 2)")
+    db.executemany("insert into search_stat values (date('now'), ?, ?, ?, ?)", [(22, 30, 4, 2), (38, 1, 1, 1)])
     page = client.get("/music/indexers").text
-    assert "50 queries (2 failed) · 4 grabs (0 failed) · 1.5 s a query" in page and "30 results, 4 the album, 2 usable" in page
-    assert "2 sent, 1 imported; failed: 1 dead torrent" in page and "1 wanted album arrived" in page
+    assert "50 queries (2 failed)<br>4 grabs (0 failed)<br>1.5 s a query" in page and "30 results<br>4 the album<br>2 usable" in page
+    assert "1 query (0 failed)<br>1 grab (0 failed)" in page and "1 result<br>" in page
+    assert "2 sent, 1 imported<br>failed: 1 dead torrent" in page and "1 wanted album arrived" in page
+    assert "<b>Local-DHT</b><div class=\"muted\">local · music" in page and "not seeded: a local index" in page and "#36</span>" in page
+    assert '<div class="scroll"><table class="grid indexers">' in page
     assert "login expired, needs a new cookie" in page and "seed = false <span class=\"muted\">(built in)</span>" in page
     assert "ratio 1 · 14 days · min_ratio 0.7 <span class=\"muted\">(built in)</span>" in page and "ratio 0.50" in page
     assert 'href="/music/indexers"' in client.get("/").text
