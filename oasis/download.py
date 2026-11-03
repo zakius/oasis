@@ -271,7 +271,10 @@ class Downloads:
         list yet is resolved once it does; see send."""
         if (sent := self.remembered(db, wanted, want["artist"])) is not None:
             return sent
-        blocked = self.blocked(db) | {r[0] for r in db.execute("select hash from download where state not in ('done', 'failed')")}
+        # Not one being downloaded, nor one imported before: what else it holds comes from it as a remembered one, but
+        # an album it held in a form no edition matches would bring it back each search.
+        blocked = self.blocked(db) | {r[0] for r in db.execute("select hash from download where state != 'failed' and hash in (select hash from download_target)")} \
+            | {r[0] for r in db.execute("select hash from download where state not in ('done', 'failed')")}
         prowlarr = SimpleNamespace(search=lambda query: self.recall("search", query, lambda: self.prowlarr.search(query)))
         picks = releases.bundles(prowlarr, want, groups, wanted, blocked, self.torbox().cached_files, lambda rg: editions(db, rg),
                                  not self.crowded, self.slow(db), self.torrent)
@@ -745,8 +748,11 @@ class Downloads:
         log.info("download %s failed: %s", row["title"], why)
 
     def block_release(self, db, row, why: str, wanted: list[str] | None = None):
-        """wanted: a bundle's, the albums it was looked at for (lift)."""
+        """wanted: a bundle's, the albums it was looked at for. Kept with all its artist's albums wanted then, missing or
+        downloading elsewhere: one of those failing elsewhere and wanted again isn't new to it (lift)."""
         artist = wanted and (db.execute(f"select artist_mbid from want_album where rg in ({','.join('?' * len(wanted))}) limit 1", wanted).fetchone() or [None])[0]
+        if artist:
+            wanted = sorted(set(wanted) | {rg for (rg,) in db.execute("select rg from want_album where artist_mbid = ? and state in ('missing', 'downloading')", (artist,))})
         db.executemany("insert or replace into release_block values (?, ?, ?, ?, ?)",
                        [(k, why, time.time(), artist, json.dumps(wanted) if wanted else None) for k in (row["hash"], row["guid"]) if k])
 

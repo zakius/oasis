@@ -456,6 +456,7 @@ def test_an_uncached_bundles_albums_are_found_once_torbox_lists_its_files(downlo
     assert "bcde" in downloads.blocked(db) and 72 in torbox.deleted
     assert db.execute("select artist_mbid, wanted from release_block where hash = 'bcde'").fetchone()[:] == ("mb-lp", '["g-met"]')
     assert "bcde" in downloads.blocked(db)  # Meteora is still wanted, but it was then too
+    assert json.loads(db.execute("select wanted from release_block where hash = 'bcde'").fetchone()[0]) == ["g-met"]
     db.execute("update want_album set state = 'missing' where rg = 'g-mtm'")  # went missing again after the block: looked at again
     assert "bcde" not in downloads.blocked(db) and not db.execute("select 1 from release_block where hash = 'bcde'").fetchone()
     db.execute("insert into release_block(hash, reason, at) values ('cdef', ?, 0)", (download.EMPTY_BUNDLE,))  # an older oasis's: once
@@ -751,3 +752,21 @@ def test_a_bundle_imported_is_remembered_and_later_albums_come_from_it_while_tor
     torbox.cached = torbox.cached_files = lambda hashes: {}
     downloads.find(db, want("Minutes to Midnight", "Linkin Park"), "g-mtm")
     assert len(downloads.prowlarr.asked) > asked and db.execute("select count(*) from bundle_kept").fetchone()[0] == 0
+
+
+def test_an_empty_bundle_stays_blocked_when_an_album_downloading_elsewhere_then_comes_back_missing(downloads, db):
+    db.executemany("insert into want_album(rg, artist_mbid, title, reason, state) values (?, 'mb-lp', ?, 'followed', ?)",
+                   [("g-ht", "Hybrid Theory", "missing"), ("g-mtm", "Minutes to Midnight", "downloading"), ("g-met", "Meteora", "have")])
+    downloads.block_release(db, {"hash": "flac", "guid": None}, download.EMPTY_BUNDLE, ["g-ht"])  # looked at for Hybrid Theory only
+    db.execute("update want_album set state = 'missing' where rg = 'g-mtm'")  # its other download's import failed
+    assert "flac" in downloads.blocked(db)
+    db.execute("update want_album set state = 'missing' where rg = 'g-met'")  # wanted anew
+    assert "flac" not in downloads.blocked(db)
+
+
+def test_a_bundle_imported_before_isnt_sent_again_by_a_bundle_search(downloads, torbox, db):
+    db.execute("insert into download(hash, album_id, title, state, created, updated) values ('aa', 0, 'Linkin Park - Discography [MP3]', 'done', 0, 0)")
+    db.execute("insert into download_target(hash, rg, files, state) values ('aa', 'g-mtm', '[]', 'failed')")
+    downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [MP3]", "aa", seeders=50)]})
+    torbox.cached_files = lambda hashes: {"aa": DISCOGRAPHY}
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht"}) is None and not torbox.added
