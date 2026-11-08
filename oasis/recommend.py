@@ -6,7 +6,7 @@ import random
 import threading
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as wait_for
 from itertools import chain, zip_longest
 
 from . import accounts, lastfm, playlists, worker
@@ -45,26 +45,44 @@ class Recommender:
         """Stations from the user's Last.fm need the API key and the user's linked Last.fm."""
         return list(STATIONS) if self.lastfm() and user["lastfm_session"] and user["lastfm_name"] else []
 
-    def similar(self, db, seed, count: int, deep: bool = False, source: str = "all", token: str | None = None) -> list[str]:
+    def similar(self, db, seed, count: int, deep: bool = False, source: str = "all", token: str | None = None,
+                wait: float | None = None) -> list[str]:
         """Track ids like the seed track from one source, or from every one at hand ("all"), taking turns so local songs
         come throughout. YouTube Music, Last.fm and ListenBrainz (with the user's token) need the network; the library
-        methods always give something. A source that gives nothing gives an empty list: no other stands in."""
+        methods always give something. A source that gives nothing gives an empty list: no other stands in.
+        The methods run at once, each on its own connection (sqlite connections stay in their thread), so the answer
+        takes as long as the slowest. With wait, a method that hasn't answered within that many seconds is left out."""
         methods = {
-            "ytm": [("YouTube Music radio", lambda: self.from_youtube(db, seed, count))],
-            "lastfm": [("Last.fm similar tracks", lambda: self.from_lastfm(db, seed, min(count, 15 if deep else 10)) if self.lastfm() else []),
-                       ("Last.fm similar artists", lambda: self.from_similar_artists(db, seed, count) if self.lastfm() else [])],
-            "listenbrainz": [("ListenBrainz radio", lambda: self.from_listenbrainz(db, seed, count, token))],
-            "library": [("linked artists", lambda: self.from_linked(db, seed, count)),
-                        ("same artist", lambda: self.from_artist(db, seed, count)),
-                        ("played together", lambda: self.from_plays(db, seed, count)),
-                        ("same genre", lambda: self.from_tags(db, seed, count))],
+            "ytm": [("YouTube Music radio", lambda db: self.from_youtube(db, seed, count))],
+            "lastfm": [("Last.fm similar tracks", lambda db: self.from_lastfm(db, seed, min(count, 15 if deep else 10)) if self.lastfm() else []),
+                       ("Last.fm similar artists", lambda db: self.from_similar_artists(db, seed, count) if self.lastfm() else [])],
+            "listenbrainz": [("ListenBrainz radio", lambda db: self.from_listenbrainz(db, seed, count, token))],
+            "library": [("linked artists", lambda db: self.from_linked(db, seed, count)),
+                        ("same artist", lambda db: self.from_artist(db, seed, count)),
+                        ("played together", lambda db: self.from_plays(db, seed, count)),
+                        ("same genre", lambda db: self.from_tags(db, seed, count))],
         }
-        found = []
-        for name, source in chain.from_iterable(methods.values()) if source == "all" else methods[source]:
+        chosen = list(chain.from_iterable(methods.values())) if source == "all" else methods[source]
+
+        def run(method):
+            own = self.connect()
             try:
-                found.append(source())
-            except Exception as e:
-                log.info("%s failed: %s", name, e)
+                return method(own)
+            finally:
+                own.close()
+
+        pool = ThreadPoolExecutor(len(chosen))
+        futures = [(name, pool.submit(run, method)) for name, method in chosen]
+        pool.shutdown(wait=False)  # a method past its wait finishes in the background; its answer is dropped
+        done, _ = wait_for([f for _, f in futures], timeout=wait)
+        found = []
+        for name, future in futures:
+            if future not in done:
+                log.info("%s took over %ss, left out", name, wait)
+            elif future.exception():
+                log.info("%s failed: %s", name, future.exception())
+            else:
+                found.append(future.result())
         picks = [id for id in chain.from_iterable(zip_longest(*found)) if id and id != seed["id"]]
         return list(dict.fromkeys(picks))[:count]
 

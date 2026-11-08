@@ -1,6 +1,7 @@
 import shutil
 import sqlite3
 import threading
+import time
 
 import pytest
 
@@ -390,3 +391,14 @@ def test_lastfm_stations_seed_from_the_users_top_or_loved_tracks(api, client):
     loved = call(client, "createPlaylist", oasis="1", oasisStation="lastfm-loved", name="Loved")["playlist"]
     assert loved["name"] == "Loved" and titles(loved["entry"])[0] == "Two" and "oasisPeriod" not in loved
     assert call(client, "createPlaylist", oasis="1", oasisStation="lastfm-top", oasisPeriod="week")["error"]["message"].startswith("oasisPeriod must be")
+
+
+def test_a_slow_source_is_left_out_rather_than_waited_for(client, ytm, monkeypatch):
+    from oasis import api as subsonic
+    monkeypatch.setattr(subsonic, "SIMILAR_WAIT", 0.5)
+    slow_radio = ytm.radio
+    monkeypatch.setattr(ytm, "radio", lambda video_id, limit: time.sleep(3) or slow_radio(video_id, limit))
+    start = time.monotonic()
+    songs = titles(similar(client)["similarSongs2"]["song"])
+    assert time.monotonic() - start < 2
+    assert "Song B" in songs and "one-yt song 0" not in songs  # Last.fm and the library came; YouTube Music didn't

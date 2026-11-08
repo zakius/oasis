@@ -65,6 +65,7 @@ ARTIST_ID_PARAMS = ("id", "artistId")
 MOVED_PARAMS = (*SONG_ID_PARAMS, "albumId", "artistId")
 FIND_FROM = 3  # characters a search needs before MusicBrainz is asked too
 YTM_SEARCH = 50  # YouTube Music songs a search asks for at most
+SIMILAR_WAIT = 6  # seconds getSimilarSongs waits for its slowest source: YouTube Music answers in about 2, Last.fm in up to 6
 
 
 class Params:
@@ -1002,7 +1003,9 @@ class Api:
         seed = self._one(db, SONGS + f" where t.{id_column(id)} = ? order by s.play_count desc, t.library desc, t.disc_no, t.track_no limit 1", id)
         account = accounts.get(db, user)
         source = self._source(p, account)
-        ids = self.oasis.recommender.similar(db, seed, min(p.int("count", 50), 200), source=source, token=account["listenbrainz_token"])
+        # A player waits for this answer with nothing to play next, so a slow source is left out rather than waited for.
+        ids = self.oasis.recommender.similar(db, seed, min(p.int("count", 50), 200), source=source, token=account["listenbrainz_token"],
+                                             wait=SIMILAR_WAIT)
         return {"song": [song(required(song_row(db, i))) for i in ids], "oasisSource": source}
 
     def getSimilarSongs2(self, db, p, user):
