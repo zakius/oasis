@@ -1,12 +1,15 @@
+import pytest
 from starlette.testclient import TestClient
 
 from conftest import call, make_track
 from oasis import artists
-from oasis.api import create_app
+from oasis.server import create_app
 from oasis.config import Config
-from oasis.credits import Credits
-from oasis.db import connect, make_id, remember
+from oasis import musicbrainz
+from oasis.enrich import Enrichment
+from oasis.db import connect
 from oasis.scan import scan
+from oasis.tracks import make_id, remember
 
 
 def release(id, artist, mbid, engineer_id):
@@ -27,6 +30,12 @@ ARTISTS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def musicbrainz_knows(monkeypatch):
+    monkeypatch.setattr(musicbrainz, "release_credits", RELEASES.__getitem__)
+    monkeypatch.setattr(musicbrainz, "artist", lambda mbid, db=None: ARTISTS[mbid])
+
+
 def client_for(tmp_path, **settings):
     root = tmp_path / "music"
     for folder, artist, mbid, rel in (("Kenshi", "米津玄師", "kenshi", "rel-k"), ("Band", "Band", "band", "rel-b"), ("Hachi", "ハチ", "hachi", "rel-h")):
@@ -45,7 +54,7 @@ def client_for(tmp_path, **settings):
 
 
 def fill(client):
-    credits = Credits(client.app.state.api._db, fetch=RELEASES.__getitem__, fetch_artist=ARTISTS.__getitem__)
+    credits = Enrichment(client.app.state.oasis.connect)
     while credits.step():
         pass
 
@@ -60,7 +69,7 @@ def test_one_musicbrainz_artist_is_one_page_and_namesakes_are_two(tmp_path):
         assert stream["artistId"] == kenshi
         later = {"id": "yt-v2", "source": "ytm", "ref": "v2", "title": "Uma to Shika", "artist": "Kenshi Yonezu", "album_artist": "Kenshi Yonezu",
                  "album": "x", "artist_id": make_id("ar-", "Kenshi Yonezu"), "album_id": make_id("al-", "Kenshi Yonezu", "x"), "duration": 250}
-        db = client.app.state.api._db()
+        db = client.app.state.oasis.connect()
         remember(db, later)
         assert call(client, "getSong", id="yt-v2")["song"]["artistId"] == kenshi
         hint = make_id("ar-", "켄시 요네즈")
@@ -84,7 +93,7 @@ def test_personas_related_artists_and_members_come_first_among_similar_artists(t
         assert [(a["name"], a["oasisLink"]) for a in similar] == [("Mori Calliope", "related")]
         band = call(client, "getArtistInfo2", id=make_id("ar-", "Band"), oasis="1")["artistInfo2"]["similarArtist"]
         assert [(a["name"], a["oasisLink"]) for a in band] == [("John Bender", "member")]  # tributes aren't links
-        member = client.app.state.api._db().execute("select artist_id from mb_artist where mbid = 'jb-2'").fetchone()[0]
+        member = client.app.state.oasis.connect().execute("select artist_id from mb_artist where mbid = 'jb-2'").fetchone()[0]
         assert [(a["name"], a["oasisLink"]) for a in call(client, "getArtistInfo2", id=member, oasis="1")["artistInfo2"]["similarArtist"]] == [("Band", "member")]
         radio = call(client, "getSimilarSongs2", id=make_id("ar-", "Mori Calliope"))["similarSongs2"]["song"]
         assert "DEMONDICE" in [s["artist"] for s in radio]

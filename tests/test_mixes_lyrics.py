@@ -6,10 +6,9 @@ import pytest
 from mutagen.id3 import ID3, USLT
 
 from conftest import call, make_client, make_track
-from oasis import api as oasis_api
-from oasis.api import transcode_target
-from oasis.lyrics import Lyrics
-from oasis.ytm import YouTubeMusic, track_row
+from oasis import playlists as oasis_playlists
+from oasis.transcode import target as transcode_target
+from oasis.ytm import YouTubeMusic, song
 
 
 def item(video_id, title, artist="Mixer", album="Mix Album"):
@@ -34,7 +33,7 @@ class FakeYtm:
                  "cover": "https://img/cover"} for id in self.current]
 
     def playlist_tracks(self, client, playlist_id):
-        return [track_row(item(v, f"Song {v}")) for v in self.current[playlist_id]]
+        return [song(item(v, f"Song {v}")) for v in self.current[playlist_id]]
 
     def cached(self, video_id):
         return None
@@ -46,13 +45,13 @@ class FakeYtm:
         return "vid-" + track["title"]
 
     def lyrics(self, video_id):
-        return Lyrics("YouTube Music", [(0, "first"), (1500, "second")], True) if video_id == "vid-Two" else None
+        return {"source": "YouTube Music", "lines": [(0, "first"), (1500, "second")], "synced": True} if video_id == "vid-Two" else None
 
     def search(self, query, limit):
         return []
 
     def album(self, browse_id):  # a soundtrack: each song names its singer, the album page Various Artists
-        return [track_row(item(v, f"Song {v}")) | {"track_no": n, "year": 2024, "album_by": "Various Artists"} for n, v in enumerate(["m1", "m6"], 1)]
+        return [song(item(v, f"Song {v}")) | {"track_no": n, "year": 2024, "album_by": "Various Artists"} for n, v in enumerate(["m1", "m6"], 1)]
 
 
 @pytest.fixture
@@ -80,7 +79,7 @@ def link(client):
 
 def test_mixes_are_read_only_playlists_in_the_library(client, ytm):
     link(client)
-    client.app.state.api._refresh_mixes("admin")
+    client.app.state.oasis.mixes.refresh("admin")
     mixes = playlists(client)
     assert set(mixes) == {"My Supermix", "My Mix 1", "Liked Music"} and {m["owner"] for m in mixes.values()} == {"YouTube Music"}  # Road trip waits for a tick
     assert mixes["My Supermix"]["oasisMix"] is True and "oasisMix" not in mixes["Liked Music"]
@@ -105,11 +104,11 @@ def test_mixes_are_read_only_playlists_in_the_library(client, ytm):
 
 
 def test_mix_refresh_follows_youtube(client, ytm):
-    api = client.app.state.api
+    api = client.app.state.oasis
     link(client)
-    api._refresh_mixes("admin")
+    api.mixes.refresh("admin")
     ytm.current = {"RDTMAK_super": ["m1", "m4"]}
-    api._refresh_mixes("admin")
+    api.mixes.refresh("admin")
     assert set(playlists(client)) == {"My Supermix"}
     titles = library_titles(client)
     assert not {"Song m2", "Song m3", "Song m4", "Song m6"} & titles  # m6 left with Liked Music
@@ -118,42 +117,43 @@ def test_mix_refresh_follows_youtube(client, ytm):
 
 def test_starred_mix_track_downloads(client, ytm):
     link(client)
-    client.app.state.api._refresh_mixes("admin")
+    client.app.state.oasis.mixes.refresh("admin")
     call(client, "star", id="yt-m1")
     assert ytm.fetched == ["m1"] and "Song m1" in library_titles(client)
 
 
 def test_songs_in_the_library_only_through_a_mix_leave_it(client):
     link(client)
-    api = client.app.state.api
-    api._refresh_mixes("admin")
-    db = api._db()
+    oasis = client.app.state.oasis
+    oasis.mixes.refresh("admin")
+    db = oasis.connect()
     db.execute("update track set library = 1 where source = 'ytm'")  # as the old rule left them
-    oasis_api.demix(db)
+    oasis_playlists.demix(db)
     assert {r[0] for r in db.execute("select ref from track where source = 'ytm' and library = 1")} == {"m6"}  # Road trip is hidden, unread
 
 
 def test_a_streaming_songs_album_artist_is_its_artist_till_its_album_page_names_another(client, ytm):
     link(client)
-    api = client.app.state.api
-    api._refresh_mixes("admin")
+    oasis = client.app.state.oasis
+    oasis.mixes.refresh("admin")
     song = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song m6")
     assert song["displayAlbumArtist"] == "Mixer" and song["albumArtists"] == [{"id": song["artistId"], "name": "Mixer"}]
     assert "track" not in song and "year" not in song
-    api._complete_album(api._db(), song["albumId"])  # as _album_loop reads it
+    assert oasis.complete_next_album() is not None  # as the album fill worker reads it
     song = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song m6")
     assert song["displayAlbumArtist"] == "Various Artists" and (song["track"], song["year"]) == (2, 2024)  # never the album's title
     album = call(client, "getAlbum", id=song["albumId"])["album"]
     assert album["artist"] == "Various Artists" and album["year"] == 2024
     assert "Various Artists" not in {a["name"] for i in call(client, "getArtists")["artists"]["index"] for a in i["artist"]}
-    api._refresh_mixes("admin")  # seen again in a playlist, which carries no year: what the album page gave stays
+    assert oasis.complete_next_album() is None  # each album page is read once
+    oasis.mixes.refresh("admin")  # seen again in a playlist, which carries no year: what the album page gave stays
     song = next(s for s in call(client, "search3", query="")["searchResult3"]["song"] if s["title"] == "Song m6")
     assert (song["displayAlbumArtist"], song["year"]) == ("Various Artists", 2024)
 
 
 def save(client, *shown, new="hide"):
     ids = {p["name"]: p["id"] for p in call(client, "getPlaylists", oasis="1")["playlists"]["playlist"]}
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     ids |= {r["name"]: str(r["id"]) for r in db.execute("select id, name from playlist where mix is not null")}
     client.post("/login", data={"name": "admin", "password": "secret"})
     return client.post("/account/youtube/playlists", data={"new": new, **{f"show-{ids[n]}": "on" for n in shown}}).text
@@ -161,17 +161,17 @@ def save(client, *shown, new="hide"):
 
 def test_library_playlists_show_as_ticked_and_their_songs_follow(client, ytm):
     link(client)
-    api = client.app.state.api
-    api._refresh_mixes("admin")
+    oasis = client.app.state.oasis
+    oasis.mixes.refresh("admin")
     client.post("/login", data={"name": "admin", "password": "secret"})
     page = client.get("/").text
     assert "Road trip" in page and "Liked Music" in page and "My Supermix" not in page.split("Playlists shown in your apps")[1].split("</form>")[0]
     assert "Playlists saved. Newly shown ones are loading." in save(client, "Liked Music", "Road trip")
-    api._refresh_mixes("admin")  # as the thread the save started does
+    oasis.mixes.refresh("admin")  # as the thread the save starts does
     assert "Road trip" in playlists(client) and "Song m5" in library_titles(client)
     save(client, "Liked Music")  # unticked: gone from apps, its songs from the library at once
     assert "Road trip" not in playlists(client) and "Song m5" not in library_titles(client)
-    hidden = api._db().execute("select id from playlist where name = 'Road trip'").fetchone()[0]
+    hidden = oasis.connect().execute("select id from playlist where name = 'Road trip'").fetchone()[0]
     assert call(client, "getPlaylist", id=hidden)["error"]["code"] == 70
     save(client)  # Liked Music hidden too: its songs stay in the library
     assert "Liked Music" not in playlists(client) and "Song m6" in library_titles(client)
@@ -179,14 +179,14 @@ def test_library_playlists_show_as_ticked_and_their_songs_follow(client, ytm):
 
 def test_playlists_added_later_follow_the_choice(client, ytm):
     link(client)
-    api = client.app.state.api
-    api._refresh_mixes("admin")
+    oasis = client.app.state.oasis
+    oasis.mixes.refresh("admin")
     ytm.current["PLsaved"] = ["m7"]
-    api._refresh_mixes("admin")
+    oasis.mixes.refresh("admin")
     assert "Saved" not in playlists(client) and "Song m7" not in library_titles(client)  # opt in: hidden till ticked
     save(client, "Liked Music", new="show")
     ytm.current["PLlater"] = ["m8"]
-    api._refresh_mixes("admin")
+    oasis.mixes.refresh("admin")
     assert "Later" in playlists(client) and "Song m8" in library_titles(client) and "Saved" not in playlists(client)  # opt out: shown till unticked
 
 
@@ -195,8 +195,8 @@ def test_an_album_pages_own_artist_is_its_songs_album_artist():
             "tracks": [{"videoId": "v1", "title": "Happy Day in Hell", "artists": [{"name": "Erika Henningsen"}], "trackNumber": 1}]}
     ytm = object.__new__(YouTubeMusic)
     ytm.api, ytm.api_lock = SimpleNamespace(get_album=lambda browse_id: page), threading.Lock()
-    (row,) = ytm.album("MPREb_hh")
-    assert (row["album_by"], row["album_artist"], row["track_no"], row["year"]) == ("Various Artists", "Erika Henningsen", 1, 2024)
+    (found,) = ytm.album("MPREb_hh")
+    assert (found["album_by"], found["album_artist"], found["track_no"], found["year"]) == ("Various Artists", "Erika Henningsen", 1, 2024)
 
 
 def lyric_lines(client, id):
@@ -256,7 +256,7 @@ def test_playlists_list_mixes_first_in_youtube_order(client, ytm):
     ytm.current = {id: ["m1"] for id in names}
     ytm.playlists = lambda client: [{"id": id, "title": name, "description": None, "cover": None} for id, name in names.items()]
     link(client)
-    client.app.state.api._db().execute("update user set ytm_new_shown = 1")  # library playlists shown as they come
-    client.app.state.api._refresh_mixes("admin")
+    client.app.state.oasis.connect().execute("update user set ytm_new_shown = 1")  # library playlists shown as they come
+    client.app.state.oasis.mixes.refresh("admin")
     call(client, "createPlaylist", name="Zebra")
     assert list(playlists(client)) == ["My Supermix", "Bunt", "Mroczna moc", "Replay Mix", "Chill Mix", "Liked Music", "aaa", "Zebra"]

@@ -4,8 +4,8 @@ import pytest
 
 from conftest import call, make_client
 from oasis import ytm as ytm_module
-from oasis.db import connect
-from oasis.ytm import Stream, track_row
+from oasis.youtube import track_row
+from oasis.ytm import Stream, song
 
 SEARCH_ITEM = {
     "videoId": "vid1", "title": "Remote Song", "artists": [{"name": "Gamma"}, {"name": "Delta"}],
@@ -23,7 +23,7 @@ class FakeYtm:
         self.cache, self.fetched, self.direct = cache, [], False
 
     def search(self, query, limit):
-        return [track_row(SEARCH_ITEM), track_row(DUPLICATE)][:limit]
+        return [song(SEARCH_ITEM), song(DUPLICATE)][:limit]
 
     def match(self, track):
         return None
@@ -63,11 +63,11 @@ def library_titles(client):
 
 
 def test_track_row_from_search_and_watch_items():
-    row = track_row(SEARCH_ITEM)
+    row = track_row(song(SEARCH_ITEM))
     assert row["id"] == "yt-vid1" and row["artist"] == "Gamma, Delta" and row["album_artist"] == "Gamma"
     assert row["cover"] == "https://img/x=w544-h544-l90-rj" and row["duration"] == 200 and row["library"] == 0
-    watch = track_row({"videoId": "w", "title": "T", "artists": [{"name": "A"}], "length": "1:02:03", "year": "2020",
-                       "thumbnail": [{"url": "https://t"}]})
+    watch = track_row(song({"videoId": "w", "title": "T", "artists": [{"name": "A"}], "length": "1:02:03", "year": "2020",
+                       "thumbnail": [{"url": "https://t"}]}))
     assert watch["duration"] == 3723 and watch["year"] == 2020 and watch["album"] == "T"
 
 
@@ -77,12 +77,12 @@ def test_search_adds_streaming_results_after_local_and_merges_duplicates(client)
     assert songs[1]["id"] == "yt-vid1" and "path" not in songs[1]
 
 
-def test_a_search_isnt_locked_out_by_writes_landing_while_youtube_music_answers(client, ytm, tmp_path, monkeypatch):
+def test_a_search_isnt_locked_out_by_writes_landing_while_youtube_music_answers(client, ytm, monkeypatch):
     def search(query, limit):  # the mix refresh writes meanwhile
-        other = connect(tmp_path / "oasis.db")
+        other = client.app.state.oasis.connect()
         other.execute("insert into playlist(name, owner, created, changed) values ('mix', 'admin', 0, 0)")
         other.close()
-        return [track_row(SEARCH_ITEM)]
+        return [song(SEARCH_ITEM)]
 
     monkeypatch.setattr(ytm, "search", search)
     found = call(client, "search3", query="e")["searchResult3"]
@@ -186,9 +186,9 @@ def test_mix_tracks_come_from_the_playlist_not_its_watch_queue(tmp_path):
             return {"tracks": [track("wrong")]}
 
     music, client = ytm_module.YouTubeMusic(tmp_path), Client()
-    assert [r["ref"] for r in music.playlist_tracks(client, "RDTMAK5uy_mix")] == ["right"]
+    assert [r["video_id"] for r in music.playlist_tracks(client, "RDTMAK5uy_mix")] == ["right"]
     client.fails = True
-    assert [r["ref"] for r in music.playlist_tracks(client, "RDTMAK5uy_mix")] == ["wrong"]  # still better than nothing
+    assert [r["video_id"] for r in music.playlist_tracks(client, "RDTMAK5uy_mix")] == ["wrong"]  # still better than nothing
     with pytest.raises(KeyError):
         music.playlist_tracks(client, "PLsaved")
 

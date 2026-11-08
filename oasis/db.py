@@ -1,8 +1,7 @@
-import hashlib
-import re
 import sqlite3
-import unicodedata
 from pathlib import Path
+
+from .tracks import artist_id
 
 SCHEMA = """
 create table if not exists track(
@@ -51,7 +50,7 @@ create table if not exists artist_link(  -- separate artists close to each other
     source text not null, primary key(artist_id, other_id, kind)
 );
 create index if not exists artist_link_other on artist_link(other_id);
-create table if not exists artist_key(  -- each folded artist name (fold) -> the artist all its spellings are
+create table if not exists artist_key(  -- each folded artist name (text.fold) -> the artist all its spellings are
     key text primary key, artist_id text not null
 );
 create table if not exists spelling(  -- artist names shown as another spelling of the same name (artists.unify)
@@ -70,7 +69,7 @@ create table if not exists playlist(
     played_pos int not null default -1,
     mix text,                       -- YouTube Music playlist id (mix or library playlist); such playlists are read-only
     cover text,                     -- image URL
-    hidden int not null default 0,  -- 1: a YouTube Music library playlist its owner chose not to show (web.py): no client sees it
+    hidden int not null default 0,  -- 1: a YouTube Music library playlist its owner chose not to show (mixes.py): no client sees it
     radio_source text,              -- a radio's source (recommend.SOURCES); null: its owner's default
     station text, period text       -- a station's kind (recommend.STATIONS) and Last.fm period: seeds from the owner's Last.fm
 );
@@ -116,7 +115,7 @@ create table if not exists download(  -- releases oasis downloads through TorBox
     uploaded int, downloaded int,           -- TorBox's last totals for it, kept after it is deleted: the tracker's running ratio
     seeding int not null default 0,         -- 1: imported and still seeding on TorBox (see download.py)
     mode text,                              -- seeding as sent to TorBox: torbox (its account's setting), seed (oasis stops it), off; null: seed if tracker, else off
-    indexer int                             -- the Prowlarr indexer it came from; null before oasis noted it (web.py goes by the guid's site then)
+    indexer int                             -- the Prowlarr indexer it came from; null before oasis noted it (by_indexer goes by the guid's site then)
 );
 create table if not exists search_stat(  -- each indexer's answers to album searches, a day at a time: results, the album, usable
     day text not null, indexer int not null, results int not null, album int not null, usable int not null, primary key(day, indexer)
@@ -187,7 +186,7 @@ create table if not exists ytm_release(  -- albums and singles from YouTube Musi
     album_id text primary key, artist_id text not null, browse_id text not null,
     title text, year int, type text, cover text
 );
-create table if not exists moved(old_id text primary key, new_id text not null);  -- stream ids now local
+create table if not exists moved(old_id text primary key, new_id text not null);  -- old ids clients may still hold: streams now local, MusicBrainz-only artists and albums that arrived
 create table if not exists play(user text not null, track_id text not null, played real not null);
 create table if not exists album_track(  -- the songs each YouTube Music album lists: a song is on its album and its single too
     album_id text not null, track_id text not null, disc_no int, track_no int, primary key(album_id, track_id)
@@ -207,7 +206,7 @@ create table if not exists mb_latin(  -- Latin names MusicBrainz's editors chose
     primary key(kind, original)
 );
 create table if not exists mb_latin_seen(ref text primary key, fetched real not null);  -- artists and releases latin.py read
-create table if not exists track_latin(  -- library tracks' names romanized and folded, for search to match romaji (see api.py)
+create table if not exists track_latin(  -- library tracks' names romanized and folded, for search to match romaji (see latin.index)
     id text primary key, source text not null,  -- source: the names they were made from
     title text, artist text, album text, album_artist text
 );
@@ -225,41 +224,6 @@ create table if not exists playlist_entry(
 """
 
 
-def make_id(prefix: str, *parts: str) -> str:
-    return prefix + hashlib.sha1("\0".join(p.casefold() for p in parts).encode()).hexdigest()[:16]
-
-
-def fold(text: str) -> str:
-    """Case, accents, spaces and punctuation aside: 'Suite‐Pee' (Unicode hyphen) and 'Suite-Pee' are the same title,
-    'Chylinska' and 'Chylińska' the same name."""
-    text = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).casefold().replace("ł", "l")
-    return re.sub(r"[\W_]+", "", text)
-
-
-def artist_id(db, name: str, mbid: str | None = None) -> str:
-    """The artist's oasis id. A MusicBrainz artist keeps the id it first got, so its spellings share one and two
-    artists of the same name get two; a name alone follows the merges in artist_alias, else is the artist another
-    spelling of it is (artist_key)."""
-    id = make_id("ar-", name)
-    if not mbid:
-        if (row := db.execute("select artist_id from artist_alias where id = ?", (id,)).fetchone()) or not (key := fold(name)):
-            return row[0] if row else id
-        db.execute("insert or ignore into artist_key values (?, ?)", (key, id))
-        return db.execute("select artist_id from artist_key where key = ?", (key,)).fetchone()[0]
-    if row := db.execute("select artist_id from mb_artist where mbid = ?", (mbid,)).fetchone():
-        return resolve(db, row[0], config_only=True)
-    if db.execute("select 1 from mb_artist where artist_id = ?", (id,)).fetchone():
-        id = make_id("ar-", name, mbid)  # another artist of this name came first
-    db.execute("insert into mb_artist(mbid, artist_id, name) values (?, ?, ?)", (mbid, id, name))
-    db.execute("delete from artist_alias where id = ? and source = 'musicbrainz'", (id,))  # the name is its own now
-    return resolve(db, id, config_only=True)
-
-
-def resolve(db, id: str, config_only=False) -> str:
-    row = db.execute("select artist_id from artist_alias where id = ? and (? or source = 'config')", (id, not config_only)).fetchone()
-    return row[0] if row else id
-
-
 migrated: set[Path] = set()
 
 
@@ -268,19 +232,19 @@ def connect(path: Path) -> sqlite3.Connection:
     db.row_factory = sqlite3.Row
     db.execute("pragma journal_mode=wal")
     db.execute("pragma foreign_keys=on")
-    db.create_function("me", 0, lambda: None, deterministic=True)  # the user a request is for: api.py sets it, nobody elsewhere
+    as_user(db, None)
     if path not in migrated:
-        rename(db)
-        db.executescript(SCHEMA)
-        migrate(db)
-        own_stats(db)
-        db.execute("create index if not exists track_release on track(mb_release)")  # on columns migrate may add
-        db.execute("create index if not exists track_group on track(mb_release_group)")
-        # One radio that follows all listening per user (recommend.played): a race once made two; the extra stays as a plain radio.
-        db.execute("update playlist set radio = 1 where radio = 2 and id not in (select min(id) from playlist where radio = 2 group by owner)")
-        db.execute("create unique index if not exists one_radio on playlist(owner) where radio = 2")
+        for step in MIGRATIONS:
+            step(db)
         migrated.add(path)
     return db
+
+
+def as_user(db: sqlite3.Connection, user: str | None):
+    """Names the user that SQL's me() stands for on this connection. Stars, ratings and plays are each user's, and
+    queries join them with stat.user = me() (api.py's SONGS, ALBUMS and ARTISTS): a Subsonic request sets its signed-in
+    user before its queries run. A new connection is for no user, so it joins nobody's."""
+    db.create_function("me", 0, lambda: user, deterministic=True)
 
 
 def rename(db: sqlite3.Connection):
@@ -307,6 +271,45 @@ def own_stats(db: sqlite3.Connection):
         db.execute("drop table stat_global")
 
 
+def lyrics_with_words(db: sqlite3.Connection):
+    """Forgets karaoke lyrics cached before their words were kept, so they are fetched again with them."""
+    db.execute("""delete from lyrics where found like '%"word_level": true%' and found not like '%"words"%'""")
+
+
+def one_listening_radio(db: sqlite3.Connection):
+    """Makes the database keep one listening radio (playlist.radio 2) per user with the unique index one_radio. A race
+    once made two; the later ones stay as radios of their own tracks (1)."""
+    db.execute("update playlist set radio = 1 where radio = 2 and id not in (select min(id) from playlist where radio = 2 group by owner)")
+    db.execute("create unique index if not exists one_radio on playlist(owner) where radio = 2")
+
+
+def reidentify(db: sqlite3.Connection):
+    """Gives MusicBrainz credits the id their artist has: credits from before artists were told apart by MusicBrainz id
+    share one per name."""
+    for mbid, name, old in db.execute("select mbid, artist_name, artist_id from credit where mbid is not null group by mbid").fetchall():
+        if (new := artist_id(db, name, mbid)) != old:
+            db.execute("update credit set artist_id = ? where mbid = ?", (new, mbid))
+
+
+def drop_left_out(db: sqlite3.Connection):
+    """Drops the rows an older oasis kept for albums a catalogue left out or a user gave up on (state skipped): those
+    aren't wanted, and have no row."""
+    db.execute("delete from want_album where state = 'skipped'")
+
+
+def set_stat(db: sqlite3.Connection, user: str, id: str, column: str, value):
+    """Sets the user's starred or rating of a track, album or artist."""
+    db.execute(f"insert into stat(user, id, {column}) values (?, ?, ?) on conflict(user, id) do update set {column} = excluded.{column}",
+               (user, id, value))
+
+
+def record_play(db: sqlite3.Connection, user: str, track_id: str, played: float):
+    """Counts a play of a track by the user, and keeps when it was for the radios' played-together."""
+    db.execute("insert into stat(user, id, play_count, played) values (?, ?, 1, ?) on conflict(user, id) do update "
+               "set play_count = play_count + 1, played = excluded.played", (user, track_id, played))
+    db.execute("insert into play values (?, ?, ?)", (user, track_id, played))
+
+
 def migrate(db: sqlite3.Connection):
     """Adds the columns a database from an older oasis lacks, as SCHEMA defines them."""
     current = sqlite3.connect(":memory:")
@@ -323,54 +326,14 @@ def migrate(db: sqlite3.Connection):
     current.close()
 
 
-def remember(db, row: dict) -> str:
-    """Caches a streaming track's metadata and returns its id. The same song already known (same artist and title,
-    length within 5 s), local or under another YouTube upload, keeps its id; a local copy wins."""
-    row["artist_id"] = artist_id(db, row["album_artist"]) if row["artist_id"] == make_id("ar-", row["album_artist"]) else resolve(db, row["artist_id"])
-    known = db.execute("select id, source from track where artist_id = ? and title = ? collate nocase and abs(duration - ?) <= 5 "
-                       "and id != ? order by source != 'local' limit 1",
-                       (row["artist_id"], row["title"], row["duration"] or 0, row["id"])).fetchone()
-    if known and not db.execute("select 1 from track where id = ?", (row["id"],)).fetchone():
-        if known["source"] == "local":
-            db.execute("update track set ytm_id = ? where id = ?", (row["ytm_id"], known["id"]))
-        return known["id"]
-    # The album a song was first seen on stays its own: other albums that list it hold it in album_track.
-    kept = ("album", "album_id", "ytm_album", "track_no", "disc_no", "year")  # a playlist's sighting carries no year
-    updates = ", ".join(f"{k} = coalesce(track.{k}, excluded.{k})" if k in kept else f"{k} = excluded.{k}"
-                        for k in row if k not in ("id", "library", "created"))
-    db.execute(f"insert into track({', '.join(row)}) values ({', '.join('?' * len(row))}) "
-               f"on conflict(id) do update set {updates}", list(row.values()))
-    return row["id"]
+def create(db: sqlite3.Connection):
+    """SCHEMA's tables, with the columns an older oasis's lack (migrate) and the indexes on those."""
+    db.executescript(SCHEMA)
+    migrate(db)
+    db.execute("create index if not exists track_release on track(mb_release)")
+    db.execute("create index if not exists track_group on track(mb_release_group)")
 
 
-def move_track(db, old: str, new: str):
-    """Moves playlist entries, plays, stars and ratings from one track to another and drops the old one; its id
-    keeps working as an alias, since clients keep ids in queues and caches."""
-    for table in ("playlist_entry", "play", "outbox"):
-        db.execute(f"update {table} set track_id = ? where track_id = ?", (new, old))
-    move_stat(db, old, new)
-    for table, column in (("lyrics", "track_id"), ("track", "id")):
-        db.execute(f"delete from {table} where {column} = ?", (old,))
-    db.execute("update moved set new_id = ? where new_id = ?", (new, old))
-    db.execute("insert or replace into moved values (?, ?)", (old, new))
-
-
-def move_stat(db, old: str, new: str):
-    """Each user's stars, ratings and plays of one id added to their own of another."""
-    db.execute("insert into stat(user, id, starred, rating, play_count, played) select user, ?, starred, rating, play_count, played "
-               "from stat where id = ? on conflict(user, id) do update set starred = coalesce(stat.starred, excluded.starred), "
-               "rating = coalesce(stat.rating, excluded.rating), play_count = stat.play_count + excluded.play_count, "
-               "played = max(coalesce(stat.played, 0), coalesce(excluded.played, 0))", (new, old))
-    db.execute("delete from stat where id = ?", (old,))
-
-
-def adopt_local_copies(db):
-    """Points streams that now have a local copy (same artist and title, length within 5 s) at the local file: playlist
-    entries, stars and plays move over and the stream entry goes, so nothing keeps streaming what's on disk."""
-    pairs = db.execute("select y.id stream, y.ref video, l.id local from track y join track l on l.source = 'local' "
-                       "and l.artist_id = y.artist_id and l.title = y.title collate nocase "
-                       "and abs(coalesce(l.duration, 0) - coalesce(y.duration, 0)) <= 5 where y.source = 'ytm'").fetchall()
-    for stream, video, local in pairs:
-        db.execute("update track set ytm_id = ? where id = ? and coalesce(ytm_id, '') = ''", (video, local))
-        move_track(db, stream, local)
-    return len(pairs)
+# What a database from any older oasis needs, in order, each time a process first connects to it; each step does
+# nothing once done.
+MIGRATIONS = [rename, create, own_stats, lyrics_with_words, one_listening_radio, reidentify, drop_left_out]

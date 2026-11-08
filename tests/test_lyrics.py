@@ -2,12 +2,11 @@ import base64
 import json
 import zlib
 
-import pytest
 
 from oasis import lyrics
-from oasis.lyrics import KUGOU_KEY, Lyrics, Query, choose, parse, same_title, similarity
+from oasis.lyrics import KUGOU_KEY, Lyrics, Query, choose, parse, same_title
 
-QUERY = Query("Song", "Artist", "Album", 200)
+QUERY = Query("Song", "Artist", 200)
 TEXT = "the first line of it\nanother line here\nand the last one"
 
 
@@ -30,7 +29,7 @@ def test_same_title_ignores_extras():
 def test_choose_follows_roma_rules():
     ytm_synced = Lyrics("YouTube Music", lines(TEXT), True)
     ytm_plain = Lyrics("YouTube Music", [(None, t) for t in TEXT.splitlines()], False)
-    word = Lyrics("NetEase", lines(TEXT), True, True)
+    word = Lyrics("NetEase", lines(TEXT.upper()), True, True)  # matches whatever the case
     other_word = Lyrics("KuGou", lines("完全に違う歌詞です\nまったく別の曲"), True, True)
     synced = Lyrics("LRCLIB", lines(TEXT), True)
     assert choose(ytm_synced, [other_word, word]) is word                 # 1: word-timed matching YouTube Music
@@ -39,7 +38,6 @@ def test_choose_follows_roma_rules():
     assert choose(ytm_plain, [other_word]) is ytm_plain                   # 4: YouTube Music plain
     assert choose(None, [synced, other_word]) is other_word               # 1 without a reference
     assert choose(None, []) is None
-    assert similarity(TEXT, TEXT.upper()) == 1.0
 
 
 def respond(monkeypatch, pages: dict):
@@ -68,7 +66,8 @@ def test_netease_word_timing(monkeypatch):
 def test_kugou_decrypts_krc(monkeypatch):
     krc = "[1000,2000]<0,500,0>Hi<500,500,0> there".encode()
     packed = zlib.compress(krc)
-    encrypted = base64.b64encode(b"krc1" + bytes(b ^ KUGOU_KEY[i % 16] for i, b in enumerate(packed))).decode()
+    key = b"@Gaw^2tGQ61-\xce\xd2ni"  # KuGou's
+    encrypted = base64.b64encode(b"krc1" + bytes(b ^ key[i % 16] for i, b in enumerate(packed))).decode()
     respond(monkeypatch, {
         "https://mobileservice.kugou.com": json.dumps({"data": {"info": [{"songname": "Song", "duration": 200, "hash": "h"}]}}).encode(),
         "https://krcs.kugou.com/search": json.dumps({"candidates": [{"id": 1, "accesskey": "k"}]}).encode(),
@@ -96,9 +95,15 @@ def test_find_survives_failing_providers(monkeypatch):
     assert lyrics.find(QUERY, youtube=lambda: Lyrics("YouTube Music", lines(TEXT), True)).source == "YouTube Music"
 
 
-def test_cleaning_drops_credits_and_heading_and_unescapes():
+def found_by(monkeypatch, provided, query=QUERY):
+    """What find makes of a provider's lyrics."""
+    monkeypatch.setattr(lyrics, "PROVIDERS", {"one": lambda query: provided})
+    return lyrics.find(query)
+
+
+def test_cleaning_drops_credits_and_heading_and_unescapes(monkeypatch):
     raw = Lyrics("KuGou", [(0, "Artist - Song"), (1, "作词：someone"), (2, "Composer: X"), (3, "don&apos;t stop"), (4, "it\\'s fine")], True)
-    assert lyrics.cleaned(raw, QUERY).lines == [(3, "don't stop"), (4, "it's fine")]
+    assert found_by(monkeypatch, raw).lines == [(3, "don't stop"), (4, "it's fine")]
 
 
 def test_lrc_offset_is_applied_positive_sooner():
@@ -106,11 +111,11 @@ def test_lrc_offset_is_applied_positive_sooner():
     assert lyrics.parse("[offset:-250]\n[00:01.00]a").lines == [(1250, "a")]
 
 
-def test_enhanced_lrc_keeps_word_timing():
+def test_enhanced_lrc_keeps_word_timing(monkeypatch):
     found = lyrics.parse("[offset:100]\n[00:02.00]<00:02.00>b<00:02.50>c\n[00:01.00]<00:01.00>a\n[00:03.00]d")
     assert found.lines == [(900, "a"), (1900, "bc"), (2900, "d")]
     assert found.words == [[[900, 1900, "a"]], [[1900, 2400, "b"], [2400, 2900, "c"]], []]  # an open word runs to the next line
-    cut = lyrics.cleaned(found, Query("x", "y", None, 0)).subset([1])
+    cut = found_by(monkeypatch, found, Query("x", "y", 0)).subset([1])
     assert cut.lines == [(1900, "bc")] and cut.words == [[[1900, 2400, "b"], [2400, 2900, "c"]]]
 
 

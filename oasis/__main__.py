@@ -7,8 +7,8 @@ from pathlib import Path
 
 import uvicorn
 
-from . import config as configuration, quality, relocate, scan
-from .api import create_app
+from . import config as configuration, library, quality, relocate, scan
+from .server import create_app
 from .db import connect
 
 
@@ -33,9 +33,7 @@ def main():
         os.nice(19)
         subprocess.run(["ionice", "-c", "3", "-p", str(os.getpid())], check=False)
         db = connect(config.database)
-        result = quality.backlog(db, args.jobs, args.delete_lossy)
-        if any(r["deleted"] for r in result["purged"]):
-            scan.scan(db, config.library)
+        library.check_quality(db, config.library, args.jobs, args.delete_lossy)
     else:
         uvicorn.run(create_app(config), host=config.host, port=config.port, access_log=False)  # Subsonic puts credentials in query strings
 

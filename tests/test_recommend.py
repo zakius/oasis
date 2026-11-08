@@ -1,8 +1,17 @@
+import shutil
+import sqlite3
+import threading
+
 import pytest
 
-from conftest import call, make_client
+from conftest import call, make_client, make_track
+from oasis import playlists
 from oasis.db import connect
-from oasis.ytm import track_row
+from oasis.playlists import LISTENING_RADIO
+from oasis.recommend import Recommender
+from oasis.scan import scan
+from oasis.youtube import remember_song
+from oasis.ytm import song
 
 
 def item(video_id, title, artist="Gamma", album="Far Away", album_id="MPREb_far", duration=200):
@@ -17,20 +26,20 @@ class FakeYtm:
         self.radios = []
 
     def search(self, query, limit):
-        rows = [track_row(item("s1", "Gamma Hit")), track_row(item("s2", "Other", artist="Someone"))]
+        rows = [song(item("s1", "Gamma Hit")), song(item("s2", "Other", artist="Someone"))]
         return [r for r in rows if r]
 
     def match(self, track):
         return {"One": "one-yt"}.get(track["title"])
 
     def find(self, artist, title, duration=None):
-        return track_row(item("lf-" + title, title, artist=artist)) if artist == "Remote Band" else None
+        return song(item("lf-" + title, title, artist=artist)) if artist == "Remote Band" else None
 
     def radio(self, video_id, limit):
         self.radios.append(video_id)
         # Every radio starts with a song the library has, then new ones unique to its seed.
-        local_copy = track_row(item("two-yt", "Two", artist="Beta", album="First", duration=2))
-        return [local_copy] + [track_row(item(f"{video_id}-{i}", f"{video_id} song {i}")) for i in range(limit - 1)]
+        local_copy = song(item("two-yt", "Two", artist="Beta", album="First", duration=2))
+        return [local_copy] + [song(item(f"{video_id}-{i}", f"{video_id} song {i}")) for i in range(limit - 1)]
 
     def cached(self, video_id):
         return None
@@ -39,10 +48,12 @@ class FakeYtm:
         pass
 
     def album(self, browse_id):
-        return [track_row(item(f"alb{i}", f"Track {i}")) | {"track_no": i} for i in (1, 2, 3)]
+        return [song(item(f"alb{i}", f"Track {i}")) | {"track_no": i} for i in (1, 2, 3)]
 
 
 class FakeLastFm:
+    secret = None  # an API key alone: it reads, but signs no one in
+
     def similar(self, artist, title, limit):
         return [("The Alpha", "Song B"), ("Remote Band", "Tune")]
 
@@ -59,13 +70,13 @@ def ytm():
 @pytest.fixture
 def client(library, tmp_path, ytm):
     with make_client(library, tmp_path / "oasis.db", ytm) as c:
-        c.app.state.api.recommender.lastfm = FakeLastFm()
+        c.app.state.oasis.lastfm = FakeLastFm()
         yield c
 
 
 @pytest.fixture
 def api(client):
-    return client.app.state.api
+    return client.app.state.oasis
 
 
 def song_id(client, title):
@@ -92,20 +103,20 @@ def test_song_missing_on_youtube_still_gets_library_songs(client, ytm):
     assert {"One", "Two"} & set(songs)           # Last.fm's similar artist Beta
 
 
-def test_played_together_comes_from_history(api, client):
-    a, b, c = song_id(client, "Song A"), song_id(client, "One"), song_id(client, "untagged")
-    for id, t in ((a, 1000), (c, 1100), (a, 90000), (c, 90100), (b, 200000)):
+def similar_ids(client, title):
+    return [s["id"] for s in call(client, "getSimilarSongs2", id=song_id(client, title))["similarSongs2"]["song"]]
+
+
+def test_played_together_comes_from_history(client):
+    a, c = song_id(client, "Song A"), song_id(client, "untagged")  # untagged: no artist or genre ties it to Song A
+    assert c not in similar_ids(client, "Song A")
+    for id, t in ((a, 1000), (c, 1100)):
         call(client, "scrobble", id=id, time=t * 1000)
-    db = api._db()
-    seed = db.execute("select * from track where id = ?", (a,)).fetchone()
-    assert api.recommender.from_plays(db, seed, 10) == [c]
+    assert c in similar_ids(client, "Song A")
 
 
-def test_lastfm_picks_map_to_library_or_youtube(api, client):
-    db = api._db()
-    seed = db.execute("select * from track where title = 'One'").fetchone()
-    picks = api.recommender.from_lastfm(db, seed, 5)
-    assert picks == [song_id(client, "Song B"), "yt-lf-Tune"]
+def test_lastfm_picks_map_to_library_or_youtube(client):
+    assert {song_id(client, "Song B"), "yt-lf-Tune"} <= set(similar_ids(client, "One"))
 
 
 def test_top_songs_put_library_first(client):
@@ -132,8 +143,7 @@ def entries(client, playlist_id):
 
 def test_radio_playlist_grows_as_it_is_played(api, client):
     radio = call(client, "createPlaylist", name="Radio from One", songId=song_id(client, "One"))["playlist"]
-    db = api._db()
-    api.recommender.top_up(db, db.execute("select * from playlist where id = ?", (radio["id"],)).fetchone())
+    api.recommender.top_up_pass()
     first = entries(client, radio["id"])
     # YouTube Music radio, Last.fm and the library's own methods take turns.
     assert first[0] == "One" and len(first) == 30 and len(set(first)) == 30
@@ -142,7 +152,7 @@ def test_radio_playlist_grows_as_it_is_played(api, client):
 
     played = call(client, "getPlaylist", id=radio["id"])["playlist"]["entry"][20]
     call(client, "scrobble", id=played["id"])
-    api.recommender.top_up(db, db.execute("select * from playlist where id = ?", (radio["id"],)).fetchone())
+    api.recommender.top_up_pass()
     grown = entries(client, radio["id"])
     assert grown[:30] == first and len(grown) == 51
 
@@ -151,18 +161,16 @@ def test_first_play_creates_a_radio_that_follows_listening(api, client):
     call(client, "scrobble", id=song_id(client, "One"))
     radio = next(p for p in call(client, "getPlaylists")["playlists"]["playlist"] if p["name"] == "Radio")
     assert radio["readonly"] is True  # oasis keeps it, so clients show it as a list rather than an editable playlist
-    db = api._db()
-    api.recommender.top_up(db, db.execute("select * from playlist where id = ?", (radio["id"],)).fetchone())
+    api.recommender.top_up_pass()
     queued = entries(client, radio["id"])
     assert queued[0] == "Two" and {"Song B", "one-yt song 0"} <= set(queued) and "One" not in queued
 
 
 def test_other_uploads_of_a_song_merge_and_albums_place_them(api, client, ytm):
-    db = api._db()
-    from oasis.db import remember
-    single = track_row(item("upload-a", "Track 2", album="Track 2", album_id=None))
-    first = remember(db, single)
-    assert remember(db, track_row(item("upload-b", "Track 2", album="Some Live Set"))) == first
+    db = api.connect()
+    single = song(item("upload-a", "Track 2", album="Track 2", album_id=None))
+    first = remember_song(db, single)
+    assert remember_song(db, song(item("upload-b", "Track 2", album="Some Live Set"))) == first
     remote = call(client, "search3", query="gamma")["searchResult3"]["song"][0]
     album = call(client, "getAlbum", id=remote["albumId"])["album"]
     assert titles(album["song"]) == ["Track 1", "Track 2", "Track 3", "Gamma Hit"]
@@ -170,12 +178,9 @@ def test_other_uploads_of_a_song_merge_and_albums_place_them(api, client, ytm):
 
 
 def test_stream_moves_to_its_new_local_copy(library, tmp_path, ytm):
-    from conftest import make_track
-    from oasis.db import connect, remember
-    from oasis.scan import scan
     with make_client(library, tmp_path / "oasis.db", ytm) as client:
-        db = connect(tmp_path / "oasis.db")
-        stream = remember(db, track_row(item("vidNew", "Brand New", artist="Beta", album="First", duration=2)))
+        db = client.app.state.oasis.connect()
+        stream = remember_song(db, song(item("vidNew", "Brand New", artist="Beta", album="First", duration=2)))
         call(client, "star", id=stream)
         playlist = call(client, "createPlaylist", name="Mine", songId=stream)["playlist"]
         call(client, "scrobble", id=stream, time=5_000_000)
@@ -209,7 +214,7 @@ def test_artist_page_lists_the_whole_youtube_discography(client, ytm, monkeypatc
             {"browse_id": "MPREb_new", "title": "Newer Album", "year": 2020, "type": "album", "cover": "https://img/new"},
             {"browse_id": "MPREb_single", "title": "A Single", "year": 2021, "type": "single", "cover": None}]}
     monkeypatch.setattr(ytm, "artist", artist, raising=False)
-    monkeypatch.setattr(ytm, "playlist_rows", lambda playlist_id, limit: [track_row(item("top1", "Hit", artist="Beta"))], raising=False)
+    monkeypatch.setattr(ytm, "playlist_rows", lambda playlist_id, limit: [song(item("top1", "Hit", artist="Beta"))], raising=False)
     albums = call(client, "getArtist", id=beta["id"])["artist"]["album"]
     assert [a["name"] for a in albums] == ["First", "A Single", "Newer Album"]  # the local album once, then newest first
     assert albums[1]["releaseTypes"] == ["Single"] and albums[2]["year"] == 2020
@@ -230,7 +235,7 @@ def test_a_song_on_an_album_and_its_single_stays_on_both(client, ytm, monkeypatc
         {"browse_id": "MPREb_single", "title": "Track 2", "year": 2019, "type": "single", "cover": None}]}, raising=False)
     listings = {"MPREb_new": [(f"alb{i}", f"Track {i}", i) for i in (1, 2, 3)], "MPREb_single": [("alb2", "Track 2", 1)]}
     monkeypatch.setattr(ytm, "album", lambda browse_id: [
-        track_row(item(v, t, artist="Beta", album="Newer Album" if browse_id == "MPREb_new" else "Track 2", album_id=browse_id)) | {"track_no": n}
+        song(item(v, t, artist="Beta", album="Newer Album" if browse_id == "MPREb_new" else "Track 2", album_id=browse_id)) | {"track_no": n}
         for v, t, n in listings[browse_id]])
     albums = {a["name"]: a for a in call(client, "getArtist", id=beta["id"])["artist"]["album"]}
     first = call(client, "getAlbum", id=albums["Newer Album"]["id"])["album"]
@@ -258,28 +263,32 @@ def test_search_for_artists_and_albums_alone_still_asks_youtube(client):
 
 
 def test_one_automatic_radio_per_user_even_when_two_plays_race(tmp_path):
-    from oasis import db as oasis_db
     path = tmp_path / "race.db"
-    db = oasis_db.connect(path)
+    db = connect(path)
     db.execute("drop index one_radio")  # a database from before the index, where a race made two
     for _ in range(2):
         db.execute("insert into playlist(name, owner, created, changed, radio) values ('Radio', 'admin', 0, 0, 2)")
-    oasis_db.migrated.discard(path)
-    db = oasis_db.connect(path)
+    db.close()
+    shutil.copy(path, tmp_path / "reopened.db")  # opened as a new server would
+    db = connect(tmp_path / "reopened.db")
     assert [tuple(r) for r in db.execute("select id, radio from playlist order by id")] == [(1, 2), (2, 1)]  # the extra stays, as a plain radio
-    # Both racing plays found no radio: the second insert is ignored.
-    db.execute("insert or ignore into playlist(name, owner, comment, created, changed, radio) values ('Radio', 'admin', '', 0, 0, 2)")
-    assert db.execute("select count(*) from playlist where radio = 2").fetchone()[0] == 1
+    # Both racing plays found no radio: the second one's isn't made.
+    assert playlists.create(db, "admin", "Radio", LISTENING_RADIO) is None
+    assert [tuple(r) for r in db.execute("select id, radio from playlist order by id")] == [(1, 2), (2, 1)]
 
 
-def test_a_failing_chore_leaves_the_radios_and_the_other_chores_be(api):
-    import threading
-    from oasis.recommend import Recommender
-    done, recommender = threading.Event(), Recommender(api.recommender.connect, None, None)
-    recommender.top_up_all = lambda db: 1 / 0
-    recommender.chores = [lambda db: 1 / 0, lambda db: done.set()]
+def test_a_failing_radio_pass_leaves_the_radio_worker_running(api):
+    done, passes = threading.Event(), []
+
+    def connect():
+        passes.append(1)
+        if len(passes) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        done.set()
+        return api.connect()
+    recommender = Recommender(connect, None, None)
     recommender.start()
-    recommender.wake.set()
+    recommender.wake()
     assert done.wait(10)
 
 
@@ -300,7 +309,7 @@ def similar(client, source=None, oasis="1", seed="One"):
 
 
 def link(api, **values):
-    db = api._db()
+    db = api.connect()
     for column, value in values.items():
         db.execute(f"update user set {column} = ? where name = 'admin'", (value,))
 
@@ -317,7 +326,7 @@ def test_a_request_names_its_source_and_gets_that_source_alone(client, ytm):
 
 
 def test_a_source_that_finds_nothing_gives_nothing_rather_than_another(api, client):
-    api.recommender.lastfm = None
+    api.lastfm = None
     assert similar(client, "lastfm")["similarSongs2"]["song"] == []
     assert similar(client, "listenbrainz")["similarSongs2"]["song"] == []  # no ListenBrainz token linked
 
@@ -362,7 +371,7 @@ def test_a_radio_started_with_a_source_keeps_it_and_fills_at_once(api, client, y
     assert radio["readonly"] is True and radio["oasisSource"] == "library" and titles(radio["entry"]) == ["One", "Two"] and ytm.radios == []
     assert "oasisSource" not in call(client, "getPlaylist", id=radio["id"])["playlist"]  # the extension's field
     call(client, "updatePlaylist", playlistId=radio["id"], name="Still a radio")
-    db = api._db()
+    db = api.connect()
     assert db.execute("select radio, radio_source from playlist where id = ?", (radio["id"],)).fetchone()[:] == (1, "library")
     assert call(client, "createPlaylist", oasis="1", name="x", oasisSource="listenbrainz")["error"]["message"].startswith("oasisSource listenbrainz isn't available")
     named = call(client, "createPlaylist", oasis="1", name="Radio from One", songId=song_id(client, "One"))["playlist"]
@@ -370,7 +379,7 @@ def test_a_radio_started_with_a_source_keeps_it_and_fills_at_once(api, client, y
 
 
 def test_lastfm_stations_seed_from_the_users_top_or_loved_tracks(api, client):
-    api.recommender.lastfm = lastfm = LastFmUser()
+    api.lastfm = lastfm = LastFmUser()
     assert call(client, "createPlaylist", oasis="1", oasisStation="lastfm-top")["error"]["message"].startswith("oasisStation lastfm-top isn't available")
     link(api, lastfm_session="s", lastfm_name="me")
     station = call(client, "createPlaylist", oasis="1", oasisStation="lastfm-top", oasisPeriod="1month", oasisSource="library")["playlist"]

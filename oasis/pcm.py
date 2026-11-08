@@ -8,9 +8,10 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .formats import PCM, suffix
+
 log = logging.getLogger(__name__)
 
-SUFFIXES = ("wav", "aif", "aiff")
 INTEGER = ("pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_u8", "pcm_s16be", "pcm_s24be", "pcm_s32be")
 LOSSY = {"mp3": ("mp3", "mp3"), "aac": ("m4a", "ipod"), "vorbis": ("ogg", "ogg"), "opus": ("opus", "opus")}  # codec: suffix, ffmpeg muxer
 KEPT: set[str] = set()  # files looked at and left as they are, not probed again while oasis runs
@@ -78,6 +79,6 @@ def convert(path: Path) -> Path | None:
 
 def convert_all(paths: list[Path], jobs: int = 4) -> dict[Path, Path]:
     """Each WAV or AIFF of paths converted (convert), in parallel: old path -> new."""
-    todo = [p for p in paths if p.suffix.lower().lstrip(".") in SUFFIXES]
+    todo = [p for p in paths if suffix(p) in PCM]
     with ThreadPoolExecutor(jobs) as pool:
         return {p: new for p, new in zip(todo, pool.map(convert, todo)) if new}

@@ -1,36 +1,12 @@
 import json
+import threading
 import time
 
 import pytest
 
-from oasis.db import connect
+from conftest import WANT, Prowlarr, finished, result, tb, torrent
 from oasis import download, releases
-from oasis.download import Downloads
-from test_doctor import FakeTorBox, torrent
-
-
-class TorBox(FakeTorBox):
-    def __init__(self, tmp_path):
-        super().__init__()
-        self.tmp, self.added, self.full, self.links = tmp_path, [], False, []
-
-    def add(self, name, magnet=None, torrent=None, mode="off"):
-        self.added.append((name, magnet, torrent))
-        self.seeded = getattr(self, "seeded", []) + [mode]
-        hash = magnet.split("btih:")[1][:4] if magnet else "file"
-        if self.full:
-            self.waiting.append({"id": 90, "hash": hash})
-            return {"queued_id": 90, "hash": hash}
-        return {"torrent_id": 70 + len(self.added), "hash": hash.upper()}
-
-    def link(self, torrent_id, file_id):
-        self.links.append(file_id)
-        return (self.tmp / "cdn" / str(file_id)).as_uri()
-
-
-def tb(id, hash, peers=1, availability=1.0, speed=0, size=0, **extra):
-    return {"download_state": "downloading", "download_finished": False, "download_present": False, "peers": peers,
-            "availability": availability, "download_speed": speed, "size": size, **torrent(id, hash, **extra)}
+from oasis.wants import Outcome
 
 
 def crowd(downloads, db):
@@ -39,71 +15,13 @@ def crowd(downloads, db):
     db.execute("insert into want_album(rg, artist_mbid, title, reason, state) values ('waiting', 'a', 'Next', 'followed', 'missing')")
 
 
-def result(title, hash="", seeders=5, size=400e6, **extra):
-    return {"title": title, "infoHash": hash, "seeders": seeders, "size": size, "guid": f"guid-{title}", "indexerId": 1, **extra}
-
-
-class Prowlarr:
-    def __init__(self, results):
-        self.results, self.asked = results, []
-
-    def search(self, query):
-        self.asked.append(query)
-        return self.results.get(query, [])
-
-
-class Importer:
-    """importer.py's place: records what it got, and fails for the release groups in failing."""
-    def __init__(self):
-        self.placed, self.failing = [], set()
-
-    def place(self, folder, group):
-        self.placed.append((folder, group))
-        if group in self.failing:
-            raise LookupError("no edition matches")
-
-
-WANT = {"artist": "Artist", "names": ["Artist"], "title": "Album", "year": "", "others": [], "discs": 1, "upgrade": False, "native": [], "other_titles": []}
-
-
 def offer(hash, quality="FLAC", **extra):
     return result(f"Artist - Album [{quality}]", hash, magnetUrl=f"magnet:?xt=urn:btih:{hash}", **extra)
 
 
-def files(tmp_path, *names):
-    (tmp_path / "cdn").mkdir(exist_ok=True)
-    for id, name in enumerate(names):
-        (tmp_path / "cdn" / str(id)).write_bytes(name.encode() * (id + 1))
-    return [{"id": id, "name": name, "size": len(name.encode()) * (id + 1)} for id, name in enumerate(names)]
-
-
-@pytest.fixture
-def db(tmp_path):
-    return connect(tmp_path / "oasis.db")
-
-
-@pytest.fixture
-def torbox(tmp_path):
-    return TorBox(tmp_path)
-
-
-@pytest.fixture
-def downloads(tmp_path, torbox, monkeypatch):
-    monkeypatch.setattr(download, "PACE", 0)
-    made = Downloads(lambda: connect(tmp_path / "oasis.db"), lambda: torbox, Importer(), Prowlarr({}), str(tmp_path / "dl"), stall_hours=1,
-                     imported=lambda: made.scans.append(1))
-    made.scans = []
-    return made
-
-
-def finished(id, hash, names, tmp_path):
-    return {**tb(id, hash, progress=1, active=False), "download_state": "completed", "download_finished": True, "download_present": True,
-            "files": files(tmp_path, *names)}
-
-
 def test_a_find_sends_the_pick_to_torbox_and_the_files_are_fetched_and_placed(downloads, torbox, db, tmp_path):
     downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
-    assert downloads.find(db, WANT, "mb-album")
+    assert downloads.find(db, WANT, "mb-album") is Outcome.SENT
     assert torbox.added == [("Artist - Album [FLAC]", "magnet:?xt=urn:btih:abcd", None)]
     row = db.execute("select * from download").fetchone()
     assert (row["hash"], row["album_id"], row["album_mbid"], row["torbox_id"], row["state"]) == ("abcd", 0, "mb-album", 71, "added")
@@ -142,9 +60,6 @@ def test_dead_torrents_get_another_try_after_two_weeks_after_all_others_but_wron
 class LoginProwlarr(Prowlarr):
     logins = names = {1: "Some-Tracker"}
 
-    def tracker(self, release):
-        return self.names.get(release.get("indexerId"))
-
 
 def seeding(downloads, torbox, db, tmp_path, ratio, **more):
     """An album from a login tracker, downloaded and imported; TorBox then seeding it at ratio."""
@@ -169,7 +84,7 @@ def test_a_login_trackers_torrent_seeds_after_its_import_till_its_ratio_is_met_a
     downloads.cycle()
     assert 71 in torbox.deleted and "stopped seeding Artist - Album [FLAC]: ratio 1.02" in caplog.text
     assert db.execute("select seeding, downloaded, uploaded from download").fetchone()[:] == (0, 1000, 1020)
-    assert downloads.totals(db) == {"Some-Tracker": (1000, 1020)}  # kept after it went
+    assert [tuple(r) for r in download.trackers(db)] == [("Some-Tracker", 1000, 1020, 0)]  # kept after it went
 
 
 def test_seeding_ends_at_the_day_cap_unless_the_trackers_ratio_is_low_and_waits_its_minimum_time(downloads, torbox, db, tmp_path, caplog):
@@ -277,7 +192,7 @@ def test_a_torrent_added_again_after_a_failure_gets_a_new_stall_timer(downloads,
 def test_a_queued_add_is_dropped_without_blocking(downloads, torbox, db):
     downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
     torbox.full = True
-    assert downloads.find(db, WANT, "mb-album") is False and downloads.added  # acquire.py makes the album due again soon, a full gap on
+    assert downloads.find(db, WANT, "mb-album") is Outcome.NO_SLOT  # acquire.py makes the album due again soon, a full gap on
     assert torbox.dropped == [90] and db.execute("select count(*) from release_block").fetchone()[0] == 0
     assert db.execute("select count(*) from download").fetchone()[0] == 0
 
@@ -305,22 +220,34 @@ def test_a_torrent_without_seeders_at_0_percent_is_dead_after_20_minutes(downloa
     assert db.execute("select state, error from download").fetchone()[:] == ("failed", "dead torrent: no seeds, no progress")
 
 
-def test_an_indexer_whose_torrents_were_often_dead_is_tried_last(downloads, db):
+def test_an_indexer_whose_torrents_were_often_dead_is_tried_last(downloads, torbox, db):
     for n in range(6):
         db.execute("insert into download(hash, guid, album_id, state, error, created, updated) values (?, ?, 0, ?, ?, 0, 0)",
                    (f"h{n}", f"https://lime.example/t/{n}", "failed" if n < 2 else "done", "dead torrent: no seeds, no progress" if n < 2 else None))
-    assert downloads.unreliable(db) == {"lime.example"}
-    lime, good = result("Artist - Album [FLAC]", "aa", seeders=40, guid="https://lime.example/x"), result("Artist - Album [MP3 320]", "bb", guid="https://good.example/y")
-    assert [r["infoHash"] for r in releases.rank([lime, good], set(), unreliable=downloads.unreliable(db))] == ["bb", "aa"]
-    assert [r["infoHash"] for r in releases.rank([lime, good], {"aa"}, unreliable=downloads.unreliable(db))] == ["aa", "bb"]  # cached: fine
+    downloads.prowlarr.results["Artist Album"] = [offer("aaaa", seeders=40, guid="https://lime.example/x"),
+                                                  offer("bbbb", "MP3 320", guid="https://good.example/y")]
+    downloads.find(db, WANT, "mb-album")
+    assert torbox.added[-1][1] == "magnet:?xt=urn:btih:bbbb"
+    torbox.have = {"aaaa"}  # cached: fine
+    downloads.find(db, WANT, "mb-album")
+    assert torbox.added[-1][1] == "magnet:?xt=urn:btih:aaaa"
 
 
-def test_how_much_of_a_download_is_copied_here_counts_partly_fetched_files(downloads, tmp_path):
-    done, partial, missing = tmp_path / "a.flac", tmp_path / "b.flac", tmp_path / "c.flac"
-    done.write_bytes(b"x" * 50)
-    (tmp_path / "b.flac.part").write_bytes(b"x" * 25)
-    downloads.copying["h"] = [(done, 50), (partial, 50), (missing, 100)]
-    assert downloads.copied("h") == 0.375 and downloads.copied("other") is None
+def test_how_much_of_a_download_is_copied_here_counts_partly_fetched_files(downloads, torbox, db, tmp_path):
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd")]
+    downloads.find(db, WANT, "mb-album")
+    names = ["Album/01.flac", "Album/02.flac", "Album/03.flac"]
+    torbox.list = [finished(71, "abcd", names, tmp_path)]
+    sizes = [f["size"] for f in torbox.list[0]["files"]]
+    folder = tmp_path / "dl" / "abcd"
+    (folder / "Album").mkdir(parents=True)
+    (folder / names[0]).write_bytes((tmp_path / "cdn" / "0").read_bytes())  # fetched before a restart
+    (folder / "Album/02.flac.part").write_bytes(b"x" * (sizes[1] // 2))  # cut short
+    seen, link = [], torbox.link
+    torbox.link = lambda torrent_id, file_id: seen.append(downloads.copied("abcd")) or link(torrent_id, file_id)
+    downloads.cycle()
+    assert seen[0] == (sizes[0] + sizes[1] // 2) / sum(sizes)
+    assert downloads.copied("other") is None
 
 
 def test_a_trickling_torrent_makes_way_when_slots_are_full_and_albums_wait_and_is_tried_last_again(downloads, torbox, db, monkeypatch):
@@ -344,9 +271,12 @@ def test_a_trickling_torrent_makes_way_when_slots_are_full_and_albums_wait_and_i
     torbox.list = [tb(71, "abcd", progress=0.1, seeds=1)]  # every slot taken and an album waits: it makes way
     downloads.cycle()
     assert db.execute("select state, error from download").fetchone()[:] == ("failed", "too slow: 10% in 2 h")
-    assert "abcd" in downloads.slow(db) and "abcd" not in downloads.blocked(db)
-    other = result("Artist - Album [FLAC]", "beef", seeders=1)
-    assert [r["infoHash"] for r in releases.rank([offer("abcd", seeders=90), other], set(), slow=downloads.slow(db))] == ["beef", "abcd"]
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd", seeders=90), offer("beef", seeders=1)]
+    downloads.find(db, WANT, "mb-album")
+    assert torbox.added[-1][1] == "magnet:?xt=urn:btih:beef"  # tried last
+    downloads.prowlarr.results["Artist Album"] = [offer("abcd", seeders=90)]
+    downloads.find(db, WANT, "mb-album")
+    assert torbox.added[-1][1] == "magnet:?xt=urn:btih:abcd"  # not never
 
 
 @pytest.mark.parametrize("swarm, why", [({"peers": 0}, "dead torrent: nobody shares it"),
@@ -471,30 +401,32 @@ def keep(db, hash="abcd", groups=None, tried=()):
 def test_a_remembered_bundle_torbox_had_no_free_slot_for_still_serves_the_album(downloads, torbox, db):
     keep(db)
     torbox.have, torbox.full = {"abcd"}, True
-    assert downloads.find(db, WANT, "g-album") is False and downloads.prowlarr.asked == []
+    assert downloads.find(db, WANT, "g-album") is Outcome.NO_SLOT and downloads.prowlarr.asked == []
     assert db.execute("select tried from bundle_kept").fetchone()[0] == "[]"
     torbox.full = False
-    assert downloads.find(db, WANT, "g-album") is True
+    assert downloads.find(db, WANT, "g-album") is Outcome.SENT
     assert json.loads(db.execute("select tried from bundle_kept").fetchone()[0]) == ["g-album"]
 
 
 def test_a_remembered_bundle_whose_files_changed_is_forgotten_not_blocked(downloads, torbox, db, tmp_path):
     keep(db)
     torbox.have = {"abcd"}
-    assert downloads.find(db, WANT, "g-album")
+    assert downloads.find(db, WANT, "g-album") is Outcome.SENT
     torbox.list = [finished(71, "abcd", ["Disco/Album (2001)/01.flac", "Disco/Album (2001)/02.flac"], tmp_path)]
     downloads.cycle()
     assert db.execute("select state from download").fetchone()[0] == "failed" and torbox.deleted == [71]
     assert db.execute("select count(*) from release_block").fetchone()[0] == db.execute("select count(*) from bundle_kept").fetchone()[0] == 0
 
 
-def test_a_bundle_downloaded_again_keeps_what_it_was_tried_for_before(downloads, db):
+def test_a_bundle_downloaded_again_keeps_what_it_was_tried_for_before(downloads, torbox, db, tmp_path):
     keep(db, tried=["g-old"])
     db.execute("insert into download(hash, album_id, title, torbox_id, state, created, updated, catalogue) values "
-               "('abcd', 0, 'Artist - Discography', 71, 'done', 0, 0, ?)", (json.dumps({"want": WANT, "groups": []}),))
-    db.execute("insert into download_target(hash, rg, files, state) values ('abcd', 'g-album', ?, 'done')", (json.dumps(["Disco/Album/01.flac"]),))
-    downloads.map_kept = lambda *args: None
-    downloads.remember(db, {"hash": "abcd"}, [{"name": "Disco/Album/01.flac", "size": 1}])
+               "('abcd', 0, 'Artist - Discography', 71, 'fetching', 0, 0, ?)", (json.dumps({"want": WANT, "groups": []}),))
+    db.execute("insert into download_target(hash, rg, files, state) values ('abcd', 'g-album', ?, 'pending')", (json.dumps(["Disco/Album/01.flac"]),))
+    torbox.list = [finished(71, "abcd", ["Disco/Album/01.flac"], tmp_path)]
+    downloads.cycle()
+    [t.join(10) for t in threading.enumerate() if t.name == "remember bundle"]
+    assert db.execute("select state from download").fetchone()[0] == "done"
     assert json.loads(db.execute("select tried from bundle_kept").fetchone()[0]) == ["g-album", "g-old"]
 
 

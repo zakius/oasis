@@ -10,49 +10,42 @@ MusicBrainz has can be wanted, under ids of its own until it arrives (see adopt)
 want_item the stars and follows."""
 import itertools
 import json
-from collections import Counter
-from collections import Counter
 import logging
 import re
 import threading
 import time
-import urllib.parse
+from collections import Counter
 
-from . import musicbrainz, releases
-from .db import move_stat, resolve
-from .importer import LOSSLESS
-from .ytm import fold
+from . import musicbrainz, releases, worker
+from .wants import Outcome
+from .formats import LOSSLESS
+from .musicbrainz import lucene, search_artist
+from .text import fold, song_key
+from .tracks import MB_IDS, album_name_of, artist_name_of, keep_old_id, library_id, mb_only, mbid_of, move
+from .wants import DUE, SEARCH_FAILED, STILL_WANTED
 
 log = logging.getLogger(__name__)
 
-MB = "https://musicbrainz.org/ws/2/"
-CATALOGUE = MB + "release-group?artist={}&type=album|ep|single&inc=artist-credits+aliases&limit=100&offset={}&fmt=json"
-PSEUDO = MB + "release?artist={}&status=pseudo-release&inc=release-groups&limit=100&offset={}&fmt=json"  # transliterations, translations
-EDITIONS = MB + "release?release-group={}&status=official&inc=recordings&limit=100&fmt=json"
-GROUP = MB + "release-group/{}?inc=artist-credits&fmt=json"
-GROUP_COVER = "https://coverartarchive.org/release-group/{}/front-500"  # the Cover Art Archive's front image, 500 px
-RELEASE = MB + "release/{}?inc=release-groups&fmt=json"
-SEARCH = MB + "{}?query={}&limit=25&fmt=json"
-KEEP_FIND = 7 * 86400                # the dashboard's and clients' searches
-MB_IDS = {"artist": "ar-mb-", "album": "al-mb-"}  # ids of artists and release groups only MusicBrainz has (see adopt)
-TYPES = ("Album", "EP", "Single")
-VIDEO = re.compile(r"video|^dvd$|blu-ray|hd-dvd|vhs|^s?vcd$|laserdisc|umd", re.I)  # MusicBrainz's medium formats; DVD-Audio is audio
-SECONDARY = ("Soundtrack",)          # secondary types wanted besides none, as Lidarr's metadata profile had them
 RECATALOGUE = 86400                  # seconds between reads of a followed artist's catalogue: new releases show within a day
-KEEP_CATALOGUE = RECATALOGUE - 3600  # so the daily read is fresh, and searches in between ask nothing
-KEEP_EDITIONS = 30 * 86400
-KEEP_GROUP = 30 * 86400
+KEEP_EDITIONS = 30 * 86400           # seconds a release group's edition (mb_group) stays
 RESEARCH, RESEARCH_MOST = 6 * 3600, 7 * 86400       # a missing album is searched again after 6 h, then twice as long each time
 SINGLE_RESEARCH, SINGLE_MOST = 7 * 86400, 28 * 86400
 BUNDLE_AGAIN = 7 * 86400             # seconds between an artist's bundle searches
 # Releases far likelier found in an artist's bundles than on their own (fan-club and live EPs, singles, demos, B-sides
 # and rarities): searched on their own only after their artist's bundle search.
 BUNDLE_FIRST = "(primary_type in ('EP', 'Single') or secondary_types like '%Live%' or secondary_types like '%Demo%' or secondary_types like '%Compilation%')"
+# SQL: a BUNDLE_FIRST album still waiting for its artist's bundle search, given the time of the last one that counts.
+DEFERRED = f"({BUNDLE_FIRST} and artist is not null and artist_mbid not in (select artist_mbid from bundle_search where searched > ?))"
 # Nothing due and TorBox has room: a search ahead of schedule every EARLY_GAP, leaving backoffs as they are. An artist's
 # bundles at most daily, an album (or a lossless copy) every RESEARCH, a single daily.
 EARLY_GAP, BUNDLE_EARLY, SINGLE_EARLY = 5 * 60, 86400, 86400
 MAP_RELEASES = 20                    # files tagged with a release but no release group, looked up per pass
-CLIENT_STATES = {"missing": "wanted", "downloading": "downloading", "have": "have"}  # want_item's, which clients see
+# want_album's states: missing, downloading, have; what a catalogue leaves out, or a user gave up, has no row. want_item's, which
+# clients see: an album's, by its want_album row's; an artist's, followed or downloading; failed when MusicBrainz can't
+# tell which it is.
+CLIENT_STATES = {"missing": "wanted", "downloading": "downloading", "have": "have"}
+BADGES = ("wanted", "downloading", "failed")  # want_item's states shown on clients' albums and artists; arrived and followed need none
+GIVEN_UP = "given up"  # why a catalogue leaves out an album a user gave up on
 RETRY_NO_MATCH = 1800     # seconds before looking an unmatched name up again
 RETRY_ERROR = 300         # seconds before retrying after MusicBrainz or Prowlarr errors
 SEARCH_GAP = 60           # seconds between searches, so a burst of stars doesn't trip TorBox's rate limit
@@ -63,66 +56,22 @@ UPGRADE_AGAIN = 7 * 86400  # seconds between searches for a lossless copy of an 
 LOSSLESS_TRACK = "(t.suffix in (" + ", ".join(f"'{s}'" for s in LOSSLESS) + ") or t.suffix = 'm4a' and t.bitrate > 512)"
 REPEATS = 0.6             # share of an album's songs already on the artist's earlier releases that makes it a repackage
 GUEST = re.compile(r"feat|ft\.|\bwith\b", re.I)  # joinphrases after which artists are guests: 'Beyoncé feat. Jay-Z'
-REPACKAGE = re.compile(r"\b(best of|greatest hits|very best|the essential|anthology|collection|singles|remaster(ed)?|anniversary|"
-                       r"deluxe|bonus ?tracks?|re-?recorded|reimagined|reissue|remixes|instrumentals?|karaoke)\b", re.I)
+REPACKAGE = re.compile(rf"\b({releases.REISSUES}|collection|remaster(ed)?|bonus ?tracks?|re-?recorded|reimagined|remixes)\b", re.I)
 # A single that is another version of its song, said in a bracket or after a dash: 'Song (Acoustic)', 'Song - Live',
 # not 'Live and Let Die'.
 VERSION = re.compile(r"(\([^)]*|\[[^\]]*|\s[-‐–—]\s.*)\b(re-?recorded|reimagined|acoustic|remix(es)?|live|instrumentals?)\b", re.I)
-
-
-def lucene(text: str) -> str:
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def find(db, kind: str, text: str) -> list[dict]:
-    """MusicBrainz artists (by any name or alias, in any script) or release groups named like text, best first."""
-    words = re.sub(r'[-+&|!(){}\[\]^"~*?:\\/]', " ", text).casefold().split()
-    if not words:
-        return []
-    path = "artist" if kind == "artist" else "release-group"
-    return musicbrainz.get(SEARCH.format(path, urllib.parse.quote(" ".join(words))), db, KEEP_FIND).get(path + "s") or []
-
-
-def pages(db, url: str, kind: str) -> list[dict]:
-    """All of a MusicBrainz browse's kind ('release-group'), page by page."""
-    found = []
-    while True:
-        page = musicbrainz.get(url.format(len(found)), db, KEEP_CATALOGUE)
-        found += page.get(kind + "s") or []
-        if not page.get(kind + "s") or len(found) >= page.get(kind + "-count", 0):
-            return found
-
-
-def release_groups(db, mbid: str) -> list[dict]:
-    """All the artist's release groups, with their aliases."""
-    return pages(db, CATALOGUE.replace("{}", mbid, 1), "release-group")
 
 
 def other_titles(db, mbid: str) -> dict[str, list[str]]:
     """Each of the artist's release groups' other whole titles in MusicBrainz, as releases.other_titles keeps them:
     its aliases ('To Us Former Prodigies') and its pseudo-releases' titles ('Ensemble Play' for アンサンブル・プレイ).
     Search hints aren't titles."""
-    groups = release_groups(db, mbid)
-    found = {g["id"]: [a["name"] for a in g.get("aliases") or [] if a.get("type") != "Search hint"] for g in groups}
-    for r in pages(db, PSEUDO.replace("{}", mbid, 1), "release"):
+    groups = musicbrainz.release_groups(mbid, db)
+    found = {g["id"]: musicbrainz.aliases(g) for g in groups}
+    for r in musicbrainz.pseudo_releases(mbid, db):
         found.get((r.get("release-group") or {}).get("id"), []).append(r["title"])
     titles = {g["id"]: g["title"] for g in groups}
     return {rg: kept for rg, names in found.items() if (kept := releases.other_titles(titles[rg], names, [t for o, t in titles.items() if o != rg]))}
-
-
-def mbid_of(id: str) -> str | None:
-    return next((id.removeprefix(p) for p in MB_IDS.values() if id.startswith(p)), None)
-
-
-def library_id(db, id: str) -> str | None:
-    """The library's id of a MusicBrainz-only artist or album that has arrived."""
-    if id.startswith(MB_IDS["album"]):
-        row = db.execute("select album_id from track where mb_release_group = ? and source = 'local' limit 1", (mbid_of(id),)).fetchone()
-        return row and row[0]
-    if id.startswith(MB_IDS["artist"]) and (row := db.execute("select artist_id from mb_artist where mbid = ?", (mbid_of(id),)).fetchone()):
-        own = resolve(db, row[0])
-        return own if db.execute("select 1 from track where artist_id = ? and source = 'local'", (own,)).fetchone() else None
-    return None
 
 
 def refs(db, kind: str, mbid: str) -> set[str]:
@@ -134,43 +83,149 @@ def refs(db, kind: str, mbid: str) -> set[str]:
 def adopt(db):
     """A MusicBrainz-only artist or album that arrived in the library takes its library id: stars, wants and follows
     move there, and the old id keeps working through moved, as clients keep ids."""
-    for (old,) in db.execute("select ref from wanted where ref like 'a_-mb-%' union select ref from want_item where ref like 'a_-mb-%' "
-                             "union select id from stat where id like 'a_-mb-%'").fetchall():
+    for (old,) in db.execute(f"select ref from wanted where {mb_only('ref')} union select ref from want_item where {mb_only('ref')} "
+                             f"union select id from stat where {mb_only('id')}").fetchall():
         if new := library_id(db, old):
-            for table in ("wanted", "want_item"):
-                db.execute(f"update or ignore {table} set ref = ? where ref = ?", (new, old))
-                db.execute(f"delete from {table} where ref = ?", (old,))
-            move_stat(db, old, new)
-            db.execute("insert or replace into moved values (?, ?)", (old, new))
+            move(db, "artist" if old.startswith(MB_IDS["artist"]) else "album", old, new)
+            keep_old_id(db, old, new)
+
+
+def want(db, user: str, kind: str, ids: list[str], on: bool):
+    """The user wants the albums or follows the artists (kind) under these ids, or no longer (on false). The next pass
+    (Acquire.wake) acts on it."""
+    for id in ids:
+        if on:
+            db.execute("insert or ignore into wanted values (?, ?, ?)", (user, kind, id))
+        else:
+            db.execute("delete from wanted where user = ? and kind = ? and ref = ?", (user, kind, id))
+
+
+def want_again(db, rg: str):
+    """The album searched for soon: its want_album row if the catalogue or a star has one, else wanted for the first
+    admin, under its MusicBrainz id. A given-up album is wanted again. No star: the user didn't ask for it."""
+    if db.execute("select 1 from want_album where rg = ?", (rg,)).fetchone():
+        db.execute("update want_album set state = 'missing', next_search = null where rg = ?", (rg,))
+        return
+    user = db.execute("select name from user order by admin desc, created limit 1").fetchone()
+    if user is None:
+        log.warning("nobody to want %s for", rg)
+        return
+    ref = MB_IDS["album"] + rg
+    want(db, user[0], "album", [ref], True)
+    db.execute("insert or ignore into want_item(kind, ref, state, mbid, updated) values ('album', ?, 'wanted', ?, ?)", (ref, rg, time.time()))
+
+
+def give_up(db, rg: str):
+    """No more searches for the album: its followed artist's catalogue leaves it out from now on. Stars of it stay:
+    Oasis.give_up takes back the user's too."""
+    db.execute("insert or replace into given_up values (?, ?)", (rg, time.time()))
+    db.execute("delete from want_album where rg = ? and reason = 'followed'", (rg,))
+
+
+def wanted_by(db, kind: str, mbid: str, user: str | None = None) -> list[str]:
+    """The ids the user (or anyone, for None) wants the album or follows the artist (kind) under."""
+    ids = refs(db, kind, mbid)
+    sql = f"select distinct ref from wanted where kind = ? and ref in ({','.join('?' * len(ids))})"
+    if user is None:
+        return [r[0] for r in db.execute(sql, (kind, *ids))]
+    return [r[0] for r in db.execute(sql + " and user = ?", (kind, *ids, user))]
+
+
+def followed_refs(db) -> set[str]:
+    """Every id an artist is followed under."""
+    return {r[0] for r in db.execute("select ref from wanted where kind = 'artist'")}
+
+
+def album(db, rg: str):
+    """The album's want_album row, None when oasis doesn't look for it."""
+    return db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
+
+
+def wanted_albums(db, artist: str | None = None, kind: str | None = None, text: str | None = None) -> list:
+    """The albums still wanted (still_wanted), of the artist (MusicBrainz id), of the primary type (kind), with text in
+    their title or artist: starred first, then by artist, albums, EPs, the rest, oldest first."""
+    where, params = [STILL_WANTED], []
+    if artist:
+        where.append("artist_mbid = ?"), params.append(artist)
+    if kind:
+        where.append("primary_type = ?"), params.append(kind)
+    if text:
+        where.append("(title like ? or artist like ?)"), params.extend([f"%{text}%"] * 2)
+    return db.execute(f"select * from want_album where {' and '.join(where)} order by reason != 'starred', artist collate nocase, "
+                      "primary_type != 'Album', primary_type != 'EP', first_date", params).fetchall()
+
+
+def wanted_artists(db) -> list:
+    """The artists with albums still wanted: artist_mbid, artist (a name), n (how many) and rg (one of them), by name."""
+    return db.execute(f"select artist_mbid, min(artist) artist, count(*) n, min(rg) rg from want_album where {STILL_WANTED} "
+                      "group by artist_mbid order by artist collate nocase").fetchall()
+
+
+def counts(db) -> dict[str, int]:
+    """How many albums are in each state."""
+    return dict(db.execute("select state, count(*) from want_album group by state").fetchall())
+
+
+def untried(db) -> int:
+    """How many missing albums were never searched."""
+    return db.execute("select count(*) from want_album where state = 'missing' and searched is null").fetchone()[0]
+
+
+def unresolved(db, user: str) -> list:
+    """Stars and follows still wanted that MusicBrainz can't tell which it is (want_item rows), each with mine:
+    whether the user's own."""
+    return db.execute("select wi.*, exists (select 1 from wanted w where w.kind = wi.kind and w.ref = wi.ref and w.user = ?) mine "
+                      "from want_item wi where wi.state = 'failed' and exists (select 1 from wanted w where w.kind = wi.kind "
+                      "and w.ref = wi.ref)", (user,)).fetchall()
 
 
 class Acquire:
-    def __init__(self, connect, downloads, secondary_types=SECONDARY, bundles=False):
-        """downloads: download.py's. bundles: also search for cached discographies and bundles."""
-        self.connect, self.downloads, self.allowed, self.bundles = connect, downloads, set(secondary_types), bundles
-        self.wake = threading.Event()
+    def __init__(self, connect, downloads, settings):
+        """downloads: download.py's. settings: config.Acquisition."""
+        self.connect, self.downloads, self.allowed, self.bundles = connect, downloads, set(settings.secondary_types), settings.bundles
+        self.woken = threading.Event()
         self.last_search, self.gap = 0.0, SEARCH_GAP
         self.soon: set[str] = set()  # release groups to search before any other (the dashboard's "search now")
         self.idle = False  # nothing was due at the last pass: searching early
 
     def start(self):
-        threading.Thread(target=self.run, daemon=True).start()
+        worker.start("acquire pass", self.step, 60, self.woken)
 
-    def run(self):
-        while True:
-            try:
-                self.reconcile()
-            except Exception:
-                log.exception("acquire pass failed")
-            self.wake.wait(self.gap if time.time() - self.last_search < self.gap else 60)
-            self.wake.clear()
+    def step(self) -> float:
+        """A pass, then a wait until the next search is due, at most a minute."""
+        self.reconcile()
+        return self.gap if time.time() - self.last_search < self.gap else 60
+
+    def wake(self):
+        """A pass now: what users want changed."""
+        self.woken.set()
+
+    def search_soon(self, rg: str):
+        """The album is searched before any other, at a pass now."""
+        self.soon.add(rg)
+        self.woken.set()
+
+    def searching_soon(self, rg: str) -> bool:
+        return rg in self.soon
+
+    def to_find(self, db) -> list[dict]:
+        """The albums still to find, albums and EPs, then singles: of each (single), how many (count), how many were
+        searched and wait for their next try (waiting), the soonest of those (next), and how many wait for their
+        artist's bundle search (deferred); the rest are due."""
+        now, found = time.time(), []
+        for single in (False, True):
+            n, waiting, first, held = db.execute(
+                "select count(*), coalesce(sum(next_search > ?), 0), min(case when next_search > ? then next_search end), "
+                f"coalesce(sum(coalesce(next_search, 0) <= ? and {DEFERRED}), 0) from want_album where state = 'missing' and (primary_type is 'Single') = ?",
+                (now, now, now, now - BUNDLE_AGAIN, single)).fetchone()
+            found.append({"single": single, "count": n, "waiting": waiting, "next": first, "deferred": held if self.bundles else 0})
+        return found
 
     def reconcile(self):
         """One pass: stars and follows resolved or let go, one artist's catalogue read, states updated, one search."""
         db = self.connect()
         try:
             adopt(db)
-            db.execute("delete from want_album where state = 'skipped'")  # left out by an older oasis, which kept a row
             for kind, ref in db.execute("select distinct kind, ref from wanted").fetchall():
                 db.execute("insert or ignore into want_item(kind, ref, state, updated) values (?, ?, 'wanted', ?)", (kind, ref, time.time()))
             for item in db.execute("select * from want_item").fetchall():
@@ -185,8 +240,11 @@ class Acquire:
                         set_state(db, item, *(self.want(db, item) if item["kind"] == "album" else self.follow(db, item)))
                 except LookupError as e:
                     set_state(db, item, "failed", str(e), retry=RETRY_NO_MATCH)
-                except Exception as e:  # MusicBrainz down, timeouts: soon again
-                    log.warning("%s %s: %s", item["kind"], item["ref"], e)
+                except Exception as e:  # MusicBrainz down, timeouts, an answer of an unexpected shape: soon again
+                    if isinstance(e, OSError):
+                        log.warning("%s %s: %s", item["kind"], item["ref"], e)
+                    else:
+                        log.exception("%s %s", item["kind"], item["ref"])
                     set_state(db, item, item["state"] if item["mbid"] else "wanted", str(e)[:300], retry=RETRY_ERROR)
             # One catalogue a pass: a first read of many artists takes MusicBrainz minutes, and searches go on meanwhile.
             due = db.execute("select * from want_item where kind = 'artist' and mbid is not null and coalesce(catalogued, 0) < ? "
@@ -212,7 +270,7 @@ class Acquire:
             db.execute("update want_item set mbid = ? where kind = ? and ref = ?", (rg, item["kind"], item["ref"]))
         row = db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
         if row is None or row["reason"] != "starred":
-            group = musicbrainz.get(GROUP.format(rg), db, KEEP_GROUP)
+            group = musicbrainz.release_group(rg, db)
             credit = group["artist-credit"][0]
             self.put(db, group, credit["artist"]["id"], credit["name"], "starred")
             db.execute("delete from given_up where rg = ?", (rg,))
@@ -234,13 +292,12 @@ class Acquire:
             return mbid_of(item["ref"])
         if known := db.execute("select mbid from mb_artist where artist_id = ? limit 1", (item["ref"],)).fetchone():
             return known[0]
-        row = db.execute("select album_artist from track where artist_id = ? limit 1", (item["ref"],)).fetchone() or \
-            db.execute("select name from ytm_artist where artist_id = ?", (item["ref"],)).fetchone()
-        if row is None:
+        name = artist_name_of(db, item["ref"])
+        if name is None:
             raise LookupError("not in oasis any more")
-        if found := next((m for c in artist_names(row[0]) for m in self.search_artist(db, c)), None):
+        if found := next((m for c in artist_names(name) for m in search_artist(c)), None):
             return found
-        raise LookupError(f"no MusicBrainz artist named {row[0]}")
+        raise LookupError(f"no MusicBrainz artist named {name}")
 
     def find_album(self, db, item) -> str:
         """The release group: its own, from the library's tags, else by title among the artist's (known from tags, else by name)."""
@@ -249,24 +306,15 @@ class Acquire:
         if known := db.execute("select mb_release_group from track where album_id = ? and coalesce(mb_release_group, '') != '' limit 1",
                                (item["ref"],)).fetchone():
             return known[0]
-        row = db.execute("select album_artist name, album title, artist_id from track where album_id = ? limit 1", (item["ref"],)).fetchone() or \
-            db.execute("select a.name, r.title, r.artist_id from ytm_release r join ytm_artist a on a.artist_id = r.artist_id "
-                       "where r.album_id = ?", (item["ref"],)).fetchone()
+        row = album_name_of(db, item["ref"])
         if row is None:
             raise LookupError("not in oasis any more")
         known = [r[0] for r in db.execute("select mbid from mb_artist where artist_id = ?", (row["artist_id"],))]
-        for mbid in itertools.chain(known, (m for c in artist_names(row["name"]) for m in self.search_artist(db, c))):
-            groups = musicbrainz.get(SEARCH.format("release-group", urllib.parse.quote(f"releasegroup:{lucene(row['title'])} AND arid:{mbid}")))
-            if fold(row["title"]) and (match := next((g for g in groups.get("release-groups") or [] if fold(g["title"]) == fold(row["title"])), None)):
+        for mbid in itertools.chain(known, (m for c in artist_names(row["name"]) for m in search_artist(c))):
+            groups = musicbrainz.search("release-group", f"releasegroup:{lucene(row['title'])} AND arid:{mbid}")
+            if fold(row["title"]) and (match := next((g for g in groups if fold(g["title"]) == fold(row["title"])), None)):
                 return match["id"]
         raise LookupError(f"no MusicBrainz album {row['title']!r} by {row['name']}")
-
-    def search_artist(self, db, name: str) -> list[str]:
-        """Artists named so, by name or alias: exact matches only, case, accents and punctuation aside."""
-        if not fold(name):
-            return []
-        found = musicbrainz.get(SEARCH.format("artist", urllib.parse.quote(lucene(name)))).get("artists") or []
-        return [a["id"] for a in found if fold(name) in {fold(a["name"]), *(fold(x["name"]) for x in a.get("aliases") or [])}]
 
     def release(self, db, item):
         """Nobody wants it any more: oasis stops looking for it. Files stay."""
@@ -279,16 +327,16 @@ class Acquire:
             db.execute("update want_item set catalogued = null where kind = 'artist' and mbid = ?", (row[0],))  # back, if followed
 
     def browse(self, db, mbid: str) -> list[dict]:
-        """The artist's albums, EPs and singles with an allowed secondary type (or none)."""
-        return [g for g in release_groups(db, mbid) if g.get("primary-type") in TYPES and set(g.get("secondary-types") or []) <= self.allowed]
+        """The artist's albums, EPs and singles with an allowed secondary type (or none), oldest first."""
+        return [g for g in musicbrainz.by_date(musicbrainz.release_groups(mbid, db)) if set(g.get("secondary-types") or []) <= self.allowed]
 
     def edition(self, db, rg: str) -> dict:
         """The smallest official edition's track count and song keys, and the most discs of any; tracks 0 without one."""
         if row := db.execute("select * from mb_group where rg = ? and fetched > ?", (rg, time.time() - KEEP_EDITIONS)).fetchone():
             return {"tracks": row["tracks"], "discs": row["discs"], "songs": set(json.loads(row["songs"]))}
         # Video discs aren't the album: a DVD-only live edition would be its smallest.
-        found = [media for r in musicbrainz.get(EDITIONS.format(rg)).get("releases") or []
-                 if (media := [m for m in r.get("media") or [] if not VIDEO.search(m.get("format") or "")])]
+        found = [media for r in musicbrainz.official_editions(rg)
+                 if (media := [m for m in r.get("media") or [] if not musicbrainz.VIDEO_MEDIA.search(m.get("format") or "")])]
         count = lambda media: sum(len(m.get("tracks") or []) for m in media)
         smallest = min((r for r in found if count(r)), key=count, default=None)
         songs = {song_key(t["title"]) for m in smallest for t in m.get("tracks") or []} if smallest else set()
@@ -303,7 +351,7 @@ class Acquire:
         another version or a re-release, what has no official release and what a user gave up on.
         Starred albums and albums with files never are, given up or not, and nor are albums and EPs Lidarr looked for
         unless the artist is only a guest on them."""
-        groups = sorted(self.browse(db, item["mbid"]), key=lambda g: g.get("first-release-date") or "9999")
+        groups = self.browse(db, item["mbid"])
         editions = {g["id"]: self.edition(db, g["id"]) for g in groups}
         starred = {r[0] for r in db.execute("select mbid from want_item where kind = 'album' and mbid is not null")}
         looked_for = {r[0] for r in db.execute("select mbid from catalogue_search where mbid is not null")}  # Lidarr's, carried over once
@@ -333,7 +381,7 @@ class Acquire:
         name = (db.execute("select name from mb_artist where mbid = ?", (item["mbid"],)).fetchone() or [None])[0] or \
             next((c["artist"]["name"] for g in groups for c in g.get("artist-credit") or [] if c["artist"]["id"] == item["mbid"]), None)
         given_up = {r[0] for r in db.execute("select rg from given_up")} - starred
-        why.update({rg: "given up" for rg in given_up})
+        why.update({rg: GIVEN_UP for rg in given_up})
         skipped = {g["id"] for g in groups if not kept(g) or g["id"] in given_up}
         for g in (g for g in groups if g["id"] not in skipped):
             self.put(db, g, item["mbid"], name, "starred" if g["id"] in starred else "followed")
@@ -366,7 +414,7 @@ class Acquire:
         for (release,) in db.execute("select distinct mb_release from track where source = 'local' and coalesce(mb_release, '') != '' "
                                      "and mb_release_group is null limit ?", (MAP_RELEASES,)).fetchall():
             try:
-                group = musicbrainz.get(RELEASE.format(release))["release-group"]["id"]
+                group = musicbrainz.release(release)["release-group"]["id"]
             except LookupError:
                 group = ""  # MusicBrainz doesn't have it: not asked again
             except OSError as e:
@@ -378,8 +426,7 @@ class Acquire:
         """have: the library holds as many tracks of the release group as its smallest edition has; downloading: oasis is."""
         active = self.downloads.groups(db)
         for row in db.execute("select w.rg, w.state, coalesce(g.tracks, 0) tracks, (select count(distinct coalesce(t.mb_track, t.id)) from track t "
-                              "where t.mb_release_group = w.rg and t.source = 'local') n from want_album w left join mb_group g on g.rg = w.rg "
-                              ).fetchall():
+                              "where t.mb_release_group = w.rg and t.source = 'local') n from want_album w left join mb_group g on g.rg = w.rg").fetchall():
             state = "downloading" if row["rg"] in active else "have" if row["n"] and row["n"] >= row["tracks"] else "missing"
             if state != row["state"]:
                 db.execute("update want_album set state = ? where rg = ?", (state, row["rg"]))
@@ -403,8 +450,8 @@ class Acquire:
         if self.bundles and self.bundle_next(db):
             return
         now, queued = time.time(), self.downloads.groups(db)
-        bundled = f"and not ({BUNDLE_FIRST} and artist is not null and artist_mbid not in (select artist_mbid from bundle_search where searched > ?))"
-        rows = db.execute(f"select * from want_album w where (state = 'missing' and coalesce(next_search, 0) <= ? {bundled if self.bundles else ''}) or (state = 'have' and "
+        bundled = f"and not {DEFERRED}"
+        rows = db.execute(f"select * from want_album w where ({DUE} {bundled if self.bundles else ''}) or (state = 'have' and "
                           "coalesce(searched, 0) < ? and not exists (select 1 from track t where t.mb_release_group = w.rg and t.source = 'local' "
                           f"and {LOSSLESS_TRACK})) order by state = 'have', searched is not null, reason != 'starred', primary_type = 'Single', "
                           "first_date desc limit 50", (now, *[now - BUNDLE_AGAIN] * self.bundles, now - UPGRADE_AGAIN)).fetchall()
@@ -443,12 +490,12 @@ class Acquire:
                          (time.time() - again,)).fetchone()
         if row is None:
             return False
-        mbid, sent, failed, started = row["artist_mbid"], None, None, time.time()
+        mbid, sent, failed = row["artist_mbid"], Outcome.NOTHING_SENT, None
         try:
             alternatives, queued = other_titles(db, mbid), self.downloads.groups(db)
             wanted = {rg for (rg,) in db.execute("select rg from want_album where artist_mbid = ? and state = 'missing'", (mbid,)) if rg not in queued}
             kept = {g["id"] for g in self.browse(db, mbid)} | wanted  # starred ones of other types too
-            groups = [{**g, "other_titles": alternatives.get(g["id"], [])} for g in release_groups(db, mbid) if g["id"] in kept]
+            groups = [{**g, "other_titles": alternatives.get(g["id"], [])} for g in musicbrainz.release_groups(mbid, db) if g["id"] in kept]
             titles = [g["title"] for g in groups if g["primary-type"] != "Single"]
             names = releases.aliases(db, row["artist"], mbid, titles)
             sent = self.downloads.bundle(db, {"artist": row["artist"], "names": names, "native": releases.native(names), "albums": titles},
@@ -456,41 +503,50 @@ class Acquire:
         except (OSError, LookupError) as e:
             log.warning("bundle search for %s failed: %s", row["artist"], e)
             failed = e
-        now = self.searched(started, sent, failed)
+        now = self.searched(sent, failed)
         # One sent: the next pass, for the rest. TorBox had no free slot, or Prowlarr or MusicBrainz failed: soon again.
-        db.execute("insert or replace into bundle_search values (?, ?)", (mbid, now - BUNDLE_AGAIN if sent else now - BUNDLE_AGAIN + RETRY_FULL if sent is False
-                                                                          else now - BUNDLE_AGAIN + RETRY_ERROR if isinstance(failed, OSError) else now))
+        if sent is Outcome.SENT:
+            searched = now - BUNDLE_AGAIN
+        elif sent is Outcome.NO_SLOT:
+            searched = now - BUNDLE_AGAIN + RETRY_FULL
+        elif isinstance(failed, OSError):
+            searched = now - BUNDLE_AGAIN + RETRY_ERROR
+        else:
+            searched = now
+        db.execute("insert or replace into bundle_search values (?, ?)", (mbid, searched))
         return True
 
     def search(self, db, row, early=False):
         """Never raises: a search Prowlarr or MusicBrainz couldn't answer (OSError) is due again after RETRY_ERROR, not
         counted as a try; the next one moves on to another album meanwhile. An early one leaves the album's backoff
         (tries, next_search) as it was."""
-        error, failed, started = "searched, no release found yet", None, time.time()
+        error, failed = "searched, no release found yet", None
         try:
             sent = self.downloads.find(db, self.target(db, row), row["rg"])
         except (OSError, LookupError) as e:
             log.warning("search for %s - %s failed: %s", row["artist"], row["title"], e)
-            sent, error, failed = None, f"search failed: {e}"[:300], e
-        now = self.searched(started, sent, failed)
+            sent, error, failed = Outcome.NOTHING_SENT, f"{SEARCH_FAILED}{e}"[:300], e
+        now = self.searched(sent, failed)
+        if sent is Outcome.SENT:
+            error = None
         if early:
-            db.execute("update want_album set searched = ?, error = ? where rg = ?", (now, None if sent else error, row["rg"]))
+            db.execute("update want_album set searched = ?, error = ? where rg = ?", (now, error, row["rg"]))
             return
         if isinstance(failed, OSError):  # unreachable, or no indexer to ask: not the album's fault
             db.execute("update want_album set next_search = ?, error = ? where rg = ?", (now + RETRY_ERROR, error, row["rg"]))
             return
-        if sent is False:  # TorBox had no free slot
+        if sent is Outcome.NO_SLOT:
             db.execute("update want_album set next_search = ? where rg = ?", (now + RETRY_FULL, row["rg"]))
             return
         first, most = (SINGLE_RESEARCH, SINGLE_MOST) if row["primary_type"] == "Single" else (RESEARCH, RESEARCH_MOST)
         db.execute("update want_album set searched = ?, tries = tries + 1, next_search = ?, error = ? where rg = ?",
-                   (now, now + min(first * 2 ** row["tries"], most), None if sent else error, row["rg"]))
+                   (now, now + min(first * 2 ** row["tries"], most), error, row["rg"]))
 
-    def searched(self, started: float, sent: bool | None, failed: Exception | None) -> float:
+    def searched(self, sent, failed: Exception | None) -> float:
         """Sets the gap to the next search: SEARCH_GAP after one that asked TorBox to add a torrent (or failed), for its
         rate limit; MISS_GAP after one that found nothing to add. Returns the time."""
         self.last_search = now = time.time()
-        self.gap = MISS_GAP if sent is None and not failed and self.downloads.added < started else SEARCH_GAP
+        self.gap = MISS_GAP if sent is Outcome.NOTHING_SENT and not failed else SEARCH_GAP
         return now
 
     def target(self, db, row) -> dict:
@@ -502,8 +558,8 @@ class Acquire:
         except (OSError, LookupError):
             groups = db.execute("select title, primary_type, first_date from want_album where artist_mbid = ? and rg != ?", (row["artist_mbid"], row["rg"])).fetchall()
         others = [t for t, kind, _ in groups if kind != "Single"]
-        same = "".join(releases.words(row["title"]))
-        namesakes = [{"type": kind, "year": (date or "")[:4]} for t, kind, date in groups if "".join(releases.words(t)) == same]
+        same = releases.squashed(row["title"])
+        namesakes = [{"type": kind, "year": (date or "")[:4]} for t, kind, date in groups if releases.squashed(t) == same]
         names = releases.aliases(db, row["artist"], row["artist_mbid"], [row["title"], *others])
         discs = (db.execute("select discs from mb_group where rg = ?", (row["rg"],)).fetchone() or [1])[0]
         try:
@@ -514,9 +570,6 @@ class Acquire:
         return {"artist": row["artist"], "names": names, "title": row["title"], "other_titles": alternatives, "year": (row["first_date"] or "")[:4],
                 "native": releases.native(names), "discs": discs, "others": others, "upgrade": row["state"] == "have",
                 "type": row["primary_type"], "namesakes": namesakes}
-
-    def still_to_find(self, db) -> int:
-        return db.execute("select count(*) from want_album where state = 'missing'").fetchone()[0]
 
 
 def artist_names(credit: str) -> list[str]:
@@ -537,11 +590,6 @@ def guest(group: dict, mbid: str) -> bool:
         if GUEST.search(credit.get("joinphrase") or ""):
             return True
     return False
-
-
-def song_key(title: str) -> str:
-    """'Du hast (Remastered 2017)', 'Du Hast - Live' -> 'duhast'."""
-    return fold(re.sub(r"\s+-\s+.*$", "", re.sub(r"\s*[(\[][^)\]]*[)\]]", "", title)))
 
 
 def set_state(db, item, state: str, error: str | None, retry: float | None = None):

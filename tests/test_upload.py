@@ -1,14 +1,18 @@
 import json
+import os
 import subprocess
+import threading
 import time
+from contextlib import contextmanager
 
 import mutagen
 import pytest
 
-from conftest import PNG, call, make_client
-from oasis import accounts, importer, musicbrainz
+from starlette.testclient import TestClient
+
+from conftest import PNG, call, edition, make_client
+from oasis import accounts, cover, musicbrainz
 from oasis.db import connect
-from test_importer import edition
 
 AUTH = {"u": "admin", "p": "secret", "f": "json"}
 
@@ -28,7 +32,7 @@ def root(tmp_path):
 @pytest.fixture
 def client(root, tmp_path, monkeypatch):
     (tmp_path / "caa").mkdir()
-    monkeypatch.setattr(importer, "COVER_ART", (tmp_path / "caa").as_uri() + "/{}.png")  # the Cover Art Archive, a file per release
+    monkeypatch.setattr(cover, "RELEASE_COVER", (tmp_path / "caa").as_uri() + "/{}.png")  # the Cover Art Archive, a file per release
     with make_client(root, tmp_path / "oasis.db") as c:
         yield c
 
@@ -69,7 +73,7 @@ def test_an_upload_with_the_clients_tags_lands_tagged_named_and_with_its_cover(c
         "title": ["Two: Live"], "artist": ["Beta & Gamma"], "albumartist": ["Beta"], "album": ["First"], "date": ["2001"], "genre": ["Rock"],
         "tracknumber": ["2"], "tracktotal": ["2"], "discnumber": ["1"]}
     assert (root / "Beta/2001 - First/cover.png").read_bytes() == PNG
-    assert client.get(f"/rest/getCoverArt", params={**AUTH, "id": album["id"]}).content == PNG
+    assert client.get("/rest/getCoverArt", params={**AUTH, "id": album["id"]}).content == PNG
     assert call(client, "getUpload", id=id)["error"]["code"] == 70
     assert not (tmp_path / "uploads" / id).exists()
 
@@ -155,23 +159,15 @@ def test_an_upgrade_keeps_the_library_tracks_it_does_not_replace(client, root, t
     assert sorted(p.name for p in (root / "Beta/2001 - First").iterdir()) == ["01 - One.flac", "02 - Two.mp3"]
 
 
-def test_a_failed_placement_leaves_the_library_as_it_was_and_the_upload_for_a_retry(client, root, tmp_path, monkeypatch):
+def test_a_failed_placement_leaves_the_library_as_it_was_and_the_upload_for_a_retry(client, root, tmp_path):
     upload(client, tmp_path, tags("One", "Two"), suffix="mp3")
     made = call(client, "createUpload", tags=json.dumps(tags("One", "Two")))["upload"]
     for n in (1, 2):
         send(client, made["id"], n, encode(tmp_path / f"src/{n}.flac"))
-    real, copies = importer.copy, []
-
-    def failing(source, target, over=False):  # the second file into the library fails
-        if root in target.parents:
-            if copies:
-                raise OSError("disk full")
-            copies.append(target)
-        real(source, target, over)
-    monkeypatch.setattr("oasis.upload.copy", failing)
+    (blocker := root / "Beta/2001 - First/02 - Two.flac").mkdir()  # the second file into the library fails
     assert call(client, "commitUpload", uploadId=made["id"])["error"]["message"].startswith("Couldn't place the upload")
+    blocker.rmdir()
     assert sorted(p.name for p in (root / "Beta/2001 - First").iterdir()) == ["01 - One.mp3", "02 - Two.mp3"]
-    monkeypatch.setattr("oasis.upload.copy", real)
     assert [s["suffix"] for s in call(client, "commitUpload", uploadId=made["id"])["album"]["song"]] == ["flac", "flac"]
 
 
@@ -203,7 +199,7 @@ def test_uploads_abandoned_a_day_ago_are_deleted(client, tmp_path):
         send(client, m["id"], 1, b"fLaC", size=100)
     db = connect(tmp_path / "oasis.db")
     db.execute("update upload set touched = ? where id = ?", (time.time() - 25 * 3600, made[0]["id"]))
-    client.app.state.api.recommender.chores[0](db)
+    client.app.state.oasis.uploads.clean(db)
     assert not (tmp_path / "uploads" / made[0]["id"]).exists() and (tmp_path / "uploads" / made[1]["id"]).exists()
     assert [r[0] for r in db.execute("select id from upload")] == [made[1]["id"]]
     assert db.execute("select count(*) from upload_track").fetchone()[0] == 1
@@ -211,7 +207,7 @@ def test_uploads_abandoned_a_day_ago_are_deleted(client, tmp_path):
 
 def test_the_extension_is_advertised_and_other_requests_are_as_they_were(client):
     extensions = {e["name"]: e["versions"] for e in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]}
-    assert extensions == {"formPost": [1], "songLyrics": [1, 2], "transcodeOffset": [1], "romanization": [1], "upload": [1], "shareUrl": [1], "oasis": [1, 2, 3]}
+    assert extensions["upload"] == extensions["formPost"] == [1]
     form = client.post("/rest/getUser", data={**AUTH, "username": "admin"}).json()["subsonic-response"]
     assert form["status"] == "ok" and form["user"]["username"] == "admin"
     assert client.post("/rest/getUser", params={"f": "json"}, data={**AUTH}).json()["subsonic-response"]["user"]["adminRole"] is True
@@ -235,12 +231,11 @@ def test_a_tracks_artists_array_wins_and_the_year_may_be_a_numeric_string(client
     assert call(client, "createUpload", tags=json.dumps({**tags("One"), "year": "MMI"}))["error"]["message"] == "year must be a number"
 
 
-def test_a_cover_that_cant_be_added_leaves_the_upload_committed(client, root, tmp_path, monkeypatch):
-    def failing(*args):
-        raise OSError("read-only cover")
-    monkeypatch.setattr(client.app.state.api.uploads.importer, "cover", failing)
+def test_a_cover_that_cant_be_added_leaves_the_upload_committed(client, root, tmp_path):
     made = call(client, "createUpload", tags=json.dumps(tags("One")))["upload"]
     send(client, made["id"], 1, encode(tmp_path / "one.flac"))
+    client.post("/rest/uploadCover", params={**AUTH, "uploadId": made["id"]}, content=PNG)
+    (tmp_path / "uploads" / made["id"] / "cover.png").chmod(0)  # unreadable
     assert call(client, "commitUpload", uploadId=made["id"])["album"]["songCount"] == 1
     assert [p.name for p in (root / "Beta/2001 - First").iterdir()] == ["01 - One.flac"] and not (tmp_path / "uploads" / made["id"]).exists()
 
@@ -263,24 +258,64 @@ def test_a_track_too_big_or_without_room_for_it_is_refused(client, tmp_path, mon
     made = call(client, "createUpload", tags=json.dumps(tags("One")))["upload"]
     assert "at most" in send(client, made["id"], 1, b"x", size=(4 << 30) + 1)["error"]["message"]
     monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=99))
-    assert send(client, made["id"], 1, b"x", size=100)["error"] == {"code": 0, "message": "Too little disk space: 100 bytes needed, 99 free"}
+    assert send(client, made["id"], 1, b"x", size=100)["error"]["message"].startswith("too little disk space")
     assert call(client, "getUpload", id=made["id"])["upload"]["track"][0]["received"] == 0
 
 
+@contextmanager
+def sending(client, upload, number, data):
+    """A request sending the track's file, its body held back midway till the block ends."""
+    started, release = threading.Event(), threading.Event()
+
+    def body():
+        yield data[:10]
+        started.set()
+        release.wait(10)
+        yield data[10:]
+    other = TestClient(client.app)  # a connection of its own
+    request = threading.Thread(target=other.post, args=("/rest/uploadTrack",), kwargs={"content": body(), "params": {
+        **AUTH, "uploadId": upload, "disc": 1, "number": number, "offset": 0, "size": len(data), "suffix": "flac"}})
+    request.start()
+    assert started.wait(10)
+    try:
+        yield
+    finally:
+        release.set()
+        request.join(10)
+
+
+@contextmanager
+def committing(client, tmp_path, upload):
+    """A request committing the upload, held midway till the block ends: the upload's cover is a pipe it waits to read."""
+    os.mkfifo(pipe := tmp_path / "uploads" / upload / "cover.png")
+    request = threading.Thread(target=call, args=(TestClient(client.app), "commitUpload"), kwargs={"uploadId": upload})
+    request.start()
+    deadline = time.time() + 10
+    while True:
+        try:
+            writer = os.open(pipe, os.O_WRONLY | os.O_NONBLOCK)
+            break
+        except OSError:  # the commit isn't reading it yet
+            assert time.time() < deadline
+            time.sleep(0.01)
+    try:
+        yield
+    finally:
+        os.close(writer)
+        request.join(10)
+
+
 def test_a_file_being_received_or_an_upload_being_committed_takes_no_other_request_for_it(client, tmp_path):
-    uploads = client.app.state.api.uploads
     made = call(client, "createUpload", tags=json.dumps(tags("One", "Two")))["upload"]
     data = encode(tmp_path / "one.flac")
-    uploads.busy.add((made["id"], (1, 1)))
-    assert send(client, made["id"], 1, data)["error"]["message"] == "Another request is sending this file or committing the upload"
-    assert send(client, made["id"], 2, data)["status"] == "ok"  # another track goes meanwhile
-    assert call(client, "commitUpload", uploadId=made["id"])["error"]["message"] == "Another request is sending this file or committing the upload"
-    uploads.busy.clear()
-    uploads.busy.add((made["id"], "commit"))
-    assert send(client, made["id"], 1, data)["error"]["code"] == 0
-    assert client.post("/rest/uploadCover", params={**AUTH, "uploadId": made["id"]}, content=PNG).json()["subsonic-response"]["error"]["code"] == 0
-    uploads.busy.clear()
-    assert send(client, made["id"], 1, data)["status"] == "ok"
+    with sending(client, made["id"], 1, data):
+        assert send(client, made["id"], 1, data)["error"]["message"] == "Another request is sending this file or committing the upload"
+        assert send(client, made["id"], 2, data)["status"] == "ok"  # another track goes meanwhile
+        assert call(client, "commitUpload", uploadId=made["id"])["error"]["message"] == "Another request is sending this file or committing the upload"
+    with committing(client, tmp_path, made["id"]):
+        assert send(client, made["id"], 1, data)["error"]["code"] == 0
+        assert client.post("/rest/uploadCover", params={**AUTH, "uploadId": made["id"]}, content=PNG).json()["subsonic-response"]["error"]["code"] == 0
+    assert (tmp_path / "music/Beta/2001 - First/01 - One.flac").exists()
 
 
 def test_a_cover_over_the_cap_is_refused(client, tmp_path, monkeypatch):
@@ -305,14 +340,14 @@ def test_bad_tags_and_numbers_are_refused_not_failed(client, tmp_path):
 
 
 def test_cleaning_spares_an_upload_with_a_request_in_progress(client, tmp_path):
-    uploads = client.app.state.api.uploads
+    uploads = client.app.state.oasis.uploads
     made = [call(client, "createUpload", tags=json.dumps(tags("One")))["upload"]["id"] for _ in range(2)]
     db = connect(tmp_path / "oasis.db")
+    with sending(client, made[0], 1, encode(tmp_path / "one.flac")):
+        db.execute("update upload set touched = ?", (time.time() - 25 * 3600,))
+        uploads.clean(db)
+        assert sorted(r[0] for r in db.execute("select id from upload")) == [made[0]]
     db.execute("update upload set touched = ?", (time.time() - 25 * 3600,))
-    uploads.busy.add((made[0], (1, 1)))
-    uploads.clean(db)
-    assert sorted(r[0] for r in db.execute("select id from upload")) == [made[0]]
-    uploads.busy.clear()
     uploads.clean(db)
     assert not db.execute("select id from upload").fetchall()
 

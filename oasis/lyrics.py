@@ -6,6 +6,7 @@ import html
 import json
 import logging
 import re
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -13,13 +14,16 @@ import urllib.request
 import zlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import mutagen
 
 from . import romanize
 from .romanize import U
+from .text import fold
+from .tracks import SAME_SONG_SECONDS, outside_names
+from .youtube import video_of
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +33,7 @@ WORD_TIME = re.compile(r"<(\d+):(\d+(?:[.:]\d+)?)>")
 # under 0.1, a different song in the same language around 0.3 (measured for roma).
 SAME_LYRICS = 0.6
 TIMEOUT = 5
+MISS_KEPT = 86400  # seconds a track no provider had lyrics for is left before asking again
 
 
 @dataclass
@@ -152,7 +157,6 @@ def timed(source: str, rows: list, word_level: bool) -> Lyrics:
 class Query:
     title: str
     artist: str
-    album: str | None
     duration: int
 
 
@@ -234,12 +238,8 @@ def cleaned(found: Lyrics, query: "Query") -> Lyrics:
     return found
 
 
-# Matching
-
 def fold_title(s: str) -> str:
-    s = "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c)).lower()
-    s = re.sub(r"[(\[（【].*?[)\]）】]", "", s)
-    return re.sub(r"[\s\W_]+", "", s)
+    return fold(re.sub(r"[(\[（【].*?[)\]）】]", "", unicodedata.normalize("NFKD", s)))
 
 
 def same_title(a: str, b: str) -> bool:
@@ -249,10 +249,10 @@ def same_title(a: str, b: str) -> bool:
 
 
 def closest(items: list, duration: int, duration_of):
-    """The candidate whose length is closest, within 5 s when the song's length is known."""
+    """The candidate whose length is closest, within SAME_SONG_SECONDS when the song's length is known."""
     if duration <= 0:
         return items[0] if items else None
-    near = [i for i in items if abs(duration_of(i) - duration) <= 5]
+    near = [i for i in items if abs(duration_of(i) - duration) <= SAME_SONG_SECONDS]
     return min(near, key=lambda i: abs(duration_of(i) - duration), default=None)
 
 
@@ -450,3 +450,41 @@ def find(query: Query, youtube=None) -> Lyrics | None:
     others = [cleaned(found, query) for job, name in jobs.items() if (found := result(job, name))]
     ytm = result(ytm_job, "YouTube Music") if ytm_job else None
     return choose(cleaned(ytm, query) if ytm else None, others)
+
+
+def youtube_music(db, ytm, r):
+    """A YouTube Music provider for find: the track's own lyrics there, by its video or the same song's. None when
+    YouTube Music has no such song."""
+    try:
+        video_id = video_of(db, r, ytm)
+    except Exception as e:
+        log.info("YouTube Music match for %s failed: %s", r["id"], e)
+        return None
+
+    def youtube():
+        found = ytm.lyrics(video_id)
+        if found is None:
+            return None
+        return Lyrics(found["source"], found["lines"], found["synced"])
+    return youtube if video_id else None
+
+
+def for_track(db, r, ytm=None) -> Lyrics | None:
+    """The song's lines, with the translations a file or provider merged into them taken out (separate): files, and
+    lyrics cached before oasis did that, still have them in."""
+    found = found_for_track(db, r, ytm)
+    return separate(found) if found else None
+
+
+def found_for_track(db, r, ytm=None) -> Lyrics | None:
+    """The track's own lyrics first; otherwise the providers' pick, cached in the lyrics table (misses for MISS_KEPT)."""
+    if r["source"] == "local" and (found := local(r["ref"])):
+        return found
+    cached = db.execute("select found, fetched from lyrics where track_id = ?", (r["id"],)).fetchone()
+    if cached and (cached["found"] or cached["fetched"] > time.time() - MISS_KEPT):
+        return Lyrics(**json.loads(cached["found"])) if cached["found"] else None
+    artist, _ = outside_names(r)
+    found = find(Query(r["title"], artist, r["duration"] or 0), youtube_music(db, ytm, r) if ytm else None)
+    db.execute("insert or replace into lyrics values (?, ?, ?)",
+               (r["id"], json.dumps(asdict(found)) if found else None, time.time()))
+    return found

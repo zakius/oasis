@@ -1,12 +1,18 @@
-"""The few TorBox API calls oasis needs. TorBox downloads torrents on its own servers, and seeds there as oasis asks
-(each indexer's seeding mode, see download.py); nothing seeds or uploads from here."""
+"""The few TorBox API calls oasis needs, with the account's key, which rdtclient holds. TorBox downloads torrents on
+its own servers, and seeds there as oasis asks (each indexer's seeding mode, see download.py); nothing seeds or uploads
+from here."""
 import json
+import os
+import shutil
+import sqlite3
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 
 API = "https://api.torbox.app/v1/api/"
+CHECK_AT_ONCE = 100  # hashes TorBox checks in one call
 
 
 class RateLimited(OSError):
@@ -37,14 +43,16 @@ class TorBox:
         return self.call("torrents/mylist?bypass_cache=true") or []
 
     def cached(self, hashes: list[str]) -> set[str]:
-        """Of these hashes (at most 100), the ones TorBox has cached and would download at once."""
-        found = self.call("torrents/checkcached?format=list&list_files=false&hash=" + ",".join(hashes)) if hashes else None
-        return {c["hash"].lower() for c in found or []}
+        """Of these hashes, the ones TorBox has cached and would download at once."""
+        return set(self.cached_files(hashes, files=False))
 
-    def cached_files(self, hashes: list[str]) -> dict[str, list[dict]]:
-        """Of these hashes (at most 100), the ones TorBox has cached, with their files: {hash: [{name, size}]}."""
-        found = self.call("torrents/checkcached?format=list&list_files=true&hash=" + ",".join(hashes)) if hashes else None
-        return {c["hash"].lower(): c.get("files") or [] for c in found or []}
+    def cached_files(self, hashes: list[str], files: bool = True) -> dict[str, list[dict]]:
+        """Of these hashes, the ones TorBox has cached, with their files: {hash: [{name, size}]}; files False leaves
+        those out."""
+        found = []
+        for i in range(0, len(hashes), CHECK_AT_ONCE):
+            found += self.call(f"torrents/checkcached?format=list&list_files={str(files).lower()}&hash=" + ",".join(hashes[i:i + CHECK_AT_ONCE])) or []
+        return {c["hash"].lower(): c.get("files") or [] for c in found}
 
     def add(self, name: str, magnet: str | None = None, torrent: bytes | None = None, mode: str = "off") -> dict:
         """Adds a magnet link or .torrent file: {torrent_id, hash}, or {queued_id, hash} when no active slot was free.
@@ -66,6 +74,30 @@ class TorBox:
 
     def delete_queued(self, queued_id: int):
         self.call("queued/controlqueued", {"queued_id": queued_id, "operation": "delete"})
+
+
+def active(torrents: list[dict]) -> int:
+    """How many of the account's torrents (TorBox.torrents) take one of the plan's active slots."""
+    return sum(bool(t["active"]) for t in torrents)
+
+
+def read_copy(path: str, sql: str, params=()) -> list:
+    """Reads another app's SQLite database from a copy, so its own writes never wait on us and it is never written."""
+    with tempfile.TemporaryDirectory() as tmp:
+        for suffix in ("", "-wal"):
+            if os.path.exists(path + suffix):
+                shutil.copy(path + suffix, os.path.join(tmp, "db" + suffix))
+        db = sqlite3.connect(os.path.join(tmp, "db"))
+        try:
+            return db.execute(sql, params).fetchall()
+        finally:
+            db.close()
+
+
+def from_rdtclient(rdt_db: str, make=TorBox):
+    """A client (make(key)) with the TorBox key rdtclient's database holds; None while it holds none."""
+    rows = read_copy(rdt_db, "select Value from Settings where SettingId = 'Provider:ApiKey'")
+    return make(rows[0][0]) if rows and rows[0][0] else None
 
 
 def multipart(fields: dict, boundary: str) -> bytes:

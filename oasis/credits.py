@@ -6,24 +6,16 @@ behind it. Missing tags are written into the files, so other players see the sam
 Files without MusicBrainz ids get their credits from their own tags."""
 import json
 import logging
-import threading
 import time
 
-import mutagen
-from mutagen._vorbis import VCommentDict
-
-from . import artists, latin, musicbrainz
-from .db import artist_id
-from .dedupe import retagged, same_audio
+from . import musicbrainz
+from .tracks import artist_id
+from .audiorecords import retagged, same_audio
+from .tags import write_tags
 
 log = logging.getLogger(__name__)
 
-MUSICBRAINZ = "https://musicbrainz.org/ws/2/release/{}?fmt=json&inc=artist-credits+recordings+isrcs+labels+genres+" \
-              "release-groups+artist-rels+recording-level-rels+work-rels+work-level-rels"
-MUSICBRAINZ_ARTIST = "https://musicbrainz.org/ws/2/artist/{}?fmt=json&inc=aliases+artist-rels"
-RETRY = 30, 600       # seconds before retrying after MusicBrainz errors (503 when busy): first, doubling up to the last
-IDLE = 300            # seconds between looks for new releases when nothing woke the worker
-NOT_FOUND = -1        # credits_at for releases MusicBrainz doesn't have
+NOT_FOUND = -1  # credits_at for releases MusicBrainz doesn't have
 
 # MusicBrainz relationship -> role, for recordings, works and whole releases.
 ROLES = {"vocal": "performer", "instrument": "performer", "performer": "performer", "performing orchestra": "performer",
@@ -31,11 +23,6 @@ ROLES = {"vocal": "performer", "instrument": "performer", "performer": "performe
          "sound": "engineer", "programming": "performer", "remixer": "remixer", "arranger": "arranger",
          "instrument arranger": "arranger", "vocal arranger": "arranger", "orchestrator": "arranger",
          "composer": "composer", "lyricist": "lyricist", "writer": "writer", "librettist": "lyricist"}
-# Role -> tag written into files (Picard's names); performers go to PERFORMER as "Name (instrument)".
-TAGS = {"composer": "COMPOSER", "lyricist": "LYRICIST", "writer": "WRITER", "arranger": "ARRANGER", "conductor": "CONDUCTOR",
-        "producer": "PRODUCER", "mixer": "MIXER", "engineer": "ENGINEER", "remixer": "REMIXER", "performer": "PERFORMER"}
-
-
 def credit(role, name, artist, position=0, sub_role=None, joinphrase=None) -> dict:
     """`name` as credited, `artist` the MusicBrainz artist (id, canonical name, type) when known."""
     artist = artist or {}
@@ -90,141 +77,41 @@ def release_metadata(data: dict) -> tuple[dict, dict]:
     return release, tracks
 
 
-def dedupe_credits(credits: list[dict]) -> list[dict]:
+def same_credit(c: dict) -> tuple:
+    """What makes two credits one, as files are tagged: the role, sub-role and artist, by MusicBrainz id, else by name."""
+    return c["role"], c["sub_role"], c["mbid"] or c["artist_name"].casefold()
+
+
+def same_listed_credit(c: dict) -> tuple:
+    """What makes two stored credits one in a listing: the role, sub-role and oasis artist, which a name without a
+    MusicBrainz id shares with the MusicBrainz artist of that name."""
+    return c["role"], c["sub_role"], c["artist_id"]
+
+
+def dedupe_credits(credits: list[dict], key=same_credit) -> list[dict]:
     seen, out = set(), []
     for c in credits:
-        key = (c["role"], c["sub_role"], c["mbid"] or c["artist_name"].casefold())
-        if key not in seen:
-            seen.add(key)
+        key_of = key(c)
+        if key_of not in seen:
+            seen.add(key_of)
             out.append(c)
     return out
 
 
-def tag_credits(tags) -> list[dict]:
-    """Credits from a file's own tags, for files MusicBrainz knows nothing about."""
-    if tags is None:
-        return []
-    get = lambda key: [str(v) for v in (tags.get(key) or [])] if key in tags else []
-    found = []
-    artists = get("artists") or get("artist")
-    found += [credit("artist", name, None, i) for i, name in enumerate(artists)]
-    found += [credit("albumartist", name, None, i) for i, name in enumerate(get("albumartist"))]
-    for role, tag in TAGS.items():
-        if role == "performer":
-            continue
-        found += [credit(role, name, None, i) for i, name in enumerate(get(tag.lower()))]
-    return dedupe_credits(found)
-
-
-def write_tags(path: str, fields: dict, credits: list[dict]) -> bool:
-    """Adds what the file lacks (Vorbis comments: FLAC, Ogg), never removing a value; returns whether it changed."""
-    audio = mutagen.File(path)
-    if audio is None or not isinstance(audio.tags, VCommentDict):
+def step(db) -> bool:
+    """Fills one release that arrived in the library; whether there was one. OSError: MusicBrainz is away."""
+    row = db.execute("select mb_release from track where source = 'local' and mb_release is not null "
+                     "and credits_at is null limit 1").fetchone()
+    if row is None:
         return False
-    tags = audio.tags
-    by_role = {}
-    for c in credits:
-        by_role.setdefault(c["role"], []).append(c)
-    wanted = {"ARTISTS": [c["name"] for c in by_role.get("artist", [])],
-              "ISRC": (fields.get("isrc") or "").split("; ") if fields.get("isrc") else [],
-              "LABEL": fields["label"].split("; ") if fields.get("label") else [],
-              "GENRE": json.loads(fields.get("genres") or "[]"),
-              "ORIGINALDATE": [fields["original_date"]] if fields.get("original_date") else []}
-    for role, tag in TAGS.items():
-        people = by_role.get(role, [])
-        wanted[tag] = [f"{c['name']} ({c['sub_role']})" if role == "performer" and c["sub_role"] else c["name"] for c in people]
-    changed = False
-    for tag, values in wanted.items():
-        values = list(dict.fromkeys(v for v in values if v))
-        have = tags.get(tag) or []
-        # Only adds: an empty tag is filled, and one holding nothing but values from here gains the rest; a tag with
-        # anything else in it (someone's own edit) stays as it is.
-        if set(have) < set(values):
-            tags[tag] = [*have, *(v for v in values if v not in have)]
-            changed = True
-    if not changed:
-        return False
-    audio.save()
+    release = row["mb_release"]
+    try:
+        data = musicbrainz.release_credits(release)
+    except LookupError:
+        db.execute("update track set credits_at = ? where mb_release = ?", (NOT_FOUND, release))
+        return True
+    apply(db, data)
     return True
-
-
-class Credits:
-    """Fills credits for releases that arrived in the library, one MusicBrainz request at a time."""
-
-    def __init__(self, connect, fetch=None, fetch_artist=None, fetch_latin=None):
-        """fetch_latin: latin.step's, for tests; else MusicBrainz through mb_cache."""
-        self.connect, self.fetch, self.fetch_artist, self.fetch_latin = connect, fetch or fetch_release, fetch_artist or fetch_artist_data, fetch_latin
-        self.wake = threading.Event()
-        self.retry = RETRY[0]
-
-    def start(self):
-        threading.Thread(target=self.run, daemon=True).start()
-
-    def run(self):
-        while True:
-            wait = IDLE
-            try:
-                while self.step():
-                    pass
-                self.unify()
-            except OSError as e:
-                log.warning("MusicBrainz: %s; again in %d s", e, self.retry)
-                wait, self.retry = self.retry, min(self.retry * 2, RETRY[1])
-            except Exception:
-                log.exception("credits failed")
-            self.wake.wait(wait)
-            self.wake.clear()
-
-    def unify(self):
-        """Spellings of artist names that came in since: one artist each (artists.unify)."""
-        db = self.connect()
-        try:
-            artists.unify(db)
-        finally:
-            db.close()
-
-    def step(self) -> bool:
-        """Fills one release, or when all are, one credited artist's names and links; whether there may be more to do."""
-        db = self.connect()
-        try:
-            row = db.execute("select mb_release from track where source = 'local' and mb_release is not null "
-                             "and credits_at is null limit 1").fetchone()
-            if row is None:
-                return self.artist_step(db) or self.latin_step(db)
-            release = row["mb_release"]
-            try:
-                data = self.fetch(release)
-            except LookupError:
-                db.execute("update track set credits_at = ? where mb_release = ?", (NOT_FOUND, release))
-                db.commit()
-                return True
-            apply(db, data)
-            self.retry = RETRY[0]
-            db.commit()
-            return True
-        finally:
-            db.close()
-
-    def latin_step(self, db) -> bool:
-        """Once credits are all read, one artist's or release's Latin names (latin.py)."""
-        if not latin.step(db, self.fetch_latin):
-            return False
-        self.retry = RETRY[0]
-        db.commit()
-        return True
-
-    def artist_step(self, db) -> bool:
-        row = db.execute("select mbid from mb_artist where fetched is null and mbid in (select mbid from credit) limit 1").fetchone()
-        if row is None:
-            return False
-        try:
-            artists.learn(db, self.fetch_artist(row["mbid"]))
-        except LookupError:
-            db.execute("update mb_artist set fetched = ? where mbid = ?", (NOT_FOUND, row["mbid"]))
-        artists.merge(db)
-        self.retry = RETRY[0]
-        db.commit()
-        return True
 
 
 def apply(db, data: dict):
@@ -255,16 +142,16 @@ def apply(db, data: dict):
 PERFORMANCE_ROLES = {"performer", "conductor", "producer", "mixer", "engineer", "remixer", "arranger", "composer", "lyricist", "writer"}
 
 
-def performance_credits(db, path: str, credits: list[dict]) -> list[dict]:
+def performance_credits(db, path: str, credits: list[dict], key=same_credit) -> list[dict]:
     """`credits` plus what MusicBrainz credits on other releases of the same audio (dedupe's matches): one
-    performance entered twice and never merged gets the union of both entries' credits."""
+    performance entered twice and never merged gets the union of both entries' credits. key: see dedupe_credits."""
     others = same_audio(db, path)
     if not others:
         return credits
     rows = db.execute(f"select c.* from credit c join track t on t.id = c.track_id where c.source = 'musicbrainz' and t.ref in "
                       f"({','.join('?' * len(others))}) order by c.position", others).fetchall()
     shared = [dict(r) for r in rows if r["role"] in PERFORMANCE_ROLES]
-    return dedupe_credits(credits + shared)
+    return dedupe_credits(credits + shared, key)
 
 
 def retag(db, path: str, fields: dict, credits: list[dict]):
@@ -283,9 +170,26 @@ def store(db, track_id: str, credits: list[dict], source: str):
                      c["position"], c["joinphrase"], source) for c in credits])
 
 
-def fetch_release(mbid: str) -> dict:
-    return musicbrainz.get(MUSICBRAINZ.format(mbid))
+def credits_of(db, track_ids: list[str]) -> dict[str, list[dict]]:
+    """Each track's credits: MusicBrainz's when it has them, else the file's tags; plus the performance credits
+    MusicBrainz has for other releases of the same audio (performance_credits)."""
+    marks = ",".join("?" * len(track_ids))
+    found = {}
+    for r in db.execute(f"select * from credit where track_id in ({marks}) order by position", track_ids):
+        found.setdefault(r["track_id"], {}).setdefault(r["source"], []).append(dict(r))
+    mine = {}
+    for id, ref in db.execute(f"select id, ref from track where id in ({marks})", track_ids):
+        sources = found.get(id, {})
+        credits = performance_credits(db, ref, sources.get("musicbrainz") or sources.get("tags", []), same_listed_credit)
+        if credits:
+            mine[id] = credits
+    return mine
 
 
-def fetch_artist_data(mbid: str) -> dict:
-    return musicbrainz.get(MUSICBRAINZ_ARTIST.format(mbid))
+def people(credits, role: str) -> tuple[list[dict], str | None]:
+    """The artists of a role, and how they read together ('A feat. B')."""
+    rows = [c for c in credits if c["role"] == role]
+    if not rows:
+        return [], None
+    joined = "".join(c["name"] + (c["joinphrase"] or "") for c in rows) if any(c["joinphrase"] for c in rows) else ", ".join(c["name"] for c in rows)
+    return [{"id": c["artist_id"], "name": c["name"]} for c in rows], joined

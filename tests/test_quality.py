@@ -4,23 +4,11 @@ import time
 import pytest
 from mutagen.flac import FLAC, Picture
 
-from oasis import quality
+from conftest import ffmpeg, lossy, make_client, music, sign_in
+from oasis import acquire, audiorecords, library, quality
+from oasis.config import Prowlarr, TorBox
 from oasis.db import connect
 from oasis.scan import scan
-from test_accounts import sign_in
-from conftest import make_client
-
-
-def ffmpeg(*args):
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-nostdin", *map(str, args)], check=True)
-
-
-def music(path, rate=44100, seconds=10, fmt="s16", *more):
-    """Pink noise swelling and fading, as music's level does: content up to the file's Nyquist frequency."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ffmpeg("-f", "lavfi", "-i", f"anoisesrc=d={seconds}:c=pink:r={rate}:a=0.3,volume='0.6+0.4*sin(t)':eval=frame", "-ac", "2", *more,
-           "-sample_fmt", fmt, "-c:a", "flac", path)
-    return path
 
 
 def padded(path):
@@ -42,24 +30,23 @@ def tagged(path):
 
 
 def metadata(path):
-    return quality.kept(quality.blocks(path)[0])
+    """The FLAC's tags and pictures."""
+    audio = FLAC(path)
+    return sorted(audio.tags), [(p.type, p.mime, p.data) for p in audio.pictures]
 
 
-def lossy(path, tmp_path, bitrate="128k"):
-    music(tmp_path / "source.flac")
-    ffmpeg("-i", tmp_path / "source.flac", "-b:a", bitrate, tmp_path / "source.mp3")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ffmpeg("-i", tmp_path / "source.mp3", "-sample_fmt", "s16", "-c:a", "flac", path)
-    return path
+def samples(path):
+    """The decoded samples, at 32 bits whatever the depth: the same for 16 bits padded to 24 and the 16 bits."""
+    return subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0", "-f", "s32le", "-"], check=True, capture_output=True).stdout
 
 
 def test_a_padded_24_bit_file_becomes_the_16_bit_file_it_is_sample_for_sample(tmp_path):
     path = tagged(padded(tmp_path / "music" / "padded.flac"))
     assert FLAC(path).info.bits_per_sample == 24
-    samples, tags, mode = quality.pcm_hash(path), metadata(path), path.stat().st_mode
+    pcm, tags, mode = samples(path), metadata(path), path.stat().st_mode
     found = quality.act(path, quality.examine(path), shared=False)
     assert (found["verdict"], found["action"], found["was"], found["bits"]) == ("padded", "converted", "24-bit 44.1 kHz", 16)
-    assert FLAC(path).info.bits_per_sample == 16 and quality.pcm_hash(path) == samples
+    assert FLAC(path).info.bits_per_sample == 16 and samples(path) == pcm
     assert metadata(path) == tags and path.stat().st_mode == mode
     assert [p.name for p in path.parent.iterdir()] == ["padded.flac"]  # no temporary files left
 
@@ -92,10 +79,10 @@ def test_an_outlier_is_recompressed_to_the_same_samples_even_without_an_md5_and_
     data = bytearray(path.read_bytes())
     data[8 + 18:8 + 34] = bytes(16)  # STREAMINFO's MD5, which some encoders leave out
     path.write_bytes(data)
-    samples, tags, size = quality.pcm_hash(path), metadata(path), path.stat().st_size
+    pcm, tags, size = samples(path), metadata(path), path.stat().st_size
     found = quality.act(path, quality.examine(path), shared=False)
     assert found["action"] == "recompressed" and found["saved"] == size - path.stat().st_size > size * quality.SMALLER
-    assert quality.pcm_hash(path) == samples and metadata(path) == tags and any(FLAC(path).info.md5_signature.to_bytes(16, "big"))
+    assert samples(path) == pcm and metadata(path) == tags and any(FLAC(path).info.md5_signature.to_bytes(16, "big"))
     before = path.read_bytes()
     assert quality.act(path, quality.examine(path), shared=False)["action"] == "kept" and path.read_bytes() == before
 
@@ -143,17 +130,17 @@ def test_the_backlog_acts_on_each_file_once_and_lists_lossy_sourced_ones_until_t
     assert first["checked"] == 8 and all(p.exists() for p in root.rglob("*.flac"))
     assert {(e["album"], e["lossy"], e["tracks"], e["deleted"]) for e in first["purged"]} == {("2001 - First", 2, 3, 0), ("2002 - Second", 1, 3, 0),
                                                                                               ("Loose", 1, 1, 0)}
-    assert db.execute("select action from audio_quality where path like '%Eight.flac'").fetchone()[0] == "converted"
+    assert audiorecords.findings(db, [str(root / "Beta/2003 - Third/01 - Eight.flac")])[0]["action"] == "converted"
     assert quality.backlog(db)["checked"] == 0  # resumes: nothing changed since
 
-    purged = quality.backlog(db, delete_lossy=True)["purged"]
+    purged = library.check_quality(db, [root], delete_lossy=True)["purged"]
     assert {(e["album"], e["deleted"]) for e in purged} == {("2001 - First", 3), ("2002 - Second", 1), ("Loose", 0)}
     assert not (root / "Beta/2001 - First/03 - Three.flac").exists()  # mostly lossy-sourced: the whole album goes
     assert sorted(p.name for p in (root / "Beta/2002 - Second").iterdir()) == ["01 - Four.flac", "03 - Six.flac"]
     assert (root / "Gamma/Loose/01 - Seven.flac").exists()  # no release group: nothing to get instead
-    assert db.execute("select state, next_search from want_album where rg = 'rg-second'").fetchone()[:] == ("missing", None)
-    assert db.execute("select * from wanted").fetchall()[0][:] == ("admin", "album", "al-mb-rg-first")
-    assert db.execute("select mbid, state from want_item").fetchone()[:] == ("rg-first", "wanted")
+    second = acquire.album(db, "rg-second")
+    assert (second["state"], second["next_search"]) == ("missing", None)
+    assert acquire.wanted_by(db, "album", "rg-first", "admin") == ["al-mb-rg-first"]
 
 
 def test_album_and_song_pages_say_what_the_files_really_hold(tmp_path):
@@ -163,12 +150,13 @@ def test_album_and_song_pages_say_what_the_files_really_hold(tmp_path):
         audio = FLAC(path)
         audio["title"], audio["album"], audio["artist"] = title, "First", "Beta"
         audio.save()
-    with make_client(root, tmp_path / "oasis.db") as client:
-        db = client.app.state.api._db()
+    # The library pages are acquisition's: oasis.toml turns it on.
+    acquisition = {"torbox": TorBox("", downloads=str(tmp_path / "dl")), "prowlarr": Prowlarr("http://127.0.0.1:9", "")}
+    with make_client(root, tmp_path / "oasis.db", **acquisition) as client:
+        db = client.app.state.oasis.connect()
         base = {"cutoff": 21700, "drop": 90.0, "sustained": True, "rate": 96000, "bits": 24, "bits_used": 24, "low_share": 0.9, "borderline": None}
-        quality.store(db, one, base | {"verdict": "upsampled", "source_rate": 44100, "action": "shared"})
-        quality.store(db, two, base | {"verdict": "upsampled", "source_rate": 44100, "action": "resampled", "was": "24-bit 96 kHz"})
-        client.app.state.api.library = True  # the library pages are acquisition's
+        audiorecords.store_finding(db, one, base | {"verdict": "upsampled", "source_rate": 44100, "action": "shared"})
+        audiorecords.store_finding(db, two, base | {"verdict": "upsampled", "source_rate": 44100, "action": "resampled", "was": "24-bit 96 kHz"})
         sign_in(client)
         album_id, song_id = db.execute("select album_id, id from track where title = 'One'").fetchone()
         page = client.get(f"/music/library/album/{album_id}").text

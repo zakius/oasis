@@ -1,6 +1,6 @@
 """The OpenSubsonic extension upload (docs/upload-extension.md): a client sends a ripped CD or an album's files, and
-oasis tags them from a MusicBrainz release or the client's tags, checks them as it checks downloads (quality.py),
-names and places them as the importer does, and adds the cover. An upload's state is in the upload tables, its files
+oasis tags them from a MusicBrainz release or the client's tags, checks, names and places them by the rules a download's
+import follows (place.py), and adds the cover. An upload's state is in the upload tables, its files
 in <database folder>/uploads/<id>/ until it is committed or cancelled, or KEEP after its last request.
 
 A commit is all or nothing: the files are tagged in a staging folder, the library files they replace are renamed
@@ -10,13 +10,11 @@ import logging
 import os
 import re
 import shutil
-import subprocess
 import threading
 import time
 import uuid
 from contextlib import contextmanager, suppress
 from pathlib import Path
-from urllib.parse import quote, quote_plus
 
 import mutagen
 from mutagen.flac import FLAC
@@ -26,25 +24,32 @@ from mutagen.oggflac import OggFLAC
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 
-from . import musicbrainz, quality
-from .db import make_id
-from .importer import AUDIO, KEEP_EDITIONS, Importer, album_folder, copy, joined, lossless, release_folder, tags_for, track_file, write
+from . import musicbrainz, quality, worker
+from .audio import check_decodes
+from .files import NoSpace, copy, need_room
+from .layout import album_folder, edition_file, given_tags, release_folder, tags_for, track_file
+from .place import cover, prepare, record, replaces, same_track
+from .tracks import album_id
 
 log = logging.getLogger(__name__)
 
 KEEP = 86400  # seconds an upload stays after its last request
+CLEAN_EVERY = 600
 MAX_TRACK = 4 << 30  # bytes a track's file may have: 24-bit/192 kHz FLAC of over an hour
-MAX_COVER = 50 << 20  # bytes a cover may have
+MAX_COVER = 50 << 20
+DECODE_TIMEOUT = 600  # seconds a track's decode check may take
 SUFFIXES = {"flac": (FLAC,), "opus": (OggOpus,), "mp3": (MP3,), "m4a": (MP4,), "ogg": (OggVorbis, OggOpus, OggFLAC)}
-DISC = "https://musicbrainz.org/ws/2/discid/{}?inc=artist-credits+recordings+labels&cdstubs=no&fmt=json"
-RELEASE = "https://musicbrainz.org/ws/2/release/{}?inc=media+recordings+artist-credits+labels+release-groups+isrcs&fmt=json"
 
 
 class Refused(Exception):
-    """A request the upload can't take: a Subsonic error code and a message."""
-    def __init__(self, message: str, code: int = 0, duplicate: bool = False):
+    """A request the upload can't take, and why. kind: MISSING for an upload, release, disc or track that isn't there,
+    DUPLICATE for albums the library has already, else None."""
+    def __init__(self, message: str, kind: str | None = None):
         super().__init__(message)
-        self.code, self.duplicate = code, duplicate
+        self.kind = kind
+
+
+MISSING, DUPLICATE = "missing", "duplicate"
 
 
 def is_format(path: Path, suffix: str) -> bool:
@@ -55,14 +60,15 @@ def is_format(path: Path, suffix: str) -> bool:
 
 
 def decodes(path: Path) -> bool:
-    """flac -t for a FLAC when flac is installed, else a decode by ffmpeg that reports no error; without ffmpeg, whether
-    mutagen reads it as its suffix says."""
-    if path.suffix == ".flac" and shutil.which("flac"):
-        return subprocess.run(["flac", "-t", "-s", str(path)], capture_output=True, timeout=600).returncode == 0
-    if shutil.which("ffmpeg"):
-        run = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-f", "null", "-"], capture_output=True, timeout=600)
-        return run.returncode == 0 and not run.stderr.strip()
-    return is_format(path, path.suffix.lstrip("."))
+    """Whether every frame of the file decodes (audio.check_decodes). Without flac and ffmpeg only whether mutagen
+    reads it as its suffix says: an install missing ffmpeg lets through files that don't decode."""
+    try:
+        check_decodes(path, timeout=DECODE_TIMEOUT)
+    except FileNotFoundError:
+        return is_format(path, path.suffix.lstrip("."))
+    except OSError:
+        return False
+    return True
 
 
 def text(value) -> bool:
@@ -70,36 +76,16 @@ def text(value) -> bool:
     return value is None or isinstance(value, str) and "\0" not in value
 
 
-def compact(d: dict) -> dict:
-    return {k: v for k, v in d.items() if v is not None}
-
-
-def disc_track(release: dict, track: dict) -> dict:
-    recording = track.get("recording") or {}
-    length = track.get("length") or recording.get("length")
-    return compact({"number": track["position"], "title": track["title"],
-                    "artist": joined(track.get("artist-credit") or recording.get("artist-credit") or release.get("artist-credit") or []),
-                    "duration": round(length / 1000) if length else None, "musicBrainzId": recording.get("id")})
-
-
-def release_of(release: dict, disc_id: str, count: int | None, cover: str | None) -> dict:
-    """lookupDisc's release: the disc is the medium holding the disc id, else the first with the TOC's track count."""
-    media, labels = release.get("media") or [], [l for l in release.get("label-info") or [] if l.get("label")]
-    medium = next((m for m in media if any(d.get("id") == disc_id for d in m.get("discs") or [])), None) or \
+def disc_of(release: dict, disc_id: str, count: int | None) -> dict:
+    """The release's medium holding the disc id, else the first with the TOC's track count, else the first."""
+    media = release.get("media") or []
+    return next((m for m in media if any(d.get("id") == disc_id for d in m.get("discs") or [])), None) or \
         next((m for m in media if m.get("track-count") == count), None) or (media or [{}])[0]
-    date = release.get("date") or ""
-    return compact({
-        "id": release["id"], "title": release["title"], "artist": joined(release.get("artist-credit") or []),
-        "year": int(date[:4]) if date[:4].isdigit() else None, "date": date or None, "country": release.get("country"),
-        "label": labels[0]["label"]["name"] if labels else None,
-        "catalogNumber": next((l["catalog-number"] for l in labels if l.get("catalog-number")), None),
-        "barcode": release.get("barcode") or None, "discCount": len(media), "discNumber": medium.get("position"), "coverArt": cover,
-        "track": [disc_track(release, t) for t in medium.get("tracks") or []]})
 
 
 class Uploads:
     def __init__(self, connect, root: Path, folder: Path):
-        self.connect, self.importer, self.folder = connect, Importer(connect, root), Path(folder)
+        self.connect, self.root, self.folder = connect, Path(root), Path(folder)
         self.lock = threading.Lock()  # one commit at a time
         self.busy, self.guard = set(), threading.Lock()  # (upload, a (disc, number), "cover" or "commit") in progress, guarded
 
@@ -118,11 +104,12 @@ class Uploads:
             with self.guard:
                 self.busy.discard((id, part))
 
-    def lookup(self, db, disc_id: str, toc: str | None) -> list[dict]:
-        """MusicBrainz's releases with the disc, else (with the TOC) its fuzzy matches; exact matches first."""
+    def lookup(self, db, disc_id: str, toc: str | None) -> list[tuple[dict, dict, str | None]]:
+        """MusicBrainz's releases with the disc, else (with the TOC) its fuzzy matches, exact matches first: each with
+        its medium that is the disc (disc_of) and the library's album of it that has a cover, if any."""
         toc = re.split(r"[\s+]+", toc.strip()) if toc else []
         try:
-            found = musicbrainz.get(DISC.format(quote(disc_id, safe="")) + (f"&toc={quote_plus(' '.join(toc))}" if toc else ""))
+            found = musicbrainz.disc(disc_id, toc)
         except LookupError:
             return []
         except OSError as e:
@@ -130,20 +117,21 @@ class Uploads:
         count = len(toc) - 3 if toc else None
         covers = lambda id: (r := db.execute("select album_id from track where source = 'local' and mb_release = ? and cover is not null limit 1",
                                              (id,)).fetchone()) and r[0]
-        releases = sorted(found.get("releases") or [], key=lambda r: not any(d.get("id") == disc_id for m in r.get("media") or [] for d in m.get("discs") or []))
-        return [release_of(r, disc_id, count, covers(r["id"])) for r in releases]
+        releases = sorted(found, key=lambda r: not any(d.get("id") == disc_id for m in r.get("media") or [] for d in m.get("discs") or []))
+        return [(r, disc_of(r, disc_id, count), covers(r["id"])) for r in releases]
 
-    def create(self, db, user: str, release_id: str | None, disc: int, tags: str | None) -> dict:
+    def create(self, db, user: str, release_id: str | None, disc: int, tags: str | None) -> str:
+        """A new upload's id."""
         if release_id:
             try:
-                release = musicbrainz.get(RELEASE.format(quote(release_id, safe="")), db, KEEP_EDITIONS)
+                release = musicbrainz.release(release_id, db)
             except LookupError:
-                raise Refused("Release not found", 70)
+                raise Refused("Release not found", MISSING)
             except OSError as e:
                 raise Refused(f"MusicBrainz is unreachable: {e}")
             medium = next((m for m in release.get("media") or [] if m["position"] == disc), None)
             if medium is None:
-                raise Refused(f"The release has no disc {disc}", 70)
+                raise Refused(f"The release has no disc {disc}", MISSING)
             slots, release, tags = [(disc, t["position"]) for t in medium["tracks"]], json.dumps(release), None
         else:
             try:
@@ -165,21 +153,19 @@ class Uploads:
         id = uuid.uuid4().hex
         db.execute("insert into upload values (?, ?, ?, ?, ?, ?)", (id, user, release, disc, tags, time.time()))
         db.executemany("insert into upload_track(upload, disc, number) values (?, ?, ?)", [(id, *s) for s in slots])
-        return self.describe(db, user, id, False)
+        return id
 
     def row(self, db, user: str, id: str):
         row = db.execute("select * from upload where id = ? and user = ?", (id, user)).fetchone()
         if row is None:
-            raise Refused("Upload not found", 70)
+            raise Refused("Upload not found", MISSING)
         db.execute("update upload set touched = ? where id = ?", (time.time(), id))
         return row
 
-    def describe(self, db, user: str, id: str, progress: bool = True) -> dict:
+    def tracks(self, db, user: str, id: str) -> list:
+        """The upload's tracks, each with its disc, number, and the bytes received of its size."""
         self.row(db, user, id)
-        tracks = db.execute("select * from upload_track where upload = ? order by disc, number", (id,)).fetchall()
-        return {"id": id, "expires": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + KEEP)), "track": [
-            {"disc": t["disc"], "number": t["number"], **({"received": t["received"], **({"size": t["size"]} if t["size"] is not None else {})}
-                                                         if progress else {})} for t in tracks]}
+        return db.execute("select * from upload_track where upload = ? order by disc, number", (id,)).fetchall()
 
     def receive(self, db, user: str, id: str, disc: int, number: int, offset: int, size: int, suffix: str, body) -> int:
         """Stores the body at offset of the track's file (an earlier offset sends again what follows it); returns the
@@ -191,7 +177,7 @@ class Uploads:
     def store_track(self, db, id: str, disc: int, number: int, offset: int, size: int, suffix: str, body) -> int:
         slot = db.execute("select * from upload_track where upload = ? and disc = ? and number = ?", (id, disc, number)).fetchone()
         if slot is None:
-            raise Refused(f"The upload has no track {disc}-{number}", 70)
+            raise Refused(f"The upload has no track {disc}-{number}", MISSING)
         if suffix not in SUFFIXES:
             raise Refused(f"Suffix '{suffix}' isn't accepted; send one of {', '.join(SUFFIXES)}")
         if not 0 <= offset <= slot["received"]:
@@ -201,8 +187,10 @@ class Uploads:
         if size > MAX_TRACK:
             raise Refused(f"A track may have {MAX_TRACK} bytes at most")
         self.folder.mkdir(parents=True, exist_ok=True)
-        if (free := shutil.disk_usage(self.folder).free) < size - offset:
-            raise Refused(f"Too little disk space: {size - offset} bytes needed, {free} free")
+        try:
+            need_room(self.folder, size - offset)
+        except NoSpace as e:
+            raise Refused(str(e))
         if slot["suffix"] and slot["suffix"] != suffix:
             (self.folder / id / f"{disc}-{number}.{slot['suffix']}").unlink(missing_ok=True)
         path, received = self.folder / id / f"{disc}-{number}.{suffix}", offset
@@ -230,28 +218,26 @@ class Uploads:
     def cover(self, db, user: str, id: str, body):
         """The album's cover, JPEG or PNG; the release's from the Cover Art Archive without it."""
         self.row(db, user, id)
+        folder = self.folder / id
         with self.holding(id, "cover"):
-            self.store_cover(self.folder / id, body)
-
-    def store_cover(self, folder: Path, body):
-        folder.mkdir(parents=True, exist_ok=True)
-        with open(part := folder / "cover.part", "wb") as out:
-            for chunk in body:
-                if out.tell() + len(chunk) > MAX_COVER:
-                    out.close()
-                    part.unlink()
-                    raise Refused(f"A cover may have {MAX_COVER} bytes at most")
-                out.write(chunk)
-        with open(part, "rb") as f:
-            head = f.read(8)
-        suffix = ".jpg" if head.startswith(b"\xff\xd8\xff") else ".png" if head.startswith(b"\x89PNG\r\n\x1a\n") else None
-        if suffix is None:
-            part.unlink()
-            raise Refused("The cover isn't a JPEG or PNG image")
-        for old in folder.glob("cover.*"):
-            if old != part:
-                old.unlink()
-        part.rename(folder / f"cover{suffix}")
+            folder.mkdir(parents=True, exist_ok=True)
+            with open(part := folder / "cover.part", "wb") as out:
+                for chunk in body:
+                    if out.tell() + len(chunk) > MAX_COVER:
+                        out.close()
+                        part.unlink()
+                        raise Refused(f"A cover may have {MAX_COVER} bytes at most")
+                    out.write(chunk)
+            with open(part, "rb") as f:
+                head = f.read(8)
+            suffix = ".jpg" if head.startswith(b"\xff\xd8\xff") else ".png" if head.startswith(b"\x89PNG\r\n\x1a\n") else None
+            if suffix is None:
+                part.unlink()
+                raise Refused("The cover isn't a JPEG or PNG image")
+            for old in folder.glob("cover.*"):
+                if old != part:
+                    old.unlink()
+            part.rename(folder / f"cover{suffix}")
 
     def cancel(self, db, user: str, id: str):
         self.row(db, user, id)
@@ -261,6 +247,16 @@ class Uploads:
         db.execute("delete from upload where id = ?", (id,))
         shutil.rmtree(self.folder / id, ignore_errors=True)
 
+    def start(self):
+        worker.start("upload cleanup", self.clean_up, CLEAN_EVERY)
+
+    def clean_up(self):
+        db = self.connect()
+        try:
+            self.clean(db)
+        finally:
+            db.close()
+
     def clean(self, db):
         """Deletes uploads abandoned KEEP ago, but none with a file being received or being committed."""
         for (id,) in db.execute("select id from upload where touched < ?", (time.time() - KEEP,)).fetchall():
@@ -269,31 +265,24 @@ class Uploads:
                     continue
             shutil.rmtree(self.folder / id, ignore_errors=True)
 
-    def layout(self, row) -> list[tuple[Path, str | None, dict]]:
-        """The albums the upload makes: folder, release group, and per (disc, number) slot its tags and file name. One
-        album, or with no album name each track a single of its own."""
+    def layout(self, row, suffixes: dict[tuple[int, int], str]) -> list[tuple[Path, str | None, dict]]:
+        """The albums the upload makes: folder, release group, and per (disc, number) slot its tags and file name (of
+        the slot's suffix). One album, or with no album name each track a single of its own."""
         if row["release"]:
             release = json.loads(row["release"])
             medium = next(m for m in release["media"] if m["position"] == row["disc"])
-            discs, widest = len(release["media"]), max(t["position"] for m in release["media"] for t in m["tracks"])
             return [(release_folder(release), (release.get("release-group") or {}).get("id"), {
-                (medium["position"], t["position"]): (tags_for(release, medium, t), track_file(medium["position"], discs, t["position"], widest, t["title"], ""))
+                (medium["position"], t["position"]): (tags_for(release, medium, t), edition_file(release, medium, t, suffixes[medium["position"], t["position"]]))
                 for t in medium["tracks"]})]
         given = json.loads(row["tags"])
         tracks, year = given["track"], str(given.get("year") or "")[:4]
         slot = lambda t: (int(t.get("disc") or 1), int(t["number"]))
-        artists = lambda t: t.get("artists") or [t.get("artist") or given["albumArtist"]]
-
-        def tags(t, album, artist, d, n, discs, total):
-            return {"title": [t["title"]], "artist": [t.get("artist") or ", ".join(artists(t))], "artists": artists(t), "albumartist": [artist],
-                    "album": [album], "date": [year], "genre": [given.get("genre")], "tracknumber": [str(n)], "totaltracks": [str(total)],
-                    "discnumber": [str(d)], "totaldiscs": [str(discs)]}
         if not given.get("album"):  # loose singles
-            return [(album_folder(artist := given.get("albumArtist") or tags(t, "", "", 1, 1, 1, 1)["artist"][0], year, t["title"]), None,
-                     {slot(t): (tags(t, t["title"], artist, 1, 1, 1, 1), track_file(1, 1, 1, 1, t["title"], ""))}) for t in tracks]
-        artist, discs, widest = given.get("albumArtist") or tags(tracks[0], "", "", 1, 1, 1, 1)["artist"][0], max(slot(t)[0] for t in tracks), max(slot(t)[1] for t in tracks)
+            return [(album_folder(artist := given.get("albumArtist") or given_tags(given, t, "", "", 1, 1, 1, 1)["artist"][0], year, t["title"]), None,
+                     {slot(t): (given_tags(given, t, t["title"], artist, 1, 1, 1, 1), track_file(1, 1, 1, 1, t["title"], suffixes[slot(t)]))}) for t in tracks]
+        artist, discs, widest = given.get("albumArtist") or given_tags(given, tracks[0], "", "", 1, 1, 1, 1)["artist"][0], max(slot(t)[0] for t in tracks), max(slot(t)[1] for t in tracks)
         return [(album_folder(artist, year, given["album"]), None, {
-            (d, n): (tags(t, given["album"], artist, d, n, discs, sum(slot(u)[0] == d for u in tracks)), track_file(d, discs, n, widest, t["title"], ""))
+            (d, n): (given_tags(given, t, given["album"], artist, d, n, discs, sum(slot(u)[0] == d for u in tracks)), track_file(d, discs, n, widest, t["title"], suffixes[d, n]))
             for t in tracks for d, n in [slot(t)]})]
 
     def commit(self, db, user: str, id: str, replace: bool) -> list[Path]:
@@ -312,51 +301,47 @@ class Uploads:
                 raise Refused(f"Track {s['disc']}-{s['number']} isn't complete")
             if not decodes(self.folder / id / f"{s['disc']}-{s['number']}.{s['suffix']}"):
                 raise Refused(f"Track {s['disc']}-{s['number']} doesn't decode")
-        albums, staging = self.layout(row), self.folder / id / "staging"
+        by_slot = {(s["disc"], s["number"]): s for s in slots}
+        albums, staging = self.layout(row, {k: s["suffix"] for k, s in by_slot.items()}), self.folder / id / "staging"
         shutil.rmtree(staging, ignore_errors=True)
         staging.mkdir()
-        by_slot = {(s["disc"], s["number"]): s for s in slots}
         staged, targets, old, firsts = {}, {}, set(), []
         for i, (folder, group, tracks) in enumerate(albums):
-            album, mine = self.importer.root / folder, [by_slot[k] for k in tracks if k in by_slot]
+            album, mine = self.root / folder, [by_slot[k] for k in tracks if k in by_slot]
             (staging / str(i)).mkdir()
             for s in mine:
                 tags, name = tracks[s["disc"], s["number"]]
-                copy(self.folder / id / f"{s['disc']}-{s['number']}.{s['suffix']}", source := staging / str(i) / f"{name}.{s['suffix']}")
+                copy(self.folder / id / f"{s['disc']}-{s['number']}.{s['suffix']}", source := staging / str(i) / name)
                 staged[source], targets[source] = tags, album / source.name
             tags = tracks[mine[0]["disc"], mine[0]["number"]][0]
-            firsts.append(album / f"{tracks[mine[0]['disc'], mine[0]['number']][1]}.{mine[0]['suffix']}")
+            firsts.append(album / tracks[mine[0]["disc"], mine[0]["number"]][1])
             uploaded = {(int(t["discnumber"][0]), int(t["tracknumber"][0])) for t in (tracks[s["disc"], s["number"]][0] for s in mine)}
             discs = {d for d, _ in uploaded}
             rows = db.execute(
                 f"select ref, coalesce(disc_no, 1), track_no from track where source = 'local' and (album_id = ? or mb_release_group = ?) and "
                 f"coalesce(disc_no, 1) in ({','.join('?' * len(discs))})",
-                (make_id("al-", tags["albumartist"][0], tags["album"][0]), group, *discs)).fetchall()
+                (album_id(tags["albumartist"][0], tags["album"][0]), group, *discs)).fetchall()
             # Only the tracks the upload replaces go: a deluxe edition's extra tracks stay.
             theirs = {Path(r[0]) for r in rows if (r[1], r[2]) in uploaded}
-            theirs |= {p for t in (targets[x] for x in staged if x.parent == staging / str(i)) if t.parent.is_dir()
-                       for p in t.parent.iterdir() if p.stem == t.stem and p.suffix.lower().lstrip(".") in AUDIO}
+            theirs |= {p for x in staged if x.parent == staging / str(i) for p in same_track(targets[x])}
             theirs = {p for p in theirs if p.is_file()}
             present = theirs | {p for r in rows if (p := Path(r[0])).is_file()}
             mine_staged = [x for x in staged if x.parent == staging / str(i)]
-            if present and not replace and not (all(map(lossless, mine_staged)) and not any(map(lossless, present))):
-                raise Refused("already in the library", duplicate=True)
+            if present and not replace and not replaces(mine_staged, present):
+                raise Refused("already in the library", DUPLICATE)
             old |= theirs
         try:
-            checked = quality.import_check(sorted(p for p in staged if p.suffix == ".flac"))
+            found = prepare(staged)
         except quality.LossySource as e:
             raise Refused(str(e))
-        for source, tags in staged.items():
-            write(source, tags)
         try:
             self.place(targets, old)
         except OSError as e:
             raise Refused(f"Couldn't place the upload: {e}")
         try:  # the upload is in: what's left only adds to it, and a retry would be refused as a duplicate
-            for source, found in checked.items():
-                quality.store(db, targets[source], found)
+            record(db, found, targets)
             for folder, _, _ in albums:
-                self.importer.cover(json.loads(row["release"]) if row["release"] else None, {self.folder / id}, self.importer.root / folder)
+                cover(json.loads(row["release"])["id"] if row["release"] else None, {self.folder / id}, self.root / folder)
         except Exception:
             log.exception("upload %s is in the library, but its cover or quality findings aren't", id)
         self.remove(db, id)
@@ -373,8 +358,6 @@ class Uploads:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 copy(source, target)
                 placed.append(target)
-                if target.stat().st_size != source.stat().st_size:
-                    raise OSError(f"{target} isn't the {source.name} it was copied from")
         except BaseException:
             for target in placed:
                 target.unlink(missing_ok=True)

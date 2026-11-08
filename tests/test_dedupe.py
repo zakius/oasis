@@ -9,7 +9,7 @@ import mutagen
 import numpy as np
 import pytest
 
-from oasis import dedupe
+from oasis import audio, audiorecords, dedupe, files
 from oasis.db import connect
 from oasis.scan import scan
 
@@ -19,7 +19,7 @@ def reflinks_work(directory: Path) -> bool:
     a.write_bytes(b"x" * 4096)
     try:
         with open(a, "rb") as source, open(b, "wb") as copy:
-            fcntl.ioctl(copy.fileno(), dedupe.FICLONE, source.fileno())
+            fcntl.ioctl(copy.fileno(), files.FICLONE, source.fileno())
         return True
     except OSError as e:
         if e.errno in (errno.EOPNOTSUPP, errno.EXDEV, errno.ENOTTY, errno.EINVAL):
@@ -65,7 +65,7 @@ def tag(path: Path, **tags):
 
 
 def pcm(path: Path) -> np.ndarray:
-    return dedupe.decode(str(path))
+    return audio.decode(str(path))
 
 
 def library(root: Path):
@@ -140,3 +140,24 @@ def test_remasters_rerecordings_and_tagged_versions_stay_apart(root):
     db = library(root)
 
     assert dedupe.run(db) == []
+
+
+def test_a_file_missing_for_a_scan_comes_back_with_its_records(tmp_path):
+    one, two = tmp_path / "music/A/01 Song.flac", tmp_path / "music/B/01 Song.flac"
+    for path in (one, two):
+        path.parent.mkdir(parents=True)
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=duration=1", str(path)], check=True)
+    db = library(tmp_path)
+    db.execute("insert into audio_pair values (?, ?, 1, 1, 1)", (str(one), str(two)))
+    db.execute("insert into audio_shared values (?, ?, 1, 1)", (str(two), str(one)))
+    db.execute("insert into audio_quality(path, mtime, checked) values (?, 1, 1)", (str(one),))
+    records = lambda: (audiorecords.same_audio(db, str(two)), audiorecords.shared_paths(db), len(audiorecords.findings(db, [str(one)])))
+    assert records() == ([str(one)], {str(one), str(two)}, 1)
+    kept = tmp_path / "kept.flac"
+    one.rename(kept)  # its folder unmounted, say
+    scan(db, [tmp_path / "music"])
+    assert not db.execute("select 1 from track where ref = ?", (str(one),)).fetchone()
+    kept.rename(one)
+    scan(db, [tmp_path / "music"])
+    assert db.execute("select 1 from track where ref = ?", (str(one),)).fetchone()
+    assert records() == ([str(one)], {str(one), str(two)}, 1)

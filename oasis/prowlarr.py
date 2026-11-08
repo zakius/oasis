@@ -1,5 +1,6 @@
 """The few Prowlarr API calls oasis's own search needs: it asks the music indexers directly, so release names are read
 by oasis (releases.py), not by Lidarr's parser."""
+import ipaddress
 import json
 import logging
 import re
@@ -8,15 +9,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-import ipaddress
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
 TIMEOUT = 90  # seconds: indexers behind FlareSolverr are slow
 AUDIO = 3000
-# Categories a search skips on an indexer without Audio (RuTor files music under Other): Movies, TV, XXX, by number or name.
-VIDEO = re.compile(r"movie|tv|xxx|anime|video|hdtv|dvd|фильм|сериал|кино", re.I)
+# Categories a search skips on an indexer without Audio (some file music under Other): Movies, TV, XXX, by number or name.
+VIDEO_CATEGORIES = re.compile(r"movie|tv|xxx|anime|video|hdtv|dvd|фильм|сериал|кино", re.I)
 
 
 def music_categories(indexer: dict) -> list[int]:
@@ -24,7 +25,13 @@ def music_categories(indexer: dict) -> list[int]:
     found = indexer.get("capabilities", {}).get("categories", [])
     if any(c["id"] == AUDIO for c in found):
         return [AUDIO]
-    return [c["id"] for c in found if not (2000 <= c["id"] < 3000 or 5000 <= c["id"] < 7000 or VIDEO.search(c["name"]))]
+    return [c["id"] for c in found if not (2000 <= c["id"] < 3000 or 5000 <= c["id"] < 7000 or VIDEO_CATEGORIES.search(c["name"]))]
+
+
+def site(url: str) -> str:
+    """A URL's site by name, the same for each of its domains: 'example' for example.org and example.net alike."""
+    parts = (urlparse(url).hostname or "").split(".")
+    return parts[-2 if len(parts) > 1 else 0]
 
 
 def local(indexer: dict) -> bool:
@@ -57,9 +64,9 @@ def failures(text: bytes) -> str:
 
 
 class Prowlarr:
-    def __init__(self, url: str, api_key: str, tag: int = 2):
-        """tag: the Prowlarr tag of the music indexers; anime's stay out of music searches."""
-        self.url, self.key, self.tag = url.rstrip("/"), api_key, tag
+    def __init__(self, settings):
+        """settings: config.Prowlarr; its tag marks the music indexers, so anime's stay out of music searches."""
+        self.url, self.key, self.tag, self.ui_url = settings.url.rstrip("/"), settings.api_key, settings.tag, settings.ui_url
         self.names: dict[int, str] = {}   # indexer id -> name: see tracker
         self.logins: dict[int, str] = {}  # the same, of those needing a login (private, semi-private): their default seeding differs
         self.errors: dict[int, tuple[float, str]] = {}  # indexer id -> (when, what) of its last failed search, for the indexers page
@@ -95,6 +102,27 @@ class Prowlarr:
         self.names |= {i["id"]: i.get("name") for i in found}
         self.logins |= {i["id"]: i["name"] for i in found if privacy(i) not in ("public", "local")}
         return {i["id"]: music_categories(i) for i in found if i["id"] not in paused}
+
+    def every(self) -> list[dict]:
+        """Every indexer Prowlarr has, music or not, with its settings."""
+        return self.call("indexer")
+
+    def indexer(self, id: int) -> dict:
+        """One indexer as Prowlarr holds it, its login fields as Prowlarr gives them (the password-type ones masked)."""
+        return self.call(f"indexer/{id}")
+
+    def overview(self) -> dict:
+        """Prowlarr's view of every indexer, music or not, for the indexers page: indexers (their settings), status and
+        stats (its health and counts, by indexer id), tags (id -> label)."""
+        return {"indexers": self.every(), "status": {s["indexerId"]: s for s in self.call("indexerstatus")},
+                "stats": {s["indexerId"]: s for s in (self.call("indexerstats") or {}).get("indexers") or []},
+                "tags": {t["id"]: t["label"] for t in self.call("tag")}}
+
+    def site_indexers(self, indexers: list[dict]) -> dict[str, int]:
+        """Each site's indexer (site), of these indexers' URLs. A site several share (an anime site and its music twin)
+        goes to an enabled music one: oasis searches only those."""
+        return {site(u): i["id"] for i in sorted(indexers, key=lambda i: (i["enable"], self.tag in i.get("tags", [])))
+                for u in [*(i.get("indexerUrls") or []), *(i.get("legacyUrls") or [])] if urlparse(u).hostname}
 
     def tracker(self, release: dict) -> str | None:
         """The name of the indexer a search result comes from, whose seeding rule it follows (see download.py)."""

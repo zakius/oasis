@@ -8,7 +8,10 @@ from mutagen.id3 import TIT2
 from oasis import pcm
 from oasis.db import connect
 from oasis.scan import scan
-from test_importer import edition, make, no_cover_art, root  # noqa: F401 (fixtures)
+import test_importer
+from conftest import edition
+
+make, no_cover_art, root = test_importer.make, test_importer.no_cover_art, test_importer.root  # its fixtures
 
 
 def wav(path, codec="pcm_s16le", seconds=2, *more):

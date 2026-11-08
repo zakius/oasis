@@ -10,28 +10,31 @@ Versions tagged as such (live, demo, acoustic, remix, edit...) never take part. 
 consulted: the same audio often has several, from singles and compilations nobody merged. Of matching files the best is kept (lossless, then resolution, then the most
 complete, then the smallest FLAC), and every other one becomes a copy-on-write clone of it (btrfs/XFS reflink) with
 its own tags written back, so each edition keeps its file, folder and tags while the audio is stored once."""
-import fcntl
+import errno
 import itertools
 import logging
 import os
 import re
-import subprocess
 from collections import defaultdict
 from pathlib import Path
 
 import mutagen
 import numpy as np
-from mutagen.flac import FLAC, Picture
-from mutagen.id3 import ID3, PictureType
+from mutagen._vorbis import VCommentDict
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3
 from mutagen.mp3 import MP3
 
-from .ytm import fold
+from . import audiorecords
+from .audio import COMPARE_RATE, decode, stream_info
+from .files import reflink
+from .formats import lossless_codec, suffix
+from .tags import pictures, values
+from .text import fold, song_key
 
 log = logging.getLogger(__name__)
 
-FICLONE = 0x40049409
 LENGTH_SLACK = 15          # seconds copies of one song may differ by
-COMPARE_RATE = 16000       # level 3 looks below 8 kHz, where lossy coding changes little
 LOSSLESS_SAME_DB = -50     # waveform residual of lossless copies of one master (measured: -74 same, -27 for a 1 dB EQ)
 LOSSY_SAME_DB = 0.5        # tonal balance and loudness deviation allowed with lossy copies (codecs <= 0.27, remasters >= 0.8)
 KEEPABLE = {"flac", "mp3"}  # formats the kept copy may have: tags are rewritten in place over the shared audio
@@ -39,40 +42,17 @@ VERSION = re.compile(r"\b(live|demo|acoustic|unplugged|re-?mix(es)?|mix|edit|ins
                      r"orchestral|piano|cover|(?<!album )(?<!original )(?<!single )version)\b", re.I)
 
 
-def song_key(title: str) -> str:
-    """'Du hast (Remastered 2017)', 'Du Hast - 2011 Remaster' -> 'duhast'."""
-    return fold(re.sub(r"\s+-\s+.*$", "", re.sub(r"\s*[(\[][^)\]]*[)\]]", "", title or "")))
-
-
 def probe(path: str) -> dict:
-    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
-                          "stream=codec_name,sample_rate,channels,bits_per_raw_sample,sample_fmt,bit_rate", "-of", "default=nw=1", path],
-                         capture_output=True, text=True, check=True).stdout
-    info = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    info = stream_info(path)
     number = lambda key: int(info[key]) if info.get(key, "").isdigit() else 0
     codec = info.get("codec_name", "")
     tags, audio = mutagen.File(path, easy=True), mutagen.File(path)
     return {"path": path, "codec": codec, "rate": number("sample_rate"), "channels": number("channels"),
             "bits": number("bits_per_raw_sample") or {"s16": 16, "s16p": 16, "s32": 32, "s32p": 32}.get(info.get("sample_fmt"), 0),
-            "bitrate": number("bit_rate"), "lossless": codec in ("flac", "alac", "ape", "wavpack") or codec.startswith("pcm_"),
+            "bitrate": number("bit_rate"), "lossless": lossless_codec(codec),
             "length": getattr(audio.info, "length", 0) if audio else 0, "size": os.path.getsize(path),
             "md5": getattr(audio.info, "md5_signature", 0) if isinstance(audio, FLAC) else 0,
-            "release_type": first_tag(tags, "releasetype")}
-
-
-def first_tag(tags, key: str) -> str:
-    try:
-        values = tags.get(key) if tags is not None else None
-    except (KeyError, ValueError):
-        values = None
-    return str(values[0]) if values else ""
-
-
-def decode(path: str, rate: int | None = None) -> np.ndarray:
-    """Samples as int32 at the native rate with all channels (exact comparisons), or float32 mono at `rate`."""
-    args, dtype = (["-ac", "1", "-ar", str(rate), "-f", "f32le"], np.float32) if rate else (["-f", "s32le"], np.int32)
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-map", "0:a:0", *args, "-"], capture_output=True, check=True).stdout
-    return np.frombuffer(raw, dtype)
+            "release_type": "; ".join(values(tags, "releasetype"))}
 
 
 def offset(a: np.ndarray, b: np.ndarray) -> int:
@@ -151,8 +131,8 @@ def clone(kept: Path, replaced: Path) -> Path:
     tmp = replaced.with_name(f".oasis-{replaced.stem}{kept.suffix}")
     try:
         with open(kept, "rb") as source, open(tmp, "wb") as copy:
-            fcntl.ioctl(copy.fileno(), FICLONE, source.fileno())
-        copy_tags(replaced, tmp, kept.suffix.lower())
+            reflink(source, copy)
+        copy_tags(replaced, tmp, suffix(kept))
         os.replace(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)
@@ -166,9 +146,10 @@ def keep_size(info):
     return info.padding if info.padding >= 0 else 1 << 16
 
 
-def copy_tags(source: Path, target: Path, suffix: str):
+def copy_tags(source: Path, target: Path, kind: str):
+    """Writes source's tags into target, a clone of kind ('flac' or 'mp3')."""
     original, easy = mutagen.File(source), mutagen.File(source, easy=True)
-    if suffix == ".mp3":
+    if kind == "mp3":
         if isinstance(original, MP3) and original.tags is not None:
             original.tags.save(target, padding=keep_size)  # ID3 holds no stream data: it saves onto any MP3 as is
             return
@@ -189,53 +170,21 @@ def copy_tags(source: Path, target: Path, suffix: str):
     else:
         for key in easy.keys() if easy else ():
             out[key] = easy[key]
-        for picture in pictures(original):
-            out.add_picture(picture)
+        if not isinstance(original.tags, VCommentDict):  # Vorbis comments' pictures came with the tags above
+            for picture in pictures(original):
+                out.add_picture(picture)
     out.save(padding=keep_size)
-
-
-def pictures(audio) -> list[Picture]:
-    found = []
-    for frame in (audio.tags.getall("APIC") if isinstance(audio.tags, ID3) else []):
-        picture = Picture()
-        picture.data, picture.mime, picture.type, picture.desc = frame.data, frame.mime, frame.type, frame.desc
-        found.append(picture)
-    for cover in (audio.tags.get("covr", []) if audio is not None and audio.tags is not None and hasattr(audio.tags, "get") else []):
-        picture = Picture()
-        picture.data, picture.mime, picture.type = bytes(cover), "image/png" if cover.imageformat == 14 else "image/jpeg", PictureType.COVER_FRONT
-        found.append(picture)
-    return found
 
 
 def pad(kept: Path, replaced: list[Path]):
     """Gives the kept FLAC room for the biggest tags among its clones, so writing them never moves the audio."""
-    if kept.suffix.lower() != ".flac":
+    if suffix(kept) != "flac":
         return
-    needed = max(sum(len(p.data) for p in pictures_of(path)) for path in replaced) + (1 << 16)
+    needed = max(sum(len(p.data) for p in pictures(mutagen.File(path))) for path in replaced) + (1 << 16)
     audio = FLAC(kept)
     current = sum(len(p.data) for p in audio.pictures) + next((b.length for b in audio.metadata_blocks if b.code == 1), 0)
     if current < needed:
         audio.save(padding=lambda info: needed)
-
-
-def pictures_of(path: Path) -> list[Picture]:
-    audio = mutagen.File(path)
-    return audio.pictures if isinstance(audio, FLAC) else pictures(audio)
-
-
-def retagged(db, path: str):
-    """Tags of a file changed, its audio didn't: dedupe's verdicts and clone records for it stay valid."""
-    mtime = os.path.getmtime(path)
-    db.execute("update audio_shared set mtime = ? where path = ?", (mtime, path))
-    db.execute("update audio_shared set kept_mtime = ? where kept = ?", (mtime, path))
-    db.execute("update audio_pair set a_mtime = ? where a = ?", (mtime, path))
-    db.execute("update audio_pair set b_mtime = ? where b = ?", (mtime, path))
-
-
-def same_audio(db, path: str) -> list[str]:
-    """Other files dedupe found to hold the same stream."""
-    return [r[0] for r in db.execute("select b from audio_pair where a = ? and level > 0 union select a from audio_pair where b = ? and level > 0",
-                                     (path, path))]
 
 
 def run(db) -> list[tuple[str, str]]:
@@ -251,7 +200,7 @@ def run(db) -> list[tuple[str, str]]:
         try:
             changed += dedupe_song(db, rows)
         except OSError as e:
-            if e.errno in (95, 18, 25):  # EOPNOTSUPP, EXDEV, ENOTTY: no reflinks here, nothing can be saved
+            if e.errno in (errno.EOPNOTSUPP, errno.EXDEV, errno.ENOTTY):  # no reflinks here, nothing can be saved
                 log.warning("dedupe: the library's filesystem can't share data between files (%s); dedupe is off", e)
                 return changed
             log.warning("dedupe: %s: %s", rows[0]["title"], e)
@@ -264,7 +213,7 @@ def run(db) -> list[tuple[str, str]]:
 
 def dedupe_song(db, rows) -> list[tuple[str, str]]:
     mtimes = {r["ref"]: os.path.getmtime(r["ref"]) for r in rows}
-    shared = {r["path"]: r for r in db.execute(f"select * from audio_shared where path in ({','.join('?' * len(rows))})", list(mtimes))}
+    shared = audiorecords.clones(db, list(mtimes))
 
     def is_clone(path, of):
         s = shared.get(path)
@@ -281,19 +230,16 @@ def dedupe_song(db, rows) -> list[tuple[str, str]]:
         a, b = sorted((x, y))
         if (a, b) in levels:
             return levels[a, b]
-        found = db.execute("select level from audio_pair where a = ? and b = ? and a_mtime = ? and b_mtime = ?",
-                           (a, b, mtimes[a], mtimes[b])).fetchone()
-        if found is None:
+        result = audiorecords.pair_level(db, a, b, mtimes[a], mtimes[b])
+        if result is None:
             if is_clone(a, b) or is_clone(b, a):
                 result = 1
             else:
                 ia, ib = info(a), info(b)
                 live = "live" in (ia["release_type"] + ib["release_type"]).lower()
                 result = 0 if live else compare(ia, ib)
-            db.execute("insert or replace into audio_pair values (?, ?, ?, ?, ?)", (a, b, mtimes[a], mtimes[b], result))
+            audiorecords.store_pair(db, a, b, mtimes[a], mtimes[b], result)
             db.commit()
-        else:
-            result = found["level"]
         levels[a, b] = result
         return result
 
@@ -320,8 +266,7 @@ def dedupe_song(db, rows) -> list[tuple[str, str]]:
         kept_mtime = os.path.getmtime(kept)
         for path in todo:
             new = clone(Path(kept), Path(path))
-            db.execute("delete from audio_shared where path = ?", (path,))
-            db.execute("insert or replace into audio_shared values (?, ?, ?, ?)", (str(new), kept, os.path.getmtime(new), kept_mtime))
+            audiorecords.store_clone(db, path, str(new), kept, os.path.getmtime(new), kept_mtime)
             changed.append((path, str(new)))
         db.commit()
         log.info("dedupe: %s: %d copies now share %s", Path(kept).stem, len(todo), Path(kept).name)

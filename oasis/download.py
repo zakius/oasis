@@ -7,44 +7,46 @@ yet (uncached, or cached as one zip) holds the albums it likely holds till it do
 is fetched whole and unpacked here first (unpacked). TorBox downloads a torrent whole, but hands out its files one by
 one. Each is seeded by TorBox once imported as its indexer's rule says (SEEDING); nothing seeds or uploads from here. A bundle imported is remembered with all it holds (bundle_kept): an album searched
 later, one starred since too, comes from it again while TorBox has it cached, before any Prowlarr search."""
-import hashlib
 import json
 import logging
 import os
 import posixpath
-import re
 import shutil
 import threading
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
-from . import releases
-from .importer import ARCHIVES, AUDIO, UNPACK_ROOM, UNPACKED, NoSpace, editions, unpack
+from . import releases, wants, worker
+from .files import need_room
+from .formats import ARCHIVES, AUDIO, IMAGES, suffix
+from .musicbrainz import editions
 from .quality import LossySource
 from .releases import hash_of
-from .torbox import RateLimited
+from .wants import Outcome
+from .torbox import RateLimited, active
+from .torrent import info_hash, magnet, torrent_files
+from .unpack import UNPACK_ROOM, UNPACKED, unpack
 
 log = logging.getLogger(__name__)
 
-INTERVAL = 60            # seconds between polls of TorBox
+INTERVAL = 60
 SLOWEST = 12 * 3600     # seconds a download may take at its pace so far
 WARM_UP = 30 * 60        # seconds a download runs before its pace counts: finding peers takes a while
 PATIENT = 30 * 60        # seconds those waits last while TorBox has slots free: a dead torrent keeps its album from another release
 EMPTY_SWARM = 10 * 60    # seconds a torrent may go without progress, seeders and a full copy among its peers
 DEAD_AFTER = 20 * 60     # seconds a torrent may sit at 0% without seeders
 UNRELIABLE = 5, 1 / 3    # an indexer with this many downloads, this share of them dead, is tried last
-KEEP = (*AUDIO, *ARCHIVES, "cue", "jpg", "jpeg", "png", "webp", "gif")  # music (perhaps packed), cue sheets and cover art; logs, nfo and the rest stay on TorBox
+KEEP = (*AUDIO, *ARCHIVES, "cue", *IMAGES)  # music (perhaps packed), cue sheets and cover art; logs, nfo and the rest stay on TorBox
 PACE = 3                 # seconds between file download requests: bursts of them get TorBox's 429
 PARALLEL = 2             # files fetched at once
 PAUSE = 300              # seconds without file downloads after a 429
 FETCH_TRIES = 5          # polls in a row a file may fail to download before the release counts as broken
 GONE_AFTER = 3           # polls in a row TorBox may leave a download out of its list before it counts as gone: the list comes back empty or short now and then
-DEAD_AGAIN = 14 * 86400  # seconds before a dead torrent is tried again, after all others: seeders come back
-EMPTY_BUNDLE = "the bundle holds no wanted album"
 KEEP_FAILED = 2 * 86400  # seconds a failed download's files stay for inspection
 KEPT_UNSEEN = 90 * 86400 # seconds a remembered bundle stays unused; TorBox's cache check when one is used is its real expiry
 # Seeding, per indexer: torbox leaves it to the TorBox account's setting (oasis neither keeps nor stops it, and drops
@@ -57,6 +59,15 @@ LOGIN, OPEN = "seed", "torbox"
 TOTALS_EVERY = 86400     # seconds between log lines of each tracker's totals
 GRAB_TRIES = 5           # picks tried in turn when TorBox won't take one
 FRESH = 3600             # seconds Prowlarr's answers to an artist's bundle searches and the .torrents read stay: its bundles go a pass apart
+# The steps of a download under way, as the dashboard names them; then done, or failed.
+STEPS = {"added": "queued on TorBox", "downloading": "downloading on TorBox", "fetching": "copying here", "importing": "importing"}
+UNDER_WAY = "state not in ('done', 'failed')"  # SQL, of a download row
+# How download.error and release_block.reason open for a release that will never download, and for one that made way
+# while slow: unreliable and slow read them back.
+DEAD = "dead torrent"
+TOO_SLOW = "too slow"
+DEAD_AGAIN = 14 * 86400  # seconds before a dead torrent is tried again, after all others: seeders come back
+EMPTY_BUNDLE = "the bundle holds no wanted album"
 
 
 def mode_of(row) -> str:
@@ -87,70 +98,106 @@ def source(release: dict) -> dict:
         except OSError:
             if not hash_of(release):
                 raise OSError(f"{url.split('?')[0]}: unreachable") from None
-    return {"magnet": f"magnet:?xt=urn:btih:{hash_of(release)}"}
+    return {"magnet": magnet(hash_of(release))}
 
 
-def info_hash(found: dict) -> str:
-    """The hash of what source() found: from the magnet link, or the .torrent's info dictionary."""
-    if m := re.search(r"btih:([0-9a-f]{40})", found.get("magnet") or "", re.I):
-        return m[1].lower()
-    data, i = found.get("torrent") or b"", 1
-    try:
-        while data[:1] == b"d" and data[i:i + 1] != b"e":
-            key_end = bencoded_end(data, i)
-            value_end = bencoded_end(data, key_end)
-            if data[i:key_end] == b"4:info":
-                return hashlib.sha1(data[key_end:value_end]).hexdigest()
-            i = value_end
-    except (ValueError, IndexError):  # not a .torrent
-        pass
-    return ""
+def under_way(db) -> list:
+    """The downloads under way, oldest first."""
+    return db.execute(f"select * from download where {UNDER_WAY} order by created").fetchall()
 
 
-def bencoded_end(data: bytes, i: int) -> int:
-    """Where the bencoded value starting at i ends."""
-    kind = data[i:i + 1]
-    if kind == b"i":
-        return data.index(b"e", i) + 1
-    if kind in (b"l", b"d"):
-        i += 1
-        while data[i:i + 1] != b"e":
-            i = bencoded_end(data, i)
-        return i + 1
-    colon = data.index(b":", i)
-    return colon + 1 + int(data[i:colon])
+def tracked(db) -> set[str]:
+    """The hashes of the downloads under way, which oasis sees through on TorBox itself; a done or failed one's torrent
+    is left to the doctor."""
+    return {r["hash"] for r in under_way(db)}
 
 
-def bdecoded(data: bytes, i: int = 0):
-    """The bencoded value starting at i: ints, bytes, lists and dicts with bytes keys."""
-    kind, end = data[i:i + 1], bencoded_end(data, i)
-    if kind == b"i":
-        return int(data[i + 1:end - 1])
-    if kind in (b"l", b"d"):
-        items, i = [], i + 1
-        while i < end - 1:
-            items.append(bdecoded(data, i))
-            i = bencoded_end(data, i)
-        return dict(zip(items[::2], items[1::2])) if kind == b"d" else items
-    return data[data.index(b":", i) + 1:end]
+def finished(db, n: int) -> list:
+    """The last n downloads done or failed, latest first."""
+    return db.execute("select * from download where state in ('done', 'failed') order by updated desc limit ?", (n,)).fetchall()
 
 
-def torrent_files(data: bytes) -> list[dict]:
-    """A .torrent's files as TorBox lists them, {name, size}, the torrent's name their first folder; [] when it isn't one."""
-    try:
-        info = bdecoded(data)[b"info"]
-        text = lambda key, d: (d.get(key + b".utf-8") or d[key]).decode(errors="replace")
-        name = text(b"name", info)
-        if b"files" not in info:
-            return [{"name": name, "size": info[b"length"]}]
-        return [{"name": "/".join([name, *(p.decode(errors="replace") for p in f.get(b"path.utf-8") or f[b"path"])]), "size": f[b"length"]}
-                for f in info[b"files"]]
-    except (ValueError, IndexError, KeyError, TypeError, AttributeError):
-        return []
+def of_album(db, rg: str) -> list:
+    """The release group's last 20 downloads, its own and bundles that were to hold it, latest first."""
+    return db.execute("select distinct d.* from download d left join download_target t on t.hash = d.hash where d.album_mbid = ? or t.rg = ? "
+                      "order by d.created desc limit 20", (rg, rg)).fetchall()
+
+
+def by_group(db, but: str = "") -> dict:
+    """The release groups being downloaded, a bundle's expected ones too, each with its download; but: of downloads
+    other than that one."""
+    return {r["rg"]: r for r in db.execute(f"select coalesce(t.rg, d.album_mbid) rg, d.* from download d left join download_target t on t.hash = d.hash "
+                                           f"where d.{UNDER_WAY} and coalesce(t.rg, d.album_mbid) is not null and d.hash != ?", (but,))}
+
+
+def seeding(db) -> list:
+    """The downloads imported and still seeding on TorBox, the longest seeding first."""
+    return db.execute("select * from download where seeding = 1 order by finished").fetchall()
+
+
+def trackers(db) -> list:
+    """Each login tracker oasis got torrents from, by name: its bytes down and up over all of them, deleted ones too,
+    and how many seed now."""
+    return db.execute("select tracker, coalesce(sum(downloaded), 0) down, coalesce(sum(uploaded), 0) up, sum(seeding) n from download "
+                      "where tracker is not null group by tracker order by tracker").fetchall()
+
+
+def count_searches(db, tally: dict):
+    """Adds an album search's answers (releases.find's tally) to each indexer's count for the day."""
+    db.executemany("insert into search_stat values (date('now'), ?, ?, ?, ?) on conflict(day, indexer) do update set results = results + excluded.results, "
+                   "album = album + excluded.album, usable = usable + excluded.usable", [(i, *n) for i, n in tally.items() if i is not None])
+
+
+def searches(db, days: int = 30) -> dict[int, tuple[int, int, int]]:
+    """Each indexer's answers to album searches over the last days: (results, the album, usable)."""
+    return {i: tuple(n) for i, *n in db.execute("select indexer, sum(results), sum(album), sum(usable) from search_stat where day >= date('now', ?) "
+                                                "group by indexer", (f"-{days} days",))}
+
+
+def by_indexer(db, guess) -> dict:
+    """What oasis got from each indexer, by Prowlarr's id: sent, done (imported), failed (a Counter of why), albums
+    (the wanted ones it supplied that are here) and last (when the latest of those arrived). guess(guid): the indexer
+    of a download from before oasis noted it."""
+    targets = {}
+    for h, rg in db.execute("select hash, rg from download_target where state = 'done'"):
+        targets.setdefault(h, set()).add(rg)
+    have = wants.here(db)
+    found = {}
+    for r in db.execute("select hash, guid, indexer, state, error, album_mbid, updated from download"):
+        m = found.setdefault(r["indexer"] or guess(r["guid"] or ""), {"sent": 0, "done": 0, "failed": Counter(), "albums": set(), "last": None})
+        m["sent"] += 1
+        if r["state"] == "done":
+            m["done"] += 1
+            if supplied := ({r["album_mbid"]} if r["album_mbid"] else targets.get(r["hash"], set())) & have:
+                m["albums"] |= supplied
+                m["last"] = max(m["last"] or 0, r["updated"])
+        elif r["state"] == "failed":
+            m["failed"][(r["error"] or "unknown").split(":")[0]] += 1
+    return found
+
+
+def blocks_by_indexer(db, guess) -> dict[int | None, list[str]]:
+    """The release_block keys (info hash, or guid) of each indexer's downloads, by Prowlarr's id; guess as by_indexer's."""
+    of = {}
+    for r in db.execute("select hash, guid, indexer from download"):
+        for key in (r["hash"], r["guid"]):
+            if key:
+                of[key] = r["indexer"] or guess(r["guid"] or "")
+    found = {}
+    for (key,) in db.execute("select hash from release_block"):
+        if key in of:
+            found.setdefault(of[key], []).append(key)
+    return found
+
+
+def unblock(db, keys: list[str]):
+    """Clears these releases' blocks, so searches may pick them again."""
+    db.executemany("delete from release_block where hash = ?", [(k,) for k in keys])
+    db.commit()
 
 
 def archives(files: list[dict]) -> list[dict]:
-    return [f for f in files if f["name"].rsplit(".", 1)[-1].lower() in ARCHIVES]
+    return [f for f in files if suffix(f["name"]) in ARCHIVES]
 
 
 def inside(path: str) -> Path:
@@ -162,21 +209,19 @@ class Downloads:
     """Sends searches' picks to TorBox and walks each download through added -> downloading -> fetching ->
     importing -> done, or failed. The state is in the download table, so a restart resumes where it was."""
 
-    def __init__(self, connect, torbox, importer, prowlarr, downloads: str, max_active: int = 8, stall_hours: float = 1, imported=lambda: None,
-                 seeding: dict | None = None):
-        """torbox: makes the TorBox client (the doctor's, with the key rdtclient holds). importer: importer.py's.
-        imported: called after each import. seeding: oasis.toml's rules per indexer (SEEDING)."""
+    def __init__(self, connect, torbox, importer, prowlarr, settings, imported=lambda: None, seeding: dict | None = None):
+        """torbox: makes the TorBox client (torbox.from_rdtclient). importer: importer.py's.
+        settings: config.TorBox. imported: called after each import. seeding: oasis.toml's rules per indexer (SEEDING)."""
+        self.connect, self.torbox_for, self.own, self.prowlarr, self.imported = connect, torbox, importer, prowlarr, imported
+        self.folder, self.max_active, self.stall = Path(settings.downloads), settings.max_active, settings.stall_hours * 3600
         self.rules, self.said_low, self.totals_said = seeding or {}, set(), 0.0
         self.saved = None    # the seed_rule rows, tracker -> rule, read once: see rule, and forget after a change
-        self.connect, self.torbox_for, self.own, self.prowlarr, self.folder, self.imported = connect, torbox, importer, prowlarr, Path(downloads), imported
-        self.max_active, self.stall = max_active, stall_hours * 3600
         self.client = None
         self.seen = {}       # hash -> (progress, since when)
         self.failures = {}   # hash -> polls in a row its files failed to download
         self.missing = {}    # hash -> polls in a row TorBox's list left it out
         self.copying = {}    # hash -> [(path, size)]: the files being fetched here, for copied()
         self.crowded = False  # TorBox's slots are all taken and albums wait: see step
-        self.added = 0.0     # when send last asked TorBox to add a torrent, for acquire's gap between searches
         self.pace, self.last_request, self.paused_until = threading.Lock(), 0.0, 0.0
         self.kept = {}       # (kind, key) -> (when, value): see recall
 
@@ -185,15 +230,7 @@ class Downloads:
         return self.client
 
     def start(self):
-        threading.Thread(target=self.run, daemon=True).start()
-
-    def run(self):
-        while True:
-            try:
-                self.cycle()
-            except Exception:  # TorBox down: next poll
-                log.exception("downloads poll failed")
-            time.sleep(INTERVAL)
+        worker.start("downloads poll", self.cycle, INTERVAL)  # TorBox down: next poll
 
     def room(self) -> bool:
         """Whether another download may start. Every active torrent of the account takes one of the plan's slots,
@@ -205,8 +242,8 @@ class Downloads:
             db.close()
 
     def active(self, db, torrents: list[dict]) -> int:
-        seeding = {r[0] for r in db.execute("select hash from download where seeding = 1")}
-        return sum(bool(t["active"]) and t["hash"].lower() not in seeding for t in torrents)
+        seeds = {r["hash"] for r in seeding(db)}
+        return active([t for t in torrents if t["hash"].lower() not in seeds])
 
     def rule(self, tracker: str, login: bool | None = None) -> dict:
         """The indexer's seeding rule: its mode (torbox, seed, off) with seed's limits. login: whether it is a login
@@ -236,26 +273,28 @@ class Downloads:
         db.commit()
         self.saved = None
 
-    def totals(self, db) -> dict[str, tuple[int, int]]:
-        """Each indexer's bytes (downloaded, uploaded) over every torrent oasis got from it, deleted ones too."""
-        return {t: (down, up) for t, down, up in db.execute("select tracker, coalesce(sum(downloaded), 0), coalesce(sum(uploaded), 0) from download "
-                                                            "where tracker is not null group by tracker")}
-
     def low(self, db) -> set[str]:
         """The indexers whose overall ratio for us is below their min_ratio; each logged once while it is."""
-        found = {t for t, (down, up) in self.totals(db).items() if (floor := self.rule(t)["min_ratio"]) is not None and down and up / down < floor}
+        totals = {r["tracker"]: (r["down"], r["up"]) for r in trackers(db)}
+        found = {t for t, (down, up) in totals.items() if (floor := self.rule(t)["min_ratio"]) is not None and down and up / down < floor}
         for t in found - self.said_low:
-            down, up = self.totals(db)[t]
+            down, up = totals[t]
             log.info("%s: our ratio is %.2f, below its %.2f: its torrents seed till their own ratio is met, and other indexers come first",
                      t, up / down, self.rule(t)["min_ratio"])
         self.said_low = found
         return found
 
-    def groups(self, db, but: str = "") -> set[str]:
-        """The release groups being downloaded, a bundle's expected ones too; but: of downloads other than that one."""
-        return {r[0] for r in db.execute("select album_mbid from download where state not in ('done', 'failed') and album_mbid is not null and hash != ? union "
-                                         "select t.rg from download_target t join download d on d.hash = t.hash where d.state not in ('done', 'failed') "
-                                         "and d.hash != ?", (but, but))}
+    def groups(self, db) -> set[str]:
+        """The release groups being downloaded (by_group)."""
+        return set(by_group(db))
+
+    def progress(self, hash: str) -> float | None:
+        """The share of a download TorBox had at the last poll; None before one saw it downloading."""
+        return self.seen.get(hash, (None,))[0]
+
+    def paused(self) -> bool:
+        """Whether file downloads wait out TorBox's rate limit."""
+        return time.time() < self.paused_until
 
     def recall(self, kind: str, key: str, make):
         """make(), kept FRESH: an artist's bundle searches run a pass apart while they send one bundle each."""
@@ -277,65 +316,75 @@ class Downloads:
             return {"hash": info_hash(found), "files": torrent_files(found.get("torrent") or b"")}
         return self.recall("torrent", release.get("guid") or release["downloadUrl"], read)
 
-    def find(self, db, want: dict, group: str) -> bool | None:
+    def find(self, db, want: dict, group: str) -> Outcome:
         """Searches Prowlarr for an album of oasis's own catalogue (acquire.py), after the bundles oasis has had (remembered);
         see send."""
-        if not want["upgrade"] and (sent := self.remembered(db, {group}, f"{want['artist']} - {want['title']}")) is not None:
-            return sent
+        label = f"{want['artist']} - {want['title']}"
+        kept = Outcome.NOTHING_SENT if want["upgrade"] else self.remembered(db, {group}, label)
+        if kept is Outcome.SENT or kept is Outcome.NO_SLOT:
+            return kept
         blocked, low, tally = self.blocked(db), self.low(db), {}
-        low_ids = frozenset(i for i, name in getattr(self.prowlarr, "names", {}).items() if name in low)
+        low_ids = frozenset(i for i, name in self.prowlarr.names.items() if name in low)
         try:
             picks = releases.find(self.prowlarr, want, blocked, self.torbox().cached, self.unreliable(db), self.slow(db), low_ids, tally)
         finally:
-            db.executemany("insert into search_stat values (date('now'), ?, ?, ?, ?) on conflict(day, indexer) do update set results = results + excluded.results, "
-                           "album = album + excluded.album, usable = usable + excluded.usable", [(i, *n) for i, n in tally.items() if i is not None])
-        return self.send(db, picks, blocked, group, f"{want['artist']} - {want['title']}")
+            count_searches(db, tally)
+        sent = self.send(db, picks, blocked, group, label)
+        return Outcome.REFUSED if sent is Outcome.NOTHING_SENT and kept is Outcome.REFUSED else sent
 
-    def bundle(self, db, want: dict, groups: list[dict], wanted: set[str]) -> bool | None:
+    def bundle(self, db, want: dict, groups: list[dict], wanted: set[str]) -> Outcome:
         """Sends the artist's bundle that holds the most wanted albums (release group ids) to TorBox: a cached one,
         to fetch only theirs, else while slots are free an uncached one with seeders; see releases.bundles. One a
         search: its albums count as downloading, so the next search (acquire.py) sends the bundle that holds the most
         of the rest, until none holds any; their albums' own searches come after. A bundle whose files TorBox doesn't
         list yet is resolved once it does; see send."""
-        if (sent := self.remembered(db, wanted, want["artist"])) is not None:
-            return sent
+        outcome = self.remembered(db, wanted, want["artist"])
+        if outcome is Outcome.SENT or outcome is Outcome.NO_SLOT:
+            return outcome
         # Not one being downloaded, nor one imported before: what else it holds comes from it as a remembered one, but
         # an album it held in a form no edition matches would bring it back each search.
-        blocked = self.blocked(db) | {r[0] for r in db.execute("select hash from download where state != 'failed' and hash in (select hash from download_target)")} \
-            | {r[0] for r in db.execute("select hash from download where state not in ('done', 'failed')")}
+        blocked = self.blocked(db) | {r["hash"] for r in under_way(db)} | \
+            {r[0] for r in db.execute("select hash from download where state != 'failed' and hash in (select hash from download_target)")}
         prowlarr = SimpleNamespace(search=lambda query: self.recall("search", query, lambda: self.prowlarr.search(query)))
-        picks = releases.bundles(prowlarr, want, groups, wanted, blocked, self.torbox().cached_files, lambda rg: editions(db, rg),
+        picks = releases.bundles(prowlarr, want, groups, wanted, blocked, self.torbox().cached_files, lambda rg: editions(rg, db),
                                  not self.crowded, self.slow(db), self.torrent)
         search = {"want": want, "wanted": sorted(wanted), "groups": [{k: g[k] for k in ("id", "title", "other_titles", "first-release-date", "primary-type")
                                                                        if k in g} for g in groups]}
         for release, targets, holds in picks[:GRAB_TRIES]:
             label = f"{want['artist']}: {len(targets)} albums" if targets else f"{want['artist']}: a bundle that may hold {len(holds)} albums"
-            if (sent := self.send(db, [release], blocked, None, label, targets, None if targets else search, holds, catalogue=search)) is not None:
+            sent = self.send(db, [release], blocked, None, label, targets, None if targets else search, holds, catalogue=search)
+            if sent is Outcome.SENT or sent is Outcome.NO_SLOT:
                 return sent
-        return None
+            if sent is Outcome.REFUSED:
+                outcome = Outcome.REFUSED
+        return outcome
 
-    def remembered(self, db, wanted: set[str], label: str) -> bool | None:
+    def remembered(self, db, wanted: set[str], label: str) -> Outcome:
         """Sends the remembered bundle (bundle_kept) that holds the most of these albums, when TorBox still has it
-        cached, to fetch only theirs; see send. Not for an album it was tried for already. One TorBox no longer has is forgotten: None when none went, and the
-        albums are searched as usual."""
-        avoid = self.blocked(db) | {r[0] for r in db.execute("select hash from download where state not in ('done', 'failed')")}
+        cached, to fetch only theirs; see send. Not for an album it was tried for already. One TorBox no longer has is
+        forgotten. When none went (NOTHING_SENT, REFUSED), the albums are searched as usual."""
+        avoid = self.blocked(db) | {r["hash"] for r in under_way(db)}
         found = [(r["hash"], r["title"], held) for r in db.execute("select * from bundle_kept order by seen desc") if r["hash"] not in avoid
-                 and (held := {rg: f for rg, f in json.loads(r["groups"]).items() if rg in wanted and rg not in json.loads(r["tried"])})][:100]
+                 and (held := {rg: f for rg, f in json.loads(r["groups"]).items() if rg in wanted and rg not in json.loads(r["tried"])})]
         listed = self.torbox().cached([h for h, _, _ in found]) if found else set()
+        outcome = Outcome.NOTHING_SENT
         for hash, title, held in sorted(found, key=lambda k: len(k[2]), reverse=True):
             if hash not in listed:
                 db.execute("delete from bundle_kept where hash = ?", (hash,))
                 log.info("remembered bundle %s is no longer cached on TorBox: forgotten", title)
                 continue
-            release = {"title": title, "infoHash": hash, "magnetUrl": f"magnet:?xt=urn:btih:{hash}"}
+            release = {"title": title, "infoHash": hash, "magnetUrl": magnet(hash)}
             # Its remembered paths: TorBox lists the files of one of 100 or more as one zip till it is added.
-            if (sent := self.send(db, [release], avoid, None, f"{label}: {len(held)} albums from a remembered bundle", held, kept=True)) is None:
+            sent = self.send(db, [release], avoid, None, f"{label}: {len(held)} albums from a remembered bundle", held, kept=True)
+            if sent is Outcome.REFUSED:
+                outcome = Outcome.REFUSED
+            if sent is Outcome.NOTHING_SENT or sent is Outcome.REFUSED:
                 continue
-            if sent:  # not when TorBox had no free slot: the albums come from it next time
+            if sent is Outcome.SENT:  # not when TorBox had no free slot: the albums come from it next time
                 db.execute("update bundle_kept set seen = ?, tried = (select json_group_array(value) from (select value from json_each(tried) union "
                            "select value from json_each(?))) where hash = ?", (time.time(), json.dumps(list(held)), hash))
             return sent
-        return None
+        return outcome
 
     def remember(self, db, row, files: list[dict]):
         """A bundle imported, with its files and every release group its folders hold (releases.targets, over all the
@@ -349,19 +398,20 @@ class Downloads:
         if row["kept"] or not row["catalogue"]:
             db.execute("update bundle_kept set seen = ? where hash = ?", (time.time(), row["hash"]))
             return
-        artist = db.execute(f"select artist_mbid from want_album where rg in ({','.join('?' * len(targets))}) and artist_mbid is not null", list(targets)).fetchone()
+        artist = wants.artist_of(db, list(targets))
         # Sent before from memory too: what it was tried for then still counts.
         tried = sorted({rg for (rg,) in db.execute("select rg from download_target where hash = ?", (row["hash"],))}
                        | {rg for (t,) in db.execute("select tried from bundle_kept where hash = ?", (row["hash"],)) for rg in json.loads(t)})
-        db.execute("insert or replace into bundle_kept values (?, ?, ?, ?, ?, ?, ?)", (row["hash"], row["title"], artist and artist[0],
+        db.execute("insert or replace into bundle_kept values (?, ?, ?, ?, ?, ?, ?)", (row["hash"], row["title"], artist,
                    json.dumps([{"name": f["name"], "size": f.get("size")} for f in files]), json.dumps(targets), time.time(), json.dumps(tried)))
         # The rest of its groups: a MusicBrainz lookup or more each, at one a second, so not in the downloads' poll.
-        threading.Thread(target=self.map_kept, args=(row["hash"], row["title"], files, json.loads(row["catalogue"])), daemon=True).start()
+        threading.Thread(target=self.map_kept, args=(row["hash"], row["title"], files, json.loads(row["catalogue"])), name="remember bundle",
+                         daemon=True).start()
 
     def map_kept(self, hash: str, title: str, files: list[dict], search: dict):
         db = self.connect()
         try:
-            held = releases.targets(files, search["want"], search["groups"], {g["id"] for g in search["groups"]}, lambda rg: editions(db, rg))
+            held = releases.targets(files, search["want"], search["groups"], {g["id"] for g in search["groups"]}, lambda rg: editions(rg, db))
             for (groups,) in db.execute("select groups from bundle_kept where hash = ?", (hash,)).fetchall():
                 db.execute("update bundle_kept set groups = ? where hash = ?", (json.dumps(held | json.loads(groups)), hash))
                 log.info("remembered bundle %s: it holds %d of the artist's release groups", title, len(held | json.loads(groups)))
@@ -372,7 +422,8 @@ class Downloads:
 
     def unreliable(self, db) -> frozenset:
         """Indexers whose seed counts don't hold up: a third or more of what oasis took from them was dead."""
-        seen = db.execute("select guid, coalesce(error like 'dead torrent%', 0) from download where guid is not null and (state = 'done' or error like 'dead torrent%')").fetchall()
+        seen = db.execute("select guid, coalesce(error like ? || '%', 0) from download where guid is not null and (state = 'done' or error like ? || '%')",
+                          (DEAD, DEAD)).fetchall()
         tally = {}
         for guid, dead in seen:
             tally.setdefault(releases.site(guid), []).append(dead)
@@ -381,32 +432,32 @@ class Downloads:
     def blocked(self, db) -> set[str]:
         """Releases never picked: those that failed, but the last resorts (slow) and bundles looked at again (lift)."""
         self.lift(db)
-        return {r[0] for r in db.execute("select hash from release_block where reason not like 'too slow%' and not (reason like 'dead torrent%' "
-                                         "and at < ?)", (time.time() - DEAD_AGAIN,))}
+        return {r[0] for r in db.execute("select hash from release_block where reason not like ? || '%' and not (reason like ? || '%' "
+                                         "and at < ?)", (TOO_SLOW, DEAD, time.time() - DEAD_AGAIN))}
 
     def slow(self, db) -> frozenset:
         """Releases tried last, not never: slow ones that made way for others, and dead ones DEAD_AGAIN after they died."""
-        return frozenset(r[0] for r in db.execute("select hash from release_block where reason like 'too slow%' or reason like 'dead torrent%' "
-                                                  "and at < ?", (time.time() - DEAD_AGAIN,)))
+        return frozenset(r[0] for r in db.execute("select hash from release_block where reason like ? || '%' or reason like ? || '%' "
+                                                  "and at < ?", (TOO_SLOW, DEAD, time.time() - DEAD_AGAIN)))
 
     def lift(self, db):
         """Unblocks a bundle that held none of the artist's wanted albums once the artist has one wanted that wasn't
         then, so its next bundle search looks at it again. One blocked by an older oasis, which didn't note what was
         wanted, is looked at again once."""
         for hash, artist, wanted in db.execute("select hash, artist_mbid, wanted from release_block where reason = ?", (EMPTY_BUNDLE,)).fetchall():
-            if artist is None or db.execute("select 1 from want_album where artist_mbid = ? and state = 'missing' and rg not in "
-                                            "(select value from json_each(?))", (artist, wanted)).fetchone():
+            if artist is None or wants.wanted_since(db, artist, json.loads(wanted)):
                 db.execute("delete from release_block where hash = ?", (hash,))
                 log.info("bundle %s: looked at again, for albums wanted since", hash)
 
     def send(self, db, picks: list[dict], blocked: set, group: str | None, label: str, targets: dict | None = None,
-             search: dict | None = None, holds: set = frozenset(), catalogue: dict | None = None, kept: bool = False) -> bool | None:
-        """Sends the first pick TorBox takes. True when one went, None when none would, False when TorBox had no free
-        slot and queued it: the queued copy goes, the release isn't at fault, and the album is due again soon.
+             search: dict | None = None, holds: set = frozenset(), catalogue: dict | None = None, kept: bool = False) -> Outcome:
+        """Sends the first pick TorBox takes. SENT when one went; NOTHING_SENT when none would, or REFUSED when TorBox
+        was asked and took none; NO_SLOT when TorBox had no free slot and queued it: the queued copy goes, the release
+        isn't at fault, and the album is due again soon.
         group: the album's release group. targets: a bundle's albums, {group: files}. search: a bundle's whose files
         TorBox doesn't list yet, for resolve; holds: the albums it likely holds, which count as downloading till then.
         catalogue: a bundle's artist search, for remember. kept: sent from a remembered bundle."""
-        tb = self.torbox()
+        tb, outcome = self.torbox(), Outcome.NOTHING_SENT
         for i, release in enumerate(picks[:GRAB_TRIES]):
             try:
                 found = source(release)
@@ -416,10 +467,10 @@ class Downloads:
             if info_hash(found) in blocked:  # listed without its hash, it is one that failed before
                 log.info("%s failed before: next", release["title"])
                 continue
-            tracker = getattr(self.prowlarr, "tracker", lambda r: None)(release)
+            tracker = self.prowlarr.tracker(release)
             mode = self.rule(tracker)["mode"] if tracker else OPEN
             try:
-                self.added = time.time()
+                outcome = Outcome.REFUSED
                 try:
                     added = tb.add(release["title"], **found, mode=mode)
                 except OSError as e:
@@ -435,7 +486,7 @@ class Downloads:
                 if queued:
                     tb.delete_queued(queued)
                 log.info("TorBox has no free slot for %s: later", release["title"])
-                return False
+                return Outcome.NO_SLOT
             now = time.time()
             later = [{k: r[k] for k in ("title", "guid", "infoHash", "magnetUrl", "downloadUrl", "seeders") if k in r} for r in picks[i + 1:i + 1 + GRAB_TRIES]]
             db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated, bundle, picks, catalogue, kept, "
@@ -453,8 +504,8 @@ class Downloads:
             db.executemany("insert into download_target(hash, rg, files, state) values (?, ?, '[]', 'expected')",
                            [(added["hash"].lower(), rg) for rg in sorted(holds) if not targets])
             log.info("sent %s to TorBox for %s", release["title"], label)
-            return True
-        return None
+            return Outcome.SENT
+        return outcome
 
     def cycle(self):
         db = self.connect()
@@ -462,8 +513,8 @@ class Downloads:
             for (hash,) in db.execute("select hash from download where state = 'failed' and updated < ?", (time.time() - KEEP_FAILED,)).fetchall():
                 shutil.rmtree(self.folder / hash, ignore_errors=True)
             db.execute("delete from bundle_kept where seen < ?", (time.time() - KEPT_UNSEEN,))
-            rows = db.execute("select * from download where state not in ('done', 'failed') order by created").fetchall()
-            seeds = db.execute("select * from download where seeding = 1").fetchall()
+            rows = under_way(db)
+            seeds = seeding(db)
             self.say_totals(db)
             if not rows and not seeds:
                 return
@@ -472,13 +523,15 @@ class Downloads:
             for row in seeds:
                 self.seed(db, row, torrents.get(row["torbox_id"]))
             # Slots all taken while albums wait for a search: slow downloads make way.
-            self.crowded = self.active(db, listed) >= self.max_active and bool(db.execute(
-                "select 1 from want_album where state = 'missing' and coalesce(next_search, 0) <= ? limit 1", (time.time(),)).fetchone())
+            self.crowded = self.active(db, listed) >= self.max_active and wants.searches_due(db)
             for row in rows:
                 try:
                     self.step(db, row, torrents.get(row["torbox_id"]))
-                except Exception as e:  # disk full, MusicBrainz down mid-import: next poll
-                    log.warning("download %s: %s", row["title"], e)
+                except Exception as e:  # disk full, MusicBrainz down mid-import: next poll. Anything else is a bug: its traceback is logged.
+                    if isinstance(e, OSError):
+                        log.warning("download %s: %s", row["title"], e)
+                    else:
+                        log.exception("download %s", row["title"])
                     db.execute("update download set error = ?, updated = ? where hash = ?", (str(e)[:300], time.time(), row["hash"]))
         finally:
             db.close()
@@ -508,18 +561,18 @@ class Downloads:
                 # Nobody to get it from, or peers holding only part of it: its slot is freed.
                 if not torrent["seeds"] and time.time() - since > wait(EMPTY_SWARM):
                     if not torrent.get("peers"):
-                        return self.fail(db, row, "dead torrent: nobody shares it")
+                        return self.fail(db, row, f"{DEAD}: nobody shares it")
                     if (have := torrent.get("availability") or 0) < 1:
-                        return self.fail(db, row, f"dead torrent: its peers have only {have:.0%} of it")
+                        return self.fail(db, row, f"{DEAD}: its peers have only {have:.0%} of it")
                 # Not a byte from no seeder: dead soon. Stalled part way: the usual wait, as seeders come and go.
                 if not torrent["seeds"] and time.time() - since > wait(DEAD_AFTER if not torrent["progress"] else self.stall):
-                    return self.fail(db, row, "dead torrent: no seeds, no progress")
+                    return self.fail(db, row, f"{DEAD}: no seeds, no progress")
                 # A trickle from one seeder: a torrent on course to take longer than SLOWEST, at its pace so far or
                 # TorBox's speed now, whichever is faster, makes way: past the usual wait when others wait for its
                 # slot, past WARM_UP for another pick of its search. It is tried again last (slow), when nothing better turns up.
                 took, speed = time.time() - row["created"], (torrent.get("download_speed") or 0) / (torrent.get("size") or float("inf"))
                 if took > WARM_UP and 1 - torrent["progress"] > (SLOWEST - took) * max(torrent["progress"] / took, speed):
-                    why = f"too slow: {torrent['progress']:.0%} in {took / 3600:.0f} h"
+                    why = f"{TOO_SLOW}: {torrent['progress']:.0%} in {took / 3600:.0f} h"
                     if self.crowded and took > self.stall:
                         return self.fail(db, row, why)
                     if row["picks"] and self.switch(db, row, why):
@@ -547,10 +600,10 @@ class Downloads:
         """Sends the next of the album's search's picks in place of a slow download, cached ones first, and blocks the
         slow one as too slow. False when none went: the picks are dropped, unless TorBox had no free slot (next poll)."""
         avoid = self.blocked(db) | self.slow(db) | {row["hash"]}
-        picks = [r for r in json.loads(row["picks"]) if not {hash_of(r), r.get("guid")} & avoid]
+        picks = [r for r in json.loads(row["picks"]) if not releases.ids(r) & avoid]
         cached = self.torbox().cached([h for r in picks if (h := hash_of(r))]) if picks else set()
-        if not (sent := self.send(db, sorted(picks, key=lambda r: hash_of(r) not in cached), avoid, row["album_mbid"], f"{row['title']} (too slow)")):
-            if sent is None:
+        if (sent := self.send(db, sorted(picks, key=lambda r: hash_of(r) not in cached), avoid, row["album_mbid"], f"{row['title']} (too slow)")) is not Outcome.SENT:
+            if sent is Outcome.NOTHING_SENT or sent is Outcome.REFUSED:
                 db.execute("update download set picks = null where hash = ?", (row["hash"],))
             return False
         self.delete(row)
@@ -565,8 +618,8 @@ class Downloads:
         otherwise. They replace the albums it was expected to hold. One whose music is packed (packed: in archives TorBox
         lists) stays unresolved: its archives are fetched, and unpacked holds the rest. False when it holds none."""
         search = json.loads(row["bundle"])
-        missing = {r[0] for r in db.execute("select rg from want_album where state in ('missing', 'downloading')")} - self.groups(db, but=row["hash"])
-        found = releases.targets(files, search["want"], search["groups"], set(search["wanted"]) & missing, lambda rg: editions(db, rg))
+        missing = wants.still_wanted(db) - set(by_group(db, but=row["hash"]))
+        found = releases.targets(files, search["want"], search["groups"], set(search["wanted"]) & missing, lambda rg: editions(rg, db))
         if not found and packed and archives(files):
             return True
         db.execute("delete from download_target where hash = ?", (row["hash"],))
@@ -580,7 +633,7 @@ class Downloads:
         """The files to fetch and where to: the torrent's music, cue sheets and cover art to <hash>/<path inside the
         torrent>, so same-named files in different folders both arrive; a bundle's targets only, to <hash>/<release
         group>/<path inside the album's folder>. None when TorBox doesn't list a target's file."""
-        files = [f for f in torrent.get("files") or [] if f["name"].rsplit(".", 1)[-1].lower() in KEEP]
+        files = [f for f in torrent.get("files") or [] if suffix(f["name"]) in KEEP]
         if row["bundle"]:  # music in archives, to unpack: those named after a wanted album, else all
             search = json.loads(row["bundle"])
             named = [f for f in archives(files) if set(releases.folder_groups(PurePosixPath(f["name"]).stem, search["want"], search["groups"])) & set(search["wanted"])]
@@ -607,7 +660,7 @@ class Downloads:
     def fetch(self, db, row, torrent) -> bool:
         """Fetches the chosen files. Files already there at full size are kept; others are fetched again. True once
         all are there."""
-        if time.time() < self.paused_until:
+        if self.paused():
             return False
         if (todo := self.chosen(db, row, torrent)) is None:
             # From memory: the remembered paths are out of date, not the release at fault. It is forgotten, not blocked.
@@ -615,15 +668,15 @@ class Downloads:
             self.fail(db, row, "a remembered bundle's files differ from TorBox's" if row["kept"] else "a bundle's files differ from what TorBox had cached",
                       block=not row["kept"])
             return False
-        if not any(f["name"].rsplit(".", 1)[-1].lower() in (*AUDIO, *ARCHIVES) for f, _ in todo):
+        if not any(suffix(f["name"]) in (*AUDIO, *ARCHIVES) for f, _ in todo):
             self.fail(db, row, "no audio files in the torrent")
             return False
         self.copying[row["hash"]] = [(path, f["size"]) for f, path in todo]
         todo = [(f, path) for f, path in todo if not (path.exists() and path.stat().st_size == f["size"])]
         self.folder.mkdir(parents=True, exist_ok=True)
         need = sum(f["size"] for f, _ in todo) + UNPACK_ROOM * sum(f["size"] for f in archives([f for f, _ in todo]))
-        if todo and (free := shutil.disk_usage(self.folder).free) < need:
-            raise NoSpace(f"too little disk space: {need / 1e9:.1f} GB needed, {free / 1e9:.1f} GB free")
+        if todo:
+            need_room(self.folder, need)
         with ThreadPoolExecutor(PARALLEL) as pool:
             errors = [e for e in pool.map(lambda job: self.fetch_file(torrent["id"], *job), todo) if e]
         if not errors:
@@ -677,7 +730,7 @@ class Downloads:
         unpack(folder)
         files = [{"name": p.relative_to(folder).as_posix(), "size": p.stat().st_size} for p in sorted((folder / UNPACKED).rglob("*")) if p.is_file()]
         if not self.resolve(db, row, files, packed=False):
-            return self.fail(db, row, "the bundle holds no wanted album")
+            return self.fail(db, row, EMPTY_BUNDLE)
         for rg, names in db.execute("select rg, files from download_target where hash = ?", (row["hash"],)).fetchall():
             names = json.loads(names)
             top = posixpath.commonpath([posixpath.dirname(n) for n in names])
@@ -760,10 +813,10 @@ class Downloads:
 
     def say_totals(self, db):
         """The totals and ratio of each indexer oasis seeds for (mode seed), in the log once every TOTALS_EVERY."""
-        if time.time() - self.totals_said < TOTALS_EVERY or not (found := {t: v for t, v in self.totals(db).items() if self.rule(t)["mode"] == "seed"}):
+        if time.time() - self.totals_said < TOTALS_EVERY or not (found := [r for r in trackers(db) if self.rule(r["tracker"])["mode"] == "seed"]):
             return
         self.totals_said = time.time()
-        for tracker, (down, up) in sorted(found.items()):
+        for tracker, down, up, _ in found:
             log.info("%s: %.1f GB down, %.1f GB up, ratio %s", tracker, down / 1e9, up / 1e9, f"{up / down:.2f}" if down else "–")
 
     def fail(self, db, row, why: str, block: bool = True, wanted: list[str] | None = None):
@@ -773,18 +826,17 @@ class Downloads:
         if block:
             self.block_release(db, row, why, wanted)
         self.set(db, row, "failed", why)
-        db.execute("update want_album set next_search = null, error = ? where rg = ?", (f"download failed: {why}", row["album_mbid"]))
+        wants.search_again(db, [row["album_mbid"]], wants.DOWNLOAD_FAILED + why)
         # A bundle's albums: the artist's next bundle search is due, for another bundle of them.
-        db.execute("update bundle_search set searched = 0 where artist_mbid in (select artist_mbid from want_album where rg in "
-                   "(select rg from download_target where hash = ?))", (row["hash"],))
+        wants.bundles_again(db, self.targets(db, row))
         log.info("download %s failed: %s", row["title"], why)
 
     def block_release(self, db, row, why: str, wanted: list[str] | None = None):
         """wanted: a bundle's, the albums it was looked at for. Kept with all its artist's albums wanted then, missing or
         downloading elsewhere: one of those failing elsewhere and wanted again isn't new to it (lift)."""
-        artist = wanted and (db.execute(f"select artist_mbid from want_album where rg in ({','.join('?' * len(wanted))}) limit 1", wanted).fetchone() or [None])[0]
+        artist = wants.artist_of(db, wanted) if wanted else None
         if artist:
-            wanted = sorted(set(wanted) | {rg for (rg,) in db.execute("select rg from want_album where artist_mbid = ? and state in ('missing', 'downloading')", (artist,))})
+            wanted = sorted(set(wanted) | wants.still_wanted(db, artist))
         db.executemany("insert or replace into release_block values (?, ?, ?, ?, ?)",
                        [(k, why, time.time(), artist, json.dumps(wanted) if wanted else None) for k in (row["hash"], row["guid"]) if k])
 
@@ -795,8 +847,12 @@ class Downloads:
                           "(select hash from download_target where rg = ?))", (rg, rg)).fetchall()
         for row in rows:
             self.fail(db, row, "blocked by a user")
-            db.execute("update want_album set next_search = null where rg in (select rg from download_target where hash = ?)", (row["hash"],))
+            wants.search_again(db, self.targets(db, row))
         return bool(rows)
+
+    def targets(self, db, row) -> list[str]:
+        """The release groups a bundle was sent for."""
+        return [r[0] for r in db.execute("select rg from download_target where hash = ?", (row["hash"],))]
 
     def delete(self, row):
         try:

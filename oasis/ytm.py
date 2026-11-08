@@ -1,23 +1,20 @@
+"""The YouTube Music client: ytmusicapi for searches, artist and album pages, playlists and signed-in accounts, the
+visionOS player for audio URLs, and the cache of downloaded audio. What oasis keeps of YouTube Music in its database is
+youtube.py's."""
 import json
 import logging
 import re
+import shlex
 import threading
-import unicodedata
 import time
 import urllib.request
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .db import fold, make_id
-
-MIX = "RDTMAK"  # the id prefix of YouTube Music's own mixes; library playlists are PL…, Liked Music LM
-LIKED = "LM"     # Liked Music: its songs stay in the library even with the playlist hidden
-
-
-def is_mix(playlist_id: str | None) -> bool:
-    return (playlist_id or "").startswith(MIX)
+from .text import fold
+from .tracks import SAME_SONG_SECONDS
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +26,8 @@ VISIONOS_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.
 VISIONOS = {"clientName": "VISIONOS", "clientVersion": "1.02", "osName": "visionOS", "osVersion": "26.5.23O471",
             "deviceMake": "Apple", "deviceModel": "RealityDevice17,1", "hl": "en", "gl": "US"}
 CHUNK = 8 << 20  # googlevideo throttles long single requests
+MIX_PREFIX = "RDTMAK"  # the ids of an account's personal mixes
+LIKED = "LM"  # Liked Music: its songs stay in the library even with the playlist hidden
 
 
 @dataclass
@@ -37,44 +36,77 @@ class Stream:
     content_type: str
     size: int
     expires: float
+    headers: dict = field(default_factory=dict)  # what a request for url must send: the URL only works with them
 
 
 def big_cover(thumbnails) -> str | None:
     return re.sub(r"=w\d+-h\d+", "=w544-h544", thumbnails[-1]["url"]) if thumbnails else None
 
 
-def track_row(item: dict) -> dict | None:
-    """Turns a ytmusicapi song (search result or watch-playlist track) into a track row."""
+def song(item: dict) -> dict | None:
+    """A ytmusicapi song (search result or watch-playlist track) as oasis reads it: video_id, title, artist (all of
+    its artists), album_artist (the first), album, album_browse_id, year, duration and cover."""
     video_id = item.get("videoId")
     if not video_id:
         return None
     artists = [a["name"] for a in item.get("artists") or [] if a.get("name")] or ["Unknown Artist"]
     title = item.get("title") or video_id
     album_ref = item.get("album") if isinstance(item.get("album"), dict) else {"name": item.get("album")}
-    album = album_ref.get("name") or title
     thumbnails = item.get("thumbnails") or item.get("thumbnail") or []
     duration = item.get("duration_seconds")
     if duration is None and (length := item.get("length") or item.get("duration")):
         duration = sum(int(part) * 60 ** i for i, part in enumerate(reversed(length.split(":"))))
     year = item.get("year")
     return {
-        "id": "yt-" + video_id, "source": "ytm", "ref": video_id, "ytm_id": video_id, "ytm_album": album_ref.get("id"), "library": 0,
-        "title": title, "artist": ", ".join(artists), "album_artist": artists[0], "album": album,
-        "artist_id": make_id("ar-", artists[0]), "album_id": make_id("al-", artists[0], album),
-        "year": int(year) if str(year or "").isdigit() else None, "duration": duration,
-        "bitrate": 128, "suffix": "m4a", "content_type": "audio/mp4",
-        "cover": big_cover(thumbnails),
-        "created": time.time(),
+        "video_id": video_id, "title": title, "artist": ", ".join(artists), "album_artist": artists[0],
+        "album": album_ref.get("name") or title, "album_browse_id": album_ref.get("id"),
+        "year": int(year) if str(year or "").isdigit() else None, "duration": duration, "cover": big_cover(thumbnails),
     }
 
 
-def read_range(url: str, start: int, end: int):
-    """Yields the bytes start..end (inclusive) in chunks."""
+def is_mix(playlist_id: str | None) -> bool:
+    """Whether a YouTube Music playlist id is one of an account's personal mixes, not a library playlist."""
+    return (playlist_id or "").startswith(MIX_PREFIX)
+
+
+def read_range(stream: Stream, start: int, end: int):
+    """Yields the stream's bytes start..end (inclusive) in chunks."""
     for pos in range(start, end + 1, CHUNK):
-        request = urllib.request.Request(url, headers={"User-Agent": VISIONOS_UA, "Range": f"bytes={pos}-{min(end, pos + CHUNK - 1)}"})
+        request = urllib.request.Request(stream.url, headers={**stream.headers, "Range": f"bytes={pos}-{min(end, pos + CHUNK - 1)}"})
         with urllib.request.urlopen(request, timeout=30) as response:
             while data := response.read(1 << 16):
                 yield data
+
+
+def youtube_headers(pasted: str) -> dict:
+    """Browser headers for ytmusicapi from what the user copied out of a signed-in music.youtube.com tab: the request
+    headers, a "Copy as cURL" command, or only the Cookie value."""
+    text = pasted.strip()
+    headers = {}
+    if text.startswith("curl "):
+        words = shlex.split(text.replace("\\\n", " "))
+        for flag, value in zip(words, words[1:]):
+            if flag in ("-H", "--header") and ":" in value:
+                key, _, val = value.partition(":")
+                headers[key.strip().lower()] = val.strip()
+            elif flag in ("-b", "--cookie"):
+                headers["cookie"] = value
+    elif re.search(r"^\s*cookie\s*:", text, re.I | re.M):
+        for line in text.splitlines():
+            key, sep, val = line.partition(":")
+            if sep and key.strip() and not key.startswith(":"):
+                headers[key.strip().lower()] = val.strip()
+    else:
+        headers["cookie"] = text.removeprefix("Cookie:").strip()
+    cookie = headers.get("cookie", "")
+    if not (sapisid := re.search(r"(?:^|;\s*)__Secure-3PAPISID=([^;\s]+)", cookie)):
+        raise ValueError("That has no YouTube sign-in cookie (__Secure-3PAPISID). Copy it from music.youtube.com while signed in.")
+    from ytmusicapi.helpers import get_authorization
+    origin = "https://music.youtube.com"
+    # ytmusicapi takes headers with a SAPISIDHASH authorization for a browser sign-in and renews it per request.
+    return {"cookie": cookie, "x-goog-authuser": headers.get("x-goog-authuser", "0"), "origin": origin,
+            "authorization": get_authorization(sapisid[1] + " " + origin),
+            "user-agent": headers.get("user-agent", "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0")}
 
 
 class YouTubeMusic:
@@ -92,29 +124,30 @@ class YouTubeMusic:
     def search(self, query: str, limit: int) -> list[dict]:
         with self.api_lock:
             results = self.api.search(query, filter="songs", limit=limit)
-        return [row for item in results[:limit] if (row := track_row(item))]
+        return [found for item in results[:limit] if (found := song(item))]
 
     def find(self, artist: str, title: str, duration: int | None = None) -> dict | None:
-        """The same song on YouTube Music: same title, and length within 5 s if known, else the same artist."""
+        """The same song on YouTube Music: same title, and length within SAME_SONG_SECONDS if known, else the same artist."""
         def same(r):
             if fold(r["title"]) != fold(title):
                 return False
             if duration:
-                return abs((r["duration"] or 0) - duration) <= 5
+                return abs((r["duration"] or 0) - duration) <= SAME_SONG_SECONDS
             return artist.casefold() in (r["album_artist"].casefold(), r["artist"].casefold())
         found = [r for r in self.search(f"{artist} {title}", 10) if same(r)]
         found.sort(key=lambda r: r["album_artist"].casefold() != artist.casefold())
         return found[0] if found else None
 
     def match(self, track) -> str | None:
+        """The video id of a track's song on YouTube Music, or None."""
         found = self.find(track["album_artist"], track["title"], track["duration"])
-        return found["ref"] if found else None
+        return found["video_id"] if found else None
 
     def radio(self, video_id: str, limit: int) -> list[dict]:
         """YouTube Music's radio for a song, without the song itself."""
         with self.api_lock:
             tracks = self.api.get_watch_playlist(videoId=video_id, radio=True, limit=limit + 1)["tracks"]
-        return [row for t in tracks if t.get("videoId") != video_id and (row := track_row(t))][:limit]
+        return [found for t in tracks if t.get("videoId") != video_id and (found := song(t))][:limit]
 
     def client(self, auth: str):
         """A signed-in ytmusicapi client for a user's browser headers (JSON), kept for reuse."""
@@ -122,6 +155,9 @@ class YouTubeMusic:
         if auth not in self.clients:
             self.clients[auth] = YTMusic(auth)
         return self.clients[auth]
+
+    def forget_client(self, auth: str):
+        self.clients.pop(auth, None)
 
     def account_name(self, client) -> str:
         with self.api_lock:
@@ -134,7 +170,7 @@ class YouTubeMusic:
             home = client.get_home(limit=50)
             library = client.get_library_playlists(limit=None)
         # ytmusicapi gives None for home items it can't parse (new kinds YouTube adds): those are skipped.
-        mixes = [c for section in home if section for c in section.get("contents") or [] if c and (c.get("playlistId") or "").startswith("RDTMAK")]
+        mixes = [c for section in home if section for c in section.get("contents") or [] if c and is_mix(c.get("playlistId"))]
         saved = [p for p in library if p and p.get("playlistId") and p["playlistId"] != "SE"]  # SE: podcast episodes
         return list({p["playlistId"]: {"id": p["playlistId"], "title": p.get("title") or p["playlistId"],
                                        "description": p.get("description"), "cover": big_cover(p.get("thumbnails"))}
@@ -143,17 +179,17 @@ class YouTubeMusic:
     def playlist_tracks(self, client, playlist_id: str) -> list[dict]:
         with self.api_lock:
             try:
-                tracks = client.get_playlist(playlist_id, limit=100 if playlist_id.startswith("RDTMAK") else None)["tracks"]
+                tracks = client.get_playlist(playlist_id, limit=100 if is_mix(playlist_id) else None)["tracks"]
             except Exception:
-                if not playlist_id.startswith("RDTMAK"):
+                if not is_mix(playlist_id):
                     raise
                 # A mix's watch playlist is the fallback only: for the themed My Mixes it holds another mix's songs.
                 tracks = client.get_watch_playlist(playlistId=playlist_id, limit=100)["tracks"]
-        return [row for t in tracks if (row := track_row(t))]
+        return [found for t in tracks if (found := song(t))]
 
-    def lyrics(self, video_id: str):
-        """YouTube Music's own lyrics, line-timed when it has timing; None when it has none."""
-        from .lyrics import Lyrics
+    def lyrics(self, video_id: str) -> dict | None:
+        """YouTube Music's own lyrics: source, lines as (start ms or None, text), and whether they are synced (line-timed,
+        when it has timing). None when it has none."""
         with self.api_lock:
             browse_id = self.api.get_watch_playlist(videoId=video_id, limit=1).get("lyrics")
             found = self.api.get_lyrics(browse_id, timestamps=True) if browse_id else None
@@ -161,8 +197,8 @@ class YouTubeMusic:
             return None
         source = "YouTube Music" + (f" · {found['source'].removeprefix('Source: ')}" if found.get("source") else "")
         if found.get("hasTimestamps"):
-            return Lyrics(source, [(line.start_time, line.text) for line in found["lyrics"]], True)
-        return Lyrics(source, [(None, line) for line in found["lyrics"].splitlines()], False)
+            return {"source": source, "lines": [(line.start_time, line.text) for line in found["lyrics"]], "synced": True}
+        return {"source": source, "lines": [(None, line) for line in found["lyrics"].splitlines()], "synced": False}
 
     def artist(self, name: str) -> dict | None:
         """The YouTube Music artist of that name: description, photo, every album and single (with paged lists
@@ -186,7 +222,7 @@ class YouTubeMusic:
     def playlist_rows(self, playlist_id: str, limit: int) -> list[dict]:
         with self.api_lock:
             tracks = self.api.get_playlist(playlist_id, limit=limit)["tracks"]
-        return [row for t in tracks if (row := track_row(t))]
+        return [found for t in tracks if (found := song(t))]
 
     def album(self, browse_id: str) -> list[dict]:
         """The album page's songs, each with its year, number and the album's own artist (album_by: 'Various Artists'
@@ -194,13 +230,13 @@ class YouTubeMusic:
         with self.api_lock:
             album = self.api.get_album(browse_id)
         cover, by = album.get("thumbnails") or [], ", ".join(a["name"] for a in album.get("artists") or [] if a.get("name")) or None
-        rows = []
+        songs = []
         for t in album.get("tracks", []):
-            row = track_row({**t, "album": {"name": album["title"], "id": browse_id}, "thumbnails": t.get("thumbnails") or cover,
-                             "artists": t.get("artists") or album.get("artists"), "year": album.get("year")})
-            if row:
-                rows.append(row | {"track_no": t.get("trackNumber"), "album_by": by or row["album_artist"]})
-        return rows
+            found = song({**t, "album": {"name": album["title"], "id": browse_id}, "thumbnails": t.get("thumbnails") or cover,
+                          "artists": t.get("artists") or album.get("artists"), "year": album.get("year")})
+            if found:
+                songs.append(found | {"track_no": t.get("trackNumber"), "album_by": by or found["album_artist"]})
+        return songs
 
     def add_history(self, client, video_id: str):
         with self.api_lock:
@@ -227,7 +263,7 @@ class YouTubeMusic:
             raise LookupError("no direct m4a audio")
         best = max(formats, key=lambda f: f.get("bitrate", 0))
         expires = int(parse_qs(urlparse(best["url"]).query).get("expire", [time.time() + 3600])[0])
-        stream = Stream(best["url"], "audio/mp4", int(best["contentLength"]), expires - 300)
+        stream = Stream(best["url"], "audio/mp4", int(best["contentLength"]), expires - 300, {"User-Agent": VISIONOS_UA})
         self.streams[video_id] = stream
         return stream
 
@@ -253,7 +289,7 @@ class YouTubeMusic:
         stream = self.resolve(video_id)
         part = self.cache / f"{video_id}.m4a.part"
         with part.open("wb") as out:
-            for data in read_range(stream.url, 0, stream.size - 1):
+            for data in read_range(stream, 0, stream.size - 1):
                 out.write(data)
         if part.stat().st_size != stream.size:
             raise OSError(f"got {part.stat().st_size} of {stream.size} bytes")

@@ -4,12 +4,10 @@ import functools
 import hmac
 import json
 import logging
+import re
 from collections import Counter
 from pathlib import Path
-import re
-import threading
 import time
-import urllib.request
 from html import escape
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
@@ -18,14 +16,15 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from . import accounts, acquire, download, importer, musicbrainz, releases
-from .acquire import MB_IDS, TYPES
-from .artists import linked
-from .forward import LastFm
-from .prowlarr import privacy as prowlarr_privacy
+from . import accounts, acquire, audiorecords, cover, download, formats, mixes, musicbrainz, prowlarr, tracks, wants, ytm
+from .musicbrainz import MBID
+from .tracks import IDS, MB_IDS
+from .artists import linked, load_settings, save_settings
+from .credits import credits_of
+from .forward import ListenBrainz
+from .lastfm import signs_in
 from .recommend import SOURCES
 from .translate import LANGUAGES
-from .ytm import LIKED, MIX
 
 log = logging.getLogger(__name__)
 
@@ -209,12 +208,8 @@ a.card:hover b { text-decoration: underline; } .card .muted { font-size: .8rem; 
 """
 
 
-STATES = {"added": "queued on TorBox", "downloading": "downloading on TorBox", "fetching": "copying here", "importing": "importing"}
-NO_COVER = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" fill="#8883"/>'
-            '<text x="50" y="64" font-size="42" text-anchor="middle" fill="#8889">♪</text></svg>')
 confirm = lambda question: f' onsubmit="return confirm({escape(json.dumps(question, ensure_ascii=False))})"'  # for buttons that drop things
 HIDE_BROKEN = 'onerror="this.removeAttribute(\'src\')"'  # a cover that fails shows the empty frame, not a broken image
-MBID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 TABS = [("home", "/", "Dashboard", "M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"),
         ("library", "/music/library", "Library", "M5 4v16M9.5 4v16M14 4.5l5.5 15"),
         ("wanted", "/music/wanted", "Wanted", "M12 3v12m-5-5 5 5 5-5M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"),
@@ -264,19 +259,21 @@ def ago(ts: float) -> str:
     return f"{minutes} min ago" if minutes < 120 else f"{minutes // 60} h ago"
 
 
-def to_find(db) -> tuple[list[tuple[int, str]], str]:
-    """The albums still to find, albums and EPs apart from singles: tiles of how many, and when their next searches are,
-    so a long wait between searches doesn't look stuck."""
-    now, tiles, lines, due = time.time(), [], [], 0
-    for label, kind, single in (("albums & EPs to find", "Albums and EPs", 0), ("singles to find", "Singles", 1)):
-        n, waiting, first = db.execute("select count(*), coalesce(sum(next_search > ?), 0), min(case when next_search > ? then next_search end) "
-                                       "from want_album where state = 'missing' and (primary_type is 'Single') = ?", (now, now, single)).fetchone()
+def to_find(acq, db) -> tuple[list[tuple[int, str]], str]:
+    """The albums still to find (acq: acquire.py's Acquire), albums and EPs apart from singles: tiles of how many, and
+    when their next searches are, so a long wait between searches doesn't look stuck."""
+    tiles, lines, due = [], [], 0
+    for f in acq.to_find(db):
+        label, kind = ("singles to find", "Singles") if f["single"] else ("albums & EPs to find", "Albums and EPs")
+        n, waiting, held = f["count"], f["waiting"], f["deferred"]
         tiles.append((n, label))
-        parts = [f"{waiting} searched, nothing found; next try {until(first)}." if waiting else "", f"{n - waiting} due for a search." if n > waiting else ""]
+        parts = [f"{waiting} searched, nothing found; next try {until(f['next'])}." if waiting else "",
+                 f"{held} wait for their artist's bundle search." if held else "",
+                 f"{n - waiting - held} due for a search." if n > waiting + held else ""]
         lines += [f"{kind}: " + " ".join(filter(None, parts))] if n else []
-        due += n - waiting
+        due += n - waiting - held
     if tiles[0][0] + tiles[1][0] and not due:
-        lines.append("Nothing is due, so oasis searches ahead of schedule every 5 min while TorBox has room.")
+        lines.append(f"Nothing is due, so oasis searches ahead of schedule every {acquire.EARLY_GAP // 60} min while TorBox has room.")
     return tiles, " ".join(lines)
 
 
@@ -355,21 +352,26 @@ def pill(text: str, tone: str = "") -> str:
 def quality_pills(db, refs: list[str]) -> str:
     """What the files really hold where it isn't what they claim (see quality.py), and what oasis made of fake hi-res."""
     notes = Counter()
-    for q in db.execute(f"select * from audio_quality where path in ({','.join('?' * len(refs))})", refs):
-        if q["verdict"] == "lossy":
+    for q in audiorecords.findings(db, refs):
+        if q["verdict"] == audiorecords.LOSSY:
             notes["from a lossy source", "bad"] += 1
-        elif q["verdict"] == "upsampled" and q["action"] != "resampled":
+        elif q["verdict"] == audiorecords.UPSAMPLED and q["action"] != audiorecords.RESAMPLED:
             notes[f"upsampled from {q['source_rate'] / 1000:g} kHz", "busy"] += 1
-        elif q["verdict"] == "padded" and q["action"] != "converted":
+        elif q["verdict"] == audiorecords.PADDED and q["action"] != audiorecords.CONVERTED:
             notes["16-bit padded to 24", "busy"] += 1
-        elif q["action"] in ("resampled", "converted"):
+        elif q["action"] in (audiorecords.RESAMPLED, audiorecords.CONVERTED):
             notes[f"was fake {q['was']}", ""] += 1
     return "".join(" " + pill(text + (f" · {n} of {len(refs)}" if n < len(refs) else ""), tone) for (text, tone), n in notes.items())
 
 
 def cover_of(rg: str) -> str:
     """A MusicBrainz release group's cover, from the Cover Art Archive until the album is here."""
-    return f'<img class="cover small" loading="lazy" alt="" src="/music/cover/al-mb-{escape(rg)}" {HIDE_BROKEN}>'
+    return f'<img class="cover small" loading="lazy" alt="" src="/music/cover/{MB_IDS["album"]}{escape(rg)}" {HIDE_BROKEN}>'
+
+
+def album_page(db, rg: str) -> str:
+    """The id a release group's album page goes by: its library album's, else its MusicBrainz one's."""
+    return tracks.library_id(db, MB_IDS["album"] + rg) or MB_IDS["album"] + rg
 
 
 def hero(image: str, kicker: str, title: str, sub: str, facts: str) -> str:
@@ -388,14 +390,11 @@ def about(a: dict) -> str:
     return details(a.get("type"), a.get("country"), "–".join(filter(None, [(life.get(k) or "")[:4] for k in ("begin", "end")])), a.get("disambiguation"))
 
 
-def credited(g: dict) -> str:
-    return "".join(c["name"] + (c.get("joinphrase") or "") for c in g.get("artist-credit") or [])
-
-
-def routes(api) -> list[Route]:
+def routes(oasis) -> list[Route]:
+    """The dashboard's routes, for oasis (server.py)."""
     def with_db(fn):
         def run(*args):
-            db = api._db()
+            db = oasis.connect()
             try:
                 return fn(db, *args)
             finally:
@@ -431,21 +430,21 @@ def routes(api) -> list[Route]:
     async def login(request: Request):
         if request.method == "GET":
             return sign_in_page(request.query_params.get("error", ""))
-        form, address = await read_form(request), request.client.host if request.client else ""
-        if api.throttle.blocked(address):
-            return sign_in_page("Too many failed sign-ins. Try again in a minute.", 429)
+        form, address = await read_form(request), accounts.client_address(request)
 
         def run(db):
-            user = accounts.get(db, form.get("name", ""))
-            matches = accounts.same(form.get("password", ""), user["password"] if user else "")  # compared for unknown users too
-            if user is None or not matches:
-                api.throttle.fail(address)
+            try:
+                user = accounts.sign_in(db, oasis.throttle, address, form.get("name", ""),
+                                        lambda password: accounts.same(form.get("password", ""), password))
+            except accounts.Refused as e:
+                if e.throttled:
+                    return sign_in_page("Too many failed sign-ins. Try again in a minute.", 429)
                 return back("/login", error="Wrong user or password.")
             return signed_in_as(RedirectResponse("/", status_code=303), db, user["name"])
         return await run_in_threadpool(with_db(run))
 
     def logout(db, request, user, form):
-        db.execute("delete from session where token = ?", (request.cookies.get(COOKIE),))
+        accounts.end_session(db, request.cookies.get(COOKIE))
         response = RedirectResponse("/login", status_code=303)
         response.delete_cookie(COOKIE)
         return response
@@ -456,10 +455,10 @@ def routes(api) -> list[Route]:
                    f'go to its history.</p><form method="post" action="/account/youtube/unlink"{confirm("Unlink YouTube Music?")}>'
                    '<button class="danger">Unlink</button></form>' + youtube_playlists(db, user)
                    if user["ytm_auth"] else YOUTUBE_STEPS)
-        if not api.ytm:
+        if not oasis.ytm:
             youtube = '<p class="muted">YouTube Music is off on this server (<code>[ytmusic] enabled</code>).</p>'
         lastfm = ((LASTFM_APP_STEPS if user["admin"] else '<p class="muted">An admin needs to connect oasis to Last.fm first.</p>')
-                  if not (api.config.lastfm_key and api.config.lastfm_secret) else
+                  if not signs_in(oasis.lastfm) else
                   f'<p class="ok">Linked as <b>{escape(user["lastfm_name"] or "")}</b>.</p><form method="post" '
                   f'action="/account/lastfm/unlink"{confirm("Unlink Last.fm?")}><button class="danger">Unlink</button></form>' if user["lastfm_session"] else
                   '<a class="button primary" href="/account/lastfm">Sign in with Last.fm</a>')
@@ -478,23 +477,21 @@ def routes(api) -> list[Route]:
                 f'<section><h2>Radio</h2>{radio_source(user)}</section>'
                 f'<section><h2>Lyrics translation</h2>{translation_language(user)}</section>'
                 f'<section><h2>Password</h2>' + (
-                    '<p class="muted">Set in oasis.toml.</p>' if user["name"] in api.config.users else
+                    '<p class="muted">Set in oasis.toml.</p>' if user["name"] in oasis.config.users else
                     f'<form method="post" action="/account/password"{confirm("Change your password? Apps signed in with the old one stop working until you update them.")}><label>New password<input type="password" name="password">'
                     '</label><button>Change</button></form>') + '</section></div></div>')
         return page("Dashboard", body, q.get("message", ""), q.get("error", ""), wide=True, live=True, tab="home")
 
     def link_youtube(db, request, user, form):
         try:
-            name = api._link_youtube(db, user["name"], accounts.youtube_headers(form.get("headers", "")))
+            name = oasis.link_youtube(db, user["name"], ytm.youtube_headers(form.get("headers", "")))
         except ValueError as e:
             return back("/", error=str(e))
-        except Exception as e:  # Fail from the API
-            return back("/", error=getattr(e, "message", str(e)))
         return back("/", message=f"YouTube Music linked as {name}. Your mixes are loading.")
 
     def radio_source(user) -> str:
         """Where similar songs and radios come from when an app doesn't choose; those the server or account lack aren't offered."""
-        offered = api.recommender.sources(user)
+        offered = oasis.recommender.sources(user)
         options = "".join(f'<label class="check"><input type="radio" name="source" value="{s}"{" checked" if s == user["radio_source"] else ""}> {SOURCES[s]}</label>'
                           for s in offered)
         missing = [SOURCES[s] for s in SOURCES if s not in offered]
@@ -519,7 +516,7 @@ def routes(api) -> list[Route]:
         return back("/", message=f"Lyrics translation: {LANGUAGES[lang] if lang else 'none'}.")
 
     def radio_source_save(db, request, user, form):
-        if form.get("source") not in api.recommender.sources(user):
+        if form.get("source") not in oasis.recommender.sources(user):
             return back("/", error="Choose one of the sources offered.")
         accounts.set_field(db, user["name"], radio_source=form["source"])
         return back("/", message=f"Radio source: {SOURCES[form['source']]}.")
@@ -527,10 +524,9 @@ def routes(api) -> list[Route]:
     def youtube_playlists(db, user) -> str:
         """The account's YouTube Music and YouTube library playlists, each shown to apps or not, and what becomes of
         those that appear later."""
-        rows = db.execute(f"select id, name, mix, hidden from playlist where owner = ? and mix is not null and mix not like '{MIX}%' "
-                          "order by mix != ?, name collate nocase", (user["name"], LIKED)).fetchall()
         boxes = "".join(f'<label class="check"><input type="checkbox" name="show-{r["id"]}"{"" if r["hidden"] else " checked"}> {escape(r["name"])}'
-                        f'{" <span class=muted>(its songs stay in your library)</span>" if r["mix"] == LIKED else ""}</label>' for r in rows)
+                        f'{" <span class=muted>(its songs stay in your library)</span>" if r["mix"] == ytm.LIKED else ""}</label>'
+                        for r in mixes.library_playlists(db, user["name"]))
         policy = "".join(f'<label class="check"><input type="radio" name="new" value="{v}"{" checked" if int(user["ytm_new_shown"]) == on else ""}> {text}</label>'
                          for v, on, text in (("hide", 0, "Hidden till I tick them"), ("show", 1, "Shown till I untick them")))
         return (f'<h3>Playlists shown in your apps</h3><p class="muted">Your mixes always show. A shown playlist\'s songs are in your '
@@ -539,40 +535,26 @@ def routes(api) -> list[Route]:
                 '<button class="primary">Save</button></form>')
 
     def youtube_playlists_save(db, request, user, form):
-        accounts.set_field(db, user["name"], ytm_new_shown=int(form.get("new") == "show"))
-        changed, shown = [], False
-        for r in db.execute(f"select id, hidden from playlist where owner = ? and mix is not null and mix not like '{MIX}%'", (user["name"],)).fetchall():
-            hidden = int(f"show-{r['id']}" not in form)
-            if hidden != r["hidden"]:
-                db.execute("update playlist set hidden = ? where id = ?", (hidden, r["id"]))
-                changed.append(r["id"])
-                shown = shown or not hidden
-        # Their songs leave or join the library now; a playlist shown again reads its songs from YouTube Music.
-        api._touch(db, [t for (t,) in db.execute(f"select track_id from playlist_entry where playlist_id in ({','.join('?' * len(changed))})", changed)])
-        if shown:
-            threading.Thread(target=api._refresh_mixes, args=(user["name"],), daemon=True).start()
-        return back("/", message="Playlists saved." + (" Newly shown ones are loading." if shown else ""))
+        shown = {int(key[5:]) for key in form if key.startswith("show-") and key[5:].isdigit()}
+        again = oasis.show_youtube_playlists(db, user["name"], shown, form.get("new") == "show")
+        return back("/", message="Playlists saved." + (" Newly shown ones are loading." if again else ""))
 
     def unlink_youtube(db, request, user, form):
-        accounts.set_field(db, user["name"], ytm_auth=None, ytm_name=None)
-        api._drop_mixes(db, user["name"])
+        oasis.unlink_youtube(db, user["name"])
         return back("/", message="YouTube Music unlinked.")
-
-    def lastfm_service():
-        return LastFm(api.config.lastfm_key, api.config.lastfm_secret, None)
 
     def lastfm_state(request) -> str:
         """Ties a Last.fm sign-in to the dashboard session that started it, so no other page can link its own account."""
         return hmac.new(request.cookies.get(COOKIE, "").encode(), b"lastfm", "sha256").hexdigest()
 
     def lastfm_start(db, request, user, form):
-        return RedirectResponse(lastfm_service().auth_url(f'{request.url_for("lastfm_callback")}?state={lastfm_state(request)}'), status_code=303)
+        return RedirectResponse(oasis.lastfm.auth_url(f'{request.url_for("lastfm_callback")}?state={lastfm_state(request)}'), status_code=303)
 
     def lastfm_callback(db, request, user, form):
         if not accounts.same(request.query_params.get("state", ""), lastfm_state(request)):
             return back("/", error="That Last.fm sign-in didn't start here. Sign in with Last.fm again.")
         try:
-            key, name = lastfm_service().sign_in(request.query_params.get("token", ""))
+            key, name = oasis.lastfm.sign_in(request.query_params.get("token", ""))
         except Exception as e:
             return back("/", error=f"Last.fm sign-in failed: {e}")
         accounts.set_field(db, user["name"], lastfm_session=key, lastfm_name=name)
@@ -581,7 +563,7 @@ def routes(api) -> list[Route]:
     def lastfm_app(db, request, user, form):
         key, secret = form.get("key", "").strip(), form.get("secret", "").strip()
         try:
-            api._set_lastfm_app(db, key, secret)
+            oasis.set_lastfm_app(db, key, secret)
         except Exception as e:
             return back("/", error=f"Last.fm didn't accept these: {e}")
         return back("/", message="oasis is connected to Last.fm. Now sign in with your Last.fm account.")
@@ -593,33 +575,34 @@ def routes(api) -> list[Route]:
     def link_listenbrainz(db, request, user, form):
         token = form.get("token", "").strip()
         if token:
-            request_ = urllib.request.Request("https://api.listenbrainz.org/1/validate-token", headers={"Authorization": "Token " + token})
             try:
-                with urllib.request.urlopen(request_, timeout=15) as response:
-                    result = json.load(response)
+                valid = ListenBrainz(token).valid()
             except Exception as e:
                 return back("/", error=f"ListenBrainz didn't answer: {e}")
-            if not result.get("valid"):
+            if not valid:
                 return back("/", error="ListenBrainz says that token isn't valid.")
         accounts.set_field(db, user["name"], listenbrainz_token=token or None)
         return back("/", message="ListenBrainz linked." if token else "ListenBrainz unlinked.")
 
     def change_password(db, request, user, form):
-        if user["name"] in api.config.users:
-            return back("/", error="This password is set in oasis.toml.")
-        if not form.get("password"):
-            return back("/", error="A password is needed.")
-        accounts.set_field(db, user["name"], password=form["password"])  # signs out every session, this one signs in again
+        try:
+            accounts.check_editable(oasis.config.users, user["name"], "password")
+        except ValueError as e:
+            return back("/", error=f"{e}.")
+        try:
+            accounts.set_password(db, user["name"], form.get("password", ""))  # signs out every session, this one signs in again
+        except ValueError as e:
+            return back("/", error=str(e))
         return signed_in_as(back("/", message="Password changed. Update it in your apps."), db, user["name"])
 
     def progress(hash: str, state: str, since: float) -> str:
         """Where a download is: queued on TorBox, TorBox downloading it (its share done), copying it here from TorBox
         (the share here), importing it. The step, share and age on one line, the bar under them."""
-        d = api.downloads
-        if d and state == "fetching" and time.time() < d.paused_until:
+        d = oasis.downloads
+        if d and state == "fetching" and d.paused():
             return f'<div class="progress"><span class="busy">copying here: paused by TorBox\'s rate limit</span><span class="muted">{ago(since)}</span></div>'
-        share = (d.seen.get(hash, (None,))[0] if state == "downloading" else d.copied(hash) if state == "fetching" else None) if d else None
-        label = STATES.get(state, state)
+        share = (d.progress(hash) if state == "downloading" else d.copied(hash) if state == "fetching" else None) if d else None
+        label = download.STEPS.get(state, state)
         return (f'<div class="progress"><span class="busy">{label}{f" {share:.0%}" if share is not None else ""}</span>'
                 f'<span class="muted">{ago(since)}</span>'
                 f'{f"""<span class="meter"><i style="width:{share:.0%}"></i></span>""" if share is not None else ""}</div>')
@@ -629,19 +612,18 @@ def routes(api) -> list[Route]:
         count = lambda sql: db.execute(sql).fetchone()[0]
         songs, albums, artists = db.execute("select count(*), count(distinct album_id), count(distinct artist_id) from track "
                                             "where source = 'local'").fetchone()
-        finding, waits = to_find(db) if api.library else ([], "")
+        finding, waits = to_find(oasis.acquire, db) if oasis.acquire else ([], "")
         tiles = [(songs, "songs"), (albums, "albums"), (artists, "artists"), *finding]
         html = '<div class="stats">' + "".join(f'<div><b>{n}</b><span>{label}</span></div>' for n, label in tiles) + '</div>'
         html += f'<p class="muted">{waits}</p>' if waits else ""
-        active = db.execute("select hash, title, state, created, kept from download where state not in ('done', 'failed') order by created").fetchall()
+        active = download.under_way(db)
         html += (f'<section><h2>Downloading <span class="count">{len(active)}</span></h2><ul class="rows">' + "".join(
             f'<li><div class="grow">{escape(r["title"])}{" <span class=\"muted\">from a remembered bundle</span>" if r["kept"] else ""}'
             f'{progress(r["hash"], r["state"], r["created"])}</div></li>'
             for r in active) + '</ul></section>' if active else '<section><h2>Downloading</h2><p class="muted">Nothing downloading.</p></section>')
-        trackers = db.execute("select tracker, coalesce(sum(downloaded), 0) down, coalesce(sum(uploaded), 0) up, sum(seeding) n from download "
-                              "where tracker is not null group by tracker order by tracker").fetchall()
+        trackers = download.trackers(db)
         if trackers:
-            seeding = db.execute("select title, tracker, finished, downloaded, uploaded from download where seeding = 1 order by finished").fetchall()
+            seeding = download.seeding(db)
             ratio = lambda down, up: f"{up / down:.2f}" if down else "–"
             html += ('<section><h2>Seeding</h2><table class="grid"><thead><tr><th>Tracker</th><th class="num">Down</th><th class="num">Up</th>'
                      '<th class="num">Ratio</th><th class="num">Seeding</th></tr></thead><tbody>' + "".join(
@@ -651,8 +633,7 @@ def routes(api) -> list[Route]:
                          f'<li><div class="grow">{escape(r["title"])}<div class="muted">{escape(r["tracker"])} · ratio {ratio(r["downloaded"] or 0, r["uploaded"] or 0)}'
                          f' · seeding {ago(r["finished"]).removesuffix(" ago") if r["finished"] else ""}</div></div></li>' for r in seeding) + '</ul>' if seeding else "")
                      + '</section>')
-        recent = db.execute("select title, state, error, updated from download where state in ('done', 'failed') "
-                            "order by updated desc limit 5").fetchall()
+        recent = download.finished(db, 5)
         if recent:
             html += '<section><h2>Lately</h2><ul class="rows">' + "".join(
                 f'<li>{"<span class=\"mark good\">✓</span>" if r["state"] == "done" else "<span class=\"mark bad\">✗</span>"}<div class="grow">'
@@ -662,16 +643,16 @@ def routes(api) -> list[Route]:
         known = count("select count(*) from track where source = 'local' and mb_release is not null")
         artists_done = count("select count(*) from mb_artist where fetched is not null and mbid in (select mbid from credit)")
         artists_all = count("select count(*) from mb_artist where mbid in (select mbid from credit)")
-        html += ('<p class="muted"><a href="/music/indexers">Indexers</a>: each one\'s health, searches, downloads and seeding.</p>' if api.library else "")
+        html += ('<p class="muted"><a href="/music/indexers">Indexers</a>: each one\'s health, searches, downloads and seeding.</p>' if oasis.acquire else "")
         html += (f'<section><h2>Background</h2><p class="muted">MusicBrainz: credits for {filled} of {known} songs, names and links for '
                  f'{artists_done} of {artists_all} artists.</p>')
-        shared = db.execute("select count(*), coalesce(sum(t.size), 0) from audio_shared a join track t on t.ref = a.path").fetchone()
-        if api.config.dedupe:
-            html += f'<p class="muted">Dedupe: {shared[0]} copies share another file\'s audio, saving {shared[1] / 1e9:.1f} GB.</p>'
+        if oasis.config.dedupe:
+            clones, saved = audiorecords.savings(db)
+            html += f'<p class="muted">Dedupe: {clones} copies share another file\'s audio, saving {saved / 1e9:.1f} GB.</p>'
         return html + '</section>'
 
     def artist_settings(db, request, user, form):
-        q, settings = request.query_params, api._artist_settings(db)
+        q, settings = request.query_params, load_settings(db, oasis.config.artists)
         lines = lambda key: escape("\n".join("; ".join(group) for group in settings.get(key, [])))
         body = ('<form method="post" action="/admin/artists">'
                 '<section><h2>Related artists</h2><p class="muted">One group per line, names separated by <code>;</code>. '
@@ -690,7 +671,7 @@ def routes(api) -> list[Route]:
         groups = lambda key: [names for line in form.get(key, "").splitlines() if len(names := [n.strip() for n in line.split(";") if n.strip()]) > 1]
         settings = {"related": groups("related"), "merge": groups("merge"),
                     "separate": [n.strip() for n in form.get("separate", "").splitlines() if n.strip()]}
-        api._set_artist_settings(db, settings)
+        save_settings(db, settings)
         return back("/admin/artists", message="Saved. Artist pages, similar artists and radios use it now.")
 
     def admin(db, request, user, form):
@@ -699,7 +680,7 @@ def routes(api) -> list[Route]:
             f'<tr><td class="lead"><b>{escape(r["name"])}</b>{" <span class=pill>admin</span>" if r["admin"] else ""}</td>'
             f'<td class="muted">{" · ".join(name for name, on in (("YouTube Music", r["ytm_auth"]), ("Last.fm", r["lastfm_session"]),
                                                                     ("ListenBrainz", r["listenbrainz_token"])) if on)}</td><td class="actions">' + (
-                '<span class="muted">from oasis.toml</span>' if r["name"] in api.config.users else
+                '<span class="muted">from oasis.toml</span>' if r["name"] in oasis.config.users else
                 f'<form method="post" action="/admin/users/{quote(r["name"])}/delete"{confirm(f"Delete the user {r['name']}?")}><button class="danger">Delete</button></form>') +
             '</td></tr>' for r in db.execute("select * from user order by name"))
         body = (f'<section><h2>Users</h2><table class="grid"><tbody>{rows}</tbody></table></section>'
@@ -717,29 +698,25 @@ def routes(api) -> list[Route]:
 
     def delete_user(db, request, user, form):
         name = request.path_params["name"]
-        if name in api.config.users:
-            return back("/admin", error="Users from oasis.toml can only be removed there.")
+        try:
+            accounts.check_editable(oasis.config.users, name, "remove")
+        except ValueError as e:
+            return back("/admin", error=f"{e}.")
         accounts.delete(db, name)
         return back("/admin", message=f"Deleted {name}.")
 
     def catalogue(handler):
         """A music page, for any signed-in user: it needs oasis's own catalogue (acquire.py)."""
         def run(db, request, user, form):
-            if not api.library:
+            if not oasis.acquire:
                 return page("Find music", "", error="Acquisition is off: it needs [torbox] with downloads and [prowlarr] in oasis.toml.", tab="find")
             return handler(db, request, user, form)
         return signed_in(run)
 
     def acquiring(handler):
         def run(db, request, user, form):
-            return handler(db, request, user, form) if api.downloads else back("/music/indexers", error="Acquisition is off.")
+            return handler(db, request, user, form) if oasis.downloads else back("/music/indexers", error="Acquisition is off.")
         return run
-
-    def mine(db, user, kind: str, mbid: str) -> list[str]:
-        """The ids the user wants the artist or album under."""
-        ids = acquire.refs(db, kind, mbid)
-        return [r[0] for r in db.execute(f"select ref from wanted where user = ? and kind = ? and ref in ({','.join('?' * len(ids))})",
-                                         (user["name"], kind, *ids))]
 
     def want_button(kind: str, mbid: str, on: bool, here: str) -> str:
         label = {("album", True): "Want", ("album", False): "Unwant", ("artist", True): "Follow", ("artist", False): "Unfollow"}[kind, on]
@@ -749,23 +726,19 @@ def routes(api) -> list[Route]:
                 f'<input type="hidden" name="next" value="{escape(here)}"><button{' class="danger"' if not on else ' class="primary"' if kind == "artist" else ""}>'
                 f'{label}</button></form>')
 
-    def followed(db, mbid: str) -> bool:
-        ids = acquire.refs(db, "artist", mbid)
-        return bool(db.execute(f"select 1 from wanted where kind = 'artist' and ref in ({','.join('?' * len(ids))})", list(ids)).fetchone())
-
     def artist_state(db, mbid: str) -> str:
-        return (f'<a class="pill good" href="/music/library/artist/{mbid}">in the library</a> ' if acquire.library_id(db, MB_IDS["artist"] + mbid) else ""
-                ) + (pill("followed", "accent") if followed(db, mbid) else "")
+        return (f'<a class="pill good" href="/music/library/artist/{mbid}">in the library</a> ' if tracks.library_id(db, MB_IDS["artist"] + mbid) else ""
+                ) + (pill("followed", "accent") if acquire.wanted_by(db, "artist", mbid) else "")
 
     def album_line(db, user, g: dict, here: str, by: bool = True) -> str:
-        row = db.execute("select state, error from want_album where rg = ?", (g["id"],)).fetchone()
-        state = pill("in the library", "good") if acquire.library_id(db, MB_IDS["album"] + g["id"]) or row and row["state"] == "have" else \
+        row = acquire.album(db, g["id"])
+        state = pill("in the library", "good") if tracks.library_id(db, MB_IDS["album"] + g["id"]) or row and row["state"] == "have" else \
             {"missing": pill("wanted", "accent"), "downloading": pill("downloading", "busy")}[row["state"]] if row else ""
         credit = g.get("artist-credit") or []
-        artist = f' — <a href="/music/artist/{credit[0]["artist"]["id"]}">{escape(credited(g))}</a>' if by and credit else ""
+        artist = f' — <a href="/music/artist/{credit[0]["artist"]["id"]}">{escape(musicbrainz.credited(credit))}</a>' if by and credit else ""
         info = details(g.get("primary-type"), *(g.get("secondary-types") or []), (g.get("first-release-date") or "")[:4], g.get("disambiguation"))
-        return (f'<li>{cover_of(g["id"])}<div class="grow"><b><a href="/music/library/album/{quote(acquire.library_id(db, MB_IDS["album"] + g["id"]) or MB_IDS["album"] + g["id"])}">{escape(g["title"])}</a></b>{artist}<div>{info} {state}</div></div>'
-                f'{want_button("album", g["id"], not mine(db, user, "album", g["id"]), here)}</li>')
+        return (f'<li>{cover_of(g["id"])}<div class="grow"><b><a href="/music/library/album/{quote(album_page(db, g["id"]))}">{escape(g["title"])}</a></b>{artist}<div>{info} {state}</div></div>'
+                f'{want_button("album", g["id"], not acquire.wanted_by(db, "album", g["id"], user["name"]), here)}</li>')
 
     def find_music(db, request, user, form):
         q = request.query_params
@@ -777,7 +750,7 @@ def routes(api) -> list[Route]:
                 f'<span>Albums</span></label></div><button class="primary right">Search MusicBrainz</button></div></form>')
         if text:
             try:
-                found = acquire.find(db, kind, text)
+                found = musicbrainz.find(kind, text, db)
             except OSError as e:
                 found, error = [], f"MusicBrainz didn't answer: {e}"
             here = f"/music?q={quote(text)}&kind={kind}"
@@ -792,17 +765,18 @@ def routes(api) -> list[Route]:
         try:
             if not MBID.fullmatch(mbid):
                 raise LookupError(mbid)
-            info, groups = musicbrainz.get(releases.ALIASES.format(mbid), db, releases.KEEP_ALIASES), acquire.release_groups(db, mbid)
+            info, groups = musicbrainz.artist(mbid, db), musicbrainz.release_groups(mbid, db)
         except LookupError:
             return back("/music", error="MusicBrainz has no such artist.")
         except OSError as e:
             return back("/music", error=f"MusicBrainz didn't answer: {e}")
         here = f"/music/artist/{mbid}"
         body = (f'<section><div class="row"><div class="grow">{about(info)}<div>{artist_state(db, mbid)}</div></div>'
-                f'{want_button("artist", mbid, not mine(db, user, "artist", mbid), here)}</div><p class="muted">Following wants its albums, EPs and '
+                f'{want_button("artist", mbid, not acquire.wanted_by(db, "artist", mbid, user["name"]), here)}</div><p class="muted">Following wants its albums, EPs and '
                 f'singles, new ones too, except repackages, singles whose songs are on its albums and what has no official release.</p></section>')
-        for kind in TYPES:
-            rows = sorted((g for g in groups if g.get("primary-type") == kind), key=lambda g: g.get("first-release-date") or "9999")
+        groups = musicbrainz.by_date(groups)
+        for kind in musicbrainz.TYPES:
+            rows = [g for g in groups if g.get("primary-type") == kind]
             if rows:
                 body += f'<section><h2>{kind}s</h2><ul class="rows">{"".join(album_line(db, user, g, here, by=False) for g in rows)}</ul></section>'
         return page(info["name"], body, q.get("message", ""), q.get("error", ""), tab="find")
@@ -813,20 +787,19 @@ def routes(api) -> list[Route]:
         if kind not in MB_IDS or not MBID.fullmatch(mbid):
             return back(here, error="Nothing to want.")
         if form.get("on"):  # under the library's id once it has it, as clients see it
-            api._want(db, user["name"], kind, [acquire.library_id(db, MB_IDS[kind] + mbid) or MB_IDS[kind] + mbid], time.time())
+            oasis.want(db, user["name"], kind, [tracks.current_id(db, MB_IDS[kind] + mbid)], time.time())
             return back(here, message="Followed: its albums are searched for." if kind == "artist" else "Wanted: it is searched for.")
-        api._want(db, user["name"], kind, mine(db, user, kind, mbid), None)
+        oasis.want(db, user["name"], kind, acquire.wanted_by(db, kind, mbid, user["name"]), None)
         return back(here, message="Unfollowed. Files already here stay." if kind == "artist" else "Unwanted. Files already here stay.")
 
     def wanted(db, request, user, form):
-        q, acq = request.query_params, api.library
+        q, acq = request.query_params, oasis.acquire
         artist_f, type_f, text = q.get("artist", ""), q.get("type", ""), q.get("q", "").strip()
         here = "/music/wanted" + ("?" + urlencode({k: v for k, v in (("artist", artist_f), ("type", type_f), ("q", text)) if v})
                                   if artist_f or type_f or text else "")
-        active = {r["rg"]: r for r in db.execute("select d.hash, d.state, d.created, coalesce(t.rg, d.album_mbid) rg from download d left join download_target t "
-                                                 "on t.hash = d.hash where d.state not in ('done', 'failed') and coalesce(t.rg, d.album_mbid) is not null")}
+        active = download.by_group(db)
 
-        untried = db.execute("select count(*) from want_album where state = 'missing' and searched is null").fetchone()[0]
+        untried = acquire.untried(db)
 
         def again(r) -> str:
             """When an album searched before is searched again: after its wait, and after every album not tried yet."""
@@ -840,9 +813,9 @@ def routes(api) -> list[Route]:
                 return "downloading", progress(d["hash"], d["state"], d["created"])
             if r["state"] == "downloading":
                 return "downloading", pill("downloading", "busy")
-            if r["rg"] in acq.soon:
+            if acq.searching_soon(r["rg"]):
                 return "next", pill("in a minute or two", "accent")
-            if (r["error"] or "").startswith(("download failed", "search failed")):
+            if (r["error"] or "").startswith((wants.DOWNLOAD_FAILED, wants.SEARCH_FAILED)):
                 return "attention", f'<span class="error">{escape(r["error"])}</span> <span class="muted">· tries again {again(r)}</span>'
             return ("notfound", f'<span class="muted">searched {ago(r["searched"])} · next try {again(r)}</span>') if r["searched"] else ("waiting", "")
 
@@ -850,31 +823,22 @@ def routes(api) -> list[Route]:
             return (f'<form method="post" action="/music/wanted/{escape(rg)}/{name}"{ask and confirm(ask)}><input type="hidden" name="next" value="{escape(here)}">'
                     f'<button{' class="danger"' if ask and name == "give-up" else ""}>{label}</button></form>')
 
-        where, params = ["state in ('missing', 'downloading')"], []
-        if artist_f:
-            where.append("artist_mbid = ?"), params.append(artist_f)
-        if type_f:
-            where.append("primary_type = ?"), params.append(type_f)
-        if text:
-            where.append("(title like ? or artist like ?)"), params.extend([f"%{text}%"] * 2)
-        rows = db.execute(f"select * from want_album where {' and '.join(where)} order by reason != 'starred', artist collate nocase, "
-                          "primary_type != 'Album', primary_type != 'EP', first_date", params).fetchall()
+        rows = acquire.wanted_albums(db, artist_f, type_f, text)
         groups: dict[str, list] = {}
         for r in rows:
             name, note = place(r)
             groups.setdefault(name, []).append((r, note))
-        artists = db.execute("select artist_mbid, artist, count(*) n from want_album where state in ('missing', 'downloading') "
-                             "group by artist_mbid order by artist collate nocase").fetchall()
+        artists = acquire.wanted_artists(db)
         option = lambda value, label, chosen: f'<option value="{escape(value)}"{" selected" if value == chosen else ""}>{escape(label)}</option>'
-        counts = dict(db.execute("select state, count(*) from want_album group by state").fetchall())
-        finding, waits = to_find(db)
+        counts = acquire.counts(db)
+        finding, waits = to_find(acq, db)
         tiles = [*finding, (counts.get("downloading", 0), "downloading"), (counts.get("have", 0), "arrived")]
         body = ('<div class="stats">' + "".join(f'<div><b>{n}</b><span>{label}</span></div>' for n, label in tiles) + '</div>'
                 + (f'<p class="muted">{waits}</p>' if waits else "") +
                 f'<form class="filters"><select name="artist" aria-label="Artist">{option("", "All artists", artist_f)}'
                 + "".join(option(a["artist_mbid"], f'{a["artist"]} ({a["n"]})', artist_f) for a in artists)
                 + f'</select><select name="type" aria-label="Type">{option("", "Any type", type_f)}'
-                + "".join(option(t, t, type_f) for t in ("Album", "EP", "Single"))
+                + "".join(option(t, t, type_f) for t in musicbrainz.TYPES)
                 + f'</select><input type="text" name="q" value="{escape(text)}" placeholder="Title or artist" aria-label="Title or artist"><button>Filter</button>'
                 + ('<a class="button" href="/music/wanted">Clear</a>' if here != "/music/wanted" else "") + '</form>'
                 + '<p class="muted">Unwanting stops the search, also for a followed artist\'s album; files already here stay, and Want brings it back.</p>')
@@ -889,7 +853,7 @@ def routes(api) -> list[Route]:
                     f'value="{",".join(r["rg"] for r, _ in items)}"><input type="hidden" name="next" value="{escape(here)}">'
                     f'<button class="danger">Unwant {"all " + str(len(items)) if len(items) > 1 else "it"}…</button></form>')
             table = "".join(
-                f'<tr id="rg-{escape(r["rg"])}"><td class="thumb">{cover_of(r["rg"])}</td><td class="lead"><b><a href="/music/library/album/{quote(acquire.library_id(db, MB_IDS["album"] + r["rg"]) or MB_IDS["album"] + r["rg"])}">{escape(r["title"])}</a></b><div class="muted">'
+                f'<tr id="rg-{escape(r["rg"])}"><td class="thumb">{cover_of(r["rg"])}</td><td class="lead"><b><a href="/music/library/album/{quote(album_page(db, r["rg"]))}">{escape(r["title"])}</a></b><div class="muted">'
                 f'<a href="/music/artist/{escape(r["artist_mbid"])}">{escape(r["artist"] or "")}</a></div></td><td class="meta">{escape(r["primary_type"] or "")}'
                 f'{" · " + escape(r["secondary_types"]) if r["secondary_types"] else ""}</td>'
                 f'<td class="meta num">{escape((r["first_date"] or "")[:4])}</td>'
@@ -903,14 +867,13 @@ def routes(api) -> list[Route]:
                      f'<th>State</th><th></th></tr></thead><tbody>{table}</tbody></table>{bulk}</details>')
         if not rows:
             body += f'<section><p class="muted">{"Nothing wanted matches." if here != "/music/wanted" else "Nothing left to find."}</p></section>'
-        lost = db.execute("select wi.*, exists (select 1 from wanted w where w.kind = wi.kind and w.ref = wi.ref and w.user = ?) mine "
-                          "from want_item wi where wi.state = 'failed' and exists (select 1 from wanted w where w.kind = wi.kind "
-                          "and w.ref = wi.ref)", (user["name"],)).fetchall()
+        lost = acquire.unresolved(db, user["name"])
         if lost:
-            names = {"album": ("select album_artist || ' – ' || album from track where album_id = ?",
-                               "select a.name || ' – ' || r.title from ytm_release r join ytm_artist a using (artist_id) where r.album_id = ?"),
-                     "artist": ("select album_artist from track where artist_id = ?", "select name from ytm_artist where artist_id = ?")}
-            name = lambda r: next((row[0] for sql in names[r["kind"]] if (row := db.execute(sql, (r["ref"],)).fetchone())), r["ref"])
+            def name(r) -> str:
+                if r["kind"] == "artist":
+                    return tracks.artist_name_of(db, r["ref"]) or r["ref"]
+                album = tracks.album_name_of(db, r["ref"])
+                return f'{album["name"]} – {album["title"]}' if album and album["name"] and album["title"] else r["ref"]
             body += ('<section><h2>Not found on MusicBrainz</h2><p class="muted">Starred, but oasis can\'t tell which MusicBrainz '
                      'artist or album it is; it asks again later. Find it and want it from there instead.</p><table class="grid"><tbody>' + "".join(
                          f'<tr><td class="lead"><b>{escape(name(r))}</b></td><td class="meta">{escape(r["kind"])}</td><td class="state"><span class="error">'
@@ -949,20 +912,19 @@ def routes(api) -> list[Route]:
     def library_artists(db) -> dict[str, dict]:
         """Artists by their page key (MusicBrainz id when known, else oasis id) with what's here and what's wanted."""
         mbid_of = dict(db.execute("select artist_id, mbid from mb_artist").fetchall())
-        followed = {r[0] for r in db.execute("select ref from wanted where kind = 'artist'")}
+        followed = acquire.followed_refs(db)
         artists: dict[str, dict] = {}
         for r in db.execute("select artist_id, min(album_artist) name, count(distinct album_id) albums, count(*) songs, sum(duration) seconds, "
                             "sum(size) bytes, max(album_id) album from track where source = 'local' group by artist_id"):
             key = mbid_of.get(r["artist_id"]) or r["artist_id"]
             artists[key] = {**dict(r), "wanted": 0, "followed": r["artist_id"] in followed, "cover": r["album"], "genres": []}
-        for r in db.execute("select artist_mbid, min(artist) name, count(*) n, min(rg) rg from want_album where state in ('missing', 'downloading') "
-                            "group by artist_mbid"):
-            a = artists.setdefault(r["artist_mbid"], {"name": r["name"], "albums": 0, "songs": 0, "seconds": 0, "bytes": 0, "cover": "al-mb-" + r["rg"],
+        for r in acquire.wanted_artists(db):
+            a = artists.setdefault(r["artist_mbid"], {"name": r["artist"], "albums": 0, "songs": 0, "seconds": 0, "bytes": 0, "cover": MB_IDS["album"] + r["rg"],
                                                       "followed": False, "genres": []})
             a["wanted"] = r["n"]
         for key, a in artists.items():
             if MBID.fullmatch(key):
-                a["followed"] = a["followed"] or bool(acquire.refs(db, "artist", key) & followed)
+                a["followed"] = a["followed"] or bool(acquire.wanted_by(db, "artist", key))
         for artist_id, genres in db.execute("select artist_id, group_concat(genres, '|') from track where source = 'local' and genres is not null "
                                              "group by artist_id"):
             counts = Counter(g for chunk in genres.split("|") for g in json.loads(chunk))
@@ -975,36 +937,35 @@ def routes(api) -> list[Route]:
         return (f'<img class="{cls}" loading="lazy" alt="" src="/music/cover/{quote(album_id)}" {HIDE_BROKEN}>' if album_id else f'<div class="{cls}"></div>')
 
     def music_cover(db, request, user, form):
-        try:
-            return api.getCoverArt(db, type("P", (), {"need": lambda self, key: request.path_params["id"]})(), user)
-        except Exception:  # no cover anywhere: a quiet placeholder, not a broken image
-            return Response(NO_COVER, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=3600"})
+        image = cover.find(db, request.path_params["id"])
+        if image is None:
+            return Response(status_code=404)
+        return Response(image[0], media_type=image[1], headers={"Cache-Control": "public, max-age=86400"})
 
     def library_artist(db, request, user, form):
         q, key = request.query_params, request.path_params["key"]
-        ids = [key] if key.startswith("ar-") else [r[0] for r in db.execute("select artist_id from mb_artist where mbid = ?", (key,))]
+        ids = [key] if key.startswith(IDS["artist"]) else [r[0] for r in db.execute("select artist_id from mb_artist where mbid = ?", (key,))]
         mbid = key if MBID.fullmatch(key) else db.execute("select mbid from mb_artist where artist_id = ?", (key,)).fetchone()
         mbid = mbid if isinstance(mbid, str) or mbid is None else mbid[0]
         marks = ",".join("?" * len(ids)) or "null"
         albums = db.execute(f"select album_id, min(album) album, min(year) year, min(original_date) original, min(release_types) types, count(*) songs, "
                             f"sum(duration) seconds, sum(size) bytes, group_concat(distinct upper(suffix)) formats, min(album_artist) artist "
                             f"from track where source = 'local' and artist_id in ({marks}) group by album_id order by year, album", ids).fetchall()
-        wanted = db.execute("select * from want_album where artist_mbid = ? and state in ('missing', 'downloading') order by first_date", (mbid,)).fetchall() if mbid else []
+        wanted = sorted(acquire.wanted_albums(db, artist=mbid), key=lambda w: w["first_date"] or "") if mbid else []
         name = (albums[0]["artist"] if albums else wanted[0]["artist"] if wanted else
                 (db.execute("select name from mb_artist where mbid = ?", (mbid,)).fetchone() or [key])[0])
         info = db.execute(f"select * from ytm_artist where artist_id in ({marks}) and description is not null limit 1", ids).fetchone()
         about = db.execute("select type from mb_artist where mbid = ?", (mbid,)).fetchone() if mbid else None
-        downloading = {r[0] for r in db.execute("select coalesce(t.rg, d.album_mbid) from download d left join download_target t on t.hash = d.hash "
-                                                "where d.state not in ('done', 'failed')")}
+        downloading = set(download.by_group(db))
         groups: dict[str, list] = {}
         for a in albums:
-            kind = ((a["types"] or "album").split(";")[0].strip() or "album").title()
-            groups.setdefault("EP" if kind == "Ep" else kind, []).append(card(a))
+            kind = musicbrainz.type_name((a["types"] or "album").split(";")[0].strip() or "album")
+            groups.setdefault(kind, []).append(card(a))
         for w in wanted:
             state = (pill("downloading", "busy") if w["state"] == "downloading" or w["rg"] in downloading else
                      pill(f"not found yet · {ago(w['searched'])}") if w["searched"] else pill("wanted", "accent"))
             groups.setdefault(w["primary_type"] or "Album", []).append(
-                f'<div class="card dim"><img class="cover" loading="lazy" alt="" src="/music/cover/al-mb-{escape(w["rg"])}" '
+                f'<div class="card dim"><img class="cover" loading="lazy" alt="" src="/music/cover/{MB_IDS["album"]}{escape(w["rg"])}" '
                 f'{HIDE_BROKEN}>'
                 f'<b>{escape(w["title"])}</b><span class="muted">{escape((w["first_date"] or "")[:4])}</span>{state}</div>')
         links = "".join(f'<a href="/music/library/artist/{quote(other)}">{escape(n)}</a> <span class="muted">{kind}</span> · '
@@ -1019,7 +980,7 @@ def routes(api) -> list[Route]:
         image = (f'<img class="cover round" loading="lazy" alt="" src="{escape(info["image"])}" {HIDE_BROKEN}>' if info and info["image"]
                  else picture(albums[-1]["album_id"] if albums else None, "round"))
         manage = (f'<div class="row"><a class="button" href="/music/artist/{mbid}">Full discography</a><div class="right">'
-                  f'{want_button("artist", mbid, not mine(db, user, "artist", mbid), f"/music/library/artist/{quote(key)}")}</div></div>' if mbid else "")
+                  f'{want_button("artist", mbid, not acquire.wanted_by(db, "artist", mbid, user["name"]), f"/music/library/artist/{quote(key)}")}</div></div>' if mbid else "")
         body = hero(image, "Artist" + (f" · {escape(about[0])}" if about and about[0] else ""), name, escape(" · ".join(filter(None, counts))),
                     f'{manage}<dl class="meta">{dl(facts)}</dl>{"<p class=muted>" + escape(info["description"][:600]) + "</p>" if info else ""}')
         for kind in ("Album", "EP", "Single", "Compilation", "Soundtrack", "Live", "Other"):
@@ -1057,11 +1018,10 @@ def routes(api) -> list[Route]:
                 return musicbrainz_album(db, request, user, album_id[len(MB_IDS["album"]):])
             return back("/music/library", error="That album isn't here.")
         t = tracks[0]
-        from .api import credits_of  # api imports this module
         credits = credits_of(db, [r["id"] for r in tracks])
         artist_key = (db.execute("select mbid from mb_artist where artist_id = ?", (t["artist_id"],)).fetchone() or [t["artist_id"]])[0]
         genres = Counter(g for r in tracks if r["genres"] for g in json.loads(r["genres"]))
-        lossless = all((r["suffix"] or "") in importer.LOSSLESS for r in tracks)
+        lossless = all((r["suffix"] or "") in formats.LOSSLESS for r in tracks)
         bitrates = sorted({r["bitrate"] for r in tracks if r["bitrate"]})
         fmt = ", ".join(sorted({(r["suffix"] or "").upper() for r in tracks})) + ("" if lossless else f' {bitrates[0]}–{bitrates[-1]} kbps'
                                                                                    if len(bitrates) > 1 else f' {bitrates[0]} kbps' if bitrates else "")
@@ -1098,7 +1058,6 @@ def routes(api) -> list[Route]:
                        (user["name"], request.path_params["id"])).fetchone()
         if r is None:
             return back("/music/library", error="That song isn't here.")
-        from .api import credits_of  # api imports this module
         mine = credits_of(db, [r["id"]]).get(r["id"], [])
         roles: dict[str, list] = {}
         for c in mine:
@@ -1108,7 +1067,7 @@ def routes(api) -> list[Route]:
         order = ["artist", "performer", "composer", "lyricist", "writer", "arranger", "conductor", "producer", "remixer", "mixer", "engineer"]
         credit_facts = [(role.title() + "s" if len(roles[role]) > 1 else role.title(), ", ".join(roles[role]))
                         for role in sorted(roles, key=lambda x: order.index(x) if x in order else 99)]
-        shared = db.execute("select kept from audio_shared where path = ?", (r["ref"],)).fetchone()
+        shared = audiorecords.kept_copy(db, r["ref"])
         lyrics = db.execute("select found is not null and found != '' from lyrics where track_id = ?", (r["id"],)).fetchone()
         facts = [*credit_facts, ("Genres", escape(", ".join(json.loads(r["genres"]) if r["genres"] else [r["genre"] or ""]))),
                  ("ISRC", escape(r["isrc"] or "")),
@@ -1116,7 +1075,7 @@ def routes(api) -> list[Route]:
                  ("Format", escape(f'{(r["suffix"] or "").upper()} · {r["bitrate"]} kbps · {size(r["size"])}') + quality_pills(db, [r["ref"]])),
                  ("Plays", f'{r["plays"] or 0}' + (f' · last {ago(r["played"])}' if r["played"] else "")),
                  ("Lyrics", ("found" if lyrics[0] else "none found") if lyrics else None),
-                 ("Shares audio with", f'<code>{escape(shared[0])}</code>' if shared else None),
+                 ("Shares audio with", f'<code>{escape(shared)}</code>' if shared else None),
                  ("File", f'<code>{escape(r["ref"])}</code>' if r["source"] == "local" else None)]
         line = [f'from <a href="/music/library/album/{quote(r["album_id"])}">{escape(r["album"])}</a>', f'disc {r["disc_no"]}' if (r["disc_no"] or 1) > 1 else "",
                 f'track {r["track_no"]}' if r["track_no"] else "", length(r["duration"])]
@@ -1124,35 +1083,28 @@ def routes(api) -> list[Route]:
                     " · ".join(filter(None, line)), f'<dl class="meta">{dl(facts)}</dl>')
         return page(r["title"], body, wide=True, tab="library", heading=False)
 
-    def give_up(db, user, rg: str):
-        api._want(db, user["name"], "album", mine(db, user, "album", rg), None)
-        db.execute("insert or replace into given_up values (?, ?)", (rg, time.time()))
-        db.execute("delete from want_album where rg = ? and reason = 'followed'", (rg,))
-
     def wanted_action(db, request, user, form):
         rg, action = request.path_params["rg"], request.path_params["action"]
         here = form.get("next", "") if form.get("next", "").startswith(("/music/wanted", "/music/library/album/")) else "/music/wanted"
-        row = db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
+        row = acquire.album(db, rg)
         if row is None or action not in ("search", "block", "give-up"):
             return back(here, error="That album isn't wanted any more.")
         name = f'{row["artist"]} – {row["title"]}'
-        if action == "block" and not (api.downloads and api.downloads.block(db, rg)):
+        if action == "block" and not (oasis.downloads and oasis.downloads.block(db, rg)):
             return back(here, error=f"Nothing is downloading for {name} that can still be stopped.")
         if action in ("search", "block"):
-            api.library.soon.add(rg)
-            api.library.wake.set()
+            oasis.acquire.search_soon(rg)
             return back(here, message=f"{name} is searched next, in a minute or two." if action == "search" else
                         f"Blocked that release of {name}; the next search picks another.", anchor=f"rg-{rg}")
-        give_up(db, user, rg)
+        oasis.give_up(db, user["name"], rg)
         return back(here, message=f"Unwanted {name}: no longer searched for. Files already here stay; Want brings it back.")
 
     def wanted_log(db, user, rg: str, here: str) -> str:
         """An album's section on what oasis did to get it: whether and why it is wanted, its searches and downloads, and
         what can be done; empty for an album never wanted nor downloaded."""
-        row = db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
-        downloads = db.execute("select distinct d.* from download d left join download_target t on t.hash = d.hash where d.album_mbid = ? or t.rg = ? "
-                               "order by d.created desc limit 20", (rg, rg)).fetchall()
-        wanted = mine(db, user, "album", rg)
+        row = acquire.album(db, rg)
+        downloads = download.of_album(db, rg)
+        wanted = acquire.wanted_by(db, "album", rg, user["name"])
         if not (row or downloads or wanted):
             return ""
         active = next((d for d in downloads if d["state"] not in ("done", "failed")), None)
@@ -1170,7 +1122,7 @@ def routes(api) -> list[Route]:
         actions = (act("block", "Try another", f"Drop this download of {name} and try another release?") if active else act("search", "Search now")) + \
             act("give-up", "Unwant", f"Unwant {name}? Its search stops; files already here stay.") if searching else ""
         log = "".join(f'<tr><td class="meta num">{ago(d["created"])}</td><td class="lead">{escape(d["title"])}</td>'
-                      f'<td class="meta">{escape("imported" if d["state"] == "done" else STATES.get(d["state"], d["state"]))}</td>'
+                      f'<td class="meta">{escape("imported" if d["state"] == "done" else download.STEPS.get(d["state"], d["state"]))}</td>'
                       f'<td class="state">{f"""<span class="error">{escape(d["error"])}</span>""" if d["error"] else ""}</td></tr>' for d in downloads)
         # Unwant drops the user's star and, for a followed artist's album, the album from the catalogue (given_up).
         star = "" if searching else want_button("album", rg, False, here) if wanted else want_button("album", rg, True, here) if not row else ""
@@ -1180,21 +1132,21 @@ def routes(api) -> list[Route]:
     def musicbrainz_album(db, request, user, rg: str):
         """The album page of a release group that isn't here yet: MusicBrainz's smallest edition's songs, and its wanted log."""
         try:
-            found = importer.editions(db, rg) if MBID.fullmatch(rg) else []
+            found = musicbrainz.editions(rg, db) if MBID.fullmatch(rg) else []
         except OSError as e:
             return back("/music/wanted", error=f"MusicBrainz didn't answer: {e}")
         if not found:
             return back("/music/wanted", error="That album isn't here, and MusicBrainz doesn't know it.")
-        audio = lambda r: [m for m in r.get("media") or [] if not acquire.VIDEO.search(m.get("format") or "")]
+        audio = lambda r: [m for m in r.get("media") or [] if not musicbrainz.VIDEO_MEDIA.search(m.get("format") or "")]
         smallest = min((r for r in found if audio(r)), key=lambda r: sum(len(m.get("tracks") or []) for m in audio(r)), default=found[0])
         group, credit = smallest.get("release-group") or {}, smallest.get("artist-credit") or []
-        row = db.execute("select * from want_album where rg = ?", (rg,)).fetchone()
+        row = acquire.album(db, rg)
         group = {"title": row and row["title"], "primary-type": row and row["primary_type"], "first-release-date": row and row["first_date"],
                  "secondary-types": row["secondary_types"].split("; ") if row and row["secondary_types"] else [], **{k: v for k, v in group.items() if v}}
         if not credit and row:
             credit = [{"name": row["artist"], "artist": {"id": row["artist_mbid"]}}]
         title, media = group["title"] or smallest.get("title") or rg, audio(smallest)
-        tracks = [t for m in media for t in m.get("tracks") or []]
+        songs = [t for m in media for t in m.get("tracks") or []]
         facts = [("Released", escape(group.get("first-release-date") or "")),
                  ("Label", escape(", ".join(dict.fromkeys(l["label"]["name"] for l in smallest.get("label-info") or [] if l.get("label"))))),
                  ("Discs", len(media) if len(media) > 1 else None), ("Editions", f"{len(found)}; the songs are the smallest one's" if len(found) > 1 else None),
@@ -1202,30 +1154,21 @@ def routes(api) -> list[Route]:
         rows = "".join(f'<tr><td class="num">{escape(f"{m.get("position")}.{t.get("number") or t.get("position")}" if len(media) > 1 else str(t.get("number") or t.get("position") or ""))}</td>'
                        f'<td class="lead">{escape(t.get("title") or "")}</td><td class="num">{length((t.get("length") or 0) // 1000)}</td></tr>'
                        for m in media for t in m.get("tracks") or [])
-        line = [f'by <a href="/music/artist/{escape(credit[0]["artist"]["id"])}">{escape(importer.joined(credit))}</a>' if credit else "",
-                escape((group.get("first-release-date") or "")[:4]), f"{len(tracks)} song{'s' if len(tracks) != 1 else ''}", length(sum(t.get("length") or 0 for t in tracks) // 1000)]
+        line = [f'by <a href="/music/artist/{escape(credit[0]["artist"]["id"])}">{escape(musicbrainz.credited(credit))}</a>' if credit else "",
+                escape((group.get("first-release-date") or "")[:4]), f"{len(songs)} song{'s' if len(songs) != 1 else ''}", length(sum(t.get("length") or 0 for t in songs) // 1000)]
         kinds = " · ".join(filter(None, [group.get("primary-type"), *(group.get("secondary-types") or [])])) or "Album"
-        body = (hero(f'<img class="cover" alt="" src="/music/cover/al-mb-{escape(rg)}" {HIDE_BROKEN}>', escape(kinds), title,
+        body = (hero(f'<img class="cover" alt="" src="/music/cover/{MB_IDS["album"]}{escape(rg)}" {HIDE_BROKEN}>', escape(kinds), title,
                      " · ".join(filter(None, line)), f'<dl class="meta">{dl(facts)}</dl>')
                 + f'<section><table class="grid tracks"><thead><tr><th class="num">#</th><th>Title</th><th class="num">Length</th></tr></thead><tbody>{rows}</tbody></table></section>'
                 + wanted_log(db, user, rg, f"/music/library/album/{MB_IDS['album']}{rg}"))
         return page(title, body, request.query_params.get("message", ""), request.query_params.get("error", ""), wide=True, tab="wanted", heading=False)
 
-    def attribution(found: list[dict], tag: int):
-        """The indexer a download came from: the one oasis noted, or before it did, the one of the release's site. A site
-        several indexers share (an anime site and its music twin) goes to an enabled music one: oasis searches only those."""
-        label = lambda host: (parts := (host or "").split("."))[-2 if len(parts) > 1 else 0]  # 'example' for example.org and example.net alike
-        by_site = {label(urlparse(u).hostname): i["id"] for i in sorted(found, key=lambda i: (i["enable"], tag in i.get("tags", [])))
-                   for u in [*(i.get("indexerUrls") or []), *(i.get("legacyUrls") or [])] if urlparse(u).hostname}
-        return lambda r: r["indexer"] or by_site.get(label(urlparse(r["guid"] or "").hostname) if (r["guid"] or "").startswith("http") else None)
+    def origin(client, found: list[dict]):
+        """guess(guid) for download.by_indexer: the indexer of the release's site, for a download from before oasis noted its indexer."""
+        sites = client.site_indexers(found)
+        return lambda guid: sites.get(prowlarr.site(guid)) if guid.startswith("http") else None
 
-    def blocks_of(db, found: list[dict], tag: int, id: int) -> list[str]:
-        """The release_block keys (info hash or guid) of the indexer's downloads."""
-        of = attribution(found, tag)
-        mine = {k for r in db.execute("select hash, guid, indexer from download").fetchall() if of(r) == id for k in (r["hash"], r["guid"]) if k}
-        return [k for (k,) in db.execute("select hash from release_block").fetchall() if k in mine]
-
-    def manage(i: dict, tags: dict[int, str], login: bool, blocks: int, saved: bool) -> str:
+    def manage(i: dict, tags: dict[int, str], login: bool, blocks: int) -> str:
         """An admin's controls for one indexer: what Prowlarr stores, then what oasis does."""
         id, name, action = i["id"], i["name"], f'/music/indexers/{i["id"]}'
         post = lambda what, inner, ask="", cls="": (f'<form class="{cls}" method="post" action="{action}/{what}"{ask and confirm(ask)}>{inner}</form>')
@@ -1243,7 +1186,7 @@ def routes(api) -> list[Route]:
             if key in fields:
                 limits += number(key, f"{label} a {'day' if (fields.get('baseSettings.limitsUnit') or {}).get('value', 0) == 0 else 'hour'}", fields[key].get("value"))
         if unit := fields.get("baseSettings.limitsUnit"):
-            limits += (f'<label>Limits per<select name="baseSettings.limitsUnit">' + "".join(
+            limits += ('<label>Limits per<select name="baseSettings.limitsUnit">' + "".join(
                 f'<option value="{o["value"]}"{" selected" if o["value"] == unit.get("value") else ""}>{escape(str(o["name"]))}</option>' for o in unit.get("selectOptions") or [])
                 + '</select></label>')
         prowlarr_side += post("limits", f'<fieldset>{legend("Priority and limits", "Prowlarr")}<div class="fields">{limits}</div>{force}<button>Save to Prowlarr</button></fieldset>')
@@ -1265,7 +1208,7 @@ def routes(api) -> list[Route]:
         prowlarr_side += post("test", '<button>Test</button> <span class="muted">Prowlarr tests it as it is saved there</span>', cls="row")
         oasis_side = ""
         if i.get("protocol") == "torrent":
-            rule, source = api.downloads.rule(name, login), api.downloads.rule_source(name)
+            rule, source = oasis.downloads.rule(name, login), oasis.downloads.rule_source(name)
             value = lambda v: "" if v is None else f"{v:g}"
             modes = "".join(f'<option value="{m}"{" selected" if m == rule["mode"] else ""}>{escape(text)}</option>' for m, text in MODES.items())
             oasis_side += post("seeding", f'<fieldset>{legend("Seeding on TorBox", "oasis database")}<p class="muted">Now: {escape(source)}'
@@ -1276,8 +1219,8 @@ def routes(api) -> list[Route]:
                                f'<label>Hours at least<input type="number" step="any" min="0" name="min_hours" value="{value(rule["min_hours"])}"></label>'
                                f'<label>Lowest total ratio<input type="number" step="any" min="0" name="min_ratio" value="{value(rule["min_ratio"])}" placeholder="none"></label></div>'
                                '<button>Save in oasis</button></fieldset>')
-            if saved:
-                oasis_side += post("reset-seeding", f'<button>Reset to default</button> <span class="muted">back to the {"oasis.toml" if name in api.downloads.rules else "default"} rule</span>',
+            if source == "oasis database":
+                oasis_side += post("reset-seeding", f'<button>Reset to default</button> <span class="muted">back to the {"oasis.toml" if name in oasis.downloads.rules else "default"} rule</span>',
                                    f"Reset {name}'s seeding rule?", "row")
         oasis_side += post("unblock", f'<button{" disabled" if not blocks else ""}>Clear {plural(blocks, "block")}</button> <span class="muted">releases from it oasis '
                            'blocked after they failed: cleared, they can be picked again (after a login fix, say)</span>',
@@ -1288,49 +1231,32 @@ def routes(api) -> list[Route]:
     def indexers(db, request, user, form):
         """Every Prowlarr indexer: Prowlarr's view of it (settings, health, counts), what oasis got from it, and for a
         torrent indexer its seeding rule and running ratio; for an admin, the controls to change them (manage)."""
-        prowlarr = api.downloads.prowlarr if api.downloads else None
+        if not oasis.downloads:
+            return page("Indexers", "", error="Acquisition is off: it needs [torbox] with downloads and [prowlarr] in oasis.toml.", tab="wanted")
+        client = oasis.downloads.prowlarr
         try:
-            found = prowlarr.call("indexer")
-            status = {s["indexerId"]: s for s in prowlarr.call("indexerstatus")}
-            stats = {s["indexerId"]: s for s in (prowlarr.call("indexerstats") or {}).get("indexers") or []}
-            tags = {t["id"]: t["label"] for t in prowlarr.call("tag")}
-        except (OSError, AttributeError) as e:
+            view = client.overview()
+        except OSError as e:
             return page("Indexers", f'<section><p class="error">Prowlarr didn\'t answer: {escape(str(e))}</p></section>', tab="wanted")
-        of = attribution(found, prowlarr.tag)
-        rows = db.execute("select hash, guid, indexer, state, error, album_mbid, updated from download").fetchall()
-        targets = {}
-        for h, rg in db.execute("select hash, rg from download_target where state = 'done'"):
-            targets.setdefault(h, set()).add(rg)
-        have = {r[0] for r in db.execute("select rg from want_album where state = 'have'")}
-        mine, keys = {}, {}
-        for r in rows:
-            m = mine.setdefault(of(r), {"sent": 0, "done": 0, "failed": Counter(), "albums": set(), "last": None})
-            m["sent"] += 1
-            keys.update({k: of(r) for k in (r["hash"], r["guid"]) if k})
-            if r["state"] == "done":
-                m["done"] += 1
-                if supplied := ({r["album_mbid"]} if r["album_mbid"] else targets.get(r["hash"], set())) & have:
-                    m["albums"] |= supplied
-                    m["last"] = max(m["last"] or 0, r["updated"])
-            elif r["state"] == "failed":
-                m["failed"][(r["error"] or "unknown").split(":")[0]] += 1
-        blocks = Counter(keys.get(k) for (k,) in db.execute("select hash from release_block"))
-        hits = {i: n for i, *n in db.execute("select indexer, sum(results), sum(album), sum(usable) from search_stat where day >= date('now', '-30 days') group by indexer")}
-        totals = api.downloads.totals(db)
-        saved = {r[0] for r in db.execute("select tracker from seed_rule")}
-        errors = getattr(prowlarr, "errors", {})
+        found, status, stats, tags = view["indexers"], view["status"], view["stats"], view["tags"]
+        guess = origin(client, found)
+        mine, blocks = download.by_indexer(db, guess), download.blocks_by_indexer(db, guess)
+        hits = download.searches(db, 30)
+        totals = {r["tracker"]: (r["down"], r["up"]) for r in download.trackers(db)}
+        errors = client.errors
         cell = lambda *parts: '<br>'.join(p for p in parts if p)
         body, unused = "", ""
         for i in sorted(found, key=lambda i: (not i["enable"], i["name"].casefold())):
-            id, name, login = i["id"], i["name"], prowlarr_privacy(i) not in ("public", "local") and i.get("protocol") == "torrent"
-            kind = cell(escape(prowlarr_privacy(i)) + (" · " + escape(", ".join(tags.get(t, str(t)) for t in i.get("tags") or [])) if i.get("tags") else ""),
+            id, name, login = i["id"], i["name"], prowlarr.privacy(i) not in ("public", "local") and i.get("protocol") == "torrent"
+            kind = cell(escape(prowlarr.privacy(i)) + (" · " + escape(", ".join(tags.get(t, str(t)) for t in i.get("tags") or [])) if i.get("tags") else ""),
                         f'<span class="muted">{escape(i.get("definitionName") or i.get("implementationName") or "")} · {escape(i.get("protocol") or "")} · #{id}</span>')
-            if prowlarr.tag not in (i.get("tags") or []):
-                use = (f'<form method="post" action="/music/indexers/{id}/tag"><input type="hidden" name="tag" value="{prowlarr.tag}"><input type="hidden" name="on" value="1">'
+            if client.tag not in (i.get("tags") or []):
+                use = (f'<form method="post" action="/music/indexers/{id}/tag"><input type="hidden" name="tag" value="{client.tag}"><input type="hidden" name="on" value="1">'
                        '<button>Use for music</button></form>' if i.get("protocol") == "torrent" else '<span class="muted">usenet: oasis searches torrents only</span>')
                 unused += (f'<li id="indexer-{id}"><div class="grow"><b>{escape(name)}</b>{"" if i["enable"] else " <span class=muted>(disabled)</span>"}'
                            f'<div class="muted">{kind}</div></div>{use if user["admin"] else ""}</li>')
                 continue
+            blocked = len(blocks.get(id, []))
             st, pr, m = status.get(id) or {}, stats.get(id) or {}, mine.get(id) or {}
             when, what = errors.get(id, (None, ""))
             if login and "login" in what.lower():
@@ -1350,10 +1276,10 @@ def routes(api) -> list[Route]:
             failed = ", ".join(f"{n} {why}" for why, n in m["failed"].most_common()) if m else ""
             ours = cell(f'{m["sent"]} sent, {m["done"]} imported' if m else "", f'failed: {escape(failed)}' if failed else "",
                         f'{plural(len(m["albums"]), "wanted album")} arrived, last {ago(m["last"])}' if m and m["albums"] else "",
-                        f'{plural(blocks[id], "release")} blocked' if blocks[id] else "")
+                        f'{plural(blocked, "release")} blocked' if blocked else "")
             seeding = ""
             if i.get("protocol") == "torrent":
-                rule, source = api.downloads.rule(name, login), api.downloads.rule_source(name)
+                rule, source = oasis.downloads.rule(name, login), oasis.downloads.rule_source(name)
                 seeding = (f'seed · ratio {rule["ratio"]:g} · {rule["days"]:g} days' + (f' · at least {rule["min_hours"]:g} h' if rule["min_hours"] else "")
                            + (f' · min_ratio {rule["min_ratio"]:g}' if rule["min_ratio"] is not None else "") if rule["mode"] == "seed" else
                            "torbox: TorBox's setting" if rule["mode"] == "torbox" else "off") + f' <span class="muted">({source})</span>'
@@ -1363,14 +1289,14 @@ def routes(api) -> list[Route]:
             body += (f'<tr id="indexer-{id}"><td class="lead"><b>{escape(name)}</b><div class="muted">{kind}</div></td><td class="state">{health}</td>'
                      f'<td>{counts}</td><td>{searched}</td><td>{ours}</td><td>{seeding}</td></tr>')
             if user["admin"]:
-                body += f'<tr class="manage"><td colspan="6">{manage(i, tags, login, blocks[id], name in saved)}</td></tr>'
-        ui = (api.config.prowlarr or {}).get("ui_url") or f"{request.url.scheme}://{request.url.hostname}:{urlparse(prowlarr.url).port or 9696}/"
+                body += f'<tr class="manage"><td colspan="6">{manage(i, tags, login, blocked)}</td></tr>'
+        ui = client.ui_url or f"{request.url.scheme}://{request.url.hostname}:{urlparse(client.url).port or 9696}/"
         body = ('<section class="split-roles"><div><h2>Prowlarr does</h2><p class="muted">the indexer definitions, logins and cookies, Cloudflare (through '
                 'FlareSolverr), running each search, query and grab limits, health and backing off after failures, and syncing indexers to Sonarr.</p></div>'
                 '<div><h2>oasis does</h2><p class="muted">the queries for each wanted album, matching results to albums, ranking them (cached on TorBox, seeders), '
                 'blocking failed releases and retrying, sending to TorBox, seeding rules, importing, and WAV to FLAC.</p></div>'
                 f'<p class="muted">Indexers are added in Prowlarr: <a href="{escape(ui)}" target="_blank" rel="noopener">Add in Prowlarr</a>. oasis uses each one tagged '
-                f'{escape(tags.get(prowlarr.tag, "music"))}, from its next search on.</p></section>'
+                f'{escape(tags.get(client.tag, "music"))}, from its next search on.</p></section>'
                 '<section><p class="muted">Prowlarr\'s counts are its own, over all apps; searches are oasis\'s album searches over the last 30 days; downloads count '
                 'oasis\'s, by the indexer it noted, or before it did by the release\'s site.</p><div class="scroll"><table class="grid indexers"><thead><tr><th>Indexer</th><th>Health</th>'
                 f'<th>Prowlarr</th><th>Searches</th><th>Downloads</th><th>Seeding</th></tr></thead><tbody>{body}</tbody></table></div></section>'
@@ -1382,9 +1308,9 @@ def routes(api) -> list[Route]:
         """One change to one indexer: to Prowlarr's copy (enable, limits, tag, credentials) through its API, a test there,
         or to oasis's own (seeding, reset-seeding, unblock)."""
         id, what = request.path_params["id"], request.path_params["action"]
-        prowlarr = api.downloads.prowlarr
+        client = oasis.downloads.prowlarr
         try:
-            i = prowlarr.call(f"indexer/{id}")
+            i = client.indexer(id)
         except OSError as e:
             return back("/music/indexers", error=f"Prowlarr didn't answer: {e}")
         name, here = i["name"], lambda **kw: back("/music/indexers", anchor=f"indexer-{id}", **kw)
@@ -1393,7 +1319,7 @@ def routes(api) -> list[Route]:
         number = lambda key, cast=float: None if (form.get(key) or "").strip() == "" else cast(form[key])
         try:
             if what == "test":
-                prowlarr.test(i)
+                client.test(i)
                 return here(message=f"{name}: Prowlarr's test passed.")
             if what == "seeding":
                 rule = {"mode": form.get("mode"), "ratio": number("ratio"), "days": number("days"), "min_hours": number("min_hours") or 0, "min_ratio": number("min_ratio")}
@@ -1401,15 +1327,14 @@ def routes(api) -> list[Route]:
                     return here(error="Mode is torbox, seed or off.")
                 if rule["ratio"] is None or rule["days"] is None or min(v for k, v in rule.items() if k != "mode" and v is not None) < 0:
                     return here(error="Ratio and days need a number, none below 0.")
-                api.downloads.save_rule(db, name, rule)
+                oasis.downloads.save_rule(db, name, rule)
                 return here(message=f"Saved {name}'s seeding rule in oasis.")
             if what == "reset-seeding":
-                api.downloads.save_rule(db, name, None)
-                return here(message=f"{name} seeds by its {api.downloads.rule_source(name)} rule again.")
+                oasis.downloads.save_rule(db, name, None)
+                return here(message=f"{name} seeds by its {oasis.downloads.rule_source(name)} rule again.")
             if what == "unblock":
-                gone = blocks_of(db, prowlarr.call("indexer"), prowlarr.tag, id)
-                db.executemany("delete from release_block where hash = ?", [(k,) for k in gone])
-                db.commit()
+                gone = download.blocks_by_indexer(db, origin(client, client.every())).get(id, [])
+                download.unblock(db, gone)
                 return here(message=f"Cleared {plural(len(gone), 'block')} from {name}.")
             if what == "enable":
                 i["enable"], done = form.get("on") == "1", "enabled" if form.get("on") == "1" else "disabled"
@@ -1439,7 +1364,7 @@ def routes(api) -> list[Route]:
                 done = f"{', '.join(f.get('label') or f['name'] for f in changed)} saved"
             else:
                 return here(error="No such change.")
-            prowlarr.save(i, force=form.get("force") == "1")
+            client.save(i, force=form.get("force") == "1")
         except ValueError:
             return here(error="That isn't a number.")
         except OSError as e:
@@ -1451,12 +1376,12 @@ def routes(api) -> list[Route]:
         here = form.get("next", "") if form.get("next", "").startswith(("/music/wanted", "/music/library/album/")) else "/music/wanted"
         rgs = [rg for rg in form.get("rgs", "").split(",") if MBID.fullmatch(rg)]
         for rg in rgs:
-            give_up(db, user, rg)
+            oasis.give_up(db, user["name"], rg)
         return back(here, message=f"Unwanted {len(rgs)} album{'s' if len(rgs) != 1 else ''}. Files already here stay.")
 
     def unwant(db, request, user, form):
         if form.get("kind") in MB_IDS:
-            api._want(db, user["name"], form["kind"], [form.get("ref", "")], None)
+            oasis.want(db, user["name"], form["kind"], [form.get("ref", "")], None)
         return back("/music/wanted", message="Given up.")
 
     return [

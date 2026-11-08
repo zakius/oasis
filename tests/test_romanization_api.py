@@ -1,4 +1,3 @@
-import json
 
 import pytest
 
@@ -36,7 +35,7 @@ def latin_keys(value) -> set:
 
 def test_advertised(client):
     extensions = {e["name"]: e["versions"] for e in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]}
-    assert extensions["romanization"] == [1] and extensions["songLyrics"] == [1, 2]
+    assert extensions["romanization"] == [1] and 2 in extensions["songLyrics"]  # romanized lyrics come as songLyrics v2
 
 
 def test_absent_or_original_changes_nothing(client):

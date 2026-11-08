@@ -2,16 +2,16 @@ import os
 
 import pytest
 
+from conftest import make_track
 from oasis import musicbrainz, relocate, scan
 from oasis.db import connect
-from test_importer import audio
 
 NAMES = {"00000000-0000-0000-0000-00000000000a": "O.N.A.", "00000000-0000-0000-0000-00000000000b": "Beta"}
 
 
 def tagged(path, artist, album, title, track, disc="1", date="1995-03-01", release="rel-1"):
-    return audio(path, 1, albumartist="whatever", musicbrainz_albumartistid=artist, album=album, title=title, tracknumber=track,
-                 discnumber=disc, originaldate=date, date="2001", musicbrainz_albumid=release)
+    return make_track(path, 1, albumartist="whatever", musicbrainz_albumartistid=artist, album=album, title=title, tracknumber=track,
+                      discnumber=disc, originaldate=date, date="2001", musicbrainz_albumid=release)
 
 
 @pytest.fixture
@@ -25,7 +25,7 @@ def library(tmp_path, monkeypatch):
     for disc in ("1", "2"):
         tagged(root / f"Beta/Two (2000)/CD 0{disc}/01 - Song.flac", b, "Two", "Song", "1", disc=f"{disc}/2", date="2000", release="rel-2")
     (root / "Beta/Two (2000)/cover.png").write_bytes(b"png")
-    audio(root / "Beta/Loose/untagged.flac", 1, title="No MusicBrainz")
+    make_track(root / "Beta/Loose/untagged.flac", 1, title="No MusicBrainz")
     (root / "Beta/Loose/cover.jpg").write_bytes(b"jpg")
     taken = tagged(root / "Beta/Taken (2003)/01 - One.flac", b, "Taken", "One", "1", date="2003", release="rel-3")
     tagged(root / "Beta/2003 - Taken/01 - One.flac", b, "Taken", "One", "1", date="2003", release="rel-3")  # already in place
@@ -67,6 +67,7 @@ def test_files_move_to_their_musicbrainz_names_and_keep_their_ids_and_stats(libr
 
     assert db.execute("select ref, cover from track where id = ?", (one,)).fetchone()[0] == str(album / "01 - Kiedy powiem sobie dość.flac")
     assert db.execute("select starred, play_count from stat where id = ?", (one,)).fetchone()[:] == (1, 3)
+    assert db.execute("select ref from track where id = ?", (two,)).fetchone()[0] == str(album / "02 - Niepotrzebny - znowu.mp3")
     new_one, new_two = str(album / "01 - Kiedy powiem sobie dość.flac"), str(album / "02 - Niepotrzebny - znowu.mp3")
     assert db.execute("select a, b, level from audio_pair").fetchall()[0][:] == (*sorted((new_one, new_two)), 1)
     assert db.execute("select path, kept from audio_shared").fetchone()[:] == (new_two, new_one)

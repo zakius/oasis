@@ -1,36 +1,13 @@
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 import pytest
 
+from conftest import TORBOX_NOW, FakeTorBox, ago, torrent
+from oasis.config import TorBox as TorBoxSettings
 from oasis.db import connect
 from oasis.doctor import Doctor
-
-NOW = datetime.now(timezone.utc)
-
-
-def ago(**delta) -> str:
-    return (NOW - timedelta(**delta)).isoformat()
-
-
-class FakeTorBox:
-    def __init__(self):
-        self.waiting, self.list, self.have, self.deleted, self.dropped = [], [], set(), [], []
-
-    def queued(self):
-        return self.waiting
-
-    def delete_queued(self, queued_id):
-        self.dropped.append(queued_id)
-
-    def torrents(self):
-        return self.list
-
-    def cached(self, hashes):
-        return self.have & set(hashes)
-
-    def delete_torrent(self, torrent_id):
-        self.deleted.append(torrent_id)
+from oasis.download import tracked
 
 
 @pytest.fixture
@@ -49,14 +26,14 @@ def torbox():
 
 
 @pytest.fixture
-def doctor(tmp_path, rdt, torbox):
-    return Doctor(lambda: connect(tmp_path / "oasis.db"), str(tmp_path / "rdtclient.db"), stall_hours=1,
-                  torbox=lambda key: torbox if key == "tb-key" else None)
+def now():
+    return [TORBOX_NOW]
 
 
-def torrent(id, hash, progress=0.5, seeds=3, created=None, active=True):
-    return {"id": id, "hash": hash, "name": f"torrent {id}", "progress": progress, "seeds": seeds, "active": active,
-            "created_at": created or ago(hours=3)}
+@pytest.fixture
+def doctor(tmp_path, rdt, torbox, now):
+    return Doctor(lambda: connect(tmp_path / "oasis.db"), TorBoxSettings(str(tmp_path / "rdtclient.db"), stall_hours=1), tracked,
+                  torbox=lambda key: torbox if key == "tb-key" else None, clock=lambda: now[0])
 
 
 def track(rdt, hash, category="sonarr", name="Show"):
@@ -79,7 +56,7 @@ def test_unfinished_torrents_neither_rdtclient_nor_oasis_tracks_are_deleted(doct
     assert torbox.deleted == [1]
 
 
-def test_dead_torrents_are_deleted_but_oasiss_own_are_left_to_it(doctor, torbox, rdt, tmp_path):
+def test_dead_torrents_are_deleted_but_oasiss_own_are_left_to_it(doctor, torbox, rdt, tmp_path, now):
     for h in ("sonarr", "fresh", "moving", "seeded"):
         track(rdt, h)
     connect(tmp_path / "oasis.db").execute("insert into download(hash, album_id, state, created, updated) values ('ours', 0, 'downloading', 0, 0)")
@@ -88,9 +65,9 @@ def test_dead_torrents_are_deleted_but_oasiss_own_are_left_to_it(doctor, torbox,
                    torrent(4, "moving", progress=0.4, seeds=0), torrent(5, "seeded", progress=0, seeds=2)]
     doctor.cycle()
     assert torbox.deleted == [2]
-    doctor.progress_seen["moving"] = (0.4, NOW - timedelta(hours=2))  # no progress since
+    now[0] += timedelta(hours=2)  # no progress since
     doctor.cycle()
-    assert torbox.deleted == [2, 2, 4]
+    assert torbox.deleted == [2, 2, 3, 4]  # and fresh is past the wait by now
 
 
 def test_dry_run_changes_nothing_and_logs_each_action(doctor, torbox, rdt, caplog):

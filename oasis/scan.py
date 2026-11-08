@@ -5,55 +5,22 @@ import time
 from pathlib import Path
 
 import mutagen
-from mutagen.easyid3 import EasyID3
-from mutagen.easymp4 import EasyMP4Tags
 
 from . import pcm
-from .credits import store, tag_credits
-from .db import adopt_local_copies, artist_id, make_id
+from .credits import store
+from .tracks import adopt_local_copies, album_id, artist_id, name_id, track_id
+from .formats import AUDIO, PCM, is_cover, suffix
+from .relocate import repoint
+from .tags import first, labels, number, pictures, tag_credits, values
 
 log = logging.getLogger(__name__)
-
-# Picard's frames for the tags read below that mutagen's MP3 and M4A interfaces lack, so those files carry what FLAC does.
-for key, name in {"artists": "ARTISTS", "releasetype": "MusicBrainz Album Type", "releasestatus": "MusicBrainz Album Status"}.items():
-    EasyID3.RegisterTXXXKey(key, name)
-EasyID3.RegisterTextKey("label", "TPUB")
-for key, name in {"artists": "ARTISTS", "originaldate": "ORIGINALDATE", "media": "MEDIA", "label": "LABEL", "catalognumber": "CATALOGNUMBER",
-                  "barcode": "BARCODE", "isrc": "ISRC", "releasetype": "MusicBrainz Album Type", "releasestatus": "MusicBrainz Album Status",
-                  "musicbrainz_releasetrackid": "MusicBrainz Release Track Id", "musicbrainz_releasegroupid": "MusicBrainz Release Group Id"}.items():
-    EasyMP4Tags.RegisterFreeformKey(key, name)
-
-CONTENT_TYPES = {
-    "mp3": "audio/mpeg", "flac": "audio/flac", "ogg": "audio/ogg", "oga": "audio/ogg", "opus": "audio/ogg",
-    "m4a": "audio/mp4", "aac": "audio/aac", "wav": "audio/wav", "wv": "audio/x-wavpack",
-    "ape": "audio/x-ape", "mpc": "audio/x-musepack", "aiff": "audio/aiff", "aif": "audio/aiff",
-}
-COVER_NAMES = ("cover", "folder", "front", "album")
-COVER_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
-
-
-def first(tags, key: str) -> str | None:
-    value = tags.get(key) if tags else None
-    return str(value[0]).strip() or None if value else None
-
-
-def number(text: str | None) -> int | None:
-    digits = (text or "").split("/")[0].strip()[:4]
-    return int(digits) if digits.isdigit() else None
 
 
 def folder_cover(directory: Path) -> str | None:
     for entry in sorted(directory.iterdir()):
-        if entry.suffix.lower() in COVER_SUFFIXES and entry.stem.lower() in COVER_NAMES:
+        if is_cover(entry):
             return str(entry)
     return None
-
-
-def has_embedded_cover(audio) -> bool:
-    if getattr(audio, "pictures", None):
-        return True
-    tags = audio.tags or {}
-    return any(k.startswith("APIC") or k.lower() in ("covr", "metadata_block_picture") for k in tags.keys())
 
 
 def read(path: Path, root: Path, covers: dict[Path, str | None]) -> dict | None:
@@ -71,20 +38,20 @@ def read(path: Path, root: Path, covers: dict[Path, str | None]) -> dict | None:
     stat = path.stat()
     length = getattr(audio.info, "length", 0) or 0
     bitrate = getattr(audio.info, "bitrate", 0) or (stat.st_size * 8 / length if length else 0)
-    suffix = path.suffix.lower().lstrip(".")
-    joined = lambda key: "; ".join(str(v) for v in tags.get(key) or []) or None if tags is not None and key in tags else None
+    kind = suffix(path)
+    joined = lambda key: "; ".join(values(tags, key)) or None
     return {
-        "id": make_id("tr-", str(path)), "source": "local", "ref": str(path), "root": str(root),
+        "id": track_id(str(path)), "source": "local", "ref": str(path), "root": str(root),
         "title": title, "artist": artist, "album_artist": album_artist, "album": album,
-        "artist_id": make_id("ar-", album_artist), "album_id": make_id("al-", album_artist, album),
-        "track_no": number(first(tags, "tracknumber")), "disc_no": number(first(tags, "discnumber")),
-        "year": number(first(tags, "date") or first(tags, "originaldate")), "genre": first(tags, "genre"),
+        "artist_id": name_id(album_artist), "album_id": album_id(album_artist, album),
+        "track_no": number(first(tags, "tracknumber"), 4), "disc_no": number(first(tags, "discnumber"), 4),
+        "year": number(first(tags, "date") or first(tags, "originaldate"), 4), "genre": first(tags, "genre"),
         "duration": round(length), "bitrate": round(bitrate / 1000), "size": stat.st_size,
-        "suffix": suffix, "content_type": CONTENT_TYPES.get(suffix, "application/octet-stream"),
-        "cover": "embedded" if has_embedded_cover(audio) else covers[path.parent],
+        "suffix": kind, "content_type": AUDIO.get(kind, "application/octet-stream"),
+        "cover": "embedded" if pictures(audio) else covers[path.parent],
         "mtime": stat.st_mtime, "created": time.time(),
         "mb_release": first(tags, "musicbrainz_albumid"), "mb_track": first(tags, "musicbrainz_releasetrackid"),
-        "mb_recording": first(tags, "musicbrainz_trackid"), "mb_release_group": first(tags, "musicbrainz_releasegroupid"), "isrc": joined("isrc"), "label": joined("label") or joined("organization"),
+        "mb_recording": first(tags, "musicbrainz_trackid"), "mb_release_group": first(tags, "musicbrainz_releasegroupid"), "isrc": joined("isrc"), "label": "; ".join(labels(tags)) or None,
         "release_types": joined("releasetype"), "original_date": first(tags, "originaldate"),
         "_credits": tag_credits(tags), "_albumartist_mbids": tags.get("musicbrainz_albumartistid") if tags else None,
     }
@@ -98,10 +65,9 @@ def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
         for directory, folders, files in os.walk(root):
             for name in files:
                 path = Path(directory, name)
-                if path.suffix.lower().lstrip(".") not in CONTENT_TYPES:
+                if suffix(path) not in AUDIO:
                     continue
-                if path.suffix.lower().lstrip(".") in pcm.SUFFIXES and (new := pcm.convert(path)):  # a WAV slipped in: FLAC, keeping its id
-                    from .relocate import repoint
+                if suffix(path) in PCM and (new := pcm.convert(path)):  # a WAV slipped in: FLAC, keeping its id
                     repoint(db, str(path), str(new))
                     if old := known.pop(str(path), None):
                         known[str(new)] = old
@@ -128,6 +94,8 @@ def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
                     store(db, row["id"], credits, "tags")
                     changed += 1
     gone = [ref for ref in known if ref not in seen]
+    # Only the tracks go. What is known of their files (dedupe's and quality's records, lyrics, credits) waits for them:
+    # a library folder that is unmounted for a scan comes back whole.
     db.executemany("delete from track where ref = ?", [(ref,) for ref in gone])
     adopted = adopt_local_copies(db) if changed else 0
     log.info("scan: %d updated, %d removed, %d streams now local", changed, len(gone), adopted)

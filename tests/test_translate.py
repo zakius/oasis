@@ -26,7 +26,7 @@ def client(tmp_path):
     make_track(root / "b/1.flac", title="Faint", artist="Linkin Park", album="Meteora")
     (root / "b/1.lrc").write_text("[00:01.00]I am a little bit of loneliness\n[00:01.00]我是一点点孤独\n")
     with make_client(root, tmp_path / "oasis.db") as c:
-        c.app.state.api.translator = FakeTranslator()
+        c.app.state.oasis.translations.translator = FakeTranslator()
         yield c
 
 
@@ -39,7 +39,7 @@ def lyrics(client, title="夜に駆ける", **params):
 
 
 def test_lyrics_are_translated_only_when_an_app_asks(client):
-    fake = client.app.state.api.translator
+    fake = client.app.state.oasis.translations.translator
     assert [e["kind"] for e in lyrics(client, enhanced="true")] == ["main", "pronunciation"]
     assert [e["kind"] for e in lyrics(client, enhanced="true", oasisTranslate="en")] == ["main", "pronunciation"]  # without oasis=1
     assert len(lyrics(client, oasis="1", oasisTranslate="en")) == 1  # songLyrics v1: main only
@@ -53,7 +53,7 @@ def test_lyrics_are_translated_only_when_an_app_asks(client):
 
 
 def test_oasis_translate_1_uses_the_dashboards_language(client):
-    fake = client.app.state.api.translator
+    fake = client.app.state.oasis.translations.translator
     assert len(lyrics(client, enhanced="true", oasis="1", oasisTranslate="1")) == 2 and fake.asked == []  # none chosen
     client.post("/login", data={"name": "admin", "password": "secret"})
     assert "Lyrics translation" in client.get("/").text
@@ -63,7 +63,7 @@ def test_oasis_translate_1_uses_the_dashboards_language(client):
 
 
 def test_a_translation_that_comes_with_the_lyrics_wins(client):
-    fake = client.app.state.api.translator
+    fake = client.app.state.oasis.translations.translator
     fake.source = "en"
     assert [(e["kind"], e.get("lang")) for e in lyrics(client, "Faint", enhanced="true", oasis="1", oasisTranslate="zh-CN")] == [("main", "xxx"), ("translation", "zh")]
     assert fake.asked == []
@@ -72,17 +72,17 @@ def test_a_translation_that_comes_with_the_lyrics_wins(client):
 
 
 def test_lyrics_in_the_language_asked_get_no_translation(client):
-    client.app.state.api.translator.source = "ja"
+    client.app.state.oasis.translations.translator.source = "ja"
     assert len(lyrics(client, enhanced="true", oasis="1", oasisTranslate="ja")) == 2
-    assert len(lyrics(client, enhanced="true", oasis="1", oasisTranslate="ja")) == 2 and len(client.app.state.api.translator.asked) == 1  # kept
+    assert len(lyrics(client, enhanced="true", oasis="1", oasisTranslate="ja")) == 2 and len(client.app.state.oasis.translations.translator.asked) == 1  # kept
 
 
 def test_a_failing_translator_leaves_the_lyrics_and_rests(client):
-    api = client.app.state.api
-    api.translator = FakeTranslator(fail=True)
+    translations = client.app.state.oasis.translations
+    translations.translator = FakeTranslator(fail=True)
     assert [e["kind"] for e in lyrics(client, enhanced="true", oasis="1", oasisTranslate="en")] == ["main", "pronunciation"]
     lyrics(client, "Faint", enhanced="true", oasis="1", oasisTranslate="en")
-    assert len(api.translator.asked) == 1  # resting after the failure
+    assert len(translations.translator.asked) == 1  # resting after the failure
 
 
 def test_the_server_says_translation_is_there(client):

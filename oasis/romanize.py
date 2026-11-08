@@ -74,8 +74,6 @@ def translit(id: str, s: str) -> str:
         return _translit[id].transliterate(s)
 
 
-# Normalizing
-
 def normalize(s: str) -> str:
     """NFKC on the half- and full-width forms block only (ＬＯＶＥ → LOVE, ｱｲ → アイ); a full-width parenthesis gets a
     space next to a word: テトリス（feat. X）."""
@@ -169,8 +167,6 @@ def own_latin(s: str) -> str | None:
     return right.strip()
 
 
-# Han: Japanese or Chinese
-
 def is_japanese(s: str, siblings=()) -> bool:
     """Kana in the string or a sibling (the item's other fields) means Japanese; Han text without kana is Japanese
     unless it or a sibling looks Chinese."""
@@ -208,8 +204,6 @@ def looks_chinese(s: str) -> bool:
             return True
     return False
 
-
-# Japanese
 
 class Token(NamedTuple):
     surface: str
@@ -377,8 +371,6 @@ def syllable(s: str, i: int) -> tuple[str, int]:
     return base, 1
 
 
-# Other scripts
-
 def other(s: str, title: bool, cyr_lang: str) -> str:
     """Non-Japanese text: each run of one script converted, a space kept between words; stylized words stay."""
     out = ""
@@ -446,8 +438,6 @@ def hangul(s: str) -> str:
         out += initial + vowel + coda
     return out
 
-
-# Cyrillic
 
 def cyrillic_language(s: str) -> str:
     """"kk", "ky", "uk", "be", "sr", "mk", "bg", "mn" or "ru" (the default), from the letters only some languages have."""
@@ -583,8 +573,6 @@ def _base_letter(c: str) -> str | None:
     letter = name.split("LETTER ", 1)[-1].split(" WITH ")[0]
     return CYRILLIC_NAMES.get(f"CYRILLIC {case} LETTER {letter}") or CYRILLIC_NAMES.get(f"CYRILLIC {case} LETTER {letter.split(' ')[-1]}")
 
-
-# What the rest of oasis calls
 
 def raw(n: str, japanese_text: bool, title: bool, cyr_lang: str | None = None) -> str:
     return punctuation("".join(r for _, r, _ in japanese(n, title)) if japanese_text else other(n, title, cyr_lang or cyrillic_language(n)))

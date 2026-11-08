@@ -3,7 +3,8 @@ from xml.etree import ElementTree
 
 from conftest import NS, PNG, call, make_track
 from oasis.db import connect
-from oasis.scan import scan
+from oasis.scan import read, scan
+from oasis.tracks import keep_old_id, track_id
 
 
 def ids_by_title(client):
@@ -107,8 +108,8 @@ def test_post_form_and_unknown_method(client):
     assert call(client, "_db")["status"] == "failed"
 
 
-def test_rescan_picks_up_changes(client, library, tmp_path):
-    db = connect(tmp_path / "oasis.db")
+def test_rescan_picks_up_changes(client, library):
+    db = client.app.state.oasis.connect()
     extra = library / "Beta/First/03.flac"
     make_track(extra, title="Three", artist="Beta", album="First", tracknumber="3")
     try:
@@ -120,9 +121,23 @@ def test_rescan_picks_up_changes(client, library, tmp_path):
     assert "Three" not in ids_by_title(client)
 
 
+def test_a_compact_date_gives_its_year_and_numbers_read_four_digits_at_most(tmp_path):
+    path = make_track(tmp_path / "a.flac", date="20010502", tracknumber="12345/20", discnumber="2")
+    found = read(path, tmp_path, {})
+    assert (found["year"], found["track_no"], found["disc_no"]) == (2001, 1234, 2)
+
+
+def test_a_local_tracks_old_id_follows_it_once_dedupe_gave_the_copy_another_format(client):
+    one = ids_by_title(client)["One"]["id"]
+    old = track_id("/music/Beta/First/01.mp3")
+    keep_old_id(client.app.state.oasis.connect(), old, one)
+    assert call(client, "getSong", id=old)["song"]["title"] == "One"
+    assert client.get("/rest/getCoverArt", params={"u": "admin", "p": "secret", "id": old}).content == PNG
+
+
 def test_oasis_fields_only_with_the_oasis_extension(client):
     album = call(client, "getAlbumList2", type="alphabeticalByName")["albumList2"]["album"][0]
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     db.execute("insert into want_item(kind, ref, state, error, updated) values ('album', ?, 'failed', 'nothing found', 0)", (album["id"],))
     db.execute("insert into want_item(kind, ref, state, updated) values ('artist', ?, 'wanted', 0)", (album["artistId"],))
     db.execute("update track set ytm_id = 'vid' where album_id = ?", (album["id"],))
@@ -136,9 +151,9 @@ def test_oasis_fields_only_with_the_oasis_extension(client):
 
 
 def test_search_romanizes_each_track_once_and_keeps_it(client, tmp_path):
-    from oasis.api import LATIN_SOURCE
+    from oasis.latin import SOURCE
     call(client, "search3", query="")
     other = connect(tmp_path / "oasis.db")  # another connection: it sees only what was committed
-    stale = f"select count(*) from track t left join track_latin l on l.id = t.id where t.library = 1 and l.source is not {LATIN_SOURCE}"
+    stale = f"select count(*) from track t left join track_latin l on l.id = t.id where t.library = 1 and l.source is not {SOURCE}"
     assert other.execute(stale).fetchone()[0] == 0 and other.execute("select count(*) from track_latin").fetchone()[0] == 5
     assert call(client, "search3", query="", songCount=500, songOffset=500)["searchResult3"].get("song", []) == []

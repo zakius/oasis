@@ -1,68 +1,41 @@
 """Keeps TorBox's few active slots free, for oasis's downloads and anime's (Sonarr through rdtclient): deletes the
 account's queued items, active torrents nobody tracks, and dead ones. Each rule works around a TorBox or rdtclient fault."""
 import logging
-import os
-import shutil
-import sqlite3
-import tempfile
-import threading
-import time
 from datetime import datetime, timedelta, timezone
 
-from .torbox import TorBox
+from . import worker
+from .torbox import TorBox, from_rdtclient, read_copy
 
 log = logging.getLogger(__name__)
 
-INTERVAL = 300                          # seconds between cycles
+INTERVAL = 300
 ORPHAN_AFTER = timedelta(minutes=10)    # rdtclient tracks its adds by then
-
-
-def read_copy(path: str, sql: str, params=()) -> list:
-    """Reads another app's SQLite database from a copy, so its own writes never wait on us and it is never written."""
-    with tempfile.TemporaryDirectory() as tmp:
-        for suffix in ("", "-wal"):
-            if os.path.exists(path + suffix):
-                shutil.copy(path + suffix, os.path.join(tmp, "db" + suffix))
-        db = sqlite3.connect(os.path.join(tmp, "db"))
-        try:
-            return db.execute(sql, params).fetchall()
-        finally:
-            db.close()
 
 
 class Doctor:
     """The rules, run every INTERVAL. dry_run logs what each would do and changes nothing."""
 
-    def __init__(self, connect, rdt_db: str, stall_hours: float = 1, dry_run: bool = False, torbox=TorBox):
-        self.connect, self.rdt_db, self.torbox_for = connect, rdt_db, torbox
-        self.stall, self.dry = timedelta(hours=stall_hours), dry_run
+    def __init__(self, connect, settings, ours, torbox=TorBox, clock=lambda: datetime.now(timezone.utc)):
+        """settings: config.TorBox. ours(db): the hashes of the downloads oasis itself sees through (download.tracked).
+        clock: the time now, timezone-aware."""
+        self.connect, self.rdt_db, self.ours, self.torbox_for, self.clock = connect, settings.rdt_db, ours, torbox, clock
+        self.stall, self.dry = timedelta(hours=settings.stall_hours), settings.dry_run
         self.progress_seen = {}  # TorBox hash -> (progress, when it was first seen at that progress)
 
     def start(self):
-        threading.Thread(target=self.run, daemon=True).start()
-
-    def run(self):
-        while True:
-            try:
-                self.cycle()
-            except Exception:  # TorBox restarts: next cycle
-                log.exception("doctor cycle failed")
-            time.sleep(INTERVAL)
+        worker.start("doctor cycle", self.cycle, INTERVAL)  # TorBox restarts: next cycle
 
     def say(self, *parts):
         log.info("%s%s", "[dry] " if self.dry else "", " ".join(str(p) for p in parts))
 
-    def torbox(self):
-        rows = read_copy(self.rdt_db, "select Value from Settings where SettingId = 'Provider:ApiKey'")  # rdtclient's TorBox key
-        return self.torbox_for(rows[0][0]) if rows and rows[0][0] else None
-
     def cycle(self):
         db = self.connect()
         try:
-            ours = {h for (h,) in db.execute("select hash from download")}  # oasis's own TorBox downloads (download.py)
+            ours = self.ours(db)
         finally:
             db.close()
-        torrents = self.sweep(torbox, datetime.now(timezone.utc), ours) if (torbox := self.torbox()) else []
+        torbox = from_rdtclient(self.rdt_db, self.torbox_for)
+        torrents = self.sweep(torbox, self.clock(), ours) if torbox else []
         log.info("doctor: %d TorBox torrents", len(torrents))
 
     def sweep(self, torbox, now, ours=frozenset()) -> list[dict]:

@@ -17,7 +17,8 @@ from pathlib import PurePosixPath
 from urllib.parse import urlparse
 
 from . import musicbrainz
-from .importer import ARCHIVES, AUDIO, LOSSLESS as LOSSLESS_FILES, key, match, number_of, title_of
+from .formats import ARCHIVES, AUDIO, IMAGES, LOSSLESS as LOSSLESS_FILES, suffix
+from .matching import key, match, number_of, title_of
 
 log = logging.getLogger(__name__)
 
@@ -26,15 +27,17 @@ LETTERS = str.maketrans({"æ": "ae", "œ": "oe", "ø": "o", "ł": "l", "đ": "d"
 BRACKETS = re.compile(r"[\[\]「」『』\"“”„«»()〈〉《》【】/／]")  # and slashes, which break some indexers' search URLs
 BRACKETED = re.compile(r"\s*[\[(（【][^\])）】]*[\])）】]")
 QUOTED = re.compile(r"[「『\"“]([^」』\"”]+)[」』\"”]")
+# Compilations, reissues and other editions of songs already out: never the album itself (acquire.REPACKAGE).
+REISSUES = r"best of|greatest hits|very best|the essential|anthology|singles|anniversary|deluxe|reissue|instrumentals?|karaoke"
 # Words that make a release something else than the album, unless its title says so. Remasters are the album.
-VARIANTS = re.compile(r"\b(best of|greatest hits|very best|the essential|anthology|singles|anniversary|deluxe|expanded|tour edition|bonus tracks?|"
-                      r"re ?recorded|reissue|remix(es|ed)?|mix ?tapes?|instrumentals?|inst|off vocal|no vocals?|karaoke|acapellas?|a ?cappellas?|live|unplugged|"
-                      r"acoustic|demos?|tribute|orchestral|symphonic|piano|lullaby|8 ?bit|sped up|slowed|nightcore|tv size)\b")
+VARIANTS = re.compile(rf"\b({REISSUES}|expanded|tour edition|bonus tracks?|re ?recorded|remix(es|ed)?|mix ?tapes?|inst|off vocal|no vocals?|"
+                      r"acapellas?|a ?cappellas?|live|unplugged|acoustic|demos?|tribute|orchestral|symphonic|piano|lullaby|8 ?bit|sped up|slowed|"
+                      r"nightcore|tv size)\b")
 CREDITED_AS_SOURCE = re.compile(r"\b(based on (the )?music of|music of|tribute to|covers? of|in the style of|songs of|plays|presents?)( the)?$")  # "Funk Daddy Present Jay-Z": a mixtape of theirs
 VARIANTS_JA = re.compile(r"インスト|カラオケ|ライ[ブヴ]|リミックス|オフボーカル")
 BUNDLES = re.compile(r"discograph|collection|complete|box ?set|anthology|\bsingles\b|全集|ディスコグラフィ", re.I)
 DISCOGRAPHY = re.compile(r"discograph|дискограф|complete|box ?set|全集|ディスコグラフィ", re.I)  # more than singles
-VIDEO = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|hdtv|web ?rip|\d{3,4}[pi]|x26[45]|h ?26[45]|hevc|xvid|divx|mkv|avi|mpe?g|mp4|vob|videos?)\b")
+VIDEO_NAMES = re.compile(r"\b(dvd\d*|dvdrip|bdmv|blu ?ray|bd ?rip|bd|hdtv|web ?rip|\d{3,4}[pi]|x26[45]|h ?26[45]|hevc|xvid|divx|mkv|avi|mpe?g|mp4|vob|videos?)\b")
 TYPES = {"single": "Single", "maxi": "Single", "ep": "EP"}  # words naming a release's type
 IMAGE = re.compile(r"\b(image|img) cue\b")  # one file for the whole disc, which the importer splits: a file per track is surer
 LOSSLESS = re.compile(r"\b(flac|alac|wav|lossless|24 ?bits?|hi ?res|ape)\b")
@@ -42,8 +45,6 @@ MP3_320 = re.compile(r"\b320( ?k| ?kbps| ?kbit)?\b")
 V0 = re.compile(r"\bv0\b")
 SIZES = 20e6, 5e9      # bytes a release may have, the most per disc
 RATE = 12e3, 1.2e6     # bytes per second of music a disc image may hold: a 96 kbps MP3 to a 24-bit 192 kHz WAV
-ALIASES = "https://musicbrainz.org/ws/2/artist/{}?inc=aliases&fmt=json"
-KEEP_ALIASES = 30 * 86400
 NATIVE_QUERIES = 2     # searches by the artist's names in other scripts
 OTHER_TITLE_QUERIES = 2  # searches by the album's other titles (romanised, translated)
 DISC = re.compile(r"^(?:cd|disc|disk)\s*(\d+)\b", re.I)  # a disc's folder inside its album's
@@ -53,7 +54,6 @@ YEAR = re.compile(r"^(19|20)\d\d$")
 # them ('Linkin Park   Jay Z  Collision Course'); and words joining artists in a credit.
 SEPARATOR = re.compile(r"[\s_]-+[\s_]*|-+[\s_]|[\s_]{2,}|[–—|:：,/／+\[\](){}（）【】「」『』\"“”]")
 CONNECTORS = {"and", "feat", "ft", "featuring", "with", "vs"}
-IMAGES = ("jpg", "jpeg", "png", "webp", "gif")
 NUMBERS = {w: str(n) for n, w in enumerate("one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen "
                                             "seventeen eighteen nineteen twenty".split(), 1)}
 ROMAN = re.compile(r"x{0,3}(ix|iv|v?i{0,3})")
@@ -69,10 +69,34 @@ def plain(text: str) -> str:
     return "".join(c if CJK.match(c) else "".join(d for d in unicodedata.normalize("NFKD", c) if not unicodedata.combining(d)) for c in text)
 
 
+def unsplit(text: str) -> str:
+    """The text as words() reads it before splitting it: plain, apostrophes gone, '&' as 'and'."""
+    return re.sub(r"['’`´]", "", plain(text).replace("&", " and "))
+
+
 def words(text: str) -> list[str]:
     """'Hardwired…To Self-Destruct' -> hardwired to self destruct; 'アンサンブル・プレイ' -> ア ン サ ン ブ ル プ レ イ."""
-    text = re.sub(r"['’`´]", "", plain(text).replace("&", " and "))
-    return re.sub(r"[\W_]+", " ", CJK.sub(r" \g<0> ", text)).split()
+    return re.sub(r"[\W_]+", " ", CJK.sub(r" \g<0> ", unsplit(text))).split()
+
+
+def apart(span: tuple[int, int], artists: list[tuple[int, int]]) -> bool:
+    """Whether a span of a name's words (spans()) overlaps none of the artist's names in it."""
+    start, end = span
+    return all(end <= a or b <= start for a, b in artists)
+
+
+def variant(name: str, title: str, names: list[str]) -> str | None:
+    """Why a release or folder named name is another variant of the title (live, instrumentals...; or missing the
+    title's own) or a video when the title isn't, else None. Variant words in the title or the artist's names are allowed."""
+    text, title_text = " ".join(words(name)), " ".join(words(title))
+    allowed = hits(VARIANTS, " ".join([title_text, *(" ".join(words(n)) for n in names)]))
+    if extra := hits(VARIANTS, text) - allowed or hits(VARIANTS_JA, plain(name)) - hits(VARIANTS_JA, plain(title)):
+        return f"variant: {sorted(extra)[0]}"
+    if missing := hits(VARIANTS, title_text) - hits(VARIANTS, text):
+        return f"not the variant: {sorted(missing)[0]}"
+    if VIDEO_NAMES.search(text) and not VIDEO_NAMES.search(title_text):
+        return "video"
+    return None
 
 
 def spans(tokens: list[str], phrase: list[str]) -> list[tuple[int, int]]:
@@ -103,7 +127,7 @@ def alone(title: str, want: dict) -> bool:
     """Whether the artist's name, opening a release's name (leads), stands alone: a separator, bracket, run of spaces,
     joining word, year or bundle word follows, not another word ('Hunter - Discography', 'Hunter (Poland) Discography',
     'Linkin Park   Papercuts', but not 'Hunter Tom - Discography', 'Hunter Hayes Discography', 'Hunter x Hunter OST')."""
-    rest = re.sub(r"['’`´]", "", plain(title[len(LEAD.match(title)[0]):]).replace("&", " and "))  # as words() reads it
+    rest = unsplit(title[len(LEAD.match(title)[0]):])
     return any(re.match(r"[\W_]*".join(map(re.escape, words(n))) + r"(?![^\W_])(\s{2,}|[\s.\]]*($|[-–—(\[{:：|/／,+]|(and|feat|ft|with|vs|(19|20)\d\d)\b|"
                         r"discograph|дискограф|complete|collection|box|anthology|singles|全集|ディスコグラフィ))", rest)
                for n in want["names"]) and bool(leads(title, want))
@@ -122,6 +146,21 @@ def hash_of(release: dict) -> str:
     return (release.get("infoHash") or "").lower()
 
 
+def ids(release: dict) -> set:
+    """What a release may be blocked by: its hash and its guid (release_block keeps both)."""
+    return {hash_of(release), release.get("guid")}
+
+
+def identity(release: dict) -> str:
+    """One torrent, from whichever indexer: its hash, else its guid."""
+    return hash_of(release) or release["guid"]
+
+
+def squashed(text: str) -> str:
+    """The text's words run together, as names are compared: spacing aside."""
+    return "".join(words(text))
+
+
 def quality(name: str) -> int:
     """From the name: 3 lossless, 2 MP3 320, 1 V0, 0 anything else."""
     text = " ".join(words(name))
@@ -135,26 +174,25 @@ def native(names: list[str]) -> list[str]:
 
 def aliases(db, name: str, mbid: str | None, titles: list[str]) -> list[str]:
     """The artist's name and its MusicBrainz name and aliases; titles: its albums and EPs."""
-    names, titles = [name], {"".join(words(t)) for t in titles}
+    names, titles = [name], {squashed(t) for t in titles}
     try:
         if not mbid:
             raise LookupError("no MusicBrainz id")
-        found = musicbrainz.get(ALIASES.format(mbid), db, KEEP_ALIASES)
+        found = musicbrainz.artist(mbid, db)
         # Search hints ('LP' for Linkin Park), very short aliases and former names that are album titles ('Hybrid
         # Theory') would match names that aren't the artist's.
-        names += [found["name"], *(a["name"] for a in found.get("aliases") or [] if a.get("type") != "Search hint"
-                                   and len(n := "".join(words(a["name"]))) >= (2 if CJK.search(a["name"]) else 3) and n not in titles)]
+        names += [found["name"], *(a for a in musicbrainz.aliases(found) if len(n := squashed(a)) >= (2 if CJK.search(a) else 3) and n not in titles)]
     except (OSError, LookupError, KeyError) as e:
         log.info("no MusicBrainz aliases for %s: %s", name, e)
-    return unique([n for n in names if words(n)], lambda n: "".join(words(n)))
+    return unique([n for n in names if words(n)], squashed)
 
 
 def other_titles(title: str, names: list[str], others: list[str]) -> list[str]:
     """Of an album's other whole titles in MusicBrainz (names), those a release may be named by instead: not
     another album's title (others) and no other variant ('BIRIKEN (Instrumental)' isn't ビリケン)."""
     variant = lambda t: (hits(VARIANTS, " ".join(words(t))), hits(VARIANTS_JA, plain(t)))
-    taken = {"".join(words(t)) for t in [title, *others]}
-    return unique([n for n in names if (j := "".join(words(n))) and j not in taken and variant(n) == variant(title)], lambda n: "".join(words(n)))
+    taken = {squashed(t) for t in [title, *others]}
+    return unique([n for n in names if (j := squashed(n)) and j not in taken and variant(n) == variant(title)], squashed)
 
 
 def reject(release: dict, want: dict) -> str | None:
@@ -166,7 +204,7 @@ def reject(release: dict, want: dict) -> str | None:
 def reject_title(release: dict, want: dict) -> str | None:
     name, title = release["title"], want["title"]
     tokens = words(name)
-    text, title_text = " ".join(tokens), " ".join(words(title))
+    title_text = " ".join(words(title))
     if not SIZES[0] < (release.get("size") or 0) < SIZES[1] * want["discs"]:
         return "size"
     artists = [s for n in want["names"] for s in spans(tokens, words(n))]
@@ -181,18 +219,13 @@ def reject_title(release: dict, want: dict) -> str | None:
     # 'Torsten Rasch - Mein Herz Brennt (Based on Music of Rammstein)': the artist is only the source of another's work.
     if all(m := CREDITED_AS_SOURCE.search(" ".join(tokens[:a])) for a, _ in artists):
         return f"another artist's: {m[1]}"
-    allowed = hits(VARIANTS, " ".join([title_text, *(" ".join(words(n)) for n in want["names"])]))
-    if extra := hits(VARIANTS, text) - allowed or hits(VARIANTS_JA, plain(name)) - hits(VARIANTS_JA, plain(title)):
-        return f"variant: {sorted(extra)[0]}"
-    if missing := hits(VARIANTS, title_text) - hits(VARIANTS, text):
-        return f"not the variant: {sorted(missing)[0]}"
-    if VIDEO.search(text) and not VIDEO.search(title_text):
-        return "video"
+    if why := variant(name, title, want["names"]):
+        return why
     if BUNDLES.search(name) and not BUNDLES.search(title):
         return "bundle"
     if {"various", "va"} & set(tokens) - set(words(" ".join([title, *want["names"]]))):
         return "various artists"
-    compact, names = "".join(words(title)), {"".join(words(n)) for n in want["names"]}
+    compact, names = squashed(title), {squashed(n) for n in want["names"]}
     for other in want["others"]:  # 'Korn III: Remember Who You Are' holds 'Korn', and is another album
         if len(o := words(other)) > len(words(title)) and spans(o, words(title)) and apart(spans(tokens, o)):
             return f"another album: {other}"
@@ -208,7 +241,7 @@ def reject_title(release: dict, want: dict) -> str | None:
     if len(compact) < 4 or compact in names:
         # Right after the artist, perhaps past the year: 'Rammstein - (2019) Rammstein', not 'This Is Rammstein (2019)'.
         after = any(start == end or start == end + 1 and tokens[end] == want["year"] for _, end in artists for start, _ in titles)
-        quoted = any("".join(words(m[1])) == compact for m in QUOTED.finditer(unicodedata.normalize("NFKC", name)))
+        quoted = any(squashed(m[1]) == compact for m in QUOTED.finditer(unicodedata.normalize("NFKC", name)))
         if compact in names and not (after or quoted):
             return "self-titled: the title isn't right after the artist"
         if not (want["year"] and want["year"] in tokens or after or quoted):
@@ -223,7 +256,7 @@ def placed(name: str, tokens: list[str], artists: list[tuple[int, int]], titles:
     ('Linkin_Park-Meteora-2003'). Opening the name, also when the title is quoted ('Creepy Nuts 3rdアルバム「アンサンブル・プレイ」').
     Spans as spans()."""
     texts = SEPARATOR.split(name)
-    part = [i for i, text in enumerate(texts) for _ in words(text)]  # the part each word is in
+    part = [i for i, text in enumerate(texts) for _ in words(text)]
     if len(part) != len(tokens):  # can't tell
         return True
     lead, quoted = len(words(LEAD.match(name)[0])), any(words(m[1]) in variants for m in QUOTED.finditer(unicodedata.normalize("NFKC", name)))
@@ -266,7 +299,7 @@ def rank(releases: list[dict], have: set[str], upgrade: bool = False, unreliable
         usable = [r for r in usable if quality(r["title"]) == 3]
     usable.sort(key=lambda r: (hash_of(r) in have or bool(r.get("downloadUrl")), hash_of(r) not in slow, r.get("indexerId") not in low, hash_of(r) in have or site(r.get("guid") or "") not in unreliable, quality(r["title"]) == 3, not IMAGE.search(" ".join(words(r["title"]))), hash_of(r) in have, quality(r["title"]),
                                r.get("seeders") or 0), reverse=True)
-    return unique(usable, lambda r: hash_of(r) or r["guid"])
+    return unique(usable, identity)
 
 
 def clean(text: str) -> str:
@@ -297,8 +330,8 @@ def find(prowlarr, want: dict, blocked: set, cached, unreliable: frozenset = fro
     tally: indexer id -> [results, the album, usable], added to for each query asked."""
     for query in queries(want):
         found = prowlarr.search(query)
-        fits = [r for r in found if not {hash_of(r), r.get("guid")} & blocked and not reject(r, want)]
-        hashes = list(dict.fromkeys(h for r in fits if (h := hash_of(r))))[:100]
+        fits = [r for r in found if not ids(r) & blocked and not reject(r, want)]
+        hashes = list(dict.fromkeys(h for r in fits if (h := hash_of(r))))
         picks = rank(fits, cached(hashes) if hashes else set(), want["upgrade"], unreliable, slow, low)
         if tally is not None:
             for i, rows in enumerate((found, fits, picks)):
@@ -315,11 +348,11 @@ def is_bundle(release: dict, want: dict) -> bool:
     ('Hunter Hayes - Discography' is another's), or holds two of the artist's album titles.
     want: artist, names, native, albums (the artist's album and EP titles)."""
     tokens, artists = words(release["title"]), leads(release["title"], want)
-    if not artists or VIDEO.search(" ".join(tokens)):
+    if not artists or VIDEO_NAMES.search(" ".join(tokens)):
         return False
-    names = {"".join(words(n)) for n in want["names"]}
-    held = {"".join(words(t)) for t in want["albums"] if len(j := "".join(words(t))) >= 4 and j not in names
-            and any(all(e <= a or b <= s for a, b in artists) for s, e in spans(tokens, words(t)))}
+    names = {squashed(n) for n in want["names"]}
+    held = {squashed(t) for t in want["albums"] if len(j := squashed(t)) >= 4 and j not in names
+            and any(apart(s, artists) for s in spans(tokens, words(t)))}
     return bool(BUNDLES.search(release["title"])) and alone(release["title"], want) or len(held) >= 2
 
 
@@ -360,21 +393,18 @@ def folder_groups(name: str, want: dict, groups: list[dict]) -> list[str]:
     name says single (a title track's single doesn't take its album's folder), and a name that says EP or single keeps
     that type. The folder's files tell the rest (targets)."""
     tokens, plain_tokens = numbered(words(name)), words(name)
-    text = " ".join(plain_tokens)
     artists = [s for n in want["names"] for s in spans(tokens, numbered(words(n)))]
-    names = {"".join(words(n)) for n in want["names"]}
+    names = {squashed(n) for n in want["names"]}
     fits = {}
     for g, named in ((g, f) for g in groups for t in [g["title"], *g.get("other_titles", ())] for f in forms(t, want)):
         title, year = numbered(words(named)), (g.get("first-release-date") or "")[:4]
-        compact, title_text = "".join(words(named)), " ".join(words(named))
-        found = [(s, e) for s, e in spans(tokens, title) if all(e <= a or b <= s for a, b in artists)]
+        compact = squashed(named)
+        found = [s for s in spans(tokens, title) if apart(s, artists)]
         # A year in the name, not the title's own ('2011 - North American Tour EP' for '2011 North American Tour EP' of 2010), must be the group's.
         dated = [{t for i, t in enumerate(tokens) if YEAR.match(t) and not s <= i < e} for s, e in found]
         if not compact or not any(year in years or not years and len(compact) >= 4 and compact not in names for years in dated):
             continue
-        allowed = hits(VARIANTS, " ".join([title_text, *(" ".join(words(n)) for n in want["names"])]))
-        if hits(VARIANTS, text) - allowed or hits(VARIANTS_JA, plain(name)) - hits(VARIANTS_JA, plain(named)) or \
-                hits(VARIANTS, title_text) - hits(VARIANTS, text) or VIDEO.search(text) and not VIDEO.search(title_text):
+        if variant(name, named, want["names"]):
             continue
         fits[g["id"]] = max(fits.get(g["id"], 0), len("".join(title)))
     best = [rg for rg, n in fits.items() if n == max(fits.values())]
@@ -397,7 +427,7 @@ def covers(audio: list[dict], editions: list[dict], artist: str, titled: bool = 
         found, disc = number_of(name), DISC.match(PurePosixPath(name).parent.name)
         return (int(disc[1]), found[1]) if found and disc else found
     files = [{"path": f["name"], "key": key(title_of(f["name"], artist)), "number": None if titled else number(f["name"]), "length": None} for f in audio]
-    return max((len(tracks) for r in editions if r.get("status") != "Pseudo-Release" and (tracks := [(m, t) for m in r.get("media") or [] for t in m.get("tracks") or []])
+    return max((len(tracks) for r in editions if not musicbrainz.is_pseudo(r) and (tracks := [(m, t) for m in r.get("media") or [] for t in m.get("tracks") or []])
                 and len(tracks) <= len(files) and match(files, tracks) is not None), default=0)
 
 
@@ -411,7 +441,7 @@ def sized(audio: list[dict], editions: list[dict]) -> bool:
     """Whether disc images are the size of an edition's music, as far as it can tell: their cue sheets, which tell the
     tracks, aren't readable before download. The importer splits them and matches the edition after."""
     lengths = [sum(t.get("length") or t["recording"].get("length") or 0 for m in r.get("media") or [] for t in m.get("tracks") or []) / 1000
-               for r in editions if r.get("status") != "Pseudo-Release"]
+               for r in editions if not musicbrainz.is_pseudo(r)]
     size = sum(f["size"] for f in audio)
     return any(RATE[0] <= size / s <= RATE[1] for s in lengths if s) or not any(lengths)
 
@@ -427,10 +457,10 @@ def targets(files: list[dict], want: dict, groups: list[dict], wanted: set[str],
     artist's release groups; wanted: those missing. editions(rg): the release group's editions with their tracks."""
     folders, sheets = {}, {PurePosixPath(f["name"]).parent for f in files if f["name"].lower().endswith(".cue")}
     for f in files:
-        if f["name"].rsplit(".", 1)[-1].lower() in AUDIO:
+        if suffix(f["name"]) in AUDIO:
             parent = PurePosixPath(f["name"]).parent
             folders.setdefault(parent.parent if DISC.match(parent.name) else parent, []).append(f)
-    lossless = lambda audio: sum(f["name"].rsplit(".", 1)[-1].lower() in LOSSLESS_FILES for f in audio)
+    lossless = lambda audio: sum(suffix(f["name"]) in LOSSLESS_FILES for f in audio)
     known, allowed = {}, hits(VARIANTS, " ".join(words(" ".join(want["names"]))))
 
     def fits(rg, audio, titled=False, exact=False) -> int:
@@ -441,7 +471,7 @@ def targets(files: list[dict], want: dict, groups: list[dict], wanted: set[str],
                 return int(not titled and sized(audio, known[rg]))
             return covers(audio, [r for r in known[rg] if not exact or sum(len(m.get("tracks") or []) for m in r.get("media") or []) == len(audio)],
                           want["artist"], titled)
-        except (OSError, LookupError) as e:
+        except LookupError as e:
             log.info("editions of %s: %s", rg, e)
             known[rg] = []
             return 0
@@ -453,13 +483,13 @@ def targets(files: list[dict], want: dict, groups: list[dict], wanted: set[str],
             rg = named[0] if named[0] in wanted and fits(named[0], audio) else None
         elif named:
             rg = max(named, key=lambda rg: fits(rg, audio, titled=True)) if any(fits(rg, audio, titled=True) for rg in named) else None
-        elif not hits(VARIANTS, " ".join(words(folder.name))) - allowed and not VIDEO.search(" ".join(words(folder.name))):
+        elif not hits(VARIANTS, " ".join(words(folder.name))) - allowed and not VIDEO_NAMES.search(" ".join(words(folder.name))):
             by_songs = [rg for rg in sorted(wanted - set(found)) if fits(rg, audio, titled=True, exact=True)]
             rg = by_songs[0] if len(by_songs) == 1 else None
         else:
             rg = None
         if rg in wanted and rg not in found:
-            extras = [f["name"] for f in files if f["name"].rsplit(".", 1)[-1].lower() in (*IMAGES, "cue") and PurePosixPath(f["name"]).is_relative_to(folder)]
+            extras = [f["name"] for f in files if suffix(f["name"]) in (*IMAGES, "cue") and PurePosixPath(f["name"]).is_relative_to(folder)]
             found[rg] = [f["name"] for f in audio] + extras
         elif set(named) & wanted - set(found):
             log.info("%s holds only part of %s", folder, named)
@@ -474,14 +504,14 @@ def loose(audio: list[dict], want: dict, singles: list[str], editions) -> dict[s
     track isn't. A file may serve an album's target and a single's both: each gets its own copy, so a single never
     takes an album's files. The importer's edition match, by length too, is the real check."""
     named = {}
-    for f in sorted(audio, key=lambda f: f["name"].rsplit(".", 1)[-1].lower() not in LOSSLESS_FILES):
+    for f in sorted(audio, key=lambda f: suffix(f["name"]) not in LOSSLESS_FILES):
         if title := key(title_of(f["name"], want["artist"])):
             named.setdefault(title, []).append((f["name"], hits(VARIANTS, " ".join(words(PurePosixPath(f["name"]).stem)))))
     found = {}
     for rg in singles:
         try:
-            official = [r for r in editions(rg) if r.get("status") != "Pseudo-Release"]
-        except (OSError, LookupError) as e:
+            official = [r for r in editions(rg) if not musicbrainz.is_pseudo(r)]
+        except LookupError as e:
             log.info("editions of %s: %s", rg, e)
             continue
         for r in sorted(official, key=lambda r: sum(len(m.get("tracks") or []) for m in r.get("media") or []), reverse=True):
@@ -503,9 +533,9 @@ def expected(release: dict, want: dict, groups: list[dict], wanted: set[str]) ->
     tokens, artists = words(release["title"]), leads(release["title"], want)
     if not artists or hits(VARIANTS, " ".join(tokens)) - BUNDLE_WORDS:
         return set()
-    names = {"".join(words(n)) for n in want["names"]}
-    found = {g["id"] for g in groups if g["id"] in wanted and len(j := "".join(words(g["title"]))) >= 4 and j not in names
-             and any(all(e <= a or b <= s for a, b in artists) for s, e in spans(tokens, words(g["title"])))}
+    names = {squashed(n) for n in want["names"]}
+    found = {g["id"] for g in groups if g["id"] in wanted and len(j := squashed(g["title"])) >= 4 and j not in names
+             and any(apart(s, artists) for s in spans(tokens, words(g["title"])))}
     if not BUNDLES.search(release["title"]):
         return found
     years, count = sorted(int(t) for t in tokens if YEAR.match(t)), RELEASES.search(" ".join(tokens))
@@ -526,8 +556,8 @@ def bundles(prowlarr, want: dict, groups: list[dict], wanted: set[str], blocked:
     oasis read come before every one it couldn't: what they hold is sure. Then cached ones: they download at once. With
     uncached, while slots are free, those with BUNDLE_SEEDERS follow: they download whole and hold a slot for long. Then
     the most groups, quality and seeders; slow ones (see rank) last."""
-    found = unique([r for q in bundle_queries(want) for r in prowlarr.search(q)], lambda r: hash_of(r) or r["guid"])
-    candidates = sorted((r for r in found if not {hash_of(r), r.get("guid")} & blocked and is_bundle(r, want)), key=lambda r: r.get("seeders") or 0, reverse=True)
+    found = unique([r for q in bundle_queries(want) for r in prowlarr.search(q)], identity)
+    candidates = sorted((r for r in found if not ids(r) & blocked and is_bundle(r, want)), key=lambda r: r.get("seeders") or 0, reverse=True)
     read, budget = {}, [TORRENTS]
 
     def listing(r):  # the .torrent's hash and files, within the budget
@@ -542,8 +572,8 @@ def bundles(prowlarr, want: dict, groups: list[dict], wanted: set[str], blocked:
     candidates = unique([r for r in map(lambda r: r if hash_of(r) else listing(r), candidates) if hash_of(r) and hash_of(r) not in blocked], hash_of)
     budget[0] = TORRENTS  # and as many for the file lists of those with hashes
     hashes = [hash_of(r) for r in candidates]
-    listed = {h: files for i in range(0, len(hashes), 100) for h, files in cached_files(hashes[i:i + 100]).items()}  # 100 a call
-    music = lambda files, kinds: any(f["name"].rsplit(".", 1)[-1].lower() in kinds for f in files)
+    listed = cached_files(hashes)
+    music = lambda files, kinds: any(suffix(f["name"]) in kinds for f in files)
     seeded = lambda r: uncached and (r.get("seeders") or 0) >= BUNDLE_SEEDERS
     picks = []
     for r in candidates:

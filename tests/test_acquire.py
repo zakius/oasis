@@ -8,12 +8,13 @@ import urllib.parse
 
 import pytest
 
-from conftest import call, make_client
-from test_accounts import sign_in
-from oasis import accounts, acquire, cover, musicbrainz
+from conftest import FakeTorBox, call, make_client, sign_in, tb
+from oasis import accounts, acquire, cover, musicbrainz, prowlarr
 from oasis.acquire import Acquire, artist_names
+from oasis.config import Acquisition, Prowlarr as ProwlarrSettings, TorBox as TorBoxSettings
 from oasis.db import connect
 from oasis.download import Downloads
+from oasis.wants import Outcome
 
 
 def group(id, title, kind="Album", date="2001", secondary=(), artist=("mb-beta", "Beta")):
@@ -31,7 +32,7 @@ class MusicBrainz:
 
     def __call__(self, url, db=None, keep=0):
         self.asked.append(url)
-        path, query = url.removeprefix(acquire.MB).split("?", 1)
+        path, query = url.removeprefix(musicbrainz.MB).split("?", 1)
         q = dict(urllib.parse.parse_qsl(query))
         if path == "release-group" and "artist" in q:
             groups = self.catalogues.get(q["artist"], [])
@@ -59,7 +60,7 @@ class MusicBrainz:
 
 class FakeDownloads:
     def __init__(self):
-        self.active, self.found, self.result, self.free, self.added = set(), [], None, True, 0.0
+        self.active, self.found, self.result, self.free = set(), [], Outcome.NOTHING_SENT, True
         self.bundled = []  # what bundle answers, in turn; then result
 
     def groups(self, db):
@@ -69,8 +70,6 @@ class FakeDownloads:
         return self.free
 
     def find(self, db, want, group):
-        if self.result is not None:
-            self.added = time.time()
         self.found.append(group)
         self.wants = getattr(self, "wants", []) + [want]
         if isinstance(self.result, Exception):
@@ -93,12 +92,12 @@ def mb(monkeypatch):
 @pytest.fixture
 def client(library, tmp_path, mb):
     with make_client(library, tmp_path / "oasis.db") as c:
-        c.app.state.api.library = Acquire(c.app.state.api._db, FakeDownloads())
+        c.app.state.oasis.acquire = Acquire(c.app.state.oasis.connect, FakeDownloads(), Acquisition(bundles=False))
         yield c
 
 
 def sync(client):
-    client.app.state.api.library.reconcile()
+    client.app.state.oasis.acquire.reconcile()
 
 
 def artist_id(client, name):
@@ -110,12 +109,12 @@ def album_of(client, title):
 
 
 def wants(client) -> dict:
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     return {r["title"]: (r["state"], r["reason"], r["error"]) for r in db.execute("select * from want_album")}
 
 
 def follow_beta(client, mb):
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     db.execute("update track set mb_release_group = 'g-first' where album = 'First'")
     db.execute("insert into mb_artist(mbid, artist_id, name) values ('mb-beta', ?, 'Beta')", (artist_id(client, "Beta"),))
     mb.catalogues["mb-beta"] = [
@@ -140,7 +139,7 @@ def test_a_followed_artists_catalogue_leaves_out_repackages_and_singles_with_not
         "Second": ("missing", "followed", None), "Film": ("missing", "followed", "searched, no release found yet"),  # newest first
         "New Song": ("missing", "followed", None)}  # a song on no album or EP kept
     assert "5 left out (2 a repackage, 1 its songs are on the artist's albums, 1 most of its songs are on earlier releases, 1 no official release)" in caplog.text
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     assert db.execute("select tracks, discs from mb_group where rg = 'g-second'").fetchone()[:] == (3, 2)
     assert db.execute("select state, catalogued is not null from want_item where kind = 'artist'").fetchone()[:] == ("followed", 1)
 
@@ -153,7 +152,7 @@ def test_a_followed_artists_catalogue_leaves_out_repackages_and_singles_with_not
 
 def test_have_counts_library_tracks_and_maps_files_tagged_without_their_release_group(client, mb):
     follow_beta(client, mb)
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     db.execute("update track set mb_release_group = null, mb_release = 'r-first' where album = 'First'")
     db.execute("update track set mb_release_group = 'g-second', mb_track = 'same' where album = 'Second'")  # 2 files of one track
     mb.releases["r-first"] = "g-first"
@@ -164,7 +163,7 @@ def test_have_counts_library_tracks_and_maps_files_tagged_without_their_release_
 
 def test_missing_albums_are_searched_in_order_and_again_ever_further_apart(client, mb, monkeypatch):
     follow_beta(client, mb)
-    acq, now = client.app.state.api.library, [time.time()]
+    acq, now = client.app.state.oasis.acquire, [time.time()]
     monkeypatch.setattr(time, "time", lambda: now[0])
 
     def search():
@@ -175,7 +174,7 @@ def test_missing_albums_are_searched_in_order_and_again_ever_further_apart(clien
     assert search() == "g-second"
     assert search() == "g-new"
     assert search() == "g-new" and len(acq.downloads.found) == 3  # nothing due: no search
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     row = db.execute("select * from want_album where rg = 'g-ost'").fetchone()
     assert (row["tries"], row["next_search"] - row["searched"], row["error"]) == (1, 6 * 3600, "searched, no release found yet")
     assert db.execute("select next_search - searched from want_album where rg = 'g-new'").fetchone()[0] == 7 * 86400
@@ -185,11 +184,11 @@ def test_missing_albums_are_searched_in_order_and_again_ever_further_apart(clien
     acq.downloads.free = False
     now[0] += 7 * 86400
     assert search() == "g-ost" and len(acq.downloads.found) == 4  # TorBox full: nothing starts
-    acq.downloads.free, acq.downloads.result = True, False
+    acq.downloads.free, acq.downloads.result = True, Outcome.NO_SLOT
     search()
     assert db.execute("select tries, next_search - ? from want_album where rg = ?", (now[0], acq.downloads.found[-1])).fetchone()[:] \
         in [(1, acquire.RETRY_FULL), (2, acquire.RETRY_FULL)]  # no free slot: soon again, not counted as a try
-    acq.downloads.result = True
+    acq.downloads.result = Outcome.SENT
     sent = search()
     acq.downloads.active.add(sent)
     sync(client)
@@ -200,7 +199,7 @@ def test_missing_albums_are_searched_in_order_and_again_ever_further_apart(clien
 
 def test_a_search_prowlarr_couldnt_answer_is_due_again_soon_without_counting_as_a_try(client, mb, monkeypatch):
     follow_beta(client, mb)
-    acq, db = client.app.state.api.library, client.app.state.api._db()
+    acq, db = client.app.state.oasis.acquire, client.app.state.oasis.connect()
     db.execute("update want_album set next_search = null, tries = 0")
     acq.downloads.result, acq.last_search = OSError("Prowlarr: no music indexer enabled and unpaused"), 0
     sync(client)
@@ -216,39 +215,42 @@ def test_a_search_prowlarr_couldnt_answer_is_due_again_soon_without_counting_as_
 
 def test_after_a_search_that_added_nothing_to_torbox_the_next_may_start_sooner(client, mb, monkeypatch):
     follow_beta(client, mb)
-    acq, now = client.app.state.api.library, [time.time()]
+    acq, now = client.app.state.oasis.acquire, [time.time()]
     monkeypatch.setattr(time, "time", lambda: now[0])
     assert acq.downloads.found == ["g-ost"] and acq.gap == acquire.MISS_GAP  # nothing found: only Prowlarr was asked
     now[0] += acquire.MISS_GAP
-    acq.downloads.result = True
+    acq.downloads.result = Outcome.SENT
     sync(client)
     assert acq.downloads.found == ["g-ost", "g-second"] and acq.gap == acquire.SEARCH_GAP  # sent to TorBox: its rate limit's gap
     now[0] += acquire.MISS_GAP
     sync(client)
     assert len(acq.downloads.found) == 2
-    acq.downloads.result = None
+    acq.downloads.result = Outcome.REFUSED  # TorBox wouldn't take it: asked all the same
     now[0] += acquire.SEARCH_GAP
-    acq.downloads.added = now[0]  # TorBox wouldn't take it: asked all the same
     sync(client)
     assert len(acq.downloads.found) == 3 and acq.gap == acquire.SEARCH_GAP
 
 
-def test_a_search_knows_the_albums_other_titles_from_its_aliases_and_pseudo_releases(client, mb):
+def test_a_search_knows_the_albums_other_titles_from_its_aliases_and_pseudo_releases(client, mb, monkeypatch):
     follow_beta(client, mb)
     second = next(g for g in mb.catalogues["mb-beta"] if g["id"] == "g-second")
     second["aliases"] = [{"name": "Zweite", "type": "Release group name"}, {"name": "2nd", "type": "Search hint"}]
     mb.pseudo["mb-beta"] = [{"title": t, "release-group": {"id": rg}} for t, rg in
                             [("Sekando", "g-second"), ("Second (Instrumental)", "g-second"), ("Film", "g-second"), ("Sekando", "g-second"),
                              ("Fuirumu", "g-ost"), ("Elsewhere", "g-unknown")]]
-    db = client.app.state.api._db()
-    assert acquire.other_titles(db, "mb-beta") == {"g-second": ["Zweite", "Sekando"], "g-ost": ["Fuirumu"]}
-    row = db.execute("select * from want_album where rg = 'g-second'").fetchone()
-    assert client.app.state.api.library.target(db, row)["other_titles"] == ["Zweite", "Sekando"]
+    acq, now = client.app.state.oasis.acquire, [time.time()]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    for rg in ("g-second", "g-ost"):
+        acq.search_soon(rg)
+        now[0] += acquire.SEARCH_GAP
+        sync(client)
+    assert acq.downloads.found[-2:] == ["g-second", "g-ost"]
+    assert [w["other_titles"] for w in acq.downloads.wants[-2:]] == [["Zweite", "Sekando"], ["Fuirumu"]]
 
 
 def test_an_artist_with_gaps_gets_a_weekly_bundle_search_in_an_album_searchs_place(client, mb, monkeypatch):
     follow_beta(client, mb)
-    acq, now = client.app.state.api.library, [time.time()]
+    acq, now = client.app.state.oasis.acquire, [time.time()]
     acq.bundles, acq.downloads.found = True, []
     acq.downloads.active.add("g-second")  # downloading on its own
     monkeypatch.setattr(time, "time", lambda: now[0])
@@ -273,7 +275,7 @@ def test_singles_whose_song_is_on_the_albums_or_that_are_another_version_arent_w
     for id, (title, songs) in singles.items():
         mb.catalogues["mb-beta"].append(group(id, title, "Single", "2012"))
         mb.songs[id] = songs
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     db.execute("insert into want_item(kind, ref, mbid, state, updated) values ('album', 'al-mb-g-star', 'g-star', 'wanted', 0)")
     db.execute("insert into wanted(kind, ref, user) values ('album', 'al-mb-g-star', 'admin')")
     db.execute("update want_item set catalogued = 0 where kind = 'artist'")
@@ -293,7 +295,7 @@ def test_guest_appearances_are_skipped_unless_starred_and_joint_credits_count(cl
     for id, artists in guests.items():
         mb.catalogues["mb-beta"].append({**group(id, id, date="2012"), "artist-credit": artists})
         mb.songs[id] = [id]
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     db.execute("update want_item set catalogued = 0")
     sync(client)
     found = {rg: (state, error) for rg, state, error in db.execute("select rg, state, error from want_album where rg in (%s)" % ",".join("?" * 5), list(guests))}
@@ -308,9 +310,9 @@ def test_guest_appearances_are_skipped_unless_starred_and_joint_credits_count(cl
 
 def test_an_artist_missing_only_singles_gets_a_bundle_search_too(client, mb, monkeypatch):
     follow_beta(client, mb)
-    acq, now = client.app.state.api.library, [time.time()]
+    acq, now = client.app.state.oasis.acquire, [time.time()]
     acq.bundles, acq.downloads.found = True, []
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     db.execute("delete from want_album where primary_type != 'Single'")  # no album or EP missing
     db.execute("insert into want_album(rg, artist_mbid, artist, title, primary_type, reason, state) values ('g-b', 'mb-beta', 'Beta', 'B-Side', 'Single', 'followed', 'missing')")
     monkeypatch.setattr(time, "time", lambda: now[0])
@@ -321,8 +323,8 @@ def test_an_artist_missing_only_singles_gets_a_bundle_search_too(client, mb, mon
 
 def test_bundles_go_one_a_pass_till_none_holds_more_then_album_searches_with_bundle_first_kinds_last(client, mb, monkeypatch):
     follow_beta(client, mb)
-    acq, now = client.app.state.api.library, [time.time()]
-    acq.bundles, acq.downloads.found, acq.downloads.bundled = True, [], [True, True, None]
+    acq, now = client.app.state.oasis.acquire, [time.time()]
+    acq.bundles, acq.downloads.found, acq.downloads.bundled = True, [], [Outcome.SENT, Outcome.SENT, Outcome.NOTHING_SENT]
     monkeypatch.setattr(time, "time", lambda: now[0])
     for _ in range(3):
         now[0] += acquire.SEARCH_GAP
@@ -334,26 +336,24 @@ def test_bundles_go_one_a_pass_till_none_holds_more_then_album_searches_with_bun
     sync(client)
     assert acq.downloads.found[3] == "g-second"  # the bundle searches are done for the week
 
-    # Till the artist's bundles are searched, its singles, EPs, live and demo releases wait; its albums don't.
-    db = client.app.state.api._db()
+    # Till the artist's bundles are searched, its singles, EPs, live and demo releases wait.
+    db = client.app.state.oasis.connect()
     db.execute("update bundle_search set searched = 0")
     db.execute("update want_album set next_search = 0, searched = null where rg in ('g-second', 'g-new')")
-    monkeypatch.setattr(acq, "bundle_next", lambda db, again=0: False)
     acq.downloads.active.add("g-second")
     now[0] += acquire.SEARCH_GAP
     sync(client)
-    assert len(acq.downloads.found) == 4
-    acq.bundles = False
+    assert acq.downloads.found[4][0] == "bundle"
     now[0] += acquire.SEARCH_GAP
     sync(client)
-    assert acq.downloads.found[4] == "g-new"
+    assert acq.downloads.found[5] == "g-new"
 
 
 def test_one_missing_ep_or_single_gets_a_bundle_search_first_and_starred_groups_of_any_type_count(client, mb, monkeypatch):
     follow_beta(client, mb)
-    acq, now = client.app.state.api.library, [time.time()]
+    acq, now = client.app.state.oasis.acquire, [time.time()]
     acq.bundles, acq.downloads.found = True, []
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     db.execute("delete from want_album where rg != 'g-new'")
     db.execute("update want_album set searched = null, next_search = null")
     monkeypatch.setattr(time, "time", lambda: now[0])
@@ -375,7 +375,7 @@ def test_collaboration_credits_split_into_artist_names():
 
 
 def test_a_new_star_resolves_through_musicbrainz_search_exact_matches_only(client, mb):
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     db.execute("insert into ytm_artist(artist_id, name, fetched) values ('ar-yt', 'Kenshi Yonezu', 0)")
     db.execute("insert into ytm_release values ('al-yt', 'ar-yt', 'MPRE', 'STRAY SHEEP', 2020, 'Album', null)")
     mb.artists = [{"id": "mb-other", "name": "Kenshi Yonezu Tribute", "aliases": []},
@@ -406,7 +406,7 @@ def test_a_new_star_resolves_through_musicbrainz_search_exact_matches_only(clien
 
 def test_unfollowing_drops_the_catalogue_but_keeps_starred_albums_and_unstarring_gives_them_back(client, mb):
     follow_beta(client, mb)
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     db.execute("insert into want_item(kind, ref, state, mbid, updated) values ('album', 'al-x', 'wanted', 'g-hits', 0)")
     db.execute("insert into wanted values ('admin', 'album', 'al-x')")
     sync(client)
@@ -423,7 +423,7 @@ def test_unfollowing_drops_the_catalogue_but_keeps_starred_albums_and_unstarring
 
 
 def test_what_lidarr_searched_and_looked_for_still_counts_once_it_is_gone(client, mb):
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     searched = time.time() - 3600
     db.executemany("insert into catalogue_search(album_id, searched, mbid) values (?, ?, ?)",
                    [(12, searched, "g-second"), (14, 0, "g-again"), (15, 0, "g-one")])  # as carried over from Lidarr
@@ -446,10 +446,13 @@ def test_catalogue_reads_keep_musicbrainzs_pace(tmp_path, monkeypatch):
         return io.BytesIO(json.dumps({"releases": [{"media": [{"tracks": [{"title": "x"}]}]}]}).encode())
 
     monkeypatch.setattr(musicbrainz.urllib.request, "urlopen", urlopen)
-    connect(tmp_path / "oasis.db").execute("insert into want_item(kind, ref, state, mbid, updated) values ('artist', 'ar-b', 'followed', 'mb-beta', 0)")
-    acq = Acquire(lambda: connect(tmp_path / "oasis.db"), FakeDownloads())
-    read = lambda db: acq.catalogue(db, db.execute("select * from want_item").fetchone())
-    reader = threading.Thread(target=lambda: read(connect(tmp_path / "oasis.db")))
+    db = connect(tmp_path / "oasis.db")
+    db.execute("insert into want_item(kind, ref, state, mbid, updated) values ('artist', 'ar-b', 'followed', 'mb-beta', 0)")
+    db.execute("insert into wanted(kind, ref, user) values ('artist', 'ar-b', 'admin')")
+    downloads = FakeDownloads()
+    downloads.free = False  # no search: the catalogue's reads only
+    acq = Acquire(lambda: connect(tmp_path / "oasis.db"), downloads, Acquisition(bundles=False))
+    reader = threading.Thread(target=acq.reconcile)
     other = threading.Thread(target=lambda: musicbrainz.get("https://musicbrainz.org/ws/2/release/r?fmt=json"))
     reader.start(), other.start()
     reader.join(), other.join()
@@ -465,7 +468,7 @@ def test_downloads_failing_make_the_album_due_again(tmp_path):
     class TorBox:
         def delete_torrent(self, id):
             pass
-    made = Downloads(lambda: connect(tmp_path / "oasis.db"), TorBox, None, None, str(tmp_path / "dl"))
+    made = Downloads(lambda: connect(tmp_path / "oasis.db"), TorBox, None, None, TorBoxSettings("", downloads=str(tmp_path / "dl")))
     assert made.groups(db) == {"g"}
     made.fail(db, db.execute("select * from download").fetchone(), "dead torrent")
     assert db.execute("select next_search, error from want_album").fetchone()[:] == (None, "download failed: dead torrent") and made.groups(db) == set()
@@ -495,9 +498,9 @@ def test_musicbrainz_searches_are_cached_and_their_words_escaped(tmp_path, monke
         return io.BytesIO(json.dumps({"artists": [{"id": KENSHI, "name": "米津玄師"}]}).encode())
     monkeypatch.setattr(musicbrainz.urllib.request, "urlopen", urlopen)
     db = connect(tmp_path / "oasis.db")
-    assert acquire.find(db, "artist", 'Kenshi "Yonezu":') == acquire.find(db, "artist", "kenshi yonezu") == [{"id": KENSHI, "name": "米津玄師"}]
-    assert sent == [acquire.MB + "artist?query=kenshi%20yonezu&limit=25&fmt=json"]  # once
-    assert acquire.find(db, "album", "?!") == [] and len(sent) == 1
+    assert musicbrainz.find("artist", 'Kenshi "Yonezu":', db) == musicbrainz.find("artist", "kenshi yonezu", db) == [{"id": KENSHI, "name": "米津玄師"}]
+    assert sent == [musicbrainz.MB + "artist?query=kenshi%20yonezu&limit=25&fmt=json"]  # once
+    assert musicbrainz.find("album", "?!", db) == [] and len(sent) == 1
 
 
 def test_the_dashboard_finds_follows_and_wants_any_artist_or_album(client, mb):
@@ -515,7 +518,7 @@ def test_the_dashboard_finds_follows_and_wants_any_artist_or_album(client, mb):
     assert "Wanted: it is searched for" in page
     sync(client)
     assert wants(client)["Lemon"] == ("missing", "starred", None)  # wanting is starring: never left out
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     assert [tuple(r) for r in db.execute("select user, kind, ref from wanted order by kind")] == [("admin", "album", "al-mb-" + LEMON), ("admin", "artist", "ar-mb-" + KENSHI)]
     assert db.execute("select starred is not null from stat where id = ?", ("al-mb-" + LEMON,)).fetchone()[0] == 1  # as clients see it
     found = client.get("/music", params={"q": "stray sheep", "kind": "album"}).text
@@ -530,19 +533,21 @@ def test_the_dashboard_finds_follows_and_wants_any_artist_or_album(client, mb):
 def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up(client, mb, monkeypatch):
     kenshi(mb)
     sign_in(client)
-    api, now = client.app.state.api, time.time()
+    api, now = client.app.state.oasis, time.time()
     client.post("/music/want", data={"kind": "artist", "mbid": KENSHI, "on": "1"})
     client.post("/music/want", data={"kind": "album", "mbid": LEMON, "on": "1"})
     sync(client)
-    db = api._db()
+    db = api.connect()
     db.execute("update want_album set error = 'download failed: dead torrent' where rg = ?", (LEMON,))
     db.execute("update want_album set searched = ?, next_search = ? where rg = ?", (now, now + 3600, STRAY))
     db.execute("insert into download(hash, album_id, album_mbid, title, state, created, updated) values ('h', 0, ?, 'B', 'downloading', ?, ?)",
                (BOOTLEG, now, now))
-    downloads = Downloads(api._db, None, None, None, "dl")
-    downloads.client, downloads.seen["h"] = type("TorBox", (), {"delete_torrent": lambda self, id: None})(), (0.42, now)
-    api.downloads = downloads
-    api.library.downloads.active.add(BOOTLEG)
+    db.execute("update download set torbox_id = 7")
+    torbox = FakeTorBox()
+    torbox.list = [tb(7, "h", progress=0.42)]
+    api.downloads = Downloads(api.connect, lambda: torbox, None, None, TorBoxSettings("", downloads="dl"))
+    api.downloads.cycle()
+    api.acquire.downloads.active.add(BOOTLEG)
     sync(client)
     page = client.get("/music/wanted").text
     assert page.index("Failed, trying again") < page.index("Lemon") < page.index("Downloading") < page.index("BOOTLEG") \
@@ -565,7 +570,10 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     gone = client.get("/music/library/album/al-mb-55555555-5555-4555-8555-555555555555").text
     assert "That album isn&#x27;t here" in gone, gone[gone.find("<main"):][:600]
     filtered = client.get("/music/wanted", params={"type": "Single", "q": "stray"}).text
-    assert "STRAY SHEEP" not in filtered or "Lemon" not in filtered
+    assert "STRAY SHEEP" not in filtered and "Lemon" not in filtered
+    assert "STRAY SHEEP" in client.get("/music/wanted", params={"q": "stray"}).text
+    singles = client.get("/music/wanted", params={"type": "Single"}).text
+    assert "Lemon" in singles and "STRAY SHEEP" not in singles
     library = client.get("/music/library").text
     assert "米津玄師" in library and f"/music/library/artist/{KENSHI}" in library
     artist = client.get(f"/music/library/artist/{KENSHI}").text
@@ -578,15 +586,15 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
     assert "Format" in song and "File" in song
 
     assert "searched next" in client.post(f"/music/wanted/{STRAY}/search").text
-    monkeypatch.setattr(api.library, "search", lambda db, row: setattr(api.library, "searched", row["rg"]))
-    api.library.last_search = 0  # a search gap later
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + acquire.SEARCH_GAP)
     sync(client)
-    assert api.library.searched == STRAY  # before the starred album
+    assert api.acquire.downloads.found[-1] == STRAY  # before the starred album
 
     assert "Blocked that release" in client.post(f"/music/wanted/{BOOTLEG}/block").text
     assert db.execute("select state from download").fetchone()[0] == "failed" and db.execute("select 1 from release_block where hash = 'h'").fetchone()
     assert "Nothing is downloading" in client.post(f"/music/wanted/{BOOTLEG}/block").text
-    api.library.downloads.active.clear()
+    api.acquire.downloads.active.clear()
 
     assert "Unwanted 米津玄師 – BOOTLEG" in client.post(f"/music/wanted/{BOOTLEG}/give-up").text
     client.post(f"/music/wanted/{LEMON}/give-up")
@@ -606,11 +614,11 @@ def test_the_wanted_page_shows_each_albums_state_and_searches_blocks_or_gives_up
 def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_that_keep_their_ids_once_here(client, mb, monkeypatch):
     kenshi(mb)
     mb.artists.append({"id": "mb-beta", "name": "Beta"})  # in the library: left out
-    client.app.state.api._db().execute("insert into mb_artist(mbid, artist_id, name) values ('mb-beta', ?, 'Beta')", (artist_id(client, "Beta"),))
+    client.app.state.oasis.connect().execute("insert into mb_artist(mbid, artist_id, name) values ('mb-beta', ?, 'Beta')", (artist_id(client, "Beta"),))
     assert call(client, "search3", query="Kenshi Yonezu")["searchResult3"] == {"artist": [], "album": [], "song": []}  # only for oasis=1
     found = call(client, "search3", query="Kenshi Yonezu", oasis="1")["searchResult3"]
     assert [a["id"] for a in found["artist"]] == ["ar-mb-" + KENSHI] and [a["id"] for a in found["album"]] == ["al-mb-" + STRAY]
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     db.execute("update track set album_artist = 'Kenshi Yonezu' where album = 'Second'")  # by another name: left out
     assert call(client, "search3", query="Kenshi Yonezu", oasis="1")["searchResult3"]["artist"][0]["name"] == "Kenshi Yonezu"
     assert len(call(client, "search3", query="Kenshi Yonezu", oasis="1")["searchResult3"]["artist"]) == 1
@@ -629,8 +637,8 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     assert album["coverArt"] == "al-mb-" + STRAY
     covers = []
 
-    def urlopen(url, timeout):
-        covers.append(url)
+    def urlopen(request, timeout):
+        covers.append(url := request.full_url)
         if STRAY not in url:
             raise urllib.error.HTTPError(url, 404, "no cover", {}, None)
         response = io.BytesIO(b"jpeg")
@@ -670,10 +678,10 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
 
 def test_an_album_searched_before_waits_behind_every_album_not_tried_yet(client, mb, monkeypatch):
     follow_beta(client, mb)
-    acq, now = client.app.state.api.library, [time.time()]
+    acq, now = client.app.state.oasis.acquire, [time.time()]
     monkeypatch.setattr(time, "time", lambda: now[0])
     assert acq.downloads.found == ["g-ost"]
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     db.execute("update want_album set next_search = null where rg = 'g-ost'")  # its download failed: due again at once
     db.execute("update want_album set reason = 'starred' where rg = 'g-ost'")  # starred, even
     now[0] += acquire.SEARCH_GAP
@@ -683,9 +691,9 @@ def test_an_album_searched_before_waits_behind_every_album_not_tried_yet(client,
 
 def test_with_nothing_due_and_room_it_searches_early_without_touching_backoff(client, mb, monkeypatch, caplog):
     follow_beta(client, mb)
-    acq, now = client.app.state.api.library, [time.time() + 3600]
+    acq, now = client.app.state.oasis.acquire, [time.time() + 3600]
     monkeypatch.setattr(time, "time", lambda: now[0])
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     h = 3600
     for rg, searched, due, tries in (("g-ost", 7 * h, 2 * 86400, 3), ("g-second", h, 3 * 86400, 2), ("g-new", 2 * h, 30 * h, 1)):
         db.execute("update want_album set searched = ?, next_search = ?, tries = ? where rg = ?", (now[0] - searched, now[0] + due, tries, rg))
@@ -712,14 +720,25 @@ def test_with_nothing_due_and_room_it_searches_early_without_touching_backoff(cl
     assert step(acquire.EARLY_GAP) == "g-new"  # the single: a day since its last search
 
 
+def test_an_item_musicbrainz_answers_oddly_for_is_tried_again_later_and_the_pass_goes_on(client, mb):
+    db = client.app.state.oasis.connect()
+    bad = group("g-bad", "Bad")
+    bad["artist-credit"] = None
+    mb.catalogues["mb-beta"] = [bad, group("g-good", "Good")]
+    for ref, rg in (("al-bad", "g-bad"), ("al-good", "g-good")):
+        db.execute("insert into want_item(kind, ref, state, mbid, updated) values ('album', ?, 'wanted', ?, 0)", (ref, rg))
+        db.execute("insert into wanted values ('admin', 'album', ?)", (ref,))
+    sync(client)
+    row = db.execute("select state, retry_at - ? from want_item where ref = 'al-bad'", (time.time(),)).fetchone()
+    assert row[0] == "wanted" and row[1] == pytest.approx(acquire.RETRY_ERROR, abs=5)
+    assert "Good" in wants(client)
+
+
 def test_the_indexers_page_shows_prowlarrs_view_oasiss_downloads_and_seeding_rules(client, mb, tmp_path):
     sign_in(client)
-    api = client.app.state.api
+    oasis = client.app.state.oasis
 
-    class Prowlarr:
-        tag, logins, url = 2, {38: "Cookie-Tracker", 40: "Ratio-Tracker"}, "http://prowlarr:9696"
-        errors = {38: (time.time(), "Prowlarr search: 400 redirected to https://cookie-tracker.example/login.php")}
-
+    class Prowlarr(prowlarr.Prowlarr):
         def call(self, path):
             return {"indexer": [{"id": 22, "name": "Open-Index", "enable": True, "privacy": "public", "tags": [2], "protocol": "torrent",
                                  "indexerUrls": ["https://open-index.example/"]},
@@ -733,8 +752,12 @@ def test_the_indexers_page_shows_prowlarrs_view_oasiss_downloads_and_seeding_rul
                                                    "numberOfFailedGrabs": 0, "averageResponseTime": 1500},
                                                   {"indexerId": 38, "numberOfQueries": 1, "numberOfFailedQueries": 0, "numberOfGrabs": 1,
                                                    "numberOfFailedGrabs": 0, "averageResponseTime": 900}]}}[path]
-    api.downloads = Downloads(api._db, None, None, Prowlarr(), str(tmp_path / "dl"), seeding={"Ratio-Tracker": {"mode": "seed", "days": 14, "min_ratio": 0.7}})
-    db = api._db()
+    found = Prowlarr(ProwlarrSettings("http://p", "k"))
+    found.logins = {38: "Cookie-Tracker", 40: "Ratio-Tracker"}
+    found.errors = {38: (time.time(), "Prowlarr search: 400 redirected to https://cookie-tracker.example/login.php")}
+    oasis.downloads = Downloads(oasis.connect, None, None, found, TorBoxSettings("", downloads=str(tmp_path / "dl")),
+                                seeding={"Ratio-Tracker": {"mode": "seed", "days": 14, "min_ratio": 0.7}})
+    db = oasis.connect()
     db.execute("insert into want_album(rg, artist_mbid, title, reason, state) values ('g-1', 'a', 'One', 'followed', 'have')")
     db.executemany("insert into download(hash, guid, album_id, album_mbid, title, state, error, created, updated, indexer, tracker, downloaded, uploaded) "
                    "values (?, ?, 0, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)", [
@@ -754,11 +777,12 @@ def test_the_indexers_page_shows_prowlarrs_view_oasiss_downloads_and_seeding_rul
     assert 'href="/music/indexers"' in client.get("/").text
 
 
-class ManagedProwlarr:
+class ManagedProwlarr(prowlarr.Prowlarr):
     """Prowlarr's indexer API as the indexers page uses it: each save replaces the stored indexer."""
-    tag, logins, errors, url = 2, {51: "Some-Tracker"}, {}, "http://prowlarr:9696"
 
     def __init__(self):
+        super().__init__(ProwlarrSettings("http://prowlarr:9696", "k"))
+        self.logins = {51: "Some-Tracker"}
         cookie = {"name": "cookie", "type": "textbox", "privacy": "normal", "label": "Cookie", "value": "uid=291; pass=storedsecret"}
         self.stored = [
             {"id": 50, "name": "Public Index 2", "enable": True, "privacy": "public", "tags": [2, 3], "protocol": "torrent", "priority": 25, "indexerUrls": ["https://public-index.example/"],
@@ -793,9 +817,9 @@ class ManagedProwlarr:
 @pytest.fixture
 def managed(client, tmp_path):
     sign_in(client)
-    api = client.app.state.api
-    api.downloads = Downloads(api._db, None, None, ManagedProwlarr(), str(tmp_path / "dl"))
-    return api.downloads.prowlarr
+    oasis = client.app.state.oasis
+    oasis.downloads = Downloads(oasis.connect, None, None, ManagedProwlarr(), TorBoxSettings("", downloads=str(tmp_path / "dl")))
+    return oasis.downloads.prowlarr
 
 
 def post(client, id, action, **form):
@@ -818,7 +842,7 @@ def test_the_indexers_page_shows_who_stores_what_and_never_a_credential(client, 
 
 
 def test_only_admins_manage_indexers(client, mb, managed):
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     accounts.create(db, "guest", "pw")
     db.commit()
     client.post("/logout")
@@ -855,7 +879,7 @@ def test_credentials_are_write_only_and_only_new_values_replace_prowlarrs(client
 
 
 def test_seeding_rules_set_in_oasis_win_till_reset(client, mb, managed):
-    downloads = client.app.state.api.downloads
+    downloads = client.app.state.oasis.downloads
     assert downloads.rule_source("Some-Tracker") == "default"
     assert "Saved Some-Tracker" in post(client, 51, "seeding", mode="off", ratio="2", days="3", min_hours="1", min_ratio="")
     assert downloads.rule("Some-Tracker") == {"mode": "off", "ratio": 2.0, "days": 3.0, "min_hours": 1.0, "min_ratio": None}
@@ -868,7 +892,7 @@ def test_seeding_rules_set_in_oasis_win_till_reset(client, mb, managed):
 
 
 def test_clearing_an_indexers_blocks_lifts_only_its_releases(client, mb, managed):
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     db.executemany("insert into download(hash, guid, album_id, title, state, created, updated, indexer) values (?, ?, 0, ?, 'failed', 0, 0, ?)",
                    [("a", None, "A", 51), ("b", "https://some.example/t/2", "B", None), ("c", None, "C", 50)])
     db.executemany("insert into release_block(hash, reason, at) values (?, 'dead torrent', 0)", [("a",), ("https://some.example/t/2",), ("c",)])

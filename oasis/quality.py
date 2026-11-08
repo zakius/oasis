@@ -5,8 +5,8 @@
 - upsampled: a rate above 48 kHz whose spectrum ends in a brick wall at 22.05 or 24 kHz is resampled to 44.1 kHz
   16-bit (a CD) or 48 kHz 24-bit;
 - lossy: a hard cutoff between 14 and 19.6 kHz, sustained across the file, is an MP3 or AAC decoded into FLAC. Such a
-  download fails the import (the importer raises LossySource); the backlog deletes such library files and wants their
-  album again, so a proper release (even an MP3 one) replaces them;
+  download fails the import (the importer raises LossySource); the backlog deletes such library files, and
+  library.check_quality wants their album again, so a proper release (even an MP3 one) replaces them;
 - anything else is recompressed with flac -8 when that saves at least 3 %.
 
 Every rewrite goes to a temporary file in the file's folder, keeps every metadata block (tags, pictures, cue sheets,
@@ -18,7 +18,6 @@ store its audio twice.
 The spectrum is averaged over loud frames only (silence and quiet passages say nothing about the top octave), over the
 whole file and per stretch of it; a cutoff counts only when every stretch loud enough shows it. Cases near the
 thresholds are recorded as borderline and never acted on."""
-import hashlib
 import logging
 import os
 import shutil
@@ -29,7 +28,10 @@ from pathlib import Path
 
 import numpy as np
 
-from . import dedupe
+from . import audiorecords
+from .audio import COMPARE_RATE, check_decodes, chunks, decode
+from .audiorecords import CONVERTED, LOSSY, PADDED, RESAMPLED, UPSAMPLED
+from .files import stderr_tail
 
 log = logging.getLogger(__name__)
 
@@ -62,39 +64,15 @@ class Unverified(Exception):
     """A rewritten file failed its checks; the original stays."""
 
 
-# Analysis
-
-def decode(path: str):
-    """The samples as int32 (left-aligned, whatever the file's depth), a chunk of frames at a time."""
-    probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate,channels,bits_per_raw_sample",
-                            "-of", "default=nw=1", path], capture_output=True, text=True, check=True).stdout
-    info = dict(line.split("=", 1) for line in probe.splitlines() if "=" in line)
-    rate, channels = int(info["sample_rate"]), int(info["channels"])
-    bits = int(info["bits_per_raw_sample"]) if info.get("bits_per_raw_sample", "").isdigit() else 16
-    process = subprocess.Popen(["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-map", "0:a:0", "-f", "s32le", "-c:a", "pcm_s32le", "-"],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-    def chunks():
-        try:
-            while data := process.stdout.read(channels * 4 << 18):
-                yield np.frombuffer(data[:len(data) // (channels * 4) * channels * 4], np.int32).reshape(-1, channels)
-        finally:
-            process.stdout.close()
-            error = process.stderr.read().decode(errors="replace").strip()
-            if process.wait() != 0:
-                raise OSError(f"can't decode {path}: {error[-200:]}")
-    return rate, channels, bits, chunks()
-
-
 def analyse(path: str) -> dict:
     """rate, bits, channels; bits_used and low_share (samples using the low 8 of 24 bits); the spectrum's cutoff (Hz),
     its drop (dB) and whether every loud stretch shows it (sustained). cutoff is None below BORDER_DB."""
-    rate, channels, bits, chunks = decode(path)
+    rate, channels, bits, decoded = chunks(path)
     n = 1 << round(np.log2(rate * FRAME_SECONDS))
     window = np.hanning(n)
     starts = np.arange(0, n // 2 + 1, max(1, round(BIN_HZ * n / rate)))
     used, low, samples, levels, spectra, rest = 0, 0, 0, [], [], np.zeros(0)
-    for chunk in chunks:
+    for chunk in decoded:
         used |= int(np.bitwise_or.reduce(chunk, axis=None))
         low += int(np.count_nonzero(chunk & 0xFFFF))
         samples += chunk.size
@@ -155,25 +133,23 @@ def classify(a: dict) -> dict:
     strong = cut is not None and drop >= CLIFF_DB and a["sustained"]
     verdict = borderline = source_rate = None
     if cut and LOSSY_HZ[0] <= cut <= LOSSY_HZ[1] and strong:
-        verdict = "lossy"
+        verdict = LOSSY
     elif a["rate"] > 48000 and cut and cut <= UPSAMPLED_HZ and strong:
-        verdict, source_rate = "upsampled", 44100 if cut < FROM_44K_HZ else 48000
+        verdict, source_rate = UPSAMPLED, 44100 if cut < FROM_44K_HZ else 48000
     elif a["bits"] > 16 and 0 < a["bits_used"] <= 16:
-        verdict = "padded"
-    if verdict != "lossy" and cut and LOSSY_HZ[0] <= cut <= BORDER_LOSSY_HZ:
-        borderline = "lossy"
+        verdict = PADDED
+    if verdict != LOSSY and cut and LOSSY_HZ[0] <= cut <= BORDER_LOSSY_HZ:
+        borderline = LOSSY
     elif verdict is None and a["rate"] > 48000 and cut and cut <= UPSAMPLED_HZ:
-        borderline = "upsampled"
+        borderline = UPSAMPLED
     elif verdict is None and a["bits"] > 16 and a["low_share"] < NEAR_16:
-        borderline = "padded"
+        borderline = PADDED
     return {"verdict": verdict, "borderline": borderline, "source_rate": source_rate}
 
 
 def examine(path: Path) -> dict:
     return (a := analyse(str(path))) | classify(a)
 
-
-# Rewriting
 
 def blocks(path: Path) -> tuple[list[tuple[int, bytes]], int]:
     """A FLAC's metadata blocks, (type, data), and where its audio frames start."""
@@ -220,7 +196,7 @@ def run(*args, **kwargs):
     try:
         return subprocess.run([str(a) for a in args], check=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=3600, **kwargs)
     except subprocess.CalledProcessError as e:
-        raise Unverified(f"{args[0]}: {e.stderr.decode(errors='replace').strip()[-200:]}") from None
+        raise Unverified(f"{args[0]}: {stderr_tail(e)}") from None
 
 
 def pcm_hash(path: Path) -> str:
@@ -230,7 +206,7 @@ def pcm_hash(path: Path) -> str:
 
 def same_waveform(a: Path, b: Path) -> bool:
     """A resample's audio is the original's: the residual at dedupe's comparison rate is far below the music."""
-    x, y = dedupe.decode(str(a), dedupe.COMPARE_RATE), dedupe.decode(str(b), dedupe.COMPARE_RATE)
+    x, y = decode(str(a), COMPARE_RATE), decode(str(b), COMPARE_RATE)
     n = min(len(x), len(y))
     x, y = x[:n].astype(np.float64), y[:n].astype(np.float64)
     return bool(np.dot(x, x)) and 10 * np.log10(np.sum((x - y) ** 2) / np.dot(x, x) + 1e-30) < -40
@@ -272,7 +248,7 @@ def check(original: Path, new: Path, rate: int | None, bits: int | None):
         raise Unverified("the metadata differs")
     old_info, new_info = next(d for k, d in old_blocks if k == 0), next(d for k, d in new_blocks if k == 0)
     (old_rate, channels, old_bits, samples), (new_rate, new_channels, new_bits, new_samples) = stream(old_info), stream(new_info)
-    run("flac", "-t", "-s", new)  # every frame decodes, and to the MD5 STREAMINFO holds
+    check_decodes(new, "flac")
     if rate:
         if (new_rate, new_channels, new_bits) != (rate, channels, bits) or abs(new_samples / rate - samples / old_rate) > 0.05:
             raise Unverified(f"resampled to {new_rate} Hz, {new_bits} bits, {new_samples / new_rate:.2f} s")
@@ -289,25 +265,23 @@ def check(original: Path, new: Path, rate: int | None, bits: int | None):
         raise Unverified("the decoded samples differ")
 
 
-# Acting
-
 def act(path: Path, found: dict, shared: bool) -> dict:
     """Converts, resamples or recompresses one checked file (never a lossy one: see purge); found gains action
     (resampled, converted, recompressed, kept, shared, failed), was and saved."""
     found = found | {"action": None, "was": None, "saved": 0}
-    if found["verdict"] == "lossy":
+    if found["verdict"] == LOSSY:
         return found
     if shared:
         return found | {"action": "shared"}
     was = f'{found["bits"]}-bit {found["rate"] / 1000:g} kHz'
     try:
-        if found["verdict"] == "upsampled":
+        if found["verdict"] == UPSAMPLED:
             bits = 16 if found["source_rate"] == 44100 or found["bits"] == 16 else 24
             saved = rewrite(path, found["source_rate"], bits, dither=bits == 16)
-            found |= {"action": "resampled", "was": was, "rate": found["source_rate"], "bits": bits}
-        elif found["verdict"] == "padded":
+            found |= {"action": RESAMPLED, "was": was, "rate": found["source_rate"], "bits": bits}
+        elif found["verdict"] == PADDED:
             saved = rewrite(path, bits=16)
-            found |= {"action": "converted", "was": was, "bits": 16}
+            found |= {"action": CONVERTED, "was": was, "bits": 16}
         else:
             saved = rewrite(path)
             found["action"] = "recompressed" if saved is not None else "kept"
@@ -320,25 +294,13 @@ def act(path: Path, found: dict, shared: bool) -> dict:
     return found
 
 
-def store(db, path: Path, found: dict):
-    db.execute("insert or replace into audio_quality(path, mtime, checked, rate, bits, bits_used, low_share, cutoff, drop_db, sustained, "
-               "verdict, borderline, source_rate, action, was, saved) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-               (str(path), path.stat().st_mtime, time.time(), found["rate"], found["bits"], found["bits_used"], found["low_share"],
-                found["cutoff"], found["drop"], int(found["sustained"]), found["verdict"], found["borderline"], found["source_rate"],
-                found.get("action"), found.get("was"), found.get("saved", 0)))
-
-
-def shared_paths(db) -> set[str]:
-    return {p for row in db.execute("select path, kept from audio_shared") for p in row}
-
-
-def backlog(db, jobs: int = JOBS, delete_lossy: bool = False) -> dict:
+def backlog(db, jobs: int = JOBS, delete_lossy: bool = False, deleted=lambda db, rg: None) -> dict:
     """Checks every library FLAC not checked since it last changed, acts on it, then purges lossy-sourced ones (only
-    listed unless delete_lossy). Resumable: each file's result is stored as it is done."""
-    checked = dict(db.execute("select path, mtime from audio_quality").fetchall())
+    listed unless delete_lossy; see purge for deleted). Resumable: each file's result is stored as it is done."""
+    checked = audiorecords.checked(db)
     files = [Path(r[0]) for r in db.execute("select ref from track where source = 'local' and lower(suffix) = 'flac' order by ref")]
     todo = [p for p in files if p.exists() and checked.get(str(p)) != p.stat().st_mtime]
-    shared, done, failed, started = shared_paths(db), 0, 0, time.time()
+    shared, done, failed, started = audiorecords.shared_paths(db), 0, 0, time.time()
     log.info("quality: %d of %d FLACs to check, %d jobs", len(todo), len(files), jobs)
     with ThreadPoolExecutor(jobs) as pool:
         futures = {pool.submit(lambda p: act(p, examine(p), str(p) in shared), p): p for p in todo}
@@ -350,20 +312,21 @@ def backlog(db, jobs: int = JOBS, delete_lossy: bool = False) -> dict:
                 log.warning("quality: can't check %s: %s", path, e)
                 failed += 1
                 continue
-            store(db, path, found)
+            audiorecords.store_finding(db, path, found)
             if found["action"] == "recompressed":
-                dedupe.retagged(db, str(path))  # the same audio: dedupe's verdicts on it stay
+                audiorecords.retagged(db, str(path))  # the same audio: dedupe's verdicts on it stay
             done += 1
             if done % 50 == 0:
                 log.info("quality: %d of %d checked, %.0f s", done, len(todo), time.time() - started)
     log.info("quality: %d checked, %d couldn't be, in %.0f s", done, failed, time.time() - started)
-    return {"checked": done, "unreadable": failed, "purged": purge(db, delete_lossy)}
+    return {"checked": done, "unreadable": failed, "purged": purge(db, delete_lossy, deleted)}
 
 
-def purge(db, delete: bool) -> list[dict]:
-    """Lossy-sourced library FLACs, by album: deleted (with the rest of the album when most of it is lossy-sourced)
-    and the album wanted again. Files no release group ties to an album stay, and are only listed."""
-    lossy = {r[0] for r in db.execute("select path from audio_quality where verdict = 'lossy'")}
+def purge(db, delete: bool, deleted) -> list[dict]:
+    """Lossy-sourced library FLACs, by album: deleted (with the rest of the album when most of it is lossy-sourced),
+    then deleted(db, rg) with the album's release group, in the same commit, so it is wanted again however a later
+    album goes. Files no release group ties to an album stay, and are only listed."""
+    lossy = audiorecords.with_verdict(db, LOSSY)
     if not lossy:
         return []
     albums: dict[str, list] = {}
@@ -389,28 +352,13 @@ def purge(db, delete: bool) -> list[dict]:
             continue
         for t in doomed:
             Path(t["ref"]).unlink(missing_ok=True)
-            for table, column in (("audio_quality", "path"), ("audio_shared", "path"), ("audio_shared", "kept"), ("audio_pair", "a"), ("audio_pair", "b")):
-                db.execute(f"delete from {table} where {column} = ?", (t["ref"],))
+        audiorecords.gone(db, [t["ref"] for t in doomed])
         entry["deleted"] = len(doomed)
-        want_again(db, rg)
+        deleted(db, rg)
         db.commit()
-        log.info("quality: %s - %s: deleted %d files (%d lossy-sourced); the album is wanted again", entry["artist"], entry["album"],
+        log.info("quality: %s - %s: deleted %d files (%d lossy-sourced)", entry["artist"], entry["album"],
                  len(doomed), len(bad))
     return report
-
-
-def want_again(db, rg: str):
-    """The album searched for soon: its want_album row if the catalogue or a star has one, else a star for the first admin."""
-    if db.execute("select 1 from want_album where rg = ?", (rg,)).fetchone():
-        db.execute("update want_album set state = 'missing', next_search = null where rg = ?", (rg,))
-        return
-    user = db.execute("select name from user order by admin desc, created limit 1").fetchone()
-    if user is None:
-        log.warning("quality: nobody to want %s for", rg)
-        return
-    ref = "al-mb-" + rg  # acquire.MB_IDS: a MusicBrainz release group's id until it arrives
-    db.execute("insert or ignore into wanted values (?, 'album', ?)", (user[0], ref))
-    db.execute("insert or ignore into want_item(kind, ref, state, mbid, updated) values ('album', ?, 'wanted', ?, ?)", (ref, rg, time.time()))
 
 
 def import_check(files: list[Path], jobs: int = JOBS) -> dict[Path, dict]:
@@ -424,7 +372,7 @@ def import_check(files: list[Path], jobs: int = JOBS) -> dict[Path, dict]:
             return None
     with ThreadPoolExecutor(jobs) as pool:
         found = {p: r for p, r in zip(files, pool.map(lambda p: safely(examine, p), files)) if r}
-        if lossy := sorted((p, r) for p, r in found.items() if r["verdict"] == "lossy"):
+        if lossy := sorted((p, r) for p, r in found.items() if r["verdict"] == LOSSY):
             raise LossySource(f"lossy source in a FLAC: {lossy[0][0].name} is cut off at {lossy[0][1]['cutoff'] / 1000:.1f} kHz"
                               + (f", and {len(lossy) - 1} more" if len(lossy) > 1 else ""))
         return {p: r for p, r in zip(found, pool.map(lambda p: safely(act, p, found[p], False), found)) if r}

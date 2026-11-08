@@ -1,19 +1,22 @@
+import time
 import urllib.parse
 
 import pytest
 
-from conftest import call, make_client
-from oasis import accounts
+from conftest import call, make_client, sign_in
+from oasis import accounts, ytm
+from oasis.lastfm import LastFm
+from oasis.remote import Rejected
 
 
 class FakeYtm:
-    def __init__(self):
-        self.clients = {}
-
     def client(self, auth):
         if "bad" in auth:
             raise ValueError("expired")
         return auth
+
+    def forget_client(self, auth):
+        pass
 
     def account_name(self, client):
         return "Tester"
@@ -28,20 +31,14 @@ def client(library, tmp_path):
         yield c
 
 
-def sign_in(client, name="admin", password="secret"):
-    response = client.post("/login", data={"name": name, "password": password}, follow_redirects=False)
-    assert response.status_code == 303
-    return response
-
-
 def test_youtube_headers_from_any_copy():
     curl = "curl 'https://music.youtube.com/youtubei/v1/browse' -H 'x-goog-authuser: 1' -H 'cookie: SID=a; __Secure-3PAPISID=b' --compressed"
-    assert accounts.youtube_headers(curl)["x-goog-authuser"] == "1"
+    assert ytm.youtube_headers(curl)["x-goog-authuser"] == "1"
     raw = "Host: music.youtube.com\nCookie: SID=a; __Secure-3PAPISID=b\nX-Goog-AuthUser: 2"
-    assert accounts.youtube_headers(raw)["x-goog-authuser"] == "2"
-    assert accounts.youtube_headers("SID=a; __Secure-3PAPISID=b")["cookie"] == "SID=a; __Secure-3PAPISID=b"
+    assert ytm.youtube_headers(raw)["x-goog-authuser"] == "2"
+    assert ytm.youtube_headers("SID=a; __Secure-3PAPISID=b")["cookie"] == "SID=a; __Secure-3PAPISID=b"
     with pytest.raises(ValueError):
-        accounts.youtube_headers("SID=a")
+        ytm.youtube_headers("SID=a")
 
 
 def test_web_sign_in_and_link_services(client):
@@ -58,24 +55,36 @@ def test_web_sign_in_and_link_services(client):
     assert "last.fm/api/account/create" in client.get("/").text
 
 
-def test_an_admin_connects_oasis_to_lastfm_on_the_dashboard(client, monkeypatch):
-    from oasis.forward import LastFm, Rejected
-
+@pytest.fixture
+def lastfm(monkeypatch):
+    """Last.fm, taking the secret 'right' and the token 't'."""
     def call(self, params):
         if self.secret != "right":
             raise Rejected("Last.fm: Invalid method signature supplied")
         return {"session": {"key": "sk", "name": "zak"}} if params["method"] == "auth.getSession" else {"token": "t"}
     monkeypatch.setattr(LastFm, "call", call)
+
+
+def link_lastfm(client) -> str:
+    """Signs the dashboard's user in with Last.fm; returns the page it lands on."""
+    location = client.get("/account/lastfm", follow_redirects=False).headers["location"]
+    callback = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)["cb"][0]
+    return client.get(callback + "&token=t").text  # Last.fm adds its token to the callback
+
+
+def test_an_admin_connects_oasis_to_lastfm_on_the_dashboard(client, lastfm, library, tmp_path):
     sign_in(client)
     assert "Invalid method signature" in client.post("/account/lastfm/app", data={"key": "k", "secret": "wrong"}).text
     assert "Sign in with Last.fm" in client.post("/account/lastfm/app", data={"key": "k", "secret": "right"}).text
-    assert client.app.state.api.recommender.lastfm.api_key == "k"
-    callback = urllib.parse.parse_qs(urllib.parse.urlsplit(client.get("/account/lastfm", follow_redirects=False).headers["location"]).query)["cb"][0]
+    location = client.get("/account/lastfm", follow_redirects=False).headers["location"]
+    assert urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)["api_key"] == ["k"]
     assert "start here" in client.get("/account/lastfm/callback", params={"token": "t"}).text  # another page's link
     assert "start here" in client.get("/account/lastfm/callback", params={"token": "t", "state": "forged"}).text
-    assert "Linked as <b>zak</b>" in client.get(callback + "&token=t").text  # Last.fm adds its token to the callback
-    db = client.app.state.api._db()
-    assert dict(db.execute("select key, value from setting").fetchall()) == {"lastfm_key": "k", "lastfm_secret": "right"}
+    assert "Linked as <b>zak</b>" in link_lastfm(client)
+    with make_client(library, tmp_path / "oasis.db") as restarted:  # the key and secret are kept
+        sign_in(restarted)
+        restarted.post("/account/lastfm/unlink")
+        assert "Linked as <b>zak</b>" in link_lastfm(restarted)
 
 
 def test_admin_manages_users_who_then_use_subsonic(client):
@@ -107,6 +116,13 @@ def test_subsonic_user_management(client):
     assert [u["username"] for u in call(client, "getUsers")["users"]["user"]] == ["admin"]
 
 
+def test_no_way_sets_an_empty_password(client):
+    call(client, "createUser", username="dave", password="pw", email="d@x")
+    assert call(client, "changePassword", username="dave", password="")["status"] == "failed"
+    assert call(client, "updateUser", username="dave", password="enc:")["status"] == "failed"
+    assert call(client, "ping", u="dave", p="pw")["status"] == "ok"
+
+
 def test_client_links_youtube_with_its_cookie(client):
     assert call(client, "oasisLinkYouTubeMusic", cookie="SID=a; __Secure-3PAPISID=b", authUser="1")["youtubeMusic"] == {"account": "Tester"}
     assert "error" in call(client, "oasisLinkYouTubeMusic", cookie="bad; __Secure-3PAPISID=b")
@@ -118,7 +134,7 @@ def test_rejected_sign_in_gives_a_short_message(client):
 
 
 def test_status_shows_oasis_downloads_and_what_arrived_lately(client):
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     rows = [("h1", "Mili - Hue [FLAC]", "downloading", None), ("h2", "Rammstein - Mutter [FLAC]", "done", None),
             ("h3", "Mili - Hue [MPC]", "failed", "dead torrent: no seeds, no progress")]
     db.executemany("insert into download(hash, album_id, title, state, error, created, updated) values (?, 1, ?, ?, ?, strftime('%s'), strftime('%s'))", rows)
@@ -128,13 +144,12 @@ def test_status_shows_oasis_downloads_and_what_arrived_lately(client):
     assert '✓</span><div class="grow">Rammstein - Mutter [FLAC]' in page and "dead torrent: no seeds, no progress" in page
 
 
-def test_get_user_reports_lastfm_forwarding(client):
-    api, db = client.app.state.api, client.app.state.api._db()
+def test_get_user_reports_lastfm_forwarding(client, lastfm):
     assert call(client, "getUser")["user"]["scrobblingEnabled"] is False
-    api.config.lastfm_key, api.config.lastfm_secret = "k", "s"
+    sign_in(client)
+    client.post("/account/lastfm/app", data={"key": "k", "secret": "right"})
     assert call(client, "getUser")["user"]["scrobblingEnabled"] is False
-    db.execute("update user set lastfm_session = 'sk' where name = 'admin'")
-    db.commit()
+    link_lastfm(client)
     assert call(client, "getUser")["user"]["scrobblingEnabled"] is True
 
 
@@ -152,7 +167,7 @@ def test_stars_ratings_and_plays_are_each_users(client):
     assert [a["id"] for a in call(client, "getStarred2")["starred2"]["album"]] == [album_id]
     call(client, "star", albumId=album_id, u="bob", p="pw")
     call(client, "unstar", albumId=album_id)
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     assert [tuple(r) for r in db.execute("select user, kind, ref from wanted")] == [("bob", "album", album_id)]  # acquisition wants bob's star
     assert [a["id"] for a in call(client, "getStarred2", u="bob", p="pw")["starred2"]["album"]] == [album_id]
 
@@ -170,14 +185,15 @@ def test_password_change_signs_out_other_dashboard_sessions(client, library, tmp
         assert other.get("/", follow_redirects=False).headers["location"] == "/login"
 
 
-def test_failed_sign_ins_are_throttled_per_address(client):
+def test_failed_sign_ins_are_throttled_per_address(client, monkeypatch):
     for _ in range(accounts.Throttle.LIMIT):
         assert call(client, "ping", p="wrong")["error"]["code"] == 40
     error = call(client, "ping")["error"]  # the right password too, until the window passes
     assert error["code"] == 0 and "Too many" in error["message"]
     response = client.post("/login", data={"name": "admin", "password": "secret"}, follow_redirects=False)
     assert response.status_code == 429 and "Too many" in response.text
-    client.app.state.api.throttle.fails.clear()
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + accounts.Throttle.WINDOW)
     assert call(client, "ping")["status"] == "ok" and sign_in(client)
 
 

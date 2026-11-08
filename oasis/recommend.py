@@ -4,14 +4,17 @@ import json
 import logging
 import random
 import threading
-import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from itertools import chain, zip_longest
 
+from . import accounts, lastfm, playlists, worker
+from .forward import LISTENBRAINZ
 from .artists import linked
-from .db import remember
+from .playlists import LISTENING_RADIO, PLAIN, set_entries
+from .tracks import BY_ARTIST_NAME, outside_names
+from .youtube import remember_song, video_of
 
 log = logging.getLogger(__name__)
 
@@ -19,7 +22,6 @@ AHEAD = 30      # unplayed tracks a radio keeps queued
 KEEP = 300      # older radio entries beyond this are dropped
 RECENT = 100    # recently played tracks a radio won't repeat
 PER_SEED = 4    # similar songs a station adds after each of the user's Last.fm songs
-LB_RADIO = "https://api.listenbrainz.org/1/explore/lb-radio"
 SOURCES = {"all": "Everything mixed", "lastfm": "Last.fm", "ytm": "YouTube Music", "library": "Your library", "listenbrainz": "ListenBrainz"}
 STATIONS = {"lastfm-top": "Last.fm top tracks", "lastfm-loved": "Last.fm loved tracks"}
 PERIODS = ("7day", "1month", "3month", "6month", "12month", "overall")  # Last.fm's periods for top tracks
@@ -28,20 +30,20 @@ PERIOD = "3month"
 
 class Recommender:
     def __init__(self, connect, ytm, lastfm):
+        """lastfm(): oasis's Last.fm app as it is now, or None."""
         self.connect, self.ytm, self.lastfm = connect, ytm, lastfm
-        self.wake = threading.Event()
-        self.chores = []  # other upkeep done on each pass, given a db
+        self.woken = threading.Event()
         self.similar_artists: dict[str, list[str]] = {}  # Last.fm's answers by artist, kept while running
 
     def sources(self, user) -> list[str]:
         """The sources that can give this user anything: Last.fm needs the server's API key, YouTube Music the server's
         YouTube Music, ListenBrainz the user's token."""
-        return [s for s, on in (("all", True), ("lastfm", self.lastfm), ("ytm", self.ytm), ("library", True),
+        return [s for s, on in (("all", True), ("lastfm", self.lastfm()), ("ytm", self.ytm), ("library", True),
                                 ("listenbrainz", user["listenbrainz_token"])) if on]
 
     def stations(self, user) -> list[str]:
         """Stations from the user's Last.fm need the API key and the user's linked Last.fm."""
-        return list(STATIONS) if self.lastfm and user["lastfm_session"] and user["lastfm_name"] else []
+        return list(STATIONS) if self.lastfm() and user["lastfm_session"] and user["lastfm_name"] else []
 
     def similar(self, db, seed, count: int, deep: bool = False, source: str = "all", token: str | None = None) -> list[str]:
         """Track ids like the seed track from one source, or from every one at hand ("all"), taking turns so local songs
@@ -49,8 +51,8 @@ class Recommender:
         methods always give something. A source that gives nothing gives an empty list: no other stands in."""
         methods = {
             "ytm": [("YouTube Music radio", lambda: self.from_youtube(db, seed, count))],
-            "lastfm": [("Last.fm similar tracks", lambda: self.from_lastfm(db, seed, min(count, 15 if deep else 10)) if self.lastfm else []),
-                       ("Last.fm similar artists", lambda: self.from_similar_artists(db, seed, count) if self.lastfm else [])],
+            "lastfm": [("Last.fm similar tracks", lambda: self.from_lastfm(db, seed, min(count, 15 if deep else 10)) if self.lastfm() else []),
+                       ("Last.fm similar artists", lambda: self.from_similar_artists(db, seed, count) if self.lastfm() else [])],
             "listenbrainz": [("ListenBrainz radio", lambda: self.from_listenbrainz(db, seed, count, token))],
             "library": [("linked artists", lambda: self.from_linked(db, seed, count)),
                         ("same artist", lambda: self.from_artist(db, seed, count)),
@@ -69,20 +71,16 @@ class Recommender:
     def from_youtube(self, db, seed, count: int) -> list[str]:
         if not self.ytm:
             return []
-        video_id = seed["ytm_id"] if seed["ytm_id"] is not None else self.ytm.match(seed)
-        if seed["ytm_id"] is None:
-            db.execute("update track set ytm_id = ? where id = ?", (video_id or "", seed["id"]))
-        return [remember(db, row) for row in self.ytm.radio(video_id, count)] if video_id else []
+        video_id = video_of(db, seed, self.ytm)
+        return [remember_song(db, song) for song in self.ytm.radio(video_id, count)] if video_id else []
 
     def from_similar_artists(self, db, seed, count: int) -> list[str]:
         """Library songs by the artists Last.fm calls similar, a few from each in turn."""
-        artist = seed["album_artist"] if seed["source"] == "ytm" else seed["artist"]
+        artist, _ = outside_names(seed)
         if artist not in self.similar_artists:
-            info = self.lastfm.artist_info(artist)
-            self.similar_artists[artist] = [a["name"] for a in info.get("similar", {}).get("artist", [])]
+            self.similar_artists[artist] = lastfm.similar_artists(self.lastfm().artist_info(artist))
         per_artist = [[r[0] for r in db.execute(
-            "select id from track where library = 1 and (album_artist = ? collate nocase or artist = ? collate nocase) "
-            "order by random() limit 3", (name, name))] for name in self.similar_artists[artist]]
+            f"select id from track where library = 1 and {BY_ARTIST_NAME} order by random() limit 3", (name, name))] for name in self.similar_artists[artist]]
         return [id for id in chain.from_iterable(zip_longest(*per_artist)) if id][:count]
 
     def from_linked(self, db, seed, count: int) -> list[str]:
@@ -115,9 +113,9 @@ class Recommender:
             "order by abs(coalesce(year, 0) - ?), random() limit ?", (seed["genre"], seed["artist_id"], seed["year"] or 0, count))]
 
     def from_lastfm(self, db, seed, count: int) -> list[str]:
-        artist = seed["album_artist"] if seed["source"] == "ytm" else seed["artist"]
+        artist, _ = outside_names(seed)
         try:
-            pairs = self.lastfm.similar(artist, seed["title"], count)
+            pairs = self.lastfm().similar(artist, seed["title"], count)
         except Exception as e:
             log.info("Last.fm similar failed: %s", e)
             return []
@@ -140,8 +138,8 @@ class Recommender:
         """(artist, title) pairs as track ids, in their order: a library song, else the song on YouTube Music."""
         ids, missing = {}, []
         for i, (a, t) in enumerate(pairs):
-            local = db.execute("select id from track where library = 1 and (artist = ? or album_artist = ?) collate nocase "
-                               "and title = ? collate nocase", (a, a, t)).fetchone()
+            local = db.execute(f"select id from track where library = 1 and {BY_ARTIST_NAME} and title = ? collate nocase",
+                               (a, a, t)).fetchone()
             if local:
                 ids[i] = local["id"]
             elif self.ytm:
@@ -149,30 +147,25 @@ class Recommender:
         if missing:
             with ThreadPoolExecutor(5) as pool:
                 found = pool.map(lambda i: self.ytm.find(*pairs[i]), missing)
-            ids |= {i: remember(db, row) for i, row in zip(missing, found) if row}
+            ids |= {i: remember_song(db, song) for i, song in zip(missing, found) if song}
         return [ids[i] for i in sorted(ids)]
 
-    # Radio playlists
-
     def start(self):
-        threading.Thread(target=self.run, daemon=True).start()
+        worker.start("radio", self.top_up_pass, 600, self.woken)
 
-    def run(self):
-        while True:
-            self.wake.wait(600)
-            self.wake.clear()
-            db = self.connect()
-            try:
-                for job in [self.top_up_all, *self.chores]:  # each on its own: one failing leaves the others be
-                    try:
-                        job(db)
-                    except Exception:
-                        log.exception("%s failed", getattr(job, "__qualname__", job))
-            finally:
-                db.close()
+    def wake(self):
+        """Tops radios up now: a playlist was made or changed."""
+        self.woken.set()
+
+    def top_up_pass(self):
+        db = self.connect()
+        try:
+            self.top_up_all(db)
+        finally:
+            db.close()
 
     def top_up_all(self, db):
-        for playlist in db.execute("select * from playlist where radio > 0").fetchall():
+        for playlist in db.execute("select * from playlist where radio != ?", (PLAIN,)).fetchall():
             try:  # one failing leaves the others be
                 self.top_up(db, playlist)
             except Exception:
@@ -180,15 +173,13 @@ class Recommender:
 
     def played(self, db, owner: str, track_ids: list[str]):
         """Moves radios past the played tracks and makes sure the owner has a radio that follows all listening."""
-        if not db.execute("select 1 from playlist where owner = ? and radio = 2", (owner,)).fetchone():
-            now = time.time()  # or ignore: two plays at once both find none, and the index one_radio keeps one
-            db.execute("insert or ignore into playlist(name, owner, comment, created, changed, radio) values (?, ?, ?, ?, ?, 2)",
-                       ("Radio", owner, "Grows from what you play", now, now))
+        if not db.execute("select 1 from playlist where owner = ? and radio = ?", (owner, LISTENING_RADIO)).fetchone():
+            playlists.create(db, owner, "Radio", LISTENING_RADIO, comment="Grows from what you play")
         for id in track_ids:
             db.execute("update playlist set played_pos = max(played_pos, (select max(pos) from playlist_entry e "
-                       "where e.playlist_id = playlist.id and e.track_id = ?)) where radio > 0 and owner = ? and exists "
-                       "(select 1 from playlist_entry e where e.playlist_id = playlist.id and e.track_id = ?)", (id, owner, id))
-        self.wake.set()
+                       "where e.playlist_id = playlist.id and e.track_id = ?)) where radio != ? and owner = ? and exists "
+                       "(select 1 from playlist_entry e where e.playlist_id = playlist.id and e.track_id = ?)", (id, PLAIN, owner, id))
+        self.woken.set()
 
     def top_up(self, db, playlist):
         entries = [r[0] for r in db.execute("select track_id from playlist_entry where playlist_id = ? order by pos", (playlist["id"],))]
@@ -196,7 +187,7 @@ class Recommender:
         missing = AHEAD - (len(entries) - 1 - played_pos)
         if missing <= 0:
             return
-        owner = db.execute("select * from user where name = ?", (playlist["owner"],)).fetchone()
+        owner = accounts.get(db, playlist["owner"])
         if not owner:
             return
         source = playlist["radio_source"] or owner["radio_source"]  # the automatic radio follows the user's default
@@ -204,7 +195,7 @@ class Recommender:
         if station:
             seeds = self.station_seeds(db, owner, station, playlist["period"] or PERIOD)
         else:
-            if playlist["radio"] == 2:
+            if playlist["radio"] == LISTENING_RADIO:
                 seed_ids = [r[0] for r in db.execute("select id from stat where user = ? and played is not null order by played desc limit 3", (owner["name"],))]
             else:
                 seed_ids = list(reversed(entries[max(0, played_pos - 2):played_pos + 1])) or entries[:3]
@@ -241,7 +232,7 @@ class Recommender:
         at a time as the station needs them."""
         if station not in self.stations(user):
             return
-        pairs = self.lastfm.user_tracks(user["lastfm_name"], station == "lastfm-loved", period)
+        pairs = self.lastfm().user_tracks(user["lastfm_name"], station == "lastfm-loved", period)
         random.shuffle(pairs)
         for pair in pairs:
             try:
@@ -257,13 +248,7 @@ class Recommender:
 def lb_radio(token: str, artist: str) -> list[tuple[str, str]]:
     """ListenBrainz's LB Radio for an artist and the artists it finds similar, popular songs first ("easy")."""
     query = urllib.parse.urlencode({"prompt": f"artist:({artist.replace('(', ' ').replace(')', ' ').strip()})", "mode": "easy"})
-    request = urllib.request.Request(f"{LB_RADIO}?{query}", headers={"Authorization": "Token " + token, "User-Agent": "oasis/0.1"})
+    request = urllib.request.Request(f"{LISTENBRAINZ}explore/lb-radio?{query}", headers={"Authorization": "Token " + token, "User-Agent": "oasis/0.1"})
     with urllib.request.urlopen(request, timeout=30) as response:
         playlist = json.load(response)["payload"]["jspf"].get("playlist") or {}
     return [(t["creator"], t["title"]) for t in playlist.get("track") or [] if t.get("creator") and t.get("title")]
-
-
-def set_entries(db, playlist_id, track_ids):
-    db.execute("delete from playlist_entry where playlist_id = ?", (playlist_id,))
-    db.executemany("insert into playlist_entry values (?, ?, ?)", [(playlist_id, i, t) for i, t in enumerate(track_ids)])
-    db.execute("update playlist set changed = ? where id = ?", (time.time(), playlist_id))

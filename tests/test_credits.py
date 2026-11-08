@@ -3,11 +3,13 @@ import pytest
 from starlette.testclient import TestClient
 
 from conftest import call, make_track
-from oasis.api import create_app
+from oasis.server import create_app
 from oasis.config import Config
-from oasis.credits import Credits
-from oasis.db import connect, make_id
+from oasis import musicbrainz
+from oasis.enrich import Enrichment
+from oasis.db import connect
 from oasis.scan import scan
+from oasis.tracks import make_id
 
 RELEASE = {
     "id": "rel-1", "title": "Songs", "artist-credit": [{"name": "Various Artists", "artist": {"id": "va", "name": "Various Artists"}, "joinphrase": ""}],
@@ -29,6 +31,13 @@ RELEASE = {
 }
 
 
+@pytest.fixture(autouse=True)
+def musicbrainz_knows(monkeypatch):
+    """MusicBrainz has RELEASE under any id, and no artists."""
+    monkeypatch.setattr(musicbrainz, "release_credits", lambda mbid: RELEASE)
+    monkeypatch.setattr(musicbrainz, "artist", lambda mbid, db=None: {}[mbid])
+
+
 @pytest.fixture
 def library(tmp_path):
     root = tmp_path / "music"
@@ -47,7 +56,7 @@ def client(library, tmp_path):
 
 
 def fill(client):
-    credits = Credits(client.app.state.api._db, fetch=lambda mbid: RELEASE, fetch_artist={}.__getitem__)
+    credits = Enrichment(client.app.state.oasis.connect)
     assert credits.step()
     while credits.step():
         pass
@@ -86,25 +95,26 @@ def test_a_member_only_credited_on_songs_has_an_artist_page(client):
 
 def test_credits_survive_rescans_and_files_without_musicbrainz_use_their_tags(client, library):
     fill(client)
-    scan(client.app.state.api._db(), [library])  # writing the tags changed the file
+    scan(client.app.state.oasis.connect(), [library])  # writing the tags changed the file
     assert any(c["role"] == "producer" for c in song_named(client, "Run")["contributors"])
     plain = song_named(client, "Plain")
     assert plain["displayComposer"] == "Tag Composer"
     assert {(c["role"], c["artist"]["name"]) for c in plain["contributors"]} == {("composer", "Tag Composer"), ("lyricist", "Tag Lyricist")}
 
 
-def test_one_performance_entered_twice_in_musicbrainz_shares_its_credits_but_not_its_artist_credit(client, library):
+def test_one_performance_entered_twice_in_musicbrainz_shares_its_credits_but_not_its_artist_credit(client, library, monkeypatch):
     other_release = {**RELEASE, "id": "rel-2", "label-info": [], "media": [{"tracks": [{
         "id": "track-2", "title": "Run", "artist-credit": [{"name": "Gawr Gura", "artist": {"id": "gura", "name": "Gawr Gura"}, "joinphrase": ""}],
         "recording": {"id": "rec-2", "relations": [{"type": "instrument", "attributes": ["bass"], "artist": {"id": "nate", "name": "Nate Mendel"}}]}}]}]}
     make_track(library / "Single/01.flac", title="Run", artist="Gawr Gura", album="Single",
                musicbrainz_albumid="rel-2", musicbrainz_releasetrackid="track-2")
-    db = client.app.state.api._db()
+    db = client.app.state.oasis.connect()
     scan(db, [library])
     first, second = str(library / "Songs/01.flac"), str(library / "Single/01.flac")
     db.execute("insert into audio_pair values (?, ?, 0, 0, 1)", tuple(sorted((first, second))))  # dedupe found one stream
     releases = {"rel-1": RELEASE, "rel-2": other_release}
-    credits = Credits(client.app.state.api._db, fetch=releases.__getitem__, fetch_artist={}.__getitem__)
+    monkeypatch.setattr(musicbrainz, "release_credits", releases.__getitem__)
+    credits = Enrichment(client.app.state.oasis.connect)
     while credits.step():
         pass
 
@@ -116,3 +126,15 @@ def test_one_performance_entered_twice_in_musicbrainz_shares_its_credits_but_not
     assert "Nate Mendel (bass)" in mutagen.File(first).tags["PERFORMER"]  # filled first, extended when the other came
     assert "Dave Grohl (guitar)" in mutagen.File(second).tags["PERFORMER"]
     assert mutagen.File(first).tags["COMPOSER"] == ["Someone Already Tagged"]
+
+
+def test_a_tagged_performer_and_the_same_audios_musicbrainz_performer_of_that_name_list_once(client, library):
+    make_track(library / "Tagged/01.flac", title="Run", artist="Gura", album="Tagged", performer="Dave Grohl (guitar)")
+    db = client.app.state.oasis.connect()
+    scan(db, [library])
+    pair = sorted((str(library / "Songs/01.flac"), str(library / "Tagged/01.flac")))
+    db.execute("insert into audio_pair values (?, ?, 0, 0, 1)", tuple(pair))
+    fill(client)
+    tagged = next(s for s in call(client, "search3", query="Run")["searchResult3"]["song"] if s["album"] == "Tagged")
+    found = [(c["role"], c.get("subRole"), c["artist"]["name"]) for c in tagged["contributors"]]
+    assert found.count(("performer", "guitar", "Dave Grohl")) == 1 and ("performer", "lead vocals", "Dave Grohl") in found

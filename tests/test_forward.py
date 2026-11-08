@@ -1,19 +1,22 @@
-import hashlib
 import json
+import threading
 import time
 import urllib.parse
 
 import pytest
 
 from conftest import call, make_client
-from oasis import forward
+from oasis import forward, lastfm
 from oasis.db import connect
-from oasis.forward import LastFm, Listen, ListenBrainz, Rejected
+from oasis.forward import Listen, ListenBrainz
+from oasis.lastfm import LastFm
+from oasis.remote import Rejected
 
 
 class Service:
     def __init__(self, fail=None):
         self.scrobbled, self.playing, self.fail = [], [], fail
+        self.played = threading.Event()
 
     def scrobble(self, listen):
         if self.fail:
@@ -22,6 +25,7 @@ class Service:
 
     def now_playing(self, listen):
         self.playing.append(listen)
+        self.played.set()
 
 
 @pytest.fixture
@@ -39,7 +43,7 @@ def test_plays_reach_services_and_retry_until_taken(setup):
     client, services, db = setup
     id = song_id(client, "Two")
     call(client, "scrobble", id=id, time=1_700_000_000_000)
-    api_forwarder = client.app.state.api.forwarder
+    api_forwarder = client.app.state.oasis.forwarder
     api_forwarder.flush()
     listen = services["ok"].scrobbled[0]
     assert (listen.artist, listen.title, listen.album, listen.played) == ("Beta", "Two", "First", 1_700_000_000)
@@ -58,11 +62,7 @@ def db_path(db):
 def test_now_playing_is_sent_but_not_queued(setup):
     client, services, db = setup
     call(client, "scrobble", id=song_id(client, "One"), submission="false")
-    for _ in range(50):
-        if services["ok"].playing:
-            break
-        time.sleep(0.01)
-    assert services["ok"].playing[0].title == "One"
+    assert services["ok"].played.wait(10) and services["ok"].playing[0].title == "One"
     assert db.execute("select count(*) from outbox").fetchone()[0] == 0
 
 
@@ -90,12 +90,12 @@ def test_youtube_history_matches_local_tracks_once(setup):
         def add_history(self, client, video_id):
             history.append(video_id)
 
-    def match(track):
-        matched.append(track["title"])
-        return "vidOne"
+        def match(self, track):
+            matched.append(track["title"])
+            return "vidOne"
 
     services = {"ytmusic": forward.YouTubeMusicHistory(Ytm(), "client")}
-    forward.Forwarder(lambda: connect(db_path(db)), lambda db, user: services, match).flush()
+    forward.Forwarder(lambda: connect(db_path(db)), lambda db, user: services, Ytm()).flush()
     assert history == ["vidOne"] and matched == ["One"]
     assert db.execute("select ytm_id from track where id = ?", (id,)).fetchone()[0] == "vidOne"
 
@@ -109,18 +109,18 @@ def test_lastfm_scrobble_is_signed(monkeypatch):
     def post(url, data, headers):
         sent.append(dict(urllib.parse.parse_qsl(data.decode())))
         return 200, b'{"scrobbles": {}}'
-    monkeypatch.setattr(forward, "post", post)
+    monkeypatch.setattr(lastfm, "post", post)
     LastFm("key", "secret", "session").scrobble(LISTEN)
     params = sent[0]
     assert params["method"] == "track.scrobble" and params["timestamp"] == "1700000000" and params["album"] == "Album"
-    unsigned = {k: v for k, v in params.items() if k not in ("api_sig", "format")}
-    base = "".join(k + unsigned[k] for k in sorted(unsigned)) + "secret"
-    assert params["api_sig"] == hashlib.md5(base.encode()).hexdigest()
+    # md5 of "albumAlbumapi_keykeyartistArtistduration200methodtrack.scrobblesksessiontimestamp1700000000trackSongsecret":
+    # each parameter but format, sorted by name, then the secret
+    assert params["api_sig"] == "419325f62b4b2d177c21c8ea241a3db0"
 
 
 @pytest.mark.parametrize("error, kind", [(16, OSError), (29, OSError), (9, Rejected)])
 def test_lastfm_errors(monkeypatch, error, kind):
-    monkeypatch.setattr(forward, "post", lambda *a: (200, json.dumps({"error": error, "message": "x"}).encode()))
+    monkeypatch.setattr(lastfm, "post", lambda *a: (200, json.dumps({"error": error, "message": "x"}).encode()))
     with pytest.raises(kind):
         LastFm("key", "secret", "session").scrobble(LISTEN)
 

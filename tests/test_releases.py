@@ -10,10 +10,12 @@ from types import SimpleNamespace
 import pytest
 
 from oasis import download, releases
-from oasis.download import info_hash, source
+from oasis.download import source
+from oasis.torrent import info_hash, torrent_files
 from oasis.quality import LossySource
 from oasis.releases import find, queries, rank, reject
-from test_download import WANT, Prowlarr, db, downloads, files, finished, result, tb, torbox  # noqa: F401 (fixtures)
+from oasis.wants import Outcome
+from conftest import WANT, Prowlarr, files, finished, result, tb
 
 
 def want(title, *names, year="", others=(), discs=1, upgrade=False, native=()):
@@ -191,7 +193,7 @@ def test_a_seedless_release_only_counts_when_torbox_has_it_cached(downloads, tor
     downloads.prowlarr = Prowlarr({"Artist Album": [result("Artist - Album [FLAC]", "abcd", seeders=0, magnetUrl="magnet:?xt=urn:btih:abcd"),
                                                     result("Artist - Album [MP3]", "ef01", seeders=0, magnetUrl="magnet:?xt=urn:btih:ef01")]})
     torbox.have = {"ef01"}
-    assert downloads.find(db, WANT, "mb-album")
+    assert downloads.find(db, WANT, "mb-album") is Outcome.SENT
     assert torbox.added == [("Artist - Album [MP3]", "magnet:?xt=urn:btih:ef01", None)]  # the seedless FLAC nobody cached is no use
     assert db.execute("select hash, album_mbid, state from download").fetchone()[:] == ("ef01", "mb-album", "added")
 
@@ -206,7 +208,7 @@ def test_a_release_listed_without_its_hash_is_skipped_when_it_failed_before(down
     db.execute("insert into release_block(hash, reason, at) values (?, 'dead', 0)", (hashlib.sha1(info).hexdigest(),))
     downloads.prowlarr = Prowlarr({"Artist Album": [result("Artist - Album [FLAC]", seeders=9, downloadUrl="http://prowlarr/1/download"),
                                                     result("Artist - Album [MP3]", "ef01", magnetUrl="magnet:?xt=urn:btih:ef01")]})
-    assert downloads.find(db, WANT, "mb-album")
+    assert downloads.find(db, WANT, "mb-album") is Outcome.SENT
     assert torbox.added == [("Artist - Album [MP3]", "magnet:?xt=urn:btih:ef01", None)]
 
 
@@ -377,10 +379,10 @@ def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloa
                 raise failure
 
     placed, failing, downloads.own = {}, {"g-mtm"}, Own()
-    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    monkeypatch.setattr(download, "editions", lambda rg, db: editions(rg))
     downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
     torbox.cached_files = lambda hashes: {"abcd": DISCOGRAPHY} if "abcd" in hashes else {}
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm", "g-met"})
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm", "g-met"}) is Outcome.SENT
     row = db.execute("select * from download").fetchone()
     assert (row["hash"], row["album_mbid"], row["state"]) == ("abcd", None, "added") and downloads.groups(db) == {"g-ht", "g-mtm"}
 
@@ -407,7 +409,7 @@ def test_a_cached_bundle_fetches_only_its_wanted_albums_and_imports_each(downloa
     failing.add("g-ht")
     downloads.prowlarr.results["Linkin Park discography"][0].update(infoHash="bcde", magnetUrl="magnet:?xt=urn:btih:bcde")
     torbox.cached_files = lambda hashes: {"bcde": DISCOGRAPHY}
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm"})
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm"}) is Outcome.SENT
     torbox.list = [{**torbox.list[0], "id": 72, "hash": "bcde"}]
     downloads.cycle()
     assert db.execute("select state, error from download where hash = 'bcde'").fetchone()[:] == ("failed", "import failed: no album of the bundle matched")
@@ -426,15 +428,22 @@ def test_uncached_bundles_come_after_cached_ones_and_only_while_slots_are_free()
 
 def test_an_uncached_bundles_albums_are_found_once_torbox_lists_its_files(downloads, torbox, db, tmp_path, monkeypatch):
     placed, downloads.own.place = {}, lambda folder, group: placed.setdefault(group, sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file()))
-    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    monkeypatch.setattr(download, "editions", lambda rg, db: editions(rg))
     downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
     torbox.cached_files = lambda hashes: {}
     db.executemany("insert into want_album(rg, artist_mbid, title, reason, state) values (?, 'mb-lp', ?, 'followed', 'missing')",
                    [("g-ht", "Hybrid Theory"), ("g-mtm", "Minutes to Midnight"), ("g-met", "Meteora")])
-    downloads.crowded = True
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm"}) is None  # slots all needed: cached bundles only
-    downloads.crowded = False
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm"})
+    # Every slot taken, by another download, while albums wait for a search: cached bundles only.
+    downloads.max_active = 1
+    db.execute("insert into download(hash, album_id, title, torbox_id, state, created, updated) values ('other', 0, 'Other', 60, 'downloading', ?, ?)",
+               (time.time(), time.time()))
+    torbox.list = [tb(60, "other", progress=0.5)]
+    downloads.cycle()
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm"}) is Outcome.NOTHING_SENT
+    torbox.list = [tb(60, "other", progress=0.5, active=False)]
+    downloads.cycle()
+    db.execute("delete from download")
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht", "g-mtm"}) is Outcome.SENT
     # Till TorBox lists its files, the albums its name says it holds count as downloading.
     assert db.execute("select state, bundle is not null from download").fetchone()[:] == ("added", 1) and downloads.groups(db) == {"g-ht", "g-mtm"}
 
@@ -451,7 +460,7 @@ def test_an_uncached_bundles_albums_are_found_once_torbox_lists_its_files(downlo
     # One that holds no wanted album fails and is blocked.
     db.execute("update want_album set state = 'have' where rg = 'g-ht'")
     downloads.prowlarr.results["Linkin Park discography"][0].update(infoHash="bcde", magnetUrl="magnet:?xt=urn:btih:bcde")
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met"})
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met"}) is Outcome.SENT
     torbox.list = [finished(72, "bcde", ["LP/Meteora (2003)/01 Foreword.flac"], tmp_path)]  # a track short
     downloads.cycle()
     assert db.execute("select state, error from download where hash = 'bcde'").fetchone()[:] == ("failed", "the bundle holds no wanted album")
@@ -465,17 +474,38 @@ def test_an_uncached_bundles_albums_are_found_once_torbox_lists_its_files(downlo
     assert "cdef" not in downloads.blocked(db)
 
 
+def test_a_musicbrainz_outage_while_a_bundle_resolves_leaves_it_to_the_next_poll(downloads, torbox, db, tmp_path, monkeypatch):
+    down = [True]
+
+    def lookup(rg, db):
+        if down[0]:
+            raise OSError("MusicBrainz: 503")
+        return editions(rg)
+    monkeypatch.setattr(download, "editions", lookup)
+    downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
+    torbox.cached_files = lambda hashes: {}
+    db.execute("insert into want_album(rg, artist_mbid, title, reason, state) values ('g-ht', 'mb-lp', 'Hybrid Theory', 'followed', 'missing')")
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht"}) is Outcome.SENT
+    torbox.list = [finished(71, "abcd", [f["name"] for f in DISCOGRAPHY], tmp_path)]
+    downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "added" and "abcd" not in downloads.blocked(db)
+    down[0] = False
+    downloads.cycle()
+    assert db.execute("select state from download").fetchone()[0] == "done"
+    assert [group for _, group in downloads.own.placed] == ["g-ht"]
+
+
 def test_a_bundles_disc_image_arrives_with_its_cue_sheet_for_the_importer_to_split(downloads, torbox, db, tmp_path, monkeypatch):
     class Own:
         def place(self, folder, group):
             placed[group] = sorted(str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file())
 
     placed, downloads.own = {}, Own()
-    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    monkeypatch.setattr(download, "editions", lambda rg, db: editions(rg))
     names = [f"LP/Meteora (2003) [image+cue]/{n}" for n in ("Meteora.ape", "Meteora.cue", "Meteora.log")]
     downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
     torbox.cached_files = lambda hashes: {"abcd": [{"name": n, "size": 40e6} for n in names]}
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met"})
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met"}) is Outcome.SENT
     torbox.list = [finished(71, "abcd", names, tmp_path)]
     downloads.cycle()
     assert placed == {"g-met": ["Meteora.ape", "Meteora.cue"]} and db.execute("select state from download").fetchone()[0] == "done"
@@ -499,9 +529,9 @@ def dot_torrent(name: str, files: list[str]) -> bytes:
 
 def test_a_torrents_files_are_read_with_their_folders():
     data = dot_torrent("LP", ["Meteora (2003)/01 Foreword.flac", "cover.jpg"])
-    assert download.torrent_files(data) == [{"name": "LP/Meteora (2003)/01 Foreword.flac", "size": 7}, {"name": "LP/cover.jpg", "size": 7}]
-    assert download.torrent_files(bencode({"info": {"name": "Album.zip", "length": 9}})) == [{"name": "Album.zip", "size": 9}]
-    assert download.torrent_files(b"<html>") == []
+    assert torrent_files(data) == [{"name": "LP/Meteora (2003)/01 Foreword.flac", "size": 7}, {"name": "LP/cover.jpg", "size": 7}]
+    assert torrent_files(bencode({"info": {"name": "Album.zip", "length": 9}})) == [{"name": "Album.zip", "size": 9}]
+    assert torrent_files(b"<html>") == []
 
 
 HUNTER = {"artist": "Hunter", "names": ["Hunter"], "native": [], "albums": ["Imperium", "Medeis", "Arachne", "Królestwo"]}
@@ -552,30 +582,29 @@ def test_what_a_bundle_holds_is_guessed_from_its_name_when_no_file_list_tells():
 
 
 def test_a_bundle_listed_without_its_hash_is_read_from_its_torrent_once_and_sent_with_it(downloads, torbox, db, monkeypatch):
-    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    monkeypatch.setattr(download, "editions", lambda rg, db: editions(rg))
     data = dot_torrent("LP", ["Meteora (2003)/01 Foreword.flac", "Meteora (2003)/02 Don't Stay.flac", "One More Light (2017)/01 Heavy.flac"])
     read = []
     monkeypatch.setattr(download, "source", lambda release: read.append(release["title"]) or {"torrent": data})
     downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", seeders=9, downloadUrl="http://prowlarr/1/download")]})
     torbox.cached_files = lambda hashes: {}
     db.executemany("insert into want_album(rg, artist_mbid, title, reason, state) values (?, 'mb-lp', ?, 'followed', 'missing')", [("g-met", "Meteora"), ("g-oml", "One More Light")])
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-oml"})  # One More Light's folder holds a track of two
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-oml"}) is Outcome.SENT  # One More Light's folder holds a track of two
     (name, magnet, torrent), = torbox.added
     assert (magnet, torrent) == (None, data) and downloads.groups(db) == {"g-met"}  # from its files: what it holds for sure
     assert db.execute("select hash from download").fetchone()[0] == "file"
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-oml"}) is None and read == ["Linkin Park - Discography [FLAC]"] * 2  # read once, sent once
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-oml"}) is Outcome.NOTHING_SENT and read == ["Linkin Park - Discography [FLAC]"] * 2  # read once, sent once
     # Its hash, once read, may be one TorBox has cached: then TorBox's list gives its targets.
-    downloads.kept, read[:] = {}, []
     db.execute("delete from download")
-    hash = download.info_hash({"torrent": data})
-    torbox.cached_files = lambda hashes: {hash: [{"name": f["name"], "size": 1} for f in download.torrent_files(data)]} if hash in hashes else {}
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-oml"})
+    hash = info_hash({"torrent": data})
+    torbox.cached_files = lambda hashes: {hash: [{"name": f["name"], "size": 1} for f in torrent_files(data)]} if hash in hashes else {}
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-oml"}) is Outcome.SENT
     assert json.loads(db.execute("select files from download_target where rg = 'g-met'").fetchone()[0]) == ["LP/Meteora (2003)/01 Foreword.flac", "LP/Meteora (2003)/02 Don't Stay.flac"]
 
 
 def test_bundles_combine_the_next_holding_the_most_of_what_the_others_dont(downloads, torbox, db, monkeypatch):
     """Each search sends one: the albums of those sent count as downloading, so the next search picks for the rest."""
-    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    monkeypatch.setattr(download, "editions", lambda rg, db: editions(rg))
     downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "aa", magnetUrl="magnet:?xt=urn:btih:aaaa"),
                                                                result("Linkin Park - Meteora + Hybrid Theory EP", "bb", magnetUrl="magnet:?xt=urn:btih:bbbb"),
                                                                result("Linkin Park - Complete [FLAC]", "cc", magnetUrl="magnet:?xt=urn:btih:cccc")]})
@@ -584,23 +613,24 @@ def test_bundles_combine_the_next_holding_the_most_of_what_the_others_dont(downl
     torbox.cached_files = lambda hashes: {h: listed[h] for h in hashes if h in listed}
     missing = {"g-ht", "g-ht-ep", "g-mtm", "g-met", "g-oml", "g-one"}
     picks = lambda: downloads.bundle(db, LP, LP_GROUPS, missing - downloads.groups(db))
-    assert picks() and downloads.groups(db) == {"g-ht", "g-mtm", "g-oml"}  # the discography: three
-    assert picks() and downloads.groups(db) == missing - {"g-one"}  # then the one with both of the rest, not the lossless one with one
-    assert picks() is None and [a[1][-4:] for a in torbox.added] == ["aaaa", "bbbb"]  # One is left to its own search
+    assert picks() is Outcome.SENT and downloads.groups(db) == {"g-ht", "g-mtm", "g-oml"}  # the discography: three
+    assert picks() is Outcome.SENT and downloads.groups(db) == missing - {"g-one"}  # then the one with both of the rest, not the lossless one with one
+    assert picks() is Outcome.NOTHING_SENT and [a[1][-4:] for a in torbox.added] == ["aaaa", "bbbb"]  # One is left to its own search
 
 
 def test_an_uncached_bundle_needs_seeders_holds_its_albums_while_it_downloads_and_frees_them_when_dead(downloads, torbox, db, monkeypatch):
     now = [time.time()]
     monkeypatch.setattr(time, "time", lambda: now[0])
-    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    monkeypatch.setattr(download, "editions", lambda rg, db: editions(rg))
     torbox.cached_files = lambda hashes: {}
     db.executemany("insert into want_album(rg, artist_mbid, title, reason, state) values (?, 'mb-lp', ?, 'followed', 'missing')", [("g-met", "Meteora"), ("g-mtm", "Minutes to Midnight")])
     db.execute("insert into bundle_search values ('mb-lp', ?)", (now[0],))
     offer = lambda seeders: [result("Linkin Park - Discography (2000-2010) [FLAC]", "abcd", seeders=seeders, magnetUrl="magnet:?xt=urn:btih:abcd")]
     downloads.prowlarr = Prowlarr({"Linkin Park discography": offer(releases.BUNDLE_SEEDERS - 1)})
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-mtm"}) is None and not torbox.added  # too few to fetch gigabytes from
-    downloads.kept, downloads.prowlarr = {}, Prowlarr({"Linkin Park discography": offer(releases.BUNDLE_SEEDERS)})
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-mtm"}) and downloads.groups(db) == {"g-met", "g-mtm"}
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-mtm"}) is Outcome.NOTHING_SENT and not torbox.added  # too few to fetch gigabytes from
+    now[0] += download.FRESH  # Prowlarr is asked again
+    downloads.prowlarr = Prowlarr({"Linkin Park discography": offer(releases.BUNDLE_SEEDERS)})
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-mtm"}) is Outcome.SENT and downloads.groups(db) == {"g-met", "g-mtm"}
     torbox.list = [tb(71, "abcd", progress=0, seeds=0, peers=0)]
     downloads.cycle()
     now[0] += download.PATIENT + 60
@@ -622,7 +652,7 @@ def test_a_bundle_packed_in_one_zip_is_unpacked_here_and_its_wanted_albums_impor
     """TorBox lists a cached torrent of 100 files or more as one zip: what it holds is guessed from its name till unpacked."""
     placed = {}
     downloads.own.place = lambda folder, group: placed.setdefault(group, sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file()))
-    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    monkeypatch.setattr(download, "editions", lambda rg, db: editions(rg))
     db.executemany("insert into want_album(rg, artist_mbid, title, reason, state) values (?, 'mb-lp', ?, 'followed', 'missing')", [("g-met", "Meteora"), ("g-mtm", "Minutes to Midnight")])
     size = zipped(tmp_path / "cdn/0", {"LP/Meteora (2003)/01 Foreword.flac": "a", "LP/Meteora (2003)/02 Don't Stay.flac": "b", "LP/Meteora (2003)/cover.jpg": "c",
                                        "LP/Underground 7.0 (2007)/01 Wake.flac": "d", "LP/Underground 7.0 (2007)/02 Given Up.flac": "e",  # misnamed
@@ -630,7 +660,7 @@ def test_a_bundle_packed_in_one_zip_is_unpacked_here_and_its_wanted_albums_impor
     listed = [{"id": 0, "name": "LP Discography/LP Discography.zip", "size": size}]
     downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
     torbox.cached_files = lambda hashes: {"abcd": listed}
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-mtm"}) and downloads.groups(db) == {"g-met", "g-mtm"}
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met", "g-mtm"}) is Outcome.SENT and downloads.groups(db) == {"g-met", "g-mtm"}
     torbox.list = [{**tb(71, "abcd", progress=1, active=False), "download_state": "completed", "download_finished": True, "download_present": True, "files": listed}]
     downloads.cycle()
     assert db.execute("select state, error from download").fetchone()[:] == ("done", None) and torbox.links == [0]
@@ -640,13 +670,13 @@ def test_a_bundle_packed_in_one_zip_is_unpacked_here_and_its_wanted_albums_impor
 
 
 def test_too_little_disk_space_for_a_packed_bundle_makes_it_wait_unblocked(downloads, torbox, db, tmp_path, monkeypatch):
-    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    monkeypatch.setattr(download, "editions", lambda rg, db: editions(rg))
     db.execute("insert into want_album(rg, artist_mbid, title, reason, state) values ('g-met', 'mb-lp', 'Meteora', 'followed', 'missing')")
     size = zipped(tmp_path / "cdn/0", {"LP/Meteora (2003)/01 Foreword.flac": "a", "LP/Meteora (2003)/02 Don't Stay.flac": "b"})
     listed = [{"id": 0, "name": "LP/LP.zip", "size": size}]
     downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
     torbox.cached_files = lambda hashes: {"abcd": listed}
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met"})
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met"}) is Outcome.SENT
     torbox.list = [{**tb(71, "abcd", progress=1, active=False), "download_state": "completed", "download_finished": True, "download_present": True, "files": listed}]
     free = [3 * size - 1]  # the zip and twice it to unpack
     monkeypatch.setattr(shutil, "disk_usage", lambda path: SimpleNamespace(free=free[0]))
@@ -717,14 +747,14 @@ def test_music_videos_and_vocal_free_tracks_are_not_the_single():
 def test_a_bundle_imported_is_remembered_and_later_albums_come_from_it_while_torbox_has_it_cached(downloads, torbox, db, tmp_path, monkeypatch):
     placed = {}
     downloads.own.place = lambda folder, group: placed.setdefault(group, sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file()))
-    monkeypatch.setattr(download, "editions", lambda db, rg: editions(rg))
+    monkeypatch.setattr(download, "editions", lambda rg, db: editions(rg))
     downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
     torbox.cached_files = lambda hashes: {"abcd": DISCOGRAPHY} if "abcd" in hashes else {}
     db.execute("insert into want_album(rg, artist_mbid, title, reason, state) values ('g-ht', 'mb-lp', 'Hybrid Theory', 'followed', 'missing')")
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht"})
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht"}) is Outcome.SENT
     torbox.list = [finished(71, "abcd", [f["name"] for f in DISCOGRAPHY], tmp_path)]
     downloads.cycle()
-    [t.join(10) for t in threading.enumerate() if t.name != "MainThread" and "map_kept" in repr(getattr(t, "_target", None))]
+    [t.join(10) for t in threading.enumerate() if t.name == "remember bundle"]
     assert set(placed) == {"g-ht"} and torbox.deleted == []
     downloads.cycle()
     assert torbox.deleted == [71]  # torbox mode: it goes once TorBox isn't seeding it
@@ -736,7 +766,7 @@ def test_a_bundle_imported_is_remembered_and_later_albums_come_from_it_while_tor
     # needn't list its files (it lists one of 100 or more as one zip): the remembered paths are fetched.
     torbox.cached = lambda hashes: {"abcd"} & set(hashes)
     asked = len(downloads.prowlarr.asked)
-    assert downloads.find(db, want("One More Light", "Linkin Park"), "g-oml")
+    assert downloads.find(db, want("One More Light", "Linkin Park"), "g-oml") is Outcome.SENT
     assert torbox.added[-1][1] == "magnet:?xt=urn:btih:abcd" and len(downloads.prowlarr.asked) == asked
     row = db.execute("select * from download where hash = 'abcd'").fetchone()
     assert (row["state"], row["kept"]) == ("added", 1)
@@ -749,7 +779,7 @@ def test_a_bundle_imported_is_remembered_and_later_albums_come_from_it_while_tor
     # An album it was tried for already isn't fetched from it again: searched as usual.
     db.execute("update download set state = 'done' where hash = 'abcd'")
     added, asked = len(torbox.added), len(downloads.prowlarr.asked)
-    assert downloads.find(db, want("Hybrid Theory", "Linkin Park"), "g-ht") is None
+    assert downloads.find(db, want("Hybrid Theory", "Linkin Park"), "g-ht") is Outcome.NOTHING_SENT
     assert len(torbox.added) == added and len(downloads.prowlarr.asked) > asked
     assert json.loads(db.execute("select tried from bundle_kept").fetchone()[0]) == ["g-ht", "g-oml"]
     # TorBox no longer has it: it is forgotten and the album searched as usual.
@@ -773,4 +803,4 @@ def test_a_bundle_imported_before_isnt_sent_again_by_a_bundle_search(downloads, 
     db.execute("insert into download_target(hash, rg, files, state) values ('aa', 'g-mtm', '[]', 'failed')")
     downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [MP3]", "aa", seeders=50)]})
     torbox.cached_files = lambda hashes: {"aa": DISCOGRAPHY}
-    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht"}) is None and not torbox.added
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-ht"}) is Outcome.NOTHING_SENT and not torbox.added

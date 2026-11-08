@@ -1,4 +1,4 @@
-"""Moves the library's files to the names importer.py gives an import, "Artist/Year - Album/NN - Title.ext", by
+"""Moves the library's files to the names layout.py gives an import, "Artist/Year - Album/NN - Title.ext", by
 their MusicBrainz tags: once, for the files placed under an older scheme. Files only move (os.rename), nothing is
 deleted but folders left empty; a file that lacks the tags, or whose new name is taken, stays where it is. Other files
 in an album's folder (covers) move with it. A track keeps its id: the database follows each move in the same
@@ -6,23 +6,18 @@ transaction, so stars, plays, playlists, credits and dedupe's verdicts stay. Wit
 in the database; the plan is checked against the database and written out all the same."""
 import logging
 import os
-import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import mutagen
 
-from . import musicbrainz
-from .importer import album_folder, track_file
-from .scan import CONTENT_TYPES
+from . import audiorecords, musicbrainz
+from .formats import AUDIO, suffix
+from .layout import album_folder, track_file
+from .tags import first, numbering, original_year
 
 log = logging.getLogger(__name__)
-
-ARTIST = "https://musicbrainz.org/ws/2/artist/{}?fmt=json"
-KEEP = 30 * 86400  # seconds an artist's name stays cached
-MBID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-
 
 @dataclass
 class Plan:
@@ -31,27 +26,17 @@ class Plan:
     in_place: int = 0
 
 
-def numbers(value) -> tuple[int | None, int | None]:
-    """'3/12' -> (3, 12); '3' -> (3, None)."""
-    m = re.match(r"\s*(\d+)\s*(?:/\s*(\d+))?", str(value or ""))
-    return (int(m[1]), int(m[2]) if m[2] else None) if m else (None, None)
-
-
 def tags_of(path: Path) -> dict | str:
     """What a file's new name needs from its tags, or what it lacks."""
     audio = mutagen.File(path, easy=True)
-    tags = audio.tags if audio is not None and audio.tags is not None else {}
-    get = lambda name: str((tags.get(name) or [""])[0]).strip() if name in tags else ""
-    artist = MBID.search(get("musicbrainz_albumartistid"))
-    year = (get("originaldate") or get("originalyear") or get("date"))[:4]
-    (track, tracks), (disc, discs) = numbers(get("tracknumber")), numbers(get("discnumber"))
-    found = {"artist": artist and artist[0], "album": get("album"), "title": get("title"), "track": track,
-             "year": year if year.isdigit() else None}
+    get = lambda name: first(audio, name) or ""
+    artist = musicbrainz.MBID.search(get("musicbrainz_albumartistid"))
+    year, place = original_year(audio), numbering(audio)
+    found = {"artist": artist and artist[0], "album": get("album"), "title": get("title"), "track": place["track"], "year": year}
     if missing := [k for k, v in found.items() if not v]:
         return "no " + ", ".join(missing)
-    return found | {"tracks": max(track, tracks or 0, numbers(get("totaltracks") or get("tracktotal"))[0] or 0), "disc": disc or 1,
-                    "discs": max(disc or 1, discs or 0, numbers(get("totaldiscs") or get("disctotal"))[0] or 0),
-                    "release": get("musicbrainz_albumid") or (artist[0], get("album"), year)}
+    return found | {"tracks": max(place["track"], place["tracks"] or 0), "disc": place["disc"] or 1,
+                    "discs": max(place["disc"] or 1, place["discs"] or 0), "release": get("musicbrainz_albumid") or (artist[0], get("album"), year)}
 
 
 def album_of(path: Path, root: Path) -> Path:
@@ -65,7 +50,7 @@ def plan(db, root: Path) -> Plan:
     for directory, folders, names_here in os.walk(root):
         files += [Path(directory, f) for f in names_here if not f.startswith(".")]  # hidden: half-written files, this tool's mapping
     files.sort()
-    audio = [p for p in files if p.suffix.lower().lstrip(".") in CONTENT_TYPES]
+    audio = [p for p in files if suffix(p) in AUDIO]
     for path in audio:
         try:
             info = tags_of(path)
@@ -77,7 +62,7 @@ def plan(db, root: Path) -> Plan:
         found[path] = info
         if info["artist"] not in names:
             try:
-                names[info["artist"]] = musicbrainz.get(ARTIST.format(info["artist"]), db, KEEP)["name"]
+                names[info["artist"]] = musicbrainz.artist(info["artist"], db)["name"]
             except (LookupError, OSError) as e:
                 names[info["artist"]] = None
                 log.warning("no MusicBrainz name for artist %s: %s", info["artist"], e)
@@ -93,7 +78,7 @@ def plan(db, root: Path) -> Plan:
     for path, info in found.items():
         discs, tracks = widest[info["release"]]
         folder = root / album_folder(names[info["artist"]], info["year"], info["album"])
-        target = folder / track_file(info["disc"], discs, info["track"], tracks, info["title"], path.suffix)
+        target = folder / track_file(info["disc"], discs, info["track"], tracks, info["title"], suffix(path))
         albums[album_of(path, root)].add(folder)
         if target == path:
             result.in_place += 1
@@ -123,16 +108,10 @@ def plan(db, root: Path) -> Plan:
 
 
 def repoint(db, old: str, new: str):
-    """The database follows one file's move: its track (whose id stays), covers, and dedupe's records."""
+    """The database follows one file's move: its track (whose id stays), covers, and dedupe's and quality's records."""
     db.execute("update track set ref = ? where ref = ? and source = 'local'", (new, old))
     db.execute("update track set cover = ? where cover = ?", (new, old))
-    db.execute("update audio_shared set path = ? where path = ?", (new, old))
-    db.execute("update audio_shared set kept = ? where kept = ?", (new, old))
-    db.execute("update audio_quality set path = ? where path = ?", (new, old))
-    for r in db.execute("select * from audio_pair where ? in (a, b)", (old,)).fetchall():
-        (a, a_mtime), (b, b_mtime) = sorted([(new if r["a"] == old else r["a"], r["a_mtime"]), (new if r["b"] == old else r["b"], r["b_mtime"])])
-        db.execute("delete from audio_pair where a = ? and b = ?", (r["a"], r["b"]))
-        db.execute("insert or replace into audio_pair values (?, ?, ?, ?, ?)", (a, b, a_mtime, b_mtime, r["level"]))
+    audiorecords.moved(db, old, new)
 
 
 def counts(db) -> dict:
@@ -180,8 +159,8 @@ def run(db, root: Path, out: Path, apply: bool) -> Plan:
             prune(old.parent, root)
         after, lost = counts(db), missing(db, os.path.exists)
     moved = [p for p in result.moves if p not in result.left]
-    print(f"{'moved' if apply else 'would move'}: {sum(p.suffix.lower().lstrip('.') in CONTENT_TYPES for p in moved)} audio files, "
-          f"{sum(p.suffix.lower().lstrip('.') not in CONTENT_TYPES for p in moved)} others; already in place: {result.in_place}; "
+    print(f"{'moved' if apply else 'would move'}: {sum(suffix(p) in AUDIO for p in moved)} audio files, "
+          f"{sum(suffix(p) not in AUDIO for p in moved)} others; already in place: {result.in_place}; "
           f"staying: {len(result.left)}; mapping: {out}")
     for reason, n in sorted(count_reasons(result.left).items()):
         print(f"  {n} staying: {reason}")

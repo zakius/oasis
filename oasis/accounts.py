@@ -2,7 +2,6 @@
 import hmac
 import re
 import secrets
-import shlex
 import threading
 import time
 
@@ -12,9 +11,24 @@ SESSION_DAYS = 30
 def sync_config_users(db, users: dict[str, str]):
     """Users from oasis.toml are admins; the file's password wins."""
     for name, password in users.items():
-        db.execute("delete from session where user = ? and user in (select name from user where password != ?)", (name, password))
-        db.execute("insert into user(name, password, admin, created) values (?, ?, 1, ?) "
-                   "on conflict(name) do update set password = excluded.password, admin = 1", (name, password, time.time()))
+        user = get(db, name)
+        if user is None:
+            db.execute("insert into user(name, password, admin, created) values (?, ?, 1, ?)", (name, password, time.time()))
+            continue
+        if user["password"] != password:
+            set_field(db, name, password=password)
+        set_field(db, name, admin=1)
+
+
+CONFIG_ONLY = {"remove": "Users from oasis.toml can only be removed there", "password": "This password is set in oasis.toml",
+               "admin": "Users from oasis.toml are always admins"}
+
+
+def check_editable(config_users: dict[str, str], name: str, change: str):
+    """Users from oasis.toml are changed there: ValueError saying so when change ("remove", "password" or "admin") is
+    asked of one of them anywhere else."""
+    if name in config_users:
+        raise ValueError(CONFIG_ONLY[change])
 
 
 def get(db, name: str):
@@ -26,9 +40,20 @@ def create(db, name: str, password: str, admin: bool = False):
         raise ValueError("Use letters, digits, '.', '@', '-' or '_' in user names.")
     if get(db, name):
         raise ValueError(f"User {name} already exists.")
+    check_password(password)
+    db.execute("insert into user(name, password, admin, created) values (?, ?, ?, ?)", (name, password, int(admin), time.time()))
+
+
+def check_password(password: str):
+    """ValueError unless there is a password: Subsonic's token auth would take an empty one."""
     if not password:
         raise ValueError("A password is needed.")
-    db.execute("insert into user(name, password, admin, created) values (?, ?, ?, ?)", (name, password, int(admin), time.time()))
+
+
+def set_password(db, name: str, password: str):
+    """ValueError when the password is empty (check_password). The new one signs the user out of the dashboard everywhere."""
+    check_password(password)
+    set_field(db, name, password=password)
 
 
 def delete(db, name: str):
@@ -65,8 +90,31 @@ class Throttle:
     def fail(self, address: str):
         with self.lock:
             since = time.time() - self.WINDOW
-            self.fails = {a: kept for a, ts in self.fails.items() if (kept := [t for t in ts if t > since])}  # quiet addresses forgotten
+            self.fails = {a: kept for a, ts in self.fails.items() if (kept := [t for t in ts if t > since])}
             self.fails.setdefault(address, []).append(time.time())
+
+
+class Refused(Exception):
+    def __init__(self, throttled: bool):
+        """throttled: the address failed too often lately, so the password wasn't even checked."""
+        self.throttled = throttled
+
+
+def client_address(request) -> str:
+    return request.client.host if request.client else ""
+
+
+def sign_in(db, throttle: Throttle, address: str, name: str, matches):
+    """The user, when matches(their stored password) is true; else Refused, a failure the throttle counts. Unknown
+    users are compared too (with ""), so the time a sign-in takes doesn't tell which names exist."""
+    if throttle.blocked(address):
+        raise Refused(throttled=True)
+    user = get(db, name)
+    ok = matches(user["password"] if user else "")
+    if user is None or not ok:
+        throttle.fail(address)
+        raise Refused(throttled=False)
+    return user
 
 
 def new_session(db, name: str) -> str:
@@ -75,39 +123,12 @@ def new_session(db, name: str) -> str:
     return token
 
 
+def end_session(db, token: str | None):
+    db.execute("delete from session where token = ?", (token,))
+
+
 def session_user(db, token: str | None):
     if not token:
         return None
     row = db.execute("select user from session where token = ? and expires > ?", (token, time.time())).fetchone()
     return get(db, row["user"]) if row else None
-
-
-def youtube_headers(pasted: str) -> dict:
-    """Browser headers for ytmusicapi from what the user copied out of a signed-in music.youtube.com tab: the request
-    headers, a "Copy as cURL" command, or only the Cookie value."""
-    text = pasted.strip()
-    headers = {}
-    if text.startswith("curl "):
-        words = shlex.split(text.replace("\\\n", " "))
-        for flag, value in zip(words, words[1:]):
-            if flag in ("-H", "--header") and ":" in value:
-                key, _, val = value.partition(":")
-                headers[key.strip().lower()] = val.strip()
-            elif flag in ("-b", "--cookie"):
-                headers["cookie"] = value
-    elif re.search(r"^\s*cookie\s*:", text, re.I | re.M):
-        for line in text.splitlines():
-            key, sep, val = line.partition(":")
-            if sep and key.strip() and not key.startswith(":"):
-                headers[key.strip().lower()] = val.strip()
-    else:
-        headers["cookie"] = text.removeprefix("Cookie:").strip()
-    cookie = headers.get("cookie", "")
-    if not (sapisid := re.search(r"(?:^|;\s*)__Secure-3PAPISID=([^;\s]+)", cookie)):
-        raise ValueError("That has no YouTube sign-in cookie (__Secure-3PAPISID). Copy it from music.youtube.com while signed in.")
-    from ytmusicapi.helpers import get_authorization
-    origin = "https://music.youtube.com"
-    # ytmusicapi takes headers with a SAPISIDHASH authorization for a browser sign-in and renews it per request.
-    return {"cookie": cookie, "x-goog-authuser": headers.get("x-goog-authuser", "0"), "origin": origin,
-            "authorization": get_authorization(sapisid[1] + " " + origin),
-            "user-agent": headers.get("user-agent", "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0")}
