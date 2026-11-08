@@ -669,6 +669,22 @@ def test_a_bundle_packed_in_one_zip_is_unpacked_here_and_its_wanted_albums_impor
     assert not (tmp_path / "dl/abcd").exists()  # the rest of the copy goes too
 
 
+def test_a_packed_bundle_holding_no_wanted_album_stays_blocked(downloads, torbox, db, tmp_path, monkeypatch):
+    """Its name promised Meteora, but unpacked it holds only an album that isn't wanted: it isn't sent again."""
+    monkeypatch.setattr(download, "editions", lambda rg, db: editions(rg))
+    db.execute("insert into want_album(rg, artist_mbid, title, reason, state) values ('g-met', 'mb-lp', 'Meteora', 'followed', 'missing')")
+    size = zipped(tmp_path / "cdn/0", {"LP/Hybrid Theory (2000)/01 Papercut.flac": "a", "LP/Hybrid Theory (2000)/02 One Step Closer.flac": "b"})
+    listed = [{"id": 0, "name": "LP Meteora/LP Meteora.zip", "size": size}]
+    downloads.prowlarr = Prowlarr({"Linkin Park discography": [result("Linkin Park - Discography [FLAC]", "abcd", magnetUrl="magnet:?xt=urn:btih:abcd")]})
+    torbox.cached_files = lambda hashes: {"abcd": listed}
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met"}) is Outcome.SENT
+    torbox.list = [{**tb(71, "abcd", progress=1, active=False), "download_state": "completed", "download_finished": True, "download_present": True, "files": listed}]
+    downloads.cycle()
+    assert db.execute("select state, error from download").fetchone()[:] == ("failed", download.EMPTY_BUNDLE)
+    assert "abcd" in downloads.blocked(db)  # Meteora is still wanted, but it was then too
+    assert downloads.bundle(db, LP, LP_GROUPS, {"g-met"}) is Outcome.NOTHING_SENT and len(torbox.added) == 1
+
+
 def test_too_little_disk_space_for_a_packed_bundle_makes_it_wait_unblocked(downloads, torbox, db, tmp_path, monkeypatch):
     monkeypatch.setattr(download, "editions", lambda rg, db: editions(rg))
     db.execute("insert into want_album(rg, artist_mbid, title, reason, state) values ('g-met', 'mb-lp', 'Meteora', 'followed', 'missing')")

@@ -730,7 +730,7 @@ class Downloads:
         unpack(folder)
         files = [{"name": p.relative_to(folder).as_posix(), "size": p.stat().st_size} for p in sorted((folder / UNPACKED).rglob("*")) if p.is_file()]
         if not self.resolve(db, row, files, packed=False):
-            return self.fail(db, row, EMPTY_BUNDLE)
+            return self.fail(db, row, EMPTY_BUNDLE, wanted=json.loads(row["bundle"])["wanted"])
         for rg, names in db.execute("select rg, files from download_target where hash = ?", (row["hash"],)).fetchall():
             names = json.loads(names)
             top = posixpath.commonpath([posixpath.dirname(n) for n in names])
