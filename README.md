@@ -2,7 +2,7 @@
 
 An OpenSubsonic music server that merges your local library with streaming services into one library. Clients see ordinary tracks and never learn where a track comes from.
 
-It pairs with **mirage**, a fooyin fork that shows the server's library as if it were on your machine, and **caravan** (com.zakius.caravan), an Android Subsonic client romanized by roma. roma ytm, the YouTube Music app, stays roma.
+It pairs with **mirage**, a fooyin fork that shows the server's library as if it were on your machine, and **caravan** (com.zakius.caravan), an Android Subsonic client romanized by roma. Both caravan and **dragoman** (com.zakius.dragoman), the YouTube Music app that was roma ytm until 2026-11-09, are built in [caravanserai](https://github.com/zakius/caravanserai).
 
 ## Status
 

@@ -1,6 +1,6 @@
 # OpenSubsonic extension `romanization`, version 1
 
-Status: agreed with the user on 2026-11-01. This is the canonical copy; roma and mirage link to it. The changes made
+Status: agreed with the user on 2026-11-01. This is the canonical copy; caravanserai (caravan and dragoman) and mirage link to it. The changes made
 while implementing it in oasis are listed at the end.
 
 Goal: the server does the romanization and sends it in a form any client can ignore. Clients that know the

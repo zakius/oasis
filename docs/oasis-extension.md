@@ -1,6 +1,6 @@
 # OpenSubsonic extension `oasis`, versions 1 to 3
 
-Status: written on 2026-11-02 from what oasis already sent every client; this is the canonical copy. caravan and roma
+Status: written on 2026-11-02 from what oasis already sent every client; this is the canonical copy. caravanserai (caravan)
 link to it.
 
 Goal: oasis's own additions (acquisition state, YouTube Music ids, home mixes, MusicBrainz-only albums) reach the
