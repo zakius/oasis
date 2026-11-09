@@ -27,6 +27,7 @@ create table if not exists track(
 );
 create index if not exists track_album on track(album_id);
 create index if not exists track_artist on track(artist_id);
+create index if not exists track_title on track(title collate nocase);  -- songs found by artist and title (recommend.resolve)
 create table if not exists credit(  -- who made each track, as credited
     track_id text not null, role text not null,  -- artist, albumartist, performer, composer, lyricist, writer, arranger...
     sub_role text,                  -- performers: instrument or voice
@@ -332,6 +333,9 @@ def create(db: sqlite3.Connection):
     migrate(db)
     db.execute("create index if not exists track_release on track(mb_release)")
     db.execute("create index if not exists track_group on track(mb_release_group)")
+    # The library's albums and artists, listed without reading the streaming tracks beside them (api.py's ALBUMS and ARTISTS)
+    db.execute("create index if not exists track_library_album on track(library, album_id)")
+    db.execute("create index if not exists track_library_artist on track(library, artist_id)")
 
 
 # What a database from any older oasis needs, in order, each time a process first connects to it; each step does

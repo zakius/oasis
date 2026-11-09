@@ -10,7 +10,7 @@ import time
 
 from . import musicbrainz
 from .tracks import artist_id
-from .audiorecords import retagged, same_audio
+from .audiorecords import retagged, same_audio, same_audio_of
 from .tags import write_tags
 
 log = logging.getLogger(__name__)
@@ -124,12 +124,12 @@ def apply(db, data: dict):
             continue
         fields = {**release, **entry["fields"]}
         store(db, row["id"], entry["credits"], "musicbrainz")
-        retag(db, row["ref"], fields, performance_credits(db, row["ref"], entry["credits"]))
+        retag(db, row["ref"], fields, performance_credits(db, same_audio(db, row["ref"]), entry["credits"]))
         for other in same_audio(db, row["ref"]):  # releases filled earlier gain what this one adds
             own = [dict(c) for c in db.execute("select c.* from credit c join track t on t.id = c.track_id where t.ref = ? "
                                                "and c.source = 'musicbrainz' order by c.position", (other,))]
             if own:
-                retag(db, other, {}, performance_credits(db, other, own))
+                retag(db, other, {}, performance_credits(db, same_audio(db, other), own))
         columns = [k for k in ("label", "release_types", "isrc", "original_date", "mb_recording", "genres") if fields.get(k)]
         genres = json.loads(fields.get("genres") or "[]")
         db.execute(f"update track set {', '.join(f'{c} = ?' for c in columns)}{', ' if columns else ''}"
@@ -142,10 +142,9 @@ def apply(db, data: dict):
 PERFORMANCE_ROLES = {"performer", "conductor", "producer", "mixer", "engineer", "remixer", "arranger", "composer", "lyricist", "writer"}
 
 
-def performance_credits(db, path: str, credits: list[dict], key=same_credit) -> list[dict]:
-    """`credits` plus what MusicBrainz credits on other releases of the same audio (dedupe's matches): one
+def performance_credits(db, others: list[str], credits: list[dict], key=same_credit) -> list[dict]:
+    """`credits` plus what MusicBrainz credits on others, the other releases of the same audio (same_audio): one
     performance entered twice and never merged gets the union of both entries' credits. key: see dedupe_credits."""
-    others = same_audio(db, path)
     if not others:
         return credits
     rows = db.execute(f"select c.* from credit c join track t on t.id = c.track_id where c.source = 'musicbrainz' and t.ref in "
@@ -177,10 +176,12 @@ def credits_of(db, track_ids: list[str]) -> dict[str, list[dict]]:
     found = {}
     for r in db.execute(f"select * from credit where track_id in ({marks}) order by position", track_ids):
         found.setdefault(r["track_id"], {}).setdefault(r["source"], []).append(dict(r))
+    refs = db.execute(f"select id, ref from track where id in ({marks})", track_ids).fetchall()
+    same = same_audio_of(db, [ref for _, ref in refs])
     mine = {}
-    for id, ref in db.execute(f"select id, ref from track where id in ({marks})", track_ids):
+    for id, ref in refs:
         sources = found.get(id, {})
-        credits = performance_credits(db, ref, sources.get("musicbrainz") or sources.get("tags", []), same_listed_credit)
+        credits = performance_credits(db, same.get(ref, []), sources.get("musicbrainz") or sources.get("tags", []), same_listed_credit)
         if credits:
             mine[id] = credits
     return mine

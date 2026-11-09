@@ -342,6 +342,8 @@ def test_listenbrainz_radio_resolves_like_lastfm_and_its_failures_give_nothing(a
     def broken(token, artist):
         raise OSError("HTTP 500")
     monkeypatch.setattr(recommend, "lb_radio", broken)
+    assert titles(similar(client, "listenbrainz")["similarSongs2"]["song"]) == ["Song B", "Tune"]  # the answer is kept a while
+    api.recommender.answers.clear()
     assert similar(client, "listenbrainz")["similarSongs2"]["song"] == []
     assert "one-yt song 0" in titles(similar(client)["similarSongs2"]["song"])  # the mix goes on without it
 
@@ -402,3 +404,24 @@ def test_a_slow_source_is_left_out_rather_than_waited_for(client, ytm, monkeypat
     songs = titles(similar(client)["similarSongs2"]["song"])
     assert time.monotonic() - start < 2
     assert "Song B" in songs and "one-yt song 0" not in songs  # Last.fm and the library came; YouTube Music didn't
+
+
+def test_a_slow_source_gives_the_songs_it_found_by_the_deadline(api, client, ytm, monkeypatch):
+    import threading, time
+    from oasis import recommend
+    release, quick = threading.Event(), ytm.find
+
+    def find(artist, title, duration=None):
+        if title == "Slow":
+            release.wait(5)
+        return quick(artist, title, duration)
+    monkeypatch.setattr(api.recommender.ytm, "find", find, raising=False)
+    monkeypatch.setattr(recommend, "lb_radio", lambda token, artist: [("Remote Band", "Tune"), ("Remote Band", "Slow")])
+    link(api, listenbrainz_token="lb-token")
+    db = api.connect()
+    seed = db.execute("select * from track where title = 'Song A'").fetchone()
+    started = time.monotonic()
+    ids = api.recommender.similar(db, seed, 10, source="listenbrainz", token="lb-token", wait=1.5)
+    release.set()
+    assert time.monotonic() - started < 1.5
+    assert [db.execute("select title from track where id = ?", (i,)).fetchone()[0] for i in ids] == ["Tune"]

@@ -194,7 +194,7 @@ def test_an_album_pages_own_artist_is_its_songs_album_artist():
     page = {"title": "Hazbin Hotel (Original Soundtrack, Pt. 1)", "year": "2024", "artists": [{"name": "Various Artists"}], "thumbnails": [],
             "tracks": [{"videoId": "v1", "title": "Happy Day in Hell", "artists": [{"name": "Erika Henningsen"}], "trackNumber": 1}]}
     ytm = object.__new__(YouTubeMusic)
-    ytm.api, ytm.api_lock = SimpleNamespace(get_album=lambda browse_id: page), threading.Lock()
+    ytm.idle, ytm.calls = [SimpleNamespace(get_album=lambda browse_id: page)], threading.Semaphore()
     (found,) = ytm.album("MPREb_hh")
     assert (found["album_by"], found["album_artist"], found["track_no"], found["year"]) == ("Various Artists", "Erika Henningsen", 1, 2024)
 

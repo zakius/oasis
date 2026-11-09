@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -66,6 +67,7 @@ MOVED_PARAMS = (*SONG_ID_PARAMS, "albumId", "artistId")
 FIND_FROM = 3  # characters a search needs before MusicBrainz is asked too
 YTM_SEARCH = 50  # YouTube Music songs a search asks for at most
 SIMILAR_WAIT = 6  # seconds getSimilarSongs waits for its slowest source: YouTube Music answers in about 2, Last.fm in up to 6
+WARM = 3  # songs at the head of a radio or similar songs: the first from YouTube is readied before a client asks (youtube.warm)
 
 
 class Params:
@@ -230,12 +232,18 @@ def respell(db, payload):
     if not names:
         return
     within = re.compile(r"(?<!\w)(?:" + "|".join(map(re.escape, sorted(names, key=len, reverse=True))) + r")(?!\w)")
+    done = {}  # a response names the same artists over and over
+
+    def spelled(v):
+        if v not in done:
+            done[v] = within.sub(lambda m: names[m[0]], names.get(v, v))
+        return done[v]
 
     def walk(value):
         if isinstance(value, dict):
             for k, v in value.items():
                 if isinstance(v, str) and (k in ARTIST_TEXT or k == "name" and str(value.get("id", "")).startswith(IDS["artist"])):
-                    value[k] = within.sub(lambda m: names[m[0]], names.get(v, v))
+                    value[k] = spelled(v)
                 else:
                     walk(v)
         elif isinstance(value, list):
@@ -430,6 +438,7 @@ class Api:
 
     def __init__(self, oasis):
         self.oasis = oasis
+        self.finder = ThreadPoolExecutor(4)  # MusicBrainz searches, made while the rest of a search3 is looked up
 
     def _authenticate(self, db, p: Params) -> str:
         if p.get("apiKey") is not None:  # OpenSubsonic's apiKeyAuthentication, which oasis doesn't advertise
@@ -576,7 +585,8 @@ class Api:
         return [clean(song(r) | {"track": r["no"], "discNumber": r["disc"]}) for r in db.execute(
             f"select {SONG_COLUMNS}, coalesce(at.disc_no, t.disc_no) as disc, coalesce(at.track_no, t.track_no) as no "
             "from track t left join stat s on s.id = t.id and s.user = me() left join album_track at on at.track_id = t.id and at.album_id = ? "
-            "where t.album_id = ? or at.album_id is not null order by disc, no is null, no, title", (album_id, album_id))]
+            "where t.id in (select id from track where album_id = ? union select track_id from album_track where album_id = ?) "
+            "order by disc, no is null, no, title", (album_id, album_id, album_id))]
 
     def getArtist(self, db, p, user):
         if tracks.mbid_of(id := p.need("id")):
@@ -706,6 +716,12 @@ class Api:
 
     def _search(self, db, p):
         terms = [t for t in p.get("query", "").replace('"', "").split() if t]
+        text = " ".join(terms)
+        # MusicBrainz, last in the answer, for what neither the library nor YouTube Music has: these can be starred like any
+        # other. Only for the oasis extension: they have no songs until they arrive, which other clients don't expect.
+        # Asked first, as it answers slowest (a second between requests), while the rest is looked up.
+        finding = {kind: self.finder.submit(self._find, kind, text) for kind in ("artist", "album")
+                   if self.oasis.acquire and p.oasis and len(text) >= FIND_FROM and p.int(kind + "Offset", 0) == 0 and p.int(kind + "Count", 20) > 0}
         latin.index(db)
 
         def match(columns: str, latin: str):
@@ -745,18 +761,15 @@ class Api:
             if p.int("albumOffset", 0) == 0 and (room := p.int("albumCount", 20) - len(albums)) > 0:
                 ids = [i for i in dict.fromkeys(s["albumId"] for s in found if s.get("albumId")) if i not in {a["id"] for a in albums}]
                 albums += [a for a in self._in_order(db, ALBUMS, "t.album_id", ids, album) if named(a["name"], a.get("artist"))][:room]
-        text = " ".join(terms)
-        if self.oasis.acquire and p.oasis and len(text) >= FIND_FROM:
-            # MusicBrainz last, for what neither the library nor YouTube Music has: these can be starred like any other.
-            # Only for the oasis extension: they have no songs until they arrive, which other clients don't expect.
+        if finding:
             names = {fold(x) for x in [*(a["name"] for a in artists), *(s.get("artist") for s in songs)] if x}
             titles = {fold(x) for x in [*(a["name"] for a in albums), *(s.get("album") for s in songs)] if x}
-            if p.int("artistOffset", 0) == 0 and (room := p.int("artistCount", 20) - len(artists)) > 0:
-                artists += [self._mb_artist(db, a) for a in self._find(db, "artist", text)
+            if "artist" in finding and (room := p.int("artistCount", 20) - len(artists)) > 0:
+                artists += [self._mb_artist(db, a) for a in finding["artist"].result()
                             if not {fold(n) for n in [a["name"], *(x["name"] for x in a.get("aliases") or [])]} & names
                             and not tracks.library_id(db, MB_IDS["artist"] + a["id"])][:room]
-            if p.int("albumOffset", 0) == 0 and (room := p.int("albumCount", 20) - len(albums)) > 0:
-                albums += [self._mb_album(db, g) for g in self._find(db, "album", text)
+            if "album" in finding and (room := p.int("albumCount", 20) - len(albums)) > 0:
+                albums += [self._mb_album(db, g) for g in finding["album"].result()
                            if fold(g["title"]) not in titles and not tracks.library_id(db, MB_IDS["album"] + g["id"])][:room]
         return {"artist": artists, "album": albums, "song": songs}
 
@@ -768,12 +781,16 @@ class Api:
         rows = {r["id"]: r for r in db.execute(query + f" where {column} in ({','.join('?' * len(ids))}) group by {column}", ids)}
         return [shape(rows[i]) for i in ids if i in rows]
 
-    def _find(self, db, kind, text) -> list[dict]:
+    def _find(self, kind, text) -> list[dict]:
+        """MusicBrainz's artists or albums named like text, on a connection of its own (for the finder's threads)."""
+        db = self.oasis.connect()
         try:
             return musicbrainz.find(kind, text, db)
         except (OSError, LookupError) as e:
             log.warning("MusicBrainz search failed: %s", e)
             return []
+        finally:
+            db.close()
 
     def _musicbrainz(self, get, *args):
         """get(*args) for a MusicBrainz-only item: a lookup of musicbrainz.py."""
@@ -1006,6 +1023,7 @@ class Api:
         # A player waits for this answer with nothing to play next, so a slow source is left out rather than waited for.
         ids = self.oasis.recommender.similar(db, seed, min(p.int("count", 50), 200), source=source, token=account["listenbrainz_token"],
                                              wait=SIMILAR_WAIT)
+        self.oasis.youtube.warm(db, ids[:WARM])
         return {"song": [song(required(song_row(db, i))) for i in ids], "oasisSource": source}
 
     def getSimilarSongs2(self, db, p, user):
@@ -1048,8 +1066,13 @@ class Api:
         return {}
 
     def _playlist(self, db, r, entries: bool) -> dict:
-        songs = [song(s) for s in db.execute(
-            SONGS + " join playlist_entry e on e.track_id = t.id where e.playlist_id = ? order by e.pos", (r["id"],))]
+        if entries:
+            songs = [song(s) for s in db.execute(
+                SONGS + " join playlist_entry e on e.track_id = t.id where e.playlist_id = ? order by e.pos", (r["id"],))]
+            count, duration = len(songs), sum(s.get("duration", 0) for s in songs)
+        else:
+            count, duration = db.execute("select count(*), coalesce(sum(t.duration), 0) from playlist_entry e join track t on t.id = e.track_id "
+                                         "where e.playlist_id = ?", (r["id"],)).fetchone()
         result = clean({
             "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": mixes.OWNER if r["mix"] else r["owner"], "public": False,
             "coverArt": IDS["playlist"] + str(r["id"]) if r["cover"] else None,
@@ -1057,7 +1080,7 @@ class Api:
             "oasisMix": True if ytm.is_mix(r["mix"]) else None, "youtubeId": r["mix"],
             "oasisSource": (r["radio_source"] or accounts.get(db, r["owner"])["radio_source"]) if r["radio"] else None,
             "oasisStation": r["station"], "oasisPeriod": r["period"],
-            "songCount": len(songs), "duration": sum(s.get("duration", 0) for s in songs),
+            "songCount": count, "duration": duration,
             "created": iso(r["created"]), "changed": iso(r["changed"]),
         })
         return {**result, "entry": songs} if entries else result
@@ -1074,6 +1097,9 @@ class Api:
 
     def getPlaylist(self, db, p, user):
         r = self._one(db, "select * from playlist where id = ? and owner = ? and hidden = 0", p.need("id"), user)
+        if r["radio"]:
+            self.oasis.youtube.warm(db, [e[0] for e in db.execute("select track_id from playlist_entry where playlist_id = ? and pos > ? "
+                                                                  "order by pos limit ?", (r["id"], r["played_pos"], WARM))])
         return {"playlist": self._playlist(db, r, True)}
 
     def createPlaylist(self, db, p, user):

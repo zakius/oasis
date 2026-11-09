@@ -48,6 +48,8 @@ def closing(s: str) -> bool:
 
 
 def has_non_latin(s: str) -> bool:
+    if s.isascii():  # every ASCII character is Latin or Common
+        return False
     return any(script(c) not in LATINISH for c in s)
 
 

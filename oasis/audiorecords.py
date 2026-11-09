@@ -59,8 +59,17 @@ def store_pair(db, a: str, b: str, a_mtime: float, b_mtime: float, level: int):
 
 def same_audio(db, path: str) -> list[str]:
     """Other files dedupe found to hold the same stream."""
-    return [r[0] for r in db.execute("select b from audio_pair where a = ? and level > 0 union select a from audio_pair where b = ? and level > 0",
-                                     (path, path))]
+    return same_audio_of(db, [path]).get(path, [])
+
+
+def same_audio_of(db, paths: list[str]) -> dict[str, list[str]]:
+    """same_audio for many files in one query: the files that have others, sorted, by path."""
+    marks = ",".join("?" * len(paths))
+    found = {}
+    for a, b in db.execute(f"select a, b from audio_pair where level > 0 and (a in ({marks}) or b in ({marks}))", [*paths, *paths]):
+        found.setdefault(a, set()).add(b)
+        found.setdefault(b, set()).add(a)
+    return {p: sorted(found[p]) for p in paths if p in found}
 
 
 def clones(db, paths: list[str]) -> dict:

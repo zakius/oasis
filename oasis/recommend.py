@@ -4,6 +4,7 @@ import json
 import logging
 import random
 import threading
+import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait as wait_for
@@ -26,6 +27,9 @@ SOURCES = {"all": "Everything mixed", "lastfm": "Last.fm", "ytm": "YouTube Music
 STATIONS = {"lastfm-top": "Last.fm top tracks", "lastfm-loved": "Last.fm loved tracks"}
 PERIODS = ("7day", "1month", "3month", "6month", "12month", "overall")  # Last.fm's periods for top tracks
 PERIOD = "3month"
+FINDS = 6       # YouTube Music searches resolve runs at once (ytm.ANONYMOUS)
+KEPT = 3600     # seconds a source's answer is kept (Recommender.answer)
+LASTFM_SIMILAR = 15  # similar tracks asked of Last.fm, the most a method uses
 
 
 class Recommender:
@@ -33,7 +37,8 @@ class Recommender:
         """lastfm(): oasis's Last.fm app as it is now, or None."""
         self.connect, self.ytm, self.lastfm = connect, ytm, lastfm
         self.woken = threading.Event()
-        self.similar_artists: dict[str, list[str]] = {}  # Last.fm's answers by artist, kept while running
+        self.answers: dict[tuple, tuple[float, object]] = {}  # (expiry, answer) by question (answer)
+        self.answers_lock = threading.Lock()
 
     def sources(self, user) -> list[str]:
         """The sources that can give this user anything: Last.fm needs the server's API key, YouTube Music the server's
@@ -51,12 +56,14 @@ class Recommender:
         come throughout. YouTube Music, Last.fm and ListenBrainz (with the user's token) need the network; the library
         methods always give something. A source that gives nothing gives an empty list: no other stands in.
         The methods run at once, each on its own connection (sqlite connections stay in their thread), so the answer
-        takes as long as the slowest. With wait, a method that hasn't answered within that many seconds is left out."""
+        takes as long as the slowest. With wait, a method that hasn't answered within that many seconds is left out; those
+        that look songs up on YouTube Music one by one give what they found by then."""
+        deadline = time.monotonic() + wait - 0.5 if wait else None  # half a second to keep what they found
         methods = {
             "ytm": [("YouTube Music radio", lambda db: self.from_youtube(db, seed, count))],
-            "lastfm": [("Last.fm similar tracks", lambda db: self.from_lastfm(db, seed, min(count, 15 if deep else 10)) if self.lastfm() else []),
+            "lastfm": [("Last.fm similar tracks", lambda db: self.from_lastfm(db, seed, min(count, 15 if deep else 10), deadline) if self.lastfm() else []),
                        ("Last.fm similar artists", lambda db: self.from_similar_artists(db, seed, count) if self.lastfm() else [])],
-            "listenbrainz": [("ListenBrainz radio", lambda db: self.from_listenbrainz(db, seed, count, token))],
+            "listenbrainz": [("ListenBrainz radio", lambda db: self.from_listenbrainz(db, seed, count, token, deadline))],
             "library": [("linked artists", lambda db: self.from_linked(db, seed, count)),
                         ("same artist", lambda db: self.from_artist(db, seed, count)),
                         ("played together", lambda db: self.from_plays(db, seed, count)),
@@ -86,19 +93,33 @@ class Recommender:
         picks = [id for id in chain.from_iterable(zip_longest(*found)) if id and id != seed["id"]]
         return list(dict.fromkeys(picks))[:count]
 
+    def answer(self, question: tuple, ask):
+        """ask(), the answer of a source on the network to question, kept for KEPT seconds. The radio that follows
+        listening asks about each song played (top_up), so an instant mix of a song just played finds the answers here."""
+        now = time.monotonic()
+        kept = self.answers.get(question)
+        if kept and kept[0] > now:
+            return kept[1]
+        found = ask()
+        with self.answers_lock:
+            self.answers = {q: a for q, a in self.answers.items() if a[0] > now}
+            self.answers[question] = (now + KEPT, found)
+        return found
+
     def from_youtube(self, db, seed, count: int) -> list[str]:
         if not self.ytm:
             return []
         video_id = video_of(db, seed, self.ytm)
-        return [remember_song(db, song) for song in self.ytm.radio(video_id, count)] if video_id else []
+        if not video_id:
+            return []
+        return [remember_song(db, song) for song in self.answer(("ytm", video_id, count), lambda: self.ytm.radio(video_id, count))]
 
     def from_similar_artists(self, db, seed, count: int) -> list[str]:
         """Library songs by the artists Last.fm calls similar, a few from each in turn."""
         artist, _ = outside_names(seed)
-        if artist not in self.similar_artists:
-            self.similar_artists[artist] = lastfm.similar_artists(self.lastfm().artist_info(artist))
+        names = self.answer(("lastfm artists", artist), lambda: lastfm.similar_artists(self.lastfm().artist_info(artist)))
         per_artist = [[r[0] for r in db.execute(
-            f"select id from track where library = 1 and {BY_ARTIST_NAME} order by random() limit 3", (name, name))] for name in self.similar_artists[artist]]
+            f"select id from track where library = 1 and {BY_ARTIST_NAME} order by random() limit 3", (name, name))] for name in names]
         return [id for id in chain.from_iterable(zip_longest(*per_artist)) if id][:count]
 
     def from_linked(self, db, seed, count: int) -> list[str]:
@@ -130,42 +151,49 @@ class Recommender:
             "select id from track where library = 1 and genre = ? collate nocase and artist_id != ? "
             "order by abs(coalesce(year, 0) - ?), random() limit ?", (seed["genre"], seed["artist_id"], seed["year"] or 0, count))]
 
-    def from_lastfm(self, db, seed, count: int) -> list[str]:
+    def from_lastfm(self, db, seed, count: int, deadline: float | None = None) -> list[str]:
         artist, _ = outside_names(seed)
         try:
-            pairs = self.lastfm().similar(artist, seed["title"], count)
+            pairs = self.answer(("lastfm", artist, seed["title"]), lambda: self.lastfm().similar(artist, seed["title"], LASTFM_SIMILAR))[:count]
         except Exception as e:
             log.info("Last.fm similar failed: %s", e)
             return []
-        return self.resolve(db, pairs)
+        return self.resolve(db, pairs, deadline)
 
-    def from_listenbrainz(self, db, seed, count: int, token: str | None) -> list[str]:
+    def from_listenbrainz(self, db, seed, count: int, token: str | None, deadline: float | None = None) -> list[str]:
         """LB Radio's songs for the seed's artist and those ListenBrainz finds similar. Its API is experimental and needs
         a user token: any failure is logged and gives nothing."""
         if not token:
             return []
         artist = seed["album_artist"] if seed["source"] == "ytm" else seed["artist"]
         try:
-            pairs = lb_radio(token, artist)
+            pairs = self.answer(("listenbrainz", token, artist), lambda: lb_radio(token, artist))
         except Exception as e:
             log.info("ListenBrainz radio failed: %s", e)
             return []
-        return self.resolve(db, pairs[:count])
+        return self.resolve(db, pairs[:count], deadline)
 
-    def resolve(self, db, pairs: list[tuple[str, str]]) -> list[str]:
-        """(artist, title) pairs as track ids, in their order: a library song, else the song on YouTube Music."""
+    def resolve(self, db, pairs: list[tuple[str, str]], deadline: float | None = None) -> list[str]:
+        """(artist, title) pairs as track ids, in their order: a library song, else the song on YouTube Music, a known
+        one before a search, whose answer is kept too. Searches not done by deadline (time.monotonic) are left out."""
         ids, missing = {}, []
         for i, (a, t) in enumerate(pairs):
-            local = db.execute(f"select id from track where library = 1 and {BY_ARTIST_NAME} and title = ? collate nocase",
-                               (a, a, t)).fetchone()
-            if local:
-                ids[i] = local["id"]
+            known = db.execute(f"select id, library from track where title = ? collate nocase and {BY_ARTIST_NAME} "
+                               "and (library = 1 or source = 'ytm') order by library desc limit 1", (t, a, a)).fetchone()
+            if known and (known["library"] or self.ytm):
+                ids[i] = known["id"]
             elif self.ytm:
                 missing.append(i)
         if missing:
-            with ThreadPoolExecutor(5) as pool:
-                found = pool.map(lambda i: self.ytm.find(*pairs[i]), missing)
-            ids |= {i: remember_song(db, song) for i, song in zip(missing, found) if song}
+            pool = ThreadPoolExecutor(FINDS)
+            searches = {i: pool.submit(self.answer, ("find", *pairs[i]), lambda pair=pairs[i]: self.ytm.find(*pair)) for i in missing}
+            done, _ = wait_for(searches.values(), timeout=deadline - time.monotonic() if deadline else None)
+            pool.shutdown(wait=False, cancel_futures=True)
+            for i, search in searches.items():
+                if search in done and search.exception():
+                    log.info("YouTube Music search for %s failed: %s", pairs[i], search.exception())
+                elif search in done and search.result():
+                    ids[i] = remember_song(db, search.result())
         return [ids[i] for i in sorted(ids)]
 
     def start(self):

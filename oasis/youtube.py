@@ -14,6 +14,7 @@ from .ytm import Stream
 log = logging.getLogger(__name__)
 
 ARTIST_PAGE_KEPT = 86400  # seconds an artist's YouTube Music page is used before it is fetched again
+WARMED = 3600             # seconds before a video is readied (warm) again
 ALBUM_GAP = 5             # seconds between the album pages complete_next_album reads
 ALBUM_IDLE = 600          # seconds before looking again when every album page was read
 
@@ -63,6 +64,13 @@ def prefetch(ytm, video_id: str):
         log.warning("download of %s failed: %s", video_id, e)
 
 
+def warm(ytm, video_id: str):
+    try:
+        ytm.warm(video_id)
+    except Exception as e:
+        log.info("warming %s failed: %s", video_id, e)
+
+
 def audio(ytm, video_id: str) -> Path | Stream:
     """What to play a streaming track from: the cached file; else YouTube's stream while the cache fills in the
     background, so playback starts in well under a second; else the download, waited for."""
@@ -85,10 +93,23 @@ class YouTubeCatalogue:
         self.ytm = ytm
         self.completed: set[str] = set()  # albums complete_album fetched in full
         self.album_tried: set[str] = set()  # albums complete_next_album asked YouTube Music for, read or not
+        self.warmed: dict[str, float] = {}  # when each video was last readied (warm), worked or not
 
     def fetch_soon(self, video_id: str):
         if self.ytm:
             fetch_soon(self.ytm, video_id)
+
+    def warm(self, db, track_ids: list[str]):
+        """Readies the stream of the first of these songs that plays from YouTube, in the background: a client is about to
+        play it. One only, as YouTube refuses players that ask too often; a client fetches the next song during this one."""
+        if not self.ytm or not track_ids:
+            return
+        refs = dict(db.execute(f"select id, ref from track where source = 'ytm' and id in ({','.join('?' * len(track_ids))})", track_ids).fetchall())
+        video_id = next((refs[id] for id in track_ids if id in refs), None)
+        if not video_id or self.warmed.get(video_id, 0) > time.time() - WARMED or self.ytm.cached(video_id):
+            return  # a client asking for a radio again and again asks YouTube once an hour, even for a song it refuses
+        self.warmed = {v: at for v, at in self.warmed.items() if at > time.time() - WARMED} | {video_id: time.time()}
+        threading.Thread(target=warm, args=(self.ytm, video_id), daemon=True).start()
 
     def search(self, db, query: str, limit: int) -> list[str]:
         """The ids of YouTube Music's songs for a query, kept as streaming tracks; none when it fails."""

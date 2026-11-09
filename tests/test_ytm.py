@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 
 import pytest
@@ -205,3 +206,23 @@ def test_songs_with_a_youtube_music_copy_carry_a_share_url_for_every_client(clie
         album = call(client, "getAlbum", id=matched["albumId"], **params)["album"]["song"]
         assert next(s for s in album if s["id"] == matched["id"])["shareUrl"] == matched["shareUrl"]
         assert "shareUrl" not in call(client, "getSong", id=local["Song B"]["id"], **params)["song"]
+
+
+def test_warm_readies_only_the_first_song_that_streams_from_youtube():
+    import sqlite3
+    from oasis.youtube import YouTubeCatalogue
+    db = sqlite3.connect(":memory:")
+    db.execute("create table track(id text, source text, ref text)")
+    db.executemany("insert into track values (?, ?, ?)", [("tr-1", "local", "/a.flac"), ("yt-2", "ytm", "v2"), ("yt-3", "ytm", "v3")])
+    warmed = threading.Event()
+    asked = []
+
+    class Ytm:
+        def cached(self, video_id):
+            return None
+
+        def warm(self, video_id):
+            asked.append(video_id)
+            warmed.set()
+    YouTubeCatalogue(Ytm()).warm(db, ["tr-1", "yt-3", "yt-2"])
+    assert warmed.wait(5) and asked == ["v3"]
