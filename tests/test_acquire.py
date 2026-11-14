@@ -9,7 +9,7 @@ import urllib.parse
 import pytest
 
 from conftest import FakeTorBox, call, make_client, sign_in, tb
-from oasis import accounts, acquire, cover, musicbrainz, prowlarr
+from oasis import accounts, acquire, api, cover, musicbrainz, prowlarr
 from oasis.acquire import Acquire, artist_names
 from oasis.config import Acquisition, Prowlarr as ProwlarrSettings, TorBox as TorBoxSettings
 from oasis.db import connect
@@ -674,6 +674,23 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     assert album_of(client, "First")["starred"] and call(client, "search3", query="Kenshi Yonezu", oasis="1")["searchResult3"]["artist"] == []
     call(client, "unstar", albumId="al-mb-" + STRAY)
     assert db.execute("select count(*) from wanted where kind = 'album'").fetchone()[0] == 0
+
+
+def test_search3_answers_without_musicbrainz_when_it_is_slow(client, mb, monkeypatch):
+    kenshi(mb)
+    answered = threading.Event()
+
+    def slow(url, db=None, keep=0):
+        answered.wait(10)
+        return mb(url, db, keep)
+    monkeypatch.setattr(musicbrainz, "get", slow)
+    monkeypatch.setattr(api, "FIND_WAIT", 0.05)
+    found = call(client, "search3", query="Beta", oasis="1")["searchResult3"]
+    assert [a["name"] for a in found["artist"]] == ["Beta"] and [s["title"] for s in found["song"]] == ["One", "Two"]  # the library's, at once
+    answered.set()
+    monkeypatch.setattr(api, "FIND_WAIT", 10)
+    found = call(client, "search3", query="Beta", oasis="1")["searchResult3"]
+    assert [a["id"] for a in found["artist"]][1:] == ["ar-mb-" + KENSHI] and [a["id"] for a in found["album"]][1:] == ["al-mb-" + STRAY]
 
 
 def test_an_album_searched_before_waits_behind_every_album_not_tried_yet(client, mb, monkeypatch):

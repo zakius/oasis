@@ -48,7 +48,8 @@ Artists and albums that only MusicBrainz knows, so they can be starred and the s
 `duration: 0`, no `song` entries, and a `coverArt` from the Cover Art Archive.
 
 - `search3` and `search2` add them after the library's and YouTube Music's results, for queries of 3 characters or
-  more, when the server acquires music.
+  more, when the server acquires music. A search waits 3 seconds for MusicBrainz; when it takes longer the answer
+  leaves them out, and a later search for the same text has them.
 - `getStarred` and `getStarred2` list the starred ones.
 - `getArtist` and `getAlbum` answer for these ids with or without `oasis=1`, as a client only has them from the two
   above. `getArtist` on an `ar-mb-` id lists the artist's MusicBrainz albums.

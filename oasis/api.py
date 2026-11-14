@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as wait_for
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -66,6 +66,8 @@ ARTIST_ID_PARAMS = ("id", "artistId")
 MOVED_PARAMS = (*SONG_ID_PARAMS, "albumId", "artistId")
 FIND_FROM = 3  # characters a search needs before MusicBrainz is asked too
 YTM_SEARCH = 50  # YouTube Music songs a search asks for at most
+FIND_WAIT = 3  # seconds a search waits for MusicBrainz, from its start: free, it answers a search's two requests in about 2;
+               # busy (503) or behind other requests, in up to a minute
 SIMILAR_WAIT = 6  # seconds getSimilarSongs waits for its slowest source: YouTube Music answers in about 2, Last.fm in up to 6
 WARM = 3  # songs at the head of a radio or similar songs: the first from YouTube is readied before a client asks (youtube.warm)
 
@@ -720,6 +722,7 @@ class Api:
         # MusicBrainz, last in the answer, for what neither the library nor YouTube Music has: these can be starred like any
         # other. Only for the oasis extension: they have no songs until they arrive, which other clients don't expect.
         # Asked first, as it answers slowest (a second between requests), while the rest is looked up.
+        started = time.monotonic()
         finding = {kind: self.finder.submit(self._find, kind, text) for kind in ("artist", "album")
                    if self.oasis.acquire and p.oasis and len(text) >= FIND_FROM and p.int(kind + "Offset", 0) == 0 and p.int(kind + "Count", 20) > 0}
         latin.index(db)
@@ -762,6 +765,12 @@ class Api:
                 ids = [i for i in dict.fromkeys(s["albumId"] for s in found if s.get("albumId")) if i not in {a["id"] for a in albums}]
                 albums += [a for a in self._in_order(db, ALBUMS, "t.album_id", ids, album) if named(a["name"], a.get("artist"))][:room]
         if finding:
+            # A lookup still busy after FIND_WAIT is left out, so the library's and YouTube Music's results don't wait
+            # for it. It finishes in the background and is kept (mb_cache): the next search for this text has it.
+            done, late = wait_for(finding.values(), timeout=max(0.0, started + FIND_WAIT - time.monotonic()))
+            if late:
+                log.info("MusicBrainz took over %ss for %r, left out", FIND_WAIT, text)
+            finding = {kind: future for kind, future in finding.items() if future in done}
             names = {fold(x) for x in [*(a["name"] for a in artists), *(s.get("artist") for s in songs)] if x}
             titles = {fold(x) for x in [*(a["name"] for a in albums), *(s.get("album") for s in songs)] if x}
             if "artist" in finding and (room := p.int("artistCount", 20) - len(artists)) > 0:
