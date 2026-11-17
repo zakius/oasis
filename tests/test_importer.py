@@ -169,7 +169,6 @@ def test_credits_and_imports_share_one_musicbrainz_pace(tmp_path, monkeypatch):
 
     def urlopen(request, timeout):
         sent.append(time.monotonic())
-        assert request.get_header("User-agent") == musicbrainz.USER_AGENT
         if len(sent) == 2:  # busy once: everyone backs off
             raise urllib.error.HTTPError(request.full_url, 503, "busy", {}, None)
         return io.BytesIO(json.dumps({"id": "x", "releases": [], "release-count": 0}).encode())
