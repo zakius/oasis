@@ -4,7 +4,7 @@ import zlib
 
 
 from oasis import lyrics
-from oasis.lyrics import KUGOU_KEY, Lyrics, Query, choose, parse, same_title
+from oasis.lyrics import Lyrics, Query, choose, parse, same_title
 
 QUERY = Query("Song", "Artist", 200)
 TEXT = "the first line of it\nanother line here\nand the last one"
@@ -63,11 +63,15 @@ def test_netease_word_timing(monkeypatch):
     assert found.words == [[[1000, 1500, "Hel"], [1500, 2000, "lo (world)"]]]
 
 
+def encrypted_krc(text):
+    """A KRC file as KuGou serves it: compressed, XORed with KuGou's key, base64."""
+    key = b"@Gaw^2tGQ61-\xce\xd2ni"
+    packed = zlib.compress(text.encode())
+    return base64.b64encode(b"krc1" + bytes(b ^ key[i % 16] for i, b in enumerate(packed))).decode()
+
+
 def test_kugou_decrypts_krc(monkeypatch):
-    krc = "[1000,2000]<0,500,0>Hi<500,500,0> there".encode()
-    packed = zlib.compress(krc)
-    key = b"@Gaw^2tGQ61-\xce\xd2ni"  # KuGou's
-    encrypted = base64.b64encode(b"krc1" + bytes(b ^ key[i % 16] for i, b in enumerate(packed))).decode()
+    encrypted = encrypted_krc("[1000,2000]<0,500,0>Hi<500,500,0> there")
     respond(monkeypatch, {
         "https://mobileservice.kugou.com": json.dumps({"data": {"info": [{"songname": "Song", "duration": 200, "hash": "h"}]}}).encode(),
         "https://krcs.kugou.com/search": json.dumps({"candidates": [{"id": 1, "accesskey": "k"}]}).encode(),
@@ -155,9 +159,7 @@ def test_lines_sung_together_in_one_language_stay():
 def test_kugou_krc_translation_block_is_a_translation(monkeypatch):
     language = base64.b64encode(json.dumps({"content": [{"type": 0, "lyricContent": [["Hai"], ["za"]]},
                                                         {"type": 1, "lyricContent": [["你好"], ["那里"]]}]}).encode()).decode()
-    krc = f"[language:{language}]\n[1000,2000]<0,500,0>Hi\n[3000,1000]<0,500,0>there".encode()
-    packed = zlib.compress(krc)
-    encrypted = base64.b64encode(b"krc1" + bytes(b ^ KUGOU_KEY[i % 16] for i, b in enumerate(packed))).decode()
+    encrypted = encrypted_krc(f"[language:{language}]\n[1000,2000]<0,500,0>Hi\n[3000,1000]<0,500,0>there")
     respond(monkeypatch, {
         "https://mobileservice.kugou.com": json.dumps({"data": {"info": [{"songname": "Song", "duration": 200, "hash": "h"}]}}).encode(),
         "https://krcs.kugou.com/search": json.dumps({"candidates": [{"id": 1, "accesskey": "k"}]}).encode(),
