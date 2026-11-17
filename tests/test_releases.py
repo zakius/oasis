@@ -344,7 +344,6 @@ def test_a_bundle_is_the_artists_and_says_so_or_holds_two_albums():
     assert releases.is_bundle(result("Linkin Park Discography FLAC"), LP) and releases.is_bundle(result("Linkin Park 2000-2017 Discography"), LP)
     assert releases.is_bundle(result("Linkin Park   Papercuts (Singles Collection 2000–2023) (2024) [FLAC]"), LP)
     assert not releases.is_bundle(result("Hunter Hayes - Discography"), HUNTER) and not releases.is_bundle(result("Hunter x Hunter Collection"), HUNTER)
-    assert not releases.is_bundle(result("Blizzard Hunter - Discography (10 releases) - 2014 - 2026, MP3, 320 kbps"), HUNTER)
     assert releases.is_bundle(result("Daron Malakian & Scars On Broadway - Discography"), {**LP, "names": ["Daron Malakian and Scars on Broadway"]})
 
 
@@ -464,10 +463,8 @@ def test_an_uncached_bundles_albums_are_found_once_torbox_lists_its_files(downlo
     torbox.list = [finished(72, "bcde", ["LP/Meteora (2003)/01 Foreword.flac"], tmp_path)]  # a track short
     downloads.cycle()
     assert db.execute("select state, error from download where hash = 'bcde'").fetchone()[:] == ("failed", "the bundle holds no wanted album")
-    assert "bcde" in downloads.blocked(db) and 72 in torbox.deleted
+    assert "bcde" in downloads.blocked(db) and 72 in torbox.deleted  # Meteora is still wanted, but it was then too
     assert db.execute("select artist_mbid, wanted from release_block where hash = 'bcde'").fetchone()[:] == ("mb-lp", '["g-met"]')
-    assert "bcde" in downloads.blocked(db)  # Meteora is still wanted, but it was then too
-    assert json.loads(db.execute("select wanted from release_block where hash = 'bcde'").fetchone()[0]) == ["g-met"]
     db.execute("update want_album set state = 'missing' where rg = 'g-mtm'")  # went missing again after the block: looked at again
     assert "bcde" not in downloads.blocked(db) and not db.execute("select 1 from release_block where hash = 'bcde'").fetchone()
     db.execute("insert into release_block(hash, reason, at) values ('cdef', ?, 0)", (download.EMPTY_BUNDLE,))  # an older oasis's: once

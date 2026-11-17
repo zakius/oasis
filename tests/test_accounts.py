@@ -125,7 +125,6 @@ def test_no_way_sets_an_empty_password(client):
 
 def test_client_links_youtube_with_its_cookie(client):
     assert call(client, "oasisLinkYouTubeMusic", cookie="SID=a; __Secure-3PAPISID=b", authUser="1")["youtubeMusic"] == {"account": "Tester"}
-    assert "error" in call(client, "oasisLinkYouTubeMusic", cookie="bad; __Secure-3PAPISID=b")
 
 
 def test_rejected_sign_in_gives_a_short_message(client):

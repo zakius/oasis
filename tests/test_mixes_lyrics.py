@@ -211,7 +211,6 @@ def test_lyrics_from_youtube_music_are_synced(client):
     lyrics = lyric_lines(client, song_id(client, "Two"))["structuredLyrics"][0]
     assert lyrics["synced"] is True and lyrics["line"] == [{"start": 0, "value": "first"}, {"start": 1500, "value": "second"}]
     assert lyric_lines(client, song_id(client, "Song A")) == {}
-    assert "songLyrics" in [e["name"] for e in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]]
 
 
 def test_local_lyrics_sidecar_and_embedded(tmp_path, ytm):

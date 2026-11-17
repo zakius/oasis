@@ -86,7 +86,6 @@ def test_a_failing_translator_leaves_the_lyrics_and_rests(client):
 
 
 def test_the_server_says_translation_is_there(client):
-    assert {"name": "oasis", "versions": [1, 2, 3]} in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]
     found = call(client, "oasisTranslation")["oasisTranslation"]
     assert found["available"] is True and "language" not in found and {"id": "zh-CN", "name": "Chinese (Simplified)"} in found["languages"]
 

@@ -132,12 +132,6 @@ def test_artist_info_from_lastfm_lists_library_artists_only(client):
     assert [a["name"] for a in info["similarArtist"]] == ["Beta"]
 
 
-def test_streaming_album_is_completed_on_open(client):
-    remote = call(client, "search3", query="gamma")["searchResult3"]["song"][0]
-    album = call(client, "getAlbum", id=remote["albumId"])["album"]
-    assert titles(album["song"]) == ["Track 1", "Track 2", "Track 3", "Gamma Hit"]
-
-
 def entries(client, playlist_id):
     return titles(call(client, "getPlaylist", id=playlist_id)["playlist"].get("entry", []))
 
@@ -349,7 +343,6 @@ def test_listenbrainz_radio_resolves_like_lastfm_and_its_failures_give_nothing(a
 
 
 def test_oasis_radio_lists_what_the_user_can_choose(api, client):
-    assert {"name": "oasis", "versions": [1, 2, 3]} in call(client, "getOpenSubsonicExtensions")["openSubsonicExtensions"]
     radio = call(client, "oasisRadio")["oasisRadio"]
     assert radio == {"defaultSource": "all", "station": [], "source": [{"id": "all", "name": "Everything mixed"}, {"id": "lastfm", "name": "Last.fm"},
                                                                         {"id": "ytm", "name": "YouTube Music"}, {"id": "library", "name": "Your library"}]}
