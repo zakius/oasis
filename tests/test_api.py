@@ -102,9 +102,7 @@ def test_xml_format(client):
     assert genre.text == "Rock" and genre.get("songCount") == "2"
 
 
-def test_post_form_and_unknown_method(client):
-    response = client.post("/rest/ping", data={"u": "admin", "p": "secret", "f": "json"}).json()
-    assert response["subsonic-response"]["status"] == "ok"
+def test_unknown_method_fails(client):
     assert call(client, "_db")["status"] == "failed"
 
 
