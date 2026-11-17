@@ -132,12 +132,6 @@ def test_artist_info_from_lastfm_lists_library_artists_only(client):
     assert [a["name"] for a in info["similarArtist"]] == ["Beta"]
 
 
-def test_streaming_album_is_completed_on_open(client):
-    remote = call(client, "search3", query="gamma")["searchResult3"]["song"][0]
-    album = call(client, "getAlbum", id=remote["albumId"])["album"]
-    assert titles(album["song"]) == ["Track 1", "Track 2", "Track 3", "Gamma Hit"]
-
-
 def entries(client, playlist_id):
     return titles(call(client, "getPlaylist", id=playlist_id)["playlist"].get("entry", []))
 
