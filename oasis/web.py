@@ -16,7 +16,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from . import accounts, acquire, audiorecords, cover, download, formats, missing, mixes, musicbrainz, prowlarr, sources, tracks, wants, ytm
+from . import accounts, acquire, audiorecords, cover, download, formats, missing, mixes, musicbrainz, prowlarr, remove, sources, tracks, wants, ytm
 from .musicbrainz import MBID
 from .tracks import IDS, MB_IDS
 from .artists import linked, load_settings, save_settings
@@ -864,19 +864,39 @@ def routes(oasis) -> list[Route]:
         return (f'<a class="pill good" href="/music/library/artist/{mbid}">in the library</a> ' if tracks.library_id(db, MB_IDS["artist"] + mbid) else ""
                 ) + (pill("followed", "accent") if acquire.wanted_by(db, "artist", mbid) else "")
 
+    def remove_button(rg: str, title: str, here: str, label: str = "Remove") -> str:
+        return (f'<form class="inline" method="post" action="/music/remove/{escape(rg)}"'
+                f'{confirm(f"Remove {title}? Its files are deleted, and nobody wants it any more.")}>'
+                f'<input type="hidden" name="next" value="{escape(here)}"><button class="danger">{label}</button></form>')
+
+    def remove_album(db, request, user, form):
+        """Admins: deletes the album's files (Oasis.remove_album), or keeps it, dropping a user's request (keep)."""
+        rg, here = request.path_params["rg"], form.get("next", "")
+        here = here if here.startswith("/music") else "/music/wanted"
+        if form.get("keep"):
+            remove.keep(db, rg)
+            return back(here, message="Kept. Its files stay.")
+        if not remove.files(db, rg):
+            return back(here, error="That album isn't in the library.")
+        deleted = oasis.remove_album(db, rg)
+        return back(here, message=f"Removed: {deleted} file{'s' if deleted != 1 else ''} deleted. Nobody wants it any more.")
+
     def album_line(db, user, g: dict, here: str, by: bool = True) -> str:
         """An album found on MusicBrainz, with what oasis does about it: Unwant while it is searched for (starred by
-        anyone, or its artist followed), Want while it is neither searched for nor here."""
+        anyone, or its artist followed) or while the user or a follow keeps it here, Want while it is neither searched
+        for nor here, and Remove for admins once it is here."""
         row = acquire.album(db, g["id"])
         here_already = tracks.library_id(db, MB_IDS["album"] + g["id"]) or row and row["state"] == "have"
         state = pill("in the library", "good") if here_already else \
             {"missing": pill("wanted", "accent"), "downloading": pill("downloading", "busy")}[row["state"]] if row else ""
-        if row and not here_already:
-            button = (f'<form class="inline" method="post" action="/music/wanted/{g["id"]}/give-up"'
-                      f'{confirm(f"Unwant {g['title']}? Its search stops; files already here stay.")}>'
-                      f'<input type="hidden" name="next" value="{escape(here)}"><button class="danger">Unwant</button></form>')
+        unwant = (f'<form class="inline" method="post" action="/music/wanted/{g["id"]}/give-up"'
+                  f'{confirm(f"Unwant {g['title']}? Its search stops; files already here stay.")}>'
+                  f'<input type="hidden" name="next" value="{escape(here)}"><button class="danger">Unwant</button></form>')
+        if here_already:
+            kept = acquire.wanted_by(db, "album", g["id"], user["name"]) or row and row["reason"] == "followed"
+            button = (unwant if kept else "") + (remove_button(g["id"], g["title"], here) if user["admin"] else "")
         else:
-            button = "" if here_already else want_button("album", g["id"], not acquire.wanted_by(db, "album", g["id"], user["name"]), here)
+            button = unwant if row else want_button("album", g["id"], not acquire.wanted_by(db, "album", g["id"], user["name"]), here)
         credit = g.get("artist-credit") or []
         artist = f' — <a href="/music/artist/{credit[0]["artist"]["id"]}">{escape(musicbrainz.credited(credit))}</a>' if by and credit else ""
         info = details(g.get("primary-type"), *(g.get("secondary-types") or []), (g.get("first-release-date") or "")[:4], g.get("disambiguation"))
@@ -985,6 +1005,16 @@ def routes(oasis) -> list[Route]:
                 + f'</select><input type="text" name="q" value="{escape(text)}" placeholder="Title or artist" aria-label="Title or artist"><button>Filter</button>'
                 + ('<a class="button" href="/music/wanted">Clear</a>' if here != "/music/wanted" else "") + '</form>'
                 + '<p class="muted">Unwanting stops the search, also for a followed artist\'s album; files already here stay, and Want brings it back.</p>')
+        if user["admin"] and (asked := remove.asked(db)):
+            lines = "".join(
+                f'<tr><td class="lead"><b><a href="/music/library/album/{quote(album_page(db, r["rg"]))}">{escape(r["title"] or "")}</a></b>'
+                f'<div class="muted">{escape(r["artist"] or "")}</div></td><td class="meta">unwanted by {escape(r["user"])}, {ago(r["asked"])}</td>'
+                f'<td class="actions">{remove_button(r["rg"], r["title"] or "it", here)}<form method="post" action="/music/remove/{escape(r["rg"])}">'
+                f'<input type="hidden" name="keep" value="1"><input type="hidden" name="next" value="{escape(here)}"><button>Keep</button></form></td></tr>'
+                for r in asked)
+            body += (f'<details class="group" id="group-removal" open><summary><span class="dot bad"></span>Asked to remove'
+                     f'<span class="count">{len(asked)}</span></summary><p class="muted">Nobody wants these any more. Remove deletes '
+                     f'their files; Keep leaves them in the library.</p><table class="grid"><tbody>{lines}</tbody></table></details>')
         titles = [("attention", "Failed, trying again"), ("downloading", "Downloading"), ("next", "Searched next"),
                   ("notfound", "Not found yet"), ("waiting", "Waiting for a first search")]
         for key, title in titles:
@@ -1297,9 +1327,9 @@ def routes(oasis) -> list[Route]:
         rg, action = request.path_params["rg"], request.path_params["action"]
         here = form.get("next", "") if form.get("next", "").startswith("/music") else "/music/wanted"
         row = acquire.album(db, rg)
-        if row is None or action not in ("search", "block", "give-up"):
+        if action not in ("search", "block", "give-up") or row is None and not (action == "give-up" and acquire.wanted_by(db, "album", rg, user["name"])):
             return back(here, error="That album isn't wanted any more.")
-        name = f'{row["artist"]} – {row["title"]}'
+        name = f'{row["artist"]} – {row["title"]}' if row else "it"
         if action == "block" and not (oasis.downloads and oasis.downloads.block(db, rg)):
             return back(here, error=f"Nothing is downloading for {name} that can still be stopped.")
         if action in ("search", "block"):
@@ -1307,6 +1337,11 @@ def routes(oasis) -> list[Route]:
             return back(here, message=f"{name} is searched next, in a minute or two." if action == "search" else
                         f"Blocked that release of {name}; the next search picks another.", anchor=f"rg-{rg}")
         oasis.give_up(db, user["name"], rg)
+        if remove.files(db, rg) and not acquire.wanted_by(db, "album", rg):
+            if user["admin"]:
+                return back(here, message=f"Unwanted {name}. Nobody wants it now; its files stay until you remove it.")
+            remove.ask(db, user["name"], rg)
+            return back(here, message=f"Unwanted {name}. Nobody else wants it, so an admin is asked whether to delete its files.")
         return back(here, message=f"Unwanted {name}: no longer searched for. Files already here stay; Want brings it back.")
 
     def wanted_log(db, user, rg: str, here: str) -> str:
@@ -1624,6 +1659,7 @@ def routes(oasis) -> list[Route]:
         Route("/music", catalogue(find_music)),
         Route("/music/artist/{mbid}", catalogue(music_artist)),
         Route("/music/want", catalogue(set_want), methods=["POST"]),
+        Route("/music/remove/{rg}", signed_in(remove_album, admin=True), methods=["POST"]),
         Route("/music/unwant", catalogue(unwant), methods=["POST"]),
         Route("/music/wanted", catalogue(wanted)),
         Route("/music/indexers", catalogue(indexers)),
