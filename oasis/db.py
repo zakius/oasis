@@ -104,8 +104,17 @@ create table if not exists user(
 );
 create table if not exists user_service(  -- the services each user turned on (sources.SERVICES)
     user text not null, service text not null,
-    account text,                   -- Qobuz's and Tidal's sign-in (JSON); YouTube Music's, Last.fm's and ListenBrainz's are user's columns
+    account text,                   -- the user's sign-in to Qobuz, Tidal, SoundCloud, Bandcamp (JSON); YouTube Music's, Last.fm's and ListenBrainz's are user's columns
     primary key(user, service)
+);
+create table if not exists bandcamp_item(  -- what oasis did with each user's Bandcamp purchases and wishlist (bandcamp.py)
+    user text not null, kind text not null,  -- purchase or wish
+    id text not null,               -- a purchase's sale ('p123'), a wish's album or track ('a123', 't123')
+    artist text, title text,
+    rg text,                        -- its MusicBrainz release group, once found
+    state text not null,            -- imported, here (the library had it lossless), wanted, unknown (to MusicBrainz), failed
+    error text, tried real not null,
+    primary key(user, kind, id)
 );
 create table if not exists app_password(  -- what apps sign in with (accounts.py): each user's own password signs in to the dashboard only
     id integer primary key, user text not null, name text not null,

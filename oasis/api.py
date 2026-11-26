@@ -1107,10 +1107,10 @@ class Api:
             count, duration = db.execute("select count(*), coalesce(sum(t.duration), 0) from playlist_entry e join track t on t.id = e.track_id "
                                          "where e.playlist_id = ? and (? or t.source != 'missing')", (r["id"], unplayable)).fetchone()
         result = clean({
-            "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": mixes.OWNER if r["mix"] else r["owner"], "public": False,
+            "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": mixes.owner(r["mix"]) if r["mix"] else r["owner"], "public": False,
             "coverArt": IDS["playlist"] + str(r["id"]) if r["cover"] else None,
             "readonly": True if r["mix"] or r["radio"] else None,  # OpenSubsonic: clients offer no edits; oasis keeps mixes and radios
-            "oasisMix": True if ytm.is_mix(r["mix"]) else None, "youtubeId": r["mix"],
+            "oasisMix": True if ytm.is_mix(r["mix"]) else None, "youtubeId": None if (r["mix"] or "").startswith(mixes.SOUNDCLOUD) else r["mix"],
             "oasisSource": (r["radio_source"] or accounts.get(db, r["owner"])["radio_source"]) if r["radio"] else None,
             "oasisStation": r["station"], "oasisPeriod": r["period"],
             "songCount": count, "duration": duration,
@@ -1125,7 +1125,7 @@ class Api:
     def _own_playlist(self, db, id, user):
         r = self._one(db, "select * from playlist where id = ? and owner = ? and hidden = 0", id, user)
         if r["mix"]:
-            raise Fail(DENIED, "YouTube Music's playlists are read-only")
+            raise Fail(DENIED, f"{mixes.owner(r['mix'])}'s playlists are read-only")
         return r
 
     def getPlaylist(self, db, p, user):
@@ -1266,16 +1266,17 @@ class Api:
         source = r["ref"]
         if r["source"] in sources.KINDS:  # another streaming service's song: its audio is cached when first played
             try:
-                source = self.oasis.sources.audio(db, user, r["source"], r["ref"])
+                source = self.oasis.sources.audio(db, user, r["source"], r["ref"], one_url=bool(target))
             except sources.Off as e:
                 raise Fail(NOT_FOUND, str(e))
             except Exception as e:
                 log.warning("%s audio of %s failed: %s", r["source"], r["ref"], e)
                 raise Fail(NOT_FOUND, "Stream unavailable")
-            target = transcode.target(p.get("format"), p.int("maxBitRate", 0), source.suffix[1:], r["bitrate"])  # the format that came
-            if target:
-                return transcode.stream(str(source), *target, p.int("timeOffset", 0))
-            return FileResponse(source, media_type=sources.content_type(source))
+            if isinstance(source, Path):
+                target = transcode.target(p.get("format"), p.int("maxBitRate", 0), source.suffix[1:], r["bitrate"])  # the format that came
+                if target:
+                    return transcode.stream(str(source), *target, p.int("timeOffset", 0))
+                return FileResponse(source, media_type=sources.content_type(source))
         if r["source"] == "ytm":
             if not self.oasis.ytm:
                 raise Fail(NOT_FOUND, "YouTube Music is not enabled")
@@ -1289,7 +1290,7 @@ class Api:
         if isinstance(source, ytm.Stream):
             if target:
                 return transcode.stream(source.url, *target, p.int("timeOffset", 0), source.headers)
-            return self._proxy(r["ref"], source, p.range)
+            return self._proxy(r["ref"], source, p.range, self.oasis.sources.forget if r["source"] in sources.KINDS else self.oasis.ytm.forget)
         if target:
             return transcode.stream(str(source), *target, p.int("timeOffset", 0))
         return FileResponse(source, media_type=r["content_type"])
@@ -1329,7 +1330,9 @@ class Api:
                 s.pop("preview", None)
         return payload
 
-    def _proxy(self, video_id, stream, range_header):
+    def _proxy(self, ref, stream, range_header, forget):
+        """The stream's audio, or the range of it asked for, as it comes from the service. forget(ref) drops its URL
+        when it breaks: it may have expired."""
         start, end = 0, stream.size - 1
         if m := re.fullmatch(r"bytes=(\d*)-(\d*)", range_header or ""):
             if m[1]:
@@ -1343,8 +1346,8 @@ class Api:
             try:
                 yield from ytm.read_range(stream, start, end)
             except Exception as e:
-                log.warning("stream of %s broke: %s", video_id, e)
-                self.oasis.ytm.forget(video_id)
+                log.warning("stream of %s broke: %s", ref, e)
+                forget(ref)
 
         headers = {"Accept-Ranges": "bytes", "Content-Length": str(end - start + 1)}
         if range_header:

@@ -30,6 +30,7 @@ CATALOGUE = MB + "release-group?artist={}&type=album|ep|single&inc=artist-credit
 PSEUDO = MB + "release?artist={}&status=pseudo-release&inc=release-groups&limit=100&offset={}&fmt=json"
 SEARCH = MB + "{}?query={}&limit=25&fmt=json"
 DISC = MB + "discid/{}?inc=artist-credits+recordings+labels&cdstubs=no&fmt=json"
+PAGE_URL = MB + "url?resource={}&inc=release-rels&fmt=json"
 
 KEEP_ARTIST = 30 * 86400    # seconds each answer stays in mb_cache, for lookups given a db
 KEEP_RELEASE = 7 * 86400
@@ -169,6 +170,15 @@ def find(kind: str, text: str, db=None) -> list[dict]:
         return []
     path = "artist" if kind == "artist" else "release-group"
     return search(path, " ".join(words), db)
+
+
+def releases_at(page: str, db=None) -> list[str]:
+    """The ids of the releases MusicBrainz links to a web page (a Bandcamp album's, say); none when it knows no such page."""
+    try:
+        found = get(PAGE_URL.format(urllib.parse.quote(page, safe="")), db, KEEP_SEARCH)
+    except LookupError:
+        return []
+    return list(dict.fromkeys(r["release"]["id"] for r in found.get("relations") or [] if r.get("release")))
 
 
 def search_artist(name: str) -> list[str]:

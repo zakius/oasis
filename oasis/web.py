@@ -219,18 +219,21 @@ a.card:hover b { text-decoration: underline; } .card .muted { font-size: .8rem; 
 confirm = lambda question: f' onsubmit="return confirm({escape(json.dumps(question, ensure_ascii=False))})"'  # for buttons that drop things
 # A cover that fails (none in the Cover Art Archive) shows the empty frame, not a broken image: a blank image in its place.
 HIDE_BROKEN = 'onerror="this.onerror=null;this.src=\'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==\'"'
-STREAMING = ("Songs that Last.fm and ListenBrainz suggest, and that neither the library nor YouTube Music has, are looked for on "
-             "your other services here, in this order; a song none has can still show in apps as one nothing plays. Their audio is "
-             "kept in <code>streams</code> beside the database once played, and then plays for everyone. These services are used "
-             "through their apps' own interfaces, not public ones, and may stop working or close an account that streams this way.")
+STREAMING = ("Songs that Last.fm and ListenBrainz suggest, and that the library doesn't have, are looked for on all your services "
+             "here at once, and the best answer plays: a lossless song, else the highest bitrate, else a preview. A song none has can "
+             "still show in apps as one nothing plays. Their audio is kept in <code>streams</code> beside the database once played, "
+             "and then plays for everyone. These services are used through their apps' own interfaces, not public ones, and may stop "
+             "working or close an account that streams this way.")
 # The services page: each group's title and what it says, and its services as (name, title, what it gives).
 SERVICES = [
     ("Streaming", STREAMING, [
         ("ytm", "YouTube Music", "Search results, radios and full songs, without an account. Yours adds your mixes and history."),
-        ("qobuz", "Qobuz", "FLAC, with a subscription that streams."),
-        ("tidal", "Tidal", "FLAC, with a subscription that streams lossless."),
-        ("bandcamp", "Bandcamp", "Full songs as 128 kbit/s MP3, where the artist allows it. Only the artist's own page counts."),
-        ("soundcloud", "SoundCloud", "Full songs as AAC from the artist's own account; songs only SoundCloud Go+ plays in full are left out.")]),
+        ("qobuz", "Qobuz", "FLAC, with a subscription that streams; 30-second samples with any account."),
+        ("tidal", "Tidal", "FLAC, with a subscription that streams lossless; 30-second previews."),
+        ("bandcamp", "Bandcamp", "Full songs as 128 kbit/s MP3, where the artist allows it. Only the artist's own page counts. "
+                                 "Signed in, your purchases come into the library and your wishlist is wanted."),
+        ("soundcloud", "SoundCloud", "Full songs as AAC from the artist's own account. Songs only SoundCloud Go+ plays in full give "
+                                     "30-second previews, or play in full with your Go+ sign-in, which also brings your likes and playlists.")]),
     ("Plays and recommendations", "", [
         ("lastfm", "Last.fm", "Similar songs and radios from Last.fm. Signed in, your plays are scrobbled there."),
         ("listenbrainz", "ListenBrainz", "Your plays go to ListenBrainz, and radios can take songs from its LB Radio.")]),
@@ -240,7 +243,11 @@ SERVICES = [
         ("apple", "Apple Music", "AAC clips from the iTunes Search API.")]),
 ]
 SERVICE_TITLES = {key: title for _, _, members in SERVICES for key, title, _ in members}
-CAPABILITY_TITLES = {"songs": "Full songs", "previews": "Previews", "account": "Account features"}  # sources.CAPABILITIES
+CAPABILITY_TITLES = {"songs": "Full songs", "signed-in": "Signed-in songs", "previews": "Previews", "account": "Account features"}  # sources.CAPABILITIES
+# What a sign-in to SoundCloud or Bandcamp adds, by capability.
+SIGNED_IN = {("soundcloud", "signed-in"): "Songs only SoundCloud Go+ plays in full play in full, as 256 kbit/s AAC, while your account has Go+.",
+             ("soundcloud", "account"): "Your likes and playlists show up as playlists, with the songs SoundCloud plays you in full.",
+             ("bandcamp", "account"): "Your purchases come into the library as FLAC, and the albums on your wishlist are wanted for you."}
 SOURCE_NAMES = {"local": "library", "ytm": "YouTube Music", "missing": "nothing", **{k: v.title for k, v in sources.KINDS.items()}}
 TABS = [("home", "/", "Dashboard", "M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"),
         ("library", "/music/library", "Library", "M5 4v16M9.5 4v16M14 4.5l5.5 15"),
@@ -919,11 +926,13 @@ def routes(oasis) -> list[Route]:
                 return html
             return html + '<h3>Your account</h3><p class="muted">Link it for your mixes and playlists, and to send your plays to its history.</p>' + YOUTUBE_STEPS
         if key in ("qobuz", "tidal"):
+            missing = "".join(withheld(c) for c in sources.CAPABILITIES[key] if c not in allowed)
             if account:
-                return linked_as(account.get("name") or "") + ("" if "songs" in allowed else withheld("songs"))
-            if "songs" not in allowed:
-                return withheld("songs")
-            not_yet = '<p class="muted">Not used till it is linked.</p>'
+                samples = '<p class="muted">Without a subscription that streams, it gives samples only.</p>' if account.get("previews_only") else ""
+                return linked_as(account.get("name") or "") + samples + missing
+            if not allowed:
+                return missing
+            not_yet = missing + '<p class="muted">Not used till it is linked.</p>'
             if key == "qobuz":
                 return (not_yet + '<form method="post" action="/services/qobuz/link"><label>Email<input type="text" name="email" autocomplete="off"></label>'
                         '<label>Password<input type="password" name="password" autocomplete="off"></label><button class="primary">Link</button></form>'
@@ -943,6 +952,13 @@ def routes(oasis) -> list[Route]:
                         '<button class="danger">Unlink</button></form>')
             return ('<p class="muted">Sign in to scrobble your plays, and for stations of your top and loved tracks.</p>'
                     '<a class="button primary" href="/services/lastfm/link">Sign in with Last.fm</a>')
+        if key in ("soundcloud", "bandcamp"):
+            html = "".join(withheld(c) for c in sources.CAPABILITIES[key] if c not in allowed)
+            adds = "".join(f'<p class="muted">{text}</p>' for (service, c), text in SIGNED_IN.items() if service == key and c in allowed)
+            if account:
+                return (html + linked_as(account.get("name") or "") + adds + f'<form method="post" action="/services/{key}/unlink"'
+                        f'{confirm(f"Unlink {SERVICE_TITLES[key]}?")}><button class="danger">Unlink</button></form>')
+            return html + (f'<h3>Your account</h3>{adds}' + ACCOUNT_STEPS[key] if adds else "")
         if key == "listenbrainz":
             if user["listenbrainz_token"]:
                 return '<p class="ok">Linked.</p>'
@@ -1006,6 +1022,7 @@ def routes(oasis) -> list[Route]:
                 return back("/services", error=f"{title} isn't offered on this server.")
             oasis.sources.turn_on(db, name, key)
             later = " Link your account below: it isn't used till then." if key in ("qobuz", "tidal", "listenbrainz") else ""
+            later = " Sign in below for what your account adds." if key in ("soundcloud", "bandcamp") else later
             return back("/services", message=f"{title} is on.{later}", anchor=f"service-{key}")
         if key == "ytm":
             oasis.unlink_youtube(db, name)
@@ -1015,6 +1032,8 @@ def routes(oasis) -> list[Route]:
             accounts.set_field(db, name, listenbrainz_token=None)
         elif key == "tidal":
             tidal_logins.pop(name, None)
+        elif key == "soundcloud":
+            oasis.soundcloud.drop(db, name)
         oasis.sources.turn_off(db, name, key)
         return back("/services", message=f"{title} is off.", anchor=f"service-{key}")
 
@@ -1029,10 +1048,11 @@ def routes(oasis) -> list[Route]:
         return back("/services", message=f"{what} {'offered' if state == 'on' else 'not offered'} on this server.", anchor=f"offer-{key}")
 
     def qobuz_link(db, request, user, form):
-        if not oasis.sources.allowed(db, "qobuz", "songs"):
+        samples = oasis.sources.allowed(db, "qobuz", "previews")
+        if not (oasis.sources.allowed(db, "qobuz", "songs") or samples):
             return back("/services", error="Qobuz isn't offered on this server.")
         try:
-            account = sources.Qobuz.link(form.get("email", "").strip(), form.get("password", ""))
+            account = sources.Qobuz.link(form.get("email", "").strip(), form.get("password", ""), samples)
         except ValueError as e:
             return back("/services", error=str(e), anchor="service-qobuz")
         except (OSError, LookupError, KeyError) as e:
@@ -1040,8 +1060,23 @@ def routes(oasis) -> list[Route]:
         oasis.sources.link(db, user["name"], "qobuz", account)
         return back("/services", message=f"Qobuz linked as {account['name']}.", anchor="service-qobuz")
 
+    def account_link(db, request, user, form):
+        """The user's SoundCloud or Bandcamp sign-in, pasted from their browser."""
+        key = request.url.path.split("/")[2]
+        link = {"soundcloud": oasis.link_soundcloud, "bandcamp": oasis.link_bandcamp}[key]
+        try:
+            name = link(db, user["name"], form.get("cookie", ""))
+        except (ValueError, LookupError, OSError) as e:
+            return back("/services", error=str(e), anchor=f"service-{key}")
+        return back("/services", message=f"{SERVICE_TITLES[key]} linked as {name}.", anchor=f"service-{key}")
+
+    def account_unlink(db, request, user, form):
+        key = request.url.path.split("/")[2]
+        oasis.unlink(db, user["name"], key)
+        return back("/services", message=f"{SERVICE_TITLES[key]} unlinked.", anchor=f"service-{key}")
+
     def tidal_link(db, request, user, form):
-        if not oasis.sources.allowed(db, "tidal", "songs"):
+        if not (oasis.sources.allowed(db, "tidal", "songs") or oasis.sources.allowed(db, "tidal", "previews")):
             return back("/services", error="Tidal isn't offered on this server.")
         name, attempt = user["name"], object()  # this click's sign-in: one started later replaces what the page shows
 
@@ -1874,6 +1909,8 @@ def routes(oasis) -> list[Route]:
         Route("/services/ytm/playlists", signed_in(youtube_playlists_save), methods=["POST"]),
         Route("/services/qobuz/link", signed_in(qobuz_link), methods=["POST"]),
         Route("/services/tidal/link", signed_in(tidal_link), methods=["POST"]),
+        *(Route(f"/services/{key}/{action}", signed_in(handler), methods=["POST"])
+          for key in ("soundcloud", "bandcamp") for action, handler in (("link", account_link), ("unlink", account_unlink))),
         Route("/services/lastfm/link", signed_in(lastfm_start)),
         Route("/services/lastfm/callback", signed_in(lastfm_callback), name="lastfm_callback"),
         Route("/services/lastfm/app", signed_in(lastfm_app, admin=True), methods=["POST"]),
@@ -1908,6 +1945,20 @@ def routes(oasis) -> list[Route]:
         Route("/admin/users/{name}/delete", signed_in(delete_user, admin=True), methods=["POST"]),
     ]
 
+
+# How to copy a SoundCloud or Bandcamp sign-in out of the browser: the cookie that holds it.
+ACCOUNT_STEPS = {key: f"""
+<p>oasis signs in with your browser's sign-in to {title}, a cookie:</p>
+<ol>
+<li>Go to <a href="https://{site}" target="_blank">{site}</a> and sign in.</li>
+<li>Press <b>F12</b> and open <b>Storage → Cookies</b> (Firefox) or <b>Application → Cookies</b> (Chrome), then <code>https://{site}</code>.</li>
+<li>Copy the value of the cookie <code>{cookie}</code>{hint}.</li>
+<li>Paste it below. Signing out of {title} in that browser ends the sign-in oasis uses.</li>
+</ol>
+<form method="post" action="/services/{key}/link"><label>{cookie}<input type="text" name="cookie" autocomplete="off"></label>
+<button class="primary">Link {title}</button></form>
+""" for key, title, site, cookie, hint in (("soundcloud", "SoundCloud", "soundcloud.com", "oauth_token", " (it starts with <code>2-</code>)"),
+                                          ("bandcamp", "Bandcamp", "bandcamp.com", "identity", ""))}
 
 YOUTUBE_STEPS = """
 <p>oasis signs in to YouTube Music with your browser's sign-in. This takes a minute, once:</p>
