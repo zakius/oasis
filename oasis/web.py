@@ -19,8 +19,10 @@ from starlette.routing import Route
 from . import accounts, acquire, audiorecords, cover, download, formats, missing, mixes, musicbrainz, prowlarr, remove, sources, tracks, wants, ytm
 from .musicbrainz import MBID
 from .tracks import IDS, MB_IDS
-from .artists import add_name, configure, linked, load_settings, needless, other_names, remove_name, save_settings
+from .artists import (ALIAS_TYPES, LINKS, add_name, add_related, configure, known_artists, linked, load_settings, names_of,
+                      needless, needless_link, other_names, related_pairs, remove_name, remove_related, save_settings)
 from .credits import credits_of
+from .text import fold
 from .db import as_user
 from .forward import ListenBrainz
 from .lastfm import signs_in
@@ -704,61 +706,145 @@ def routes(oasis) -> list[Route]:
 
     def artist_settings(db, request, user, form):
         q, settings = request.query_params, load_settings(db, oasis.config.artists)
-        lines = lambda key: escape("\n".join("; ".join(group) for group in settings.get(key, [])))
+        look = q.get("look", "").strip()
 
-        def why(r):
+        def why(check, *names):
             try:
-                reason = needless(db, r["artist"], r["name"])
+                reason = check(db, *names)
             except OSError:  # MusicBrainz is away
                 return ""
             return f'<div class="muted">{escape(reason)}</div>' if reason else ""
 
-        rows = "".join(
-            f'<tr><td class="lead"><b>{escape(r["artist"])}</b></td><td>{escape(r["name"])}{why(r)}</td><td class="actions">'
-            + ('<span class="muted">from oasis.toml</span>' if r["source"] == "config" else
-               f'<form method="post" action="/admin/artists/names/remove"><input type="hidden" name="name" value="{escape(r["name"])}">'
-               '<button class="danger">Remove</button></form>') + '</td></tr>' for r in other_names(db))
-        body = ('<section><h2>Same artist</h2><p class="muted">Other names of an artist that MusicBrainz doesn\'t know belong '
-                'together. Songs under any of them are the artist\'s, and downloads search and match by them too.</p>'
-                + (f'<table class="grid"><thead><tr><th>Artist</th><th>Other name</th><th></th></tr></thead><tbody>{rows}</tbody></table>'
-                   if rows else '<p class="muted">None yet.</p>')
-                + '<form method="post" action="/admin/artists/names"><label>Artist<input type="text" name="artist" required></label>'
-                '<label>Other name<input type="text" name="name" required></label><button class="primary">Add</button></form></section>'
-                '<form method="post" action="/admin/artists">'
-                '<section><h2>Related artists</h2><p class="muted">One group per line, names separated by <code>;</code>. '
-                'Separate artists that belong together: they come first among each other\'s similar artists and mix into each '
-                f'other\'s radios. Clients only ever see them as related.</p><textarea name="related">{lines("related")}</textarea></section>'
-                '<section><h2>Keep separate</h2><p class="muted">One name per line. MusicBrainz lists it as another name of '
-                'some artist, but here it\'s someone else.</p>'
-                f'<textarea name="separate">{escape(chr(10).join(settings.get("separate", [])))}</textarea></section>'
-                '<button class="primary">Save</button></form>')
+        def hidden(fields):
+            return "".join(f'<input type="hidden" name="{k}" value="{escape(v)}">' for k, v in {**fields, "look": look}.items())
+
+        def remove(action, fields, source):
+            if source == "config":
+                return '<span class="muted">from oasis.toml</span>'
+            return f'<form method="post" action="{action}">{hidden(fields)}<button class="danger">Remove</button></form>'
+
+        def row(lead, text, note, action):
+            return f'<tr><td class="lead"><b>{escape(lead)}</b></td><td>{escape(text)}{note}</td><td class="actions">{action}</td></tr>'
+
+        def grid(head, rows):
+            return f'<table class="grid"><thead><tr>{head}<th></th></tr></thead><tbody>{rows}</tbody></table>' if rows else '<p class="muted">None yet.</p>'
+
+        def adder(action, fields, name, placeholder):
+            return (f'<form class="row" method="post" action="{action}">{hidden(fields)}<div class="grow"><input type="text" name="{name}" '
+                    f'placeholder="{placeholder}" aria-label="{placeholder}" required></div><button class="primary" title="Add">+</button></form>')
+
+        def panel(data):
+            """What MusicBrainz knows of the artist, locked, then the user's own rows, and + to add more."""
+            mine, locked = names_of(data), '<span class="muted">from MusicBrainz</span>'
+            names = row(data["name"], "", '<div class="muted">MusicBrainz name</div>', locked)
+            for a in data.get("aliases") or []:
+                used = a.get("type") in ALIAS_TYPES
+                note = " · ".join(filter(None, [a.get("type") or "Alias", a.get("locale"), "" if used else "oasis doesn't use it"]))
+                names += row(a["name"], "", f'<div class="muted">{escape(note)}</div>', locked)
+            for r in other_names(db):
+                if fold(r["artist"]) in mine or fold(r["name"]) in mine:
+                    names += row(r["name"], "", f'<div class="muted">Yours, another name of {escape(r["artist"])}</div>{why(needless, r["artist"], r["name"])}',
+                                 remove("/admin/artists/names/remove", {"name": r["name"]}, r["source"]))
+            related, seen = "", set()
+            for r in data.get("relations") or []:
+                if not r.get("artist") or (key := (r["artist"]["name"], r["type"])) in seen:
+                    continue
+                seen.add(key)
+                used = r["type"] in LINKS
+                note = " · ".join(filter(None, [r["type"], "ended" if r.get("ended") else "", "" if used else "oasis doesn't use it"]))
+                related += row(r["artist"]["name"], "", f'<div class="muted">{escape(note)}</div>', locked)
+            for r in related_pairs(db):
+                if fold(r["artist"]) in mine or fold(r["other"]) in mine:
+                    other = r["other"] if fold(r["artist"]) in mine else r["artist"]
+                    related += row(other, "", f'<div class="muted">Yours</div>{why(needless_link, r["artist"], r["other"])}',
+                                   remove("/admin/artists/related/remove", {"artist": r["artist"], "other": r["other"]}, r["source"]))
+            about = " · ".join(filter(None, [data.get("type"), data.get("disambiguation")]))
+            return (f'<section><h2>{escape(data["name"])}</h2><p class="muted">{escape(about)}{" · " if about else ""}'
+                    f'<a href="https://musicbrainz.org/artist/{escape(data["id"])}">MusicBrainz</a>. Rows from MusicBrainz are locked; '
+                    '<b>+</b> adds one of your own.</p>'
+                    f'<h3>Names</h3><table class="grid"><tbody>{names}</tbody></table>'
+                    + adder("/admin/artists/names", {"artist": data["name"]}, "name", "Another name")
+                    + f'<h3>Related</h3><table class="grid"><tbody>{related}</tbody></table>'
+                    + adder("/admin/artists/related", {"artist": data["name"]}, "other", "A related artist") + '</section>')
+
+        body = ('<section><h2>Look up an artist</h2><p class="muted">Shows the names and related artists MusicBrainz already '
+                f'has for an artist, beside your own.</p><form class="row" method="get" action="/admin/artists"><div class="grow">'
+                f'<input type="text" name="look" value="{escape(look)}" placeholder="Artist" aria-label="Artist"></div>'
+                '<button class="primary">Look up</button></form></section>')
+        if look:
+            try:
+                found = known_artists(db, [look], lookup=True)
+                body += "".join(panel(d) for d in found[:5]) or f'<p class="muted">MusicBrainz knows no artist called {escape(look)}.</p>'
+            except OSError:
+                body += '<p class="error">MusicBrainz isn\'t answering. Try again in a minute.</p>'
+        same = "".join(row(r["artist"], r["name"], why(needless, r["artist"], r["name"]),
+                           remove("/admin/artists/names/remove", {"name": r["name"]}, r["source"])) for r in other_names(db))
+        related = "".join(row(r["artist"], r["other"], why(needless_link, r["artist"], r["other"]),
+                              remove("/admin/artists/related/remove", {"artist": r["artist"], "other": r["other"]}, r["source"]))
+                          for r in related_pairs(db))
+        body += ('<section><h2>Same artist</h2><p class="muted">Other names of an artist that MusicBrainz doesn\'t know belong '
+                 'together. Songs under any of them are the artist\'s, and downloads search and match by them too.</p>'
+                 + grid("<th>Artist</th><th>Other name</th>", same)
+                 + '<form method="post" action="/admin/artists/names"><label>Artist<input type="text" name="artist" required></label>'
+                 '<label>Other name<input type="text" name="name" required></label><button class="primary">Add</button></form></section>'
+                 '<section><h2>Related artists</h2><p class="muted">Separate artists that belong together: they come first among '
+                 'each other\'s similar artists and mix into each other\'s radios. Clients only ever see them as related.</p>'
+                 + grid("<th>Artist</th><th>Related to</th>", related)
+                 + '<form method="post" action="/admin/artists/related"><label>Artist<input type="text" name="artist" required></label>'
+                 '<label>Related artist<input type="text" name="other" required></label><button class="primary">Add</button></form></section>'
+                 '<form method="post" action="/admin/artists">'
+                 '<section><h2>Keep separate</h2><p class="muted">One name per line. MusicBrainz lists it as another name of '
+                 'some artist, but here it\'s someone else.</p>'
+                 f'<textarea name="separate">{escape(chr(10).join(settings.get("separate", [])))}</textarea></section>'
+                 '<button class="primary">Save</button></form>')
         return page("Artist settings", body, q.get("message", ""), q.get("error", ""), tab="home")
 
+    def settings_page(form) -> str:
+        look = form.get("look", "").strip()
+        return f"/admin/artists?look={quote(look)}" if look else "/admin/artists"
+
     def save_artist_settings(db, request, user, form):
-        groups = lambda key: [names for line in form.get(key, "").splitlines() if len(names := [n.strip() for n in line.split(";") if n.strip()]) > 1]
-        settings = {"related": groups("related"), "separate": [n.strip() for n in form.get("separate", "").splitlines() if n.strip()]}
-        save_settings(db, settings)
-        return back("/admin/artists", message="Saved. Artist pages, similar artists and radios use it now.")
+        save_settings(db, {"separate": [n.strip() for n in form.get("separate", "").splitlines() if n.strip()]})
+        return back("/admin/artists", message="Saved. Artist pages use it now.")
 
     def add_artist_name(db, request, user, form):
         artist, name = form.get("artist", "").strip(), form.get("name", "").strip()
         if not artist or not name:
-            return back("/admin/artists", error="Give the artist and its other name.")
+            return back(settings_page(form), error="Give the artist and its other name.")
         try:
             reason = needless(db, artist, name, lookup=True)
         except OSError:  # MusicBrainz is away: the user knows best
             reason = None
         if reason:
-            return back("/admin/artists", message=f"Nothing to add. {reason}")
+            return back(settings_page(form), message=f"Nothing to add. {reason}")
         add_name(db, artist, name)
         configure(db, load_settings(db, oasis.config.artists))
-        return back("/admin/artists", message=f"{name} is {artist} now. Artist pages use it at once, and the artist's "
-                                              "missing albums are searched for again soon.")
+        return back(settings_page(form), message=f"{name} is {artist} now. Artist pages use it at once, and the artist's "
+                                                 "missing albums are searched for again soon.")
 
     def remove_artist_name(db, request, user, form):
         remove_name(db, form.get("name", ""))
         configure(db, load_settings(db, oasis.config.artists))
-        return back("/admin/artists", message=f"Removed {form.get('name', '')}.")
+        return back(settings_page(form), message=f"Removed {form.get('name', '')}.")
+
+    def add_related_artist(db, request, user, form):
+        artist, other = form.get("artist", "").strip(), form.get("other", "").strip()
+        if not artist or not other:
+            return back(settings_page(form), error="Give both artists.")
+        try:
+            reason = needless_link(db, artist, other, lookup=True)
+        except OSError:
+            reason = None
+        if reason:
+            return back(settings_page(form), message=f"Nothing to add. {reason}")
+        add_related(db, artist, other)
+        configure(db, load_settings(db, oasis.config.artists))
+        return back(settings_page(form), message=f"{artist} and {other} are related now: similar artists and radios use it at once.")
+
+    def remove_related_artist(db, request, user, form):
+        remove_related(db, form.get("artist", ""), form.get("other", ""))
+        configure(db, load_settings(db, oasis.config.artists))
+        return back(settings_page(form), message=f"{form.get('artist', '')} and {form.get('other', '')} aren't related any more.")
 
     def admin(db, request, user, form):
         q = request.query_params
@@ -1671,6 +1757,8 @@ def routes(oasis) -> list[Route]:
         Route("/admin/artists", signed_in(save_artist_settings, admin=True), methods=["POST"]),
         Route("/admin/artists/names", signed_in(add_artist_name, admin=True), methods=["POST"]),
         Route("/admin/artists/names/remove", signed_in(remove_artist_name, admin=True), methods=["POST"]),
+        Route("/admin/artists/related", signed_in(add_related_artist, admin=True), methods=["POST"]),
+        Route("/admin/artists/related/remove", signed_in(remove_related_artist, admin=True), methods=["POST"]),
         Route("/logout", signed_in(logout), methods=["POST"]),
         Route("/account/youtube", signed_in(link_youtube), methods=["POST"]),
         Route("/account/youtube/unlink", signed_in(unlink_youtube), methods=["POST"]),

@@ -106,23 +106,49 @@ def test_the_users_merges_and_splits_win(tmp_path):
         assert call(client, "getArtist", id=make_id("ar-", "Kenshi Yonezu"))["artist"]["id"] == make_id("ar-", "Kenshi Yonezu")
 
 
-def test_artist_settings_on_the_dashboard_apply_at_once_and_other_names_can_be_taken_back(tmp_path, monkeypatch):
+def test_artist_settings_on_the_dashboard_apply_at_once_and_can_be_taken_back(tmp_path, monkeypatch):
     monkeypatch.setattr(musicbrainz, "search_artist", lambda name: [])
-    with client_for(tmp_path, related=[["Mori Calliope", "DEMONDICE"]]) as client:
+    with client_for(tmp_path, related=[["Gawr Gura", "Senzawa"]]) as client:
         client.post("/login", data={"name": "admin", "password": "secret"})
         page = client.get("/admin/artists").text
-        assert "Mori Calliope; DEMONDICE" in page  # oasis.toml's groups until saved here
-        saved = client.post("/admin/artists", data={"related": "Gawr Gura; Senzawa\nlonely", "separate": ""}).text
-        assert "Saved" in saved and "Gawr Gura; Senzawa" in saved and "lonely" not in saved
+        assert "<b>Gawr Gura</b></td><td>Senzawa" in page and "from oasis.toml" in page
+        added = client.post("/admin/artists/related", data={"artist": "Mori Calliope", "other": "DEMONDICE"}).text
+        assert "Mori Calliope and DEMONDICE are related now" in added
+        similar = call(client, "getArtistInfo2", id=make_id("ar-", "DEMONDICE"), oasis="1")["artistInfo2"]["similarArtist"]
+        assert [(a["name"], a["oasisLink"]) for a in similar] == [("Mori Calliope", "related")]
+        client.post("/admin/artists/related/remove", data={"artist": "DEMONDICE", "other": "Mori Calliope"})  # either way round
         assert "similarArtist" not in call(client, "getArtistInfo2", id=make_id("ar-", "DEMONDICE"), oasis="1")["artistInfo2"]
+
         added = client.post("/admin/artists/names", data={"artist": "Beta", "name": "Beta Band"}).text
         assert "Beta Band is Beta now" in added and "<td>Beta Band" in added
         assert len(call(client, "getArtist", id=make_id("ar-", "Beta"))["artist"]["album"]) == 2
-
         client.post("/admin/artists/names/remove", data={"name": "Beta Band"})
         assert [a["name"] for a in call(client, "getArtist", id=make_id("ar-", "Beta"))["artist"]["album"]] == ["One"]
         assert [a["name"] for a in call(client, "getArtist", id=make_id("ar-", "Beta Band"))["artist"]["album"]] == ["Two"]
+        assert "Saved" in client.post("/admin/artists", data={"separate": "Kenshi Yonezu"}).text
         assert "<span>artists</span>" in client.get("/").text and "Downloading" in client.get("/").text
+
+
+def test_looking_an_artist_up_shows_what_musicbrainz_has_locked_beside_the_users_own_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(musicbrainz, "search_artist", lambda name: ["kenshi"] if name == "Kenshi Yonezu" else [])
+    with client_for(tmp_path) as client:
+        fill(client)
+        client.post("/login", data={"name": "admin", "password": "secret"})
+        page = client.get("/admin/artists", params={"look": "Kenshi Yonezu"}).text  # by an alias: MusicBrainz finds whose
+        assert "<h2>米津玄師</h2>" in page and "Person" in page
+        assert "<b>Kenshi Yonezu</b></td><td><div class=\"muted\">Artist name</div>" in page
+        assert "Search hint · oasis doesn&#x27;t use it" in page  # 켄시 요네즈
+        assert "<b>ハチ</b></td><td><div class=\"muted\">is person</div>" in page
+        assert page.count('<span class="muted">from MusicBrainz</span>') == 4 and "Remove" not in page  # its name, two aliases, ハチ: all locked
+
+        known = client.post("/admin/artists/related", data={"artist": "米津玄師", "other": "ハチ", "look": "Kenshi Yonezu"})
+        assert "MusicBrainz already links 米津玄師 and ハチ (is person)" in known.text
+        added = client.post("/admin/artists/names", data={"artist": "米津玄師", "name": "켄시 요네즈", "look": "Kenshi Yonezu"})
+        assert "look=Kenshi%20Yonezu" in str(added.url) and "<h2>米津玄師</h2>" in added.text
+        assert "<b>켄시 요네즈</b></td><td><div class=\"muted\">Yours, another name of 米津玄師</div>" in added.text
+        client.post("/admin/artists/related", data={"artist": "米津玄師", "other": "Mori Calliope"})
+        assert "<b>Mori Calliope</b></td><td><div class=\"muted\">Yours</div>" in client.get("/admin/artists", params={"look": "米津玄師"}).text
+        assert "MusicBrainz knows no artist called Nobody" in client.get("/admin/artists", params={"look": "Nobody"}).text
 
 
 def test_names_musicbrainz_or_spelling_already_join_are_not_added(tmp_path, monkeypatch):
@@ -145,7 +171,7 @@ def test_names_musicbrainz_or_spelling_already_join_are_not_added(tmp_path, monk
 
 def test_an_artists_other_names_come_with_any_of_its_names_and_search_its_albums_again(tmp_path):
     db = connect(tmp_path / "oasis.db")
-    artists.from_config(db, [["Stachursky", "Stachurski", "Jacek Stachursky"]])
+    artists.from_config(db, {"merge": [["Stachursky", "Stachurski", "Jacek Stachursky"]]})
     assert artists.declared(db, ["stachurski"]) == ["Stachursky", "Stachurski", "Jacek Stachursky"]
     assert artists.declared(db, ["Someone"]) == []
     assert releases.aliases(db, "Stachurski", None, []) == ["Stachurski", "Stachursky", "Jacek Stachursky"]
