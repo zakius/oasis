@@ -183,9 +183,30 @@ def test_credits_and_imports_share_one_musicbrainz_pace(tmp_path, monkeypatch):
     for w in workers:
         w.join()
     gaps = [b - a for a, b in zip(sent, sent[1:])]
-    assert len(sent) == 6 and min(gaps) >= 1.0 and max(gaps) >= 2
+    assert len(sent) == 6 and min(gaps) >= 1.0 and max(gaps) >= 1.9  # a request already on its way may go first
     musicbrainz.editions("g0", db)  # cached
     assert len(sent) == 6
+
+
+def test_a_slow_musicbrainz_answer_holds_up_no_other_request(monkeypatch):
+    started = []
+
+    def urlopen(request, timeout):
+        started.append((request.full_url, time.monotonic()))
+        if "slow" in request.full_url:
+            time.sleep(4)
+        return io.BytesIO(json.dumps({"id": "x", "releases": [], "release-count": 0}).encode())
+
+    monkeypatch.setattr(musicbrainz.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(musicbrainz, "next_at", 0.0)
+    slow = threading.Thread(target=musicbrainz.release_credits, args=("slow",))
+    slow.start()
+    time.sleep(0.1)
+    begun = time.monotonic()
+    musicbrainz.release_credits("quick")
+    took = time.monotonic() - begun
+    slow.join()
+    assert took < 2.5 and [u for u, _ in started] == [musicbrainz.RELEASE_CREDITS.format("slow"), musicbrainz.RELEASE_CREDITS.format("quick")]
 
 
 def test_identical_editions_fall_to_the_official_original():

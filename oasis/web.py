@@ -212,7 +212,8 @@ a.card:hover b { text-decoration: underline; } .card .muted { font-size: .8rem; 
 
 
 confirm = lambda question: f' onsubmit="return confirm({escape(json.dumps(question, ensure_ascii=False))})"'  # for buttons that drop things
-HIDE_BROKEN = 'onerror="this.removeAttribute(\'src\')"'  # a cover that fails shows the empty frame, not a broken image
+# A cover that fails (none in the Cover Art Archive) shows the empty frame, not a broken image: a blank image in its place.
+HIDE_BROKEN = 'onerror="this.onerror=null;this.src=\'data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==\'"'
 KINDS = sources.KINDS | sources.PREVIEWS  # what the services page turns on and off
 SOURCE_NAMES = {"local": "library", "ytm": "YouTube Music", "missing": "nothing", **{k: v.title for k, v in sources.KINDS.items()}}
 TABS = [("home", "/", "Dashboard", "M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"),

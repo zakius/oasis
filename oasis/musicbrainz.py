@@ -55,22 +55,22 @@ def get(url: str, db=None, keep: float = 0) -> dict:
         if row:
             return json.loads(row[0])
     for backoff in (*BACKOFF, None):
+        # Requests start GAP apart, but run side by side: one slow answer doesn't hold up a search someone waits on.
         with lock:
             time.sleep(max(0.0, next_at - time.time()))
-            try:
-                with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}),
-                                            timeout=60) as response:
-                    body = response.read()
-                break
-            except urllib.error.HTTPError as e:
-                if e.code in (400, 404):  # 400: not a valid id
-                    raise LookupError(url) from e
-                if e.code < 500 or backoff is None:
-                    raise OSError(f"{url}: {e.code}") from e
-                next_at = time.time() + backoff
-                continue
-            finally:
-                next_at = max(next_at, time.time() + GAP)
+            next_at = time.time() + GAP
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}),
+                                        timeout=60) as response:
+                body = response.read()
+            break
+        except urllib.error.HTTPError as e:
+            if e.code in (400, 404):  # 400: not a valid id
+                raise LookupError(url) from e
+            if e.code < 500 or backoff is None:
+                raise OSError(f"{url}: {e.code}") from e
+            with lock:  # MusicBrainz is busy: every request waits
+                next_at = max(next_at, time.time() + backoff)
     if db is not None and keep:
         db.execute("insert or replace into mb_cache values (?, ?, ?)", (url, body.decode(), time.time()))
     return json.loads(body)
