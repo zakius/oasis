@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -58,6 +59,10 @@ create table if not exists artist_key(  -- each folded artist name (text.fold) -
 );
 create table if not exists spelling(  -- artist names shown as another spelling of the same name (artists.unify)
     variant text primary key, spelled text not null
+);
+create table if not exists same_artist(  -- other names the user gives artists, which MusicBrainz doesn't know (artists.py)
+    name text primary key, artist text not null,
+    source text not null            -- dashboard, or config (oasis.toml's merge lists)
 );
 create table if not exists setting(key text primary key, value text);  -- settings made on the dashboard
 create table if not exists stat(  -- each user's stars, ratings and plays, as Subsonic keeps them
@@ -308,6 +313,16 @@ def drop_left_out(db: sqlite3.Connection):
     db.execute("delete from want_album where state = 'skipped'")
 
 
+def same_artists(db: sqlite3.Connection):
+    """Moves the dashboard's merge lists, kept with its other artist settings before, to same_artist."""
+    row = db.execute("select value from setting where key = 'artists'").fetchone()
+    settings = json.loads(row[0]) if row else {}
+    if "merge" in settings:
+        for first, *others in settings.pop("merge"):
+            db.executemany("insert or ignore into same_artist values (?, ?, 'dashboard')", [(n, first) for n in others])
+        db.execute("update setting set value = ? where key = 'artists'", (json.dumps(settings, ensure_ascii=False),))
+
+
 def set_stat(db: sqlite3.Connection, user: str, id: str, column: str, value):
     """Sets the user's starred or rating of a track, album or artist."""
     db.execute(f"insert into stat(user, id, {column}) values (?, ?, ?) on conflict(user, id) do update set {column} = excluded.{column}",
@@ -354,4 +369,4 @@ def create(db: sqlite3.Connection):
 
 # What a database from any older oasis needs, in order, each time a process first connects to it; each step does
 # nothing once done.
-MIGRATIONS = [rename, create, own_stats, lyrics_with_words, one_listening_radio, reidentify, drop_left_out]
+MIGRATIONS = [rename, create, own_stats, lyrics_with_words, one_listening_radio, reidentify, drop_left_out, same_artists]

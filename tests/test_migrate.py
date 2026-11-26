@@ -1,3 +1,4 @@
+import json
 import shutil
 import sqlite3
 from pathlib import Path
@@ -75,3 +76,16 @@ def test_albums_an_older_oasis_left_out_lose_their_rows(tmp_path):
                  "('g-2', 'mb-1', 'Hits', 'followed', 'skipped')")
     db = database.connect(path)
     assert [r[0] for r in db.execute("select rg from want_album")] == ["g-1"]
+
+
+def test_dashboard_merges_move_to_their_own_table(tmp_path):
+    path = tmp_path / "old.db"
+    legacy = sqlite3.connect(path)
+    legacy.execute("create table setting(key text primary key, value text)")
+    legacy.execute("insert into setting values ('artists', ?)", (json.dumps({"related": [["A", "B"]], "merge": [["Beta", "Beta Band", "BB"]]}),))
+    legacy.commit()
+    legacy.close()
+    db = database.connect(path)
+    assert [tuple(r) for r in db.execute("select name, artist, source from same_artist order by name")] == [
+        ("BB", "Beta", "dashboard"), ("Beta Band", "Beta", "dashboard")]
+    assert json.loads(db.execute("select value from setting where key = 'artists'").fetchone()[0]) == {"related": [["A", "B"]]}
