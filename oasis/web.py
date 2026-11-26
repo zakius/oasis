@@ -423,7 +423,7 @@ def routes(oasis) -> list[Route]:
         return HTMLResponse(page("Sign in", f'<section class="login"><h1 class="brand">{LOGO}oasis</h1><form method="post"><label>User<input type="text" '
                                  'name="name" autocomplete="username" autofocus></label><label>Password<input type="password" name="password" '
                                  'autocomplete="current-password"></label><button class="primary">Sign in</button></form>'
-                                 '<p class="muted">The same user and password as in your Subsonic apps.</p></section>',
+                                 '<p class="muted">Your oasis password, not an app password.</p></section>',
                                  error=error, heading=False).body, status)
 
     def signed_in_as(response: Response, db, name: str) -> Response:
@@ -437,8 +437,7 @@ def routes(oasis) -> list[Route]:
 
         def run(db):
             try:
-                user = accounts.sign_in(db, oasis.throttle, address, form.get("name", ""),
-                                        lambda password: accounts.same(form.get("password", ""), password))
+                user = accounts.sign_in(db, oasis.throttle, address, form.get("name", ""), accounts.password_matches(form.get("password", "")))
             except accounts.Refused as e:
                 if e.throttled:
                     return sign_in_page("Too many failed sign-ins. Try again in a minute.", 429)
@@ -481,9 +480,11 @@ def routes(oasis) -> list[Route]:
                 f'<section><h2>Radio</h2>{radio_source(user)}</section>'
                 f'<section><h2>Songs nothing can play</h2>{missing_songs(user)}</section>'
                 f'<section><h2>Lyrics translation</h2>{translation_language(user)}</section>'
-                f'<section><h2>Password</h2>' + (
+                '<section><h2>Apps</h2><p class="muted">Subsonic apps sign in with app passwords, not yours.</p>'
+                '<a class="button" href="/account/apps">App passwords</a></section>'
+                f'<section><h2>Password</h2><p class="muted">Signs in to this dashboard only.</p>' + (
                     '<p class="muted">Set in oasis.toml.</p>' if user["name"] in oasis.config.users else
-                    f'<form method="post" action="/account/password"{confirm("Change your password? Apps signed in with the old one stop working until you update them.")}><label>New password<input type="password" name="password">'
+                    f'<form method="post" action="/account/password"{confirm("Change your password?")}><label>New password<input type="password" name="password">'
                     '</label><button>Change</button></form>') + '</section></div></div>')
         return page("Dashboard", body, q.get("message", ""), q.get("error", ""), wide=True, live=True, tab="home")
 
@@ -613,7 +614,37 @@ def routes(oasis) -> list[Route]:
             accounts.set_password(db, user["name"], form.get("password", ""))  # signs out every session, this one signs in again
         except ValueError as e:
             return back("/", error=str(e))
-        return signed_in_as(back("/", message="Password changed. Update it in your apps."), db, user["name"])
+        return signed_in_as(back("/", message="Password changed."), db, user["name"])
+
+    def app_passwords(db, request, user, form):
+        """The user's app passwords; a POST makes one, shown here once. The page doesn't refresh itself, so the new
+        password stays until it's copied."""
+        q, shown = request.query_params, ""
+        if request.method == "POST":
+            try:
+                secret = accounts.new_app_password(db, user["name"], form.get("name", ""))
+            except ValueError as e:
+                return back("/account/apps", error=str(e))
+            shown = (f'<section><h2>New app password</h2><p>In {escape(form["name"].strip())}, sign in as <b>{escape(user["name"])}</b> with '
+                     f'<code>{secret}</code></p><p class="muted">It isn\'t shown again. Apps that support API keys '
+                     'can take it as their key, without your user name.</p></section>')
+        rows = "".join(f'<tr><td class="lead"><b>{escape(r["name"])}</b></td><td class="muted">made {time.strftime("%Y-%m-%d", time.localtime(r["created"]))}</td>'
+                       f'<td class="actions"><form method="post" action="/account/apps/{r["id"]}/revoke"{confirm(f"Revoke the password of {r['name']}? It stops working at once.")}>'
+                       '<button class="danger">Revoke</button></form></td></tr>' for r in accounts.app_passwords(db, user["name"]))
+        old = any(r["name"] == accounts.OLD_APPS for r in accounts.app_passwords(db, user["name"]))
+        body = (shown + '<section><h2>App passwords</h2><p class="muted">Each Subsonic app signs in with its own password, so a lost '
+                'phone or a leaked one costs only that password: revoke it here. An app password can play, star, make playlists and '
+                'scrobble, but not sign in to this dashboard or change users and passwords.</p>'
+                + (f'<p class="muted"><b>{accounts.OLD_APPS}</b> is your password from then. Once your apps have passwords of their own, '
+                   'revoke it.</p>' if old else "")
+                + (f'<table class="grid"><tbody>{rows}</tbody></table>' if rows else '<p class="muted">None yet.</p>')
+                + '</section><section><h2>New app password</h2><form method="post" action="/account/apps"><label>App<input type="text" '
+                'name="name" placeholder="Symfonium on my phone"></label><button class="primary">Make</button></form></section>')
+        return page("App passwords", body, q.get("message", ""), q.get("error", ""), tab="home")
+
+    def revoke_app_password(db, request, user, form):
+        accounts.revoke_app_password(db, user["name"], request.path_params["id"])
+        return back("/account/apps", message="Revoked. Apps using it are signed out.")
 
     def progress(hash: str, state: str, since: float) -> str:
         """Where a download is: queued on TorBox, TorBox downloading it (its share done), copying it here from TorBox
@@ -714,7 +745,7 @@ def routes(oasis) -> list[Route]:
             accounts.create(db, form.get("name", "").strip(), form.get("password", ""), bool(form.get("admin")))
         except ValueError as e:
             return back("/admin", error=str(e))
-        return back("/admin", message=f"Created {form['name'].strip()}. They can sign in here to link their services.")
+        return back("/admin", message=f"Created {form['name'].strip()}. They sign in here to make app passwords and link their services.")
 
     def delete_user(db, request, user, form):
         name = request.path_params["name"]
@@ -834,14 +865,23 @@ def routes(oasis) -> list[Route]:
                 ) + (pill("followed", "accent") if acquire.wanted_by(db, "artist", mbid) else "")
 
     def album_line(db, user, g: dict, here: str, by: bool = True) -> str:
+        """An album found on MusicBrainz, with what oasis does about it: Unwant while it is searched for (starred by
+        anyone, or its artist followed), Want while it is neither searched for nor here."""
         row = acquire.album(db, g["id"])
-        state = pill("in the library", "good") if tracks.library_id(db, MB_IDS["album"] + g["id"]) or row and row["state"] == "have" else \
+        here_already = tracks.library_id(db, MB_IDS["album"] + g["id"]) or row and row["state"] == "have"
+        state = pill("in the library", "good") if here_already else \
             {"missing": pill("wanted", "accent"), "downloading": pill("downloading", "busy")}[row["state"]] if row else ""
+        if row and not here_already:
+            button = (f'<form class="inline" method="post" action="/music/wanted/{g["id"]}/give-up"'
+                      f'{confirm(f"Unwant {g['title']}? Its search stops; files already here stay.")}>'
+                      f'<input type="hidden" name="next" value="{escape(here)}"><button class="danger">Unwant</button></form>')
+        else:
+            button = "" if here_already else want_button("album", g["id"], not acquire.wanted_by(db, "album", g["id"], user["name"]), here)
         credit = g.get("artist-credit") or []
         artist = f' — <a href="/music/artist/{credit[0]["artist"]["id"]}">{escape(musicbrainz.credited(credit))}</a>' if by and credit else ""
         info = details(g.get("primary-type"), *(g.get("secondary-types") or []), (g.get("first-release-date") or "")[:4], g.get("disambiguation"))
         return (f'<li>{cover_of(g["id"])}<div class="grow"><b><a href="/music/library/album/{quote(album_page(db, g["id"]))}">{escape(g["title"])}</a></b>{artist}<div>{info} {state}</div></div>'
-                f'{want_button("album", g["id"], not acquire.wanted_by(db, "album", g["id"], user["name"]), here)}</li>')
+                f'{button}</li>')
 
     def find_music(db, request, user, form):
         q = request.query_params
@@ -1255,7 +1295,7 @@ def routes(oasis) -> list[Route]:
 
     def wanted_action(db, request, user, form):
         rg, action = request.path_params["rg"], request.path_params["action"]
-        here = form.get("next", "") if form.get("next", "").startswith(("/music/wanted", "/music/library/album/")) else "/music/wanted"
+        here = form.get("next", "") if form.get("next", "").startswith("/music") else "/music/wanted"
         row = acquire.album(db, rg)
         if row is None or action not in ("search", "block", "give-up"):
             return back(here, error="That album isn't wanted any more.")
@@ -1578,6 +1618,8 @@ def routes(oasis) -> list[Route]:
         Route("/account/lastfm/unlink", signed_in(unlink_lastfm), methods=["POST"]),
         Route("/account/listenbrainz", signed_in(link_listenbrainz), methods=["POST"]),
         Route("/account/password", signed_in(change_password), methods=["POST"]),
+        Route("/account/apps", signed_in(app_passwords), methods=["GET", "POST"]),
+        Route("/account/apps/{id:int}/revoke", signed_in(revoke_app_password), methods=["POST"]),
         Route("/admin", signed_in(admin, admin=True)),
         Route("/music", catalogue(find_music)),
         Route("/music/artist/{mbid}", catalogue(music_artist)),

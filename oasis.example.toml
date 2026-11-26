@@ -34,7 +34,8 @@ secret = ""
 # url = "http://prowlarr:9696"
 # api_key = ""
 
-# Admins. More users can be added on the account page (http://<host>:4533/admin) or with Subsonic's createUser.
+# Admins: this password signs in to the dashboard. Apps use app passwords made there. More users can be added on
+# the dashboard (http://<host>:4533/admin).
 [[users]]
 name = "admin"
 password = "change-me"

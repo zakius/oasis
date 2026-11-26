@@ -514,6 +514,9 @@ def test_the_dashboard_finds_follows_and_wants_any_artist_or_album(client, mb):
     assert "Followed" in page and '"pill accent">followed<' in page and "Unfollow</button>" in page
     sync(client)
     assert wants(client) == {"STRAY SHEEP": ("missing", "followed", "searched, no release found yet"), "BOOTLEG": ("missing", "followed", None)}
+    page = client.get(f"/music/artist/{KENSHI}").text
+    line = page[page.index("STRAY SHEEP"):page.index("</li>", page.index("STRAY SHEEP"))]
+    assert f'action="/music/wanted/{STRAY}/give-up"' in line and "Unwant</button>" in line  # searched for: the follow wants it
     page = client.post("/music/want", data={"kind": "album", "mbid": LEMON, "on": "1", "next": f"/music/artist/{KENSHI}"}).text
     assert "Wanted: it is searched for" in page
     sync(client)
@@ -523,6 +526,10 @@ def test_the_dashboard_finds_follows_and_wants_any_artist_or_album(client, mb):
     assert db.execute("select starred is not null from stat where id = ?", ("al-mb-" + LEMON,)).fetchone()[0] == 1  # as clients see it
     found = client.get("/music", params={"q": "stray sheep", "kind": "album"}).text
     assert f'— <a href="/music/artist/{KENSHI}">米津玄師</a>' in found and "Album · 2020" in found and '"pill accent">wanted<' in found
+    page = client.post(f"/music/wanted/{STRAY}/give-up", data={"next": f"/music/artist/{KENSHI}"}).text
+    assert "Unwanted 米津玄師 – STRAY SHEEP" in page and "Unfollow</button>" in page  # back on the artist's page
+    sync(client)
+    assert "STRAY SHEEP" not in wants(client)
     client.post("/music/want", data={"kind": "album", "mbid": LEMON, "next": "/music"})
     client.post("/music/want", data={"kind": "artist", "mbid": KENSHI, "next": "https://elsewhere"})
     sync(client)

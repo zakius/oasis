@@ -12,13 +12,15 @@ With `[ytmusic] enabled = true`, searches also return YouTube Music songs after 
 
 ## Accounts
 
-Open `http://<host>:4533/` and sign in with a Subsonic user and password. The account page links each user's own services:
+Open `http://<host>:4533/` and sign in with your user and password. The account page links each user's own services:
 
 - **YouTube Music**: paste the "Copy as cURL" of a `browse` request (or its request headers, or the `Cookie` value) from a signed-in music.youtube.com tab, as the page explains step by step. oasis checks the sign-in and shows the account name. Clients can also link it themselves: `oasisLinkYouTubeMusic` takes `cookie` (the Cookie header) and optional `authUser`, which roma used to hand over its own Google sign-in until 2026-11-01; caravan has no YouTube code, so accounts are linked on this page. `oasisUnlinkYouTubeMusic` removes it.
 - **Last.fm**: "Sign in with Last.fm" goes through Last.fm's own page. The server needs `[lastfm] api_key` and `secret`.
 - **ListenBrainz**: paste the user token. oasis checks it.
 
-Users in `oasis.toml` are admins, and their passwords are set there. Admins add and remove other users on `/admin` or with Subsonic's `createUser`, `updateUser`, `deleteUser` and `getUsers`; anyone changes their own password on the account page or with `changePassword`. Passwords are stored as given, because Subsonic's token login needs them.
+Users in `oasis.toml` are admins, and their passwords are set there. Admins add and remove other users on `/admin`; anyone changes their own password on the account page. A user's password signs in to the dashboard only, and is stored hashed (scrypt).
+
+Subsonic apps sign in with app passwords instead: each user makes one per app on `/account/apps`, names it, and revokes it there. oasis makes them random, so one that leaks was never used anywhere else and opens only the API; Subsonic's token login needs the secret itself, so app passwords are stored as given. An app password is also an API key (OpenSubsonic's `apiKeyAuthentication`), sent as `apiKey` without `u`. Apps can't change users or passwords: `createUser`, `updateUser`, `deleteUser` and `changePassword` are refused, and `getUser` and `getUsers` still answer. A password stored as given by an older oasis becomes an app password named "Apps signed in before app passwords", so apps keep working, and the same password, hashed, signs in to the dashboard; revoke it once the apps have their own.
 
 Each play a client reports (`scrobble`) goes to the services its user linked. oasis keeps each play until the service takes it, so plays made offline or during an outage arrive later. Plays of local tracks reach YouTube Music history too: oasis finds the same song there (same title, length within 5 seconds) and remembers the match. Clients should not scrobble to Last.fm themselves, or plays count twice.
 
@@ -113,7 +115,7 @@ docker compose up -d --build
 
 `compose.yaml` mounts `~/Music` read-only at `/music`. The container runs as UID 1000, so `./config` must be writable by that user; set `user:` in `compose.yaml` otherwise.
 
-Point a Subsonic client at `http://<host>:4533`. `oasis scan` runs a scan without serving. `oasis relocate` moves files placed under an older scheme (Lidarr's `Artist/Album (Year)`) to the import's names by their MusicBrainz tags; it only plans and checks the moves until given `--apply`, and should run while the server is stopped. Tracks keep their ids, so stars, plays and playlists stay, and the moves are written to `.oasis-renames-<date>.tsv` in the library. `oasis quality` runs the same checks over the library, beside the server and at the lowest CPU and I/O priority (`docker compose exec -d oasis sh -c 'oasis -c /config/oasis.toml quality >> /config/quality.log 2>&1'`); it resumes where it stopped and skips files dedupe shares. It lists lossy-sourced FLACs, and with `--delete-lossy` deletes them (their whole album when most of it is) and wants the album again; files without a MusicBrainz release group stay. The server rescans when a client calls `startScan`.
+Point a Subsonic client at `http://<host>:4533`, with an app password. `oasis scan` runs a scan without serving. `oasis relocate` moves files placed under an older scheme (Lidarr's `Artist/Album (Year)`) to the import's names by their MusicBrainz tags; it only plans and checks the moves until given `--apply`, and should run while the server is stopped. Tracks keep their ids, so stars, plays and playlists stay, and the moves are written to `.oasis-renames-<date>.tsv` in the library. `oasis quality` runs the same checks over the library, beside the server and at the lowest CPU and I/O priority (`docker compose exec -d oasis sh -c 'oasis -c /config/oasis.toml quality >> /config/quality.log 2>&1'`); it resumes where it stopped and skips files dedupe shares. It lists lossy-sourced FLACs, and with `--delete-lossy` deletes them (their whole album when most of it is) and wants the album again; files without a MusicBrainz release group stay. The server rescans when a client calls `startScan`.
 
 ## Supported API
 

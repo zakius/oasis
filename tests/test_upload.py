@@ -183,7 +183,8 @@ def test_cancel_deletes_the_uploads_files_and_state(client, tmp_path):
 def test_only_admins_have_upload_role_and_may_upload(client, tmp_path):
     db = connect(tmp_path / "oasis.db")
     accounts.create(db, "guest", "pw")
-    guest = {"u": "guest", "p": "pw"}
+    accounts.add_app(db, "guest", "tests", "app")
+    guest = {"u": "guest", "p": "app"}
     assert call(client, "getUser", username="guest")["user"]["uploadRole"] is False
     assert call(client, "getUser")["user"]["uploadRole"] is True
     for method in ("lookupDisc", "createUpload", "getUpload", "cancelUpload", "commitUpload"):

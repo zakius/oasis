@@ -28,7 +28,7 @@ from .tracks import BY_ARTIST_NAME, IDS, MB_IDS, id_column, resolve
 log = logging.getLogger(__name__)
 
 VERSION = "1.16.1"
-NOT_FOUND, MISSING, AUTH, MECHANISM, DENIED = 70, 10, 40, 42, 50
+NOT_FOUND, MISSING, AUTH, CONFLICT, BAD_KEY, DENIED = 70, 10, 40, 43, 44, 50
 
 
 class Fail(Exception):
@@ -485,20 +485,29 @@ class Api:
         self.finder = ThreadPoolExecutor(4)  # MusicBrainz searches, made while the rest of a search3 is looked up
 
     def _authenticate(self, db, p: Params) -> str:
-        if p.get("apiKey") is not None:  # OpenSubsonic's apiKeyAuthentication, which oasis doesn't advertise
-            raise Fail(MECHANISM, "Provided authentication mechanism not supported")
-        user = p.need("u")
-        if (token := p.get("t")) is not None:
-            matches = lambda password: accounts.same(hashlib.md5((password + p.need("s")).encode()).hexdigest(), token.lower())
+        """The user an app password signs in, given with the user's name (u, with t and s or with p) or alone as an API key
+        (apiKey, OpenSubsonic's apiKeyAuthentication)."""
+        throttle = self.oasis.throttle
+        if (key := p.get("apiKey")) is not None:
+            if p.get("u") is not None:
+                raise Fail(CONFLICT, "Multiple conflicting authentication mechanisms provided")
+            sign_in, wrong = lambda: accounts.sign_in_with_key(db, throttle, p.address, key), Fail(BAD_KEY, "Invalid API key")
         else:
-            matches = lambda password: accounts.same(decode_password(p.need("p")), password)
+            if (token := p.get("t")) is not None:
+                salt = p.need("s")
+                fits = lambda secret: accounts.same(hashlib.md5((secret + salt).encode()).hexdigest(), token.lower())
+            else:
+                password = decode_password(p.need("p"))
+                fits = lambda secret: accounts.same(password, secret)
+            matches = lambda user: user is not None and any(fits(secret) for secret in accounts.app_secrets(db, user["name"]))
+            sign_in = lambda: accounts.sign_in(db, throttle, p.address, p.need("u"), matches)
+            wrong = Fail(AUTH, "Wrong username or password. Apps sign in with an app password, made on the oasis dashboard.")
         try:
-            accounts.sign_in(db, self.oasis.throttle, p.address, user, matches)
+            return sign_in()["name"]
         except accounts.Refused as e:
             if e.throttled:
                 raise Fail(0, "Too many failed sign-ins from this address. Try again in a minute.")
-            raise Fail(AUTH, "Wrong username or password")
-        return user
+            raise wrong
 
     def _one(self, db, sql: str, *args):
         return required(db.execute(sql, args).fetchone())
@@ -513,7 +522,7 @@ class Api:
 
     def getOpenSubsonicExtensions(self, db, p, user):
         return {"openSubsonicExtensions": [{"name": name, "versions": versions} for name, versions in (
-            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]), ("shareUrl", [1]),
+            ("apiKeyAuthentication", [1]), ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]), ("shareUrl", [1]),
             ("unavailableSongs", [1]), ("oasis", [1, 2, 3]))]}
 
     def _user(self, row) -> dict:
@@ -526,12 +535,6 @@ class Api:
         if not accounts.get(db, user)["admin"]:
             raise Fail(DENIED, "Only admins can do that")
 
-    def _editable(self, name, change):
-        try:
-            accounts.check_editable(self.oasis.config.users, name, change)
-        except ValueError as e:
-            raise Fail(DENIED, str(e))
-
     def getUser(self, db, p, user):
         name = p.get("username", user)
         if name != user:
@@ -543,48 +546,10 @@ class Api:
         return {"users": {"user": [self._user(r) for r in db.execute("select * from user order by name")]}}
 
     def createUser(self, db, p, user):
-        self._admin(db, user)
-        try:
-            accounts.create(db, p.need("username"), decode_password(p.need("password")), p.get("adminRole") == "true")
-        except ValueError as e:
-            raise Fail(0, str(e))
-        return {}
+        """Apps get no say over users and passwords: an app password opens less than the dashboard does."""
+        raise Fail(DENIED, "Users and passwords are managed on the oasis dashboard")
 
-    def updateUser(self, db, p, user):
-        self._admin(db, user)
-        name = self._one(db, "select name from user where name = ?", p.need("username"))["name"]
-        password, admin = p.get("password"), p.get("adminRole")
-        if password is not None:
-            self._editable(name, "password")
-        if admin is not None and admin != "true":  # oasis.toml's users are admins already
-            self._editable(name, "admin")
-        if password is not None:
-            self._set_password(db, name, decode_password(password))
-        if admin is not None:
-            accounts.set_field(db, name, admin=int(admin == "true"))
-        return {}
-
-    def deleteUser(self, db, p, user):
-        self._admin(db, user)
-        name = p.need("username")
-        self._editable(name, "remove")
-        accounts.delete(db, name)
-        return {}
-
-    def changePassword(self, db, p, user):
-        name = p.need("username")
-        if name != user:
-            self._admin(db, user)
-        self._editable(name, "password")
-        self._one(db, "select 1 from user where name = ?", name)
-        self._set_password(db, name, decode_password(p.need("password")))
-        return {}
-
-    def _set_password(self, db, name, password):
-        try:
-            accounts.set_password(db, name, password)
-        except ValueError as e:
-            raise Fail(0, str(e))
+    updateUser = deleteUser = changePassword = createUser
 
     def oasisLinkYouTubeMusic(self, db, p, user):
         """For clients that already have a YouTube Music sign-in (roma): cookie is the music.youtube.com Cookie header
