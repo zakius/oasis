@@ -77,5 +77,6 @@ An unplayable song carries the usual fields where the server knows them: `title`
 - When the song arrives (its album is downloaded, or a streaming service has it), its stars and playlist entries move
   to the playable song, and the `ms-` id keeps working.
 - A radio counts only playable songs toward the 30 it keeps queued.
-- With previews on (the user's, on the dashboard's Services), a song that Deezer's public API or Apple's iTunes Search API has
-  gets `preview: 30`. oasis asks for the clip's link when it is first played, and keeps the clip.
+- With previews on (the user's, on the dashboard's Services), a song that Deezer's public API, Apple's iTunes Search API,
+  SoundCloud (a Go+ song's public clip), Qobuz (a sample, with the user's account) or Tidal (with the user's account)
+  has gets `preview: 30`. oasis fetches the clip when it is first played, and keeps it.

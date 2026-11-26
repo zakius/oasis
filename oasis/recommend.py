@@ -1,9 +1,11 @@
 """Song recommendations from YouTube Music, Last.fm, ListenBrainz and the library itself, and radio playlists that grow
 as they are played: from their own songs, from everything played, or as stations from the user's Last.fm. A song Last.fm
-or ListenBrainz suggests is played from the library, else YouTube Music, else another streaming service (sources.py);
-when none has it, it can be kept as a song nothing plays (missing.py), for the users who want to see those."""
+or ListenBrainz suggests is played from the library, else from the best of what the user's streaming services answer,
+all asked at once (YouTube Music and the others of sources.py); when none has it, it can be kept as a song nothing plays
+(missing.py), with a preview where a preview service has one, for the users who want to see those."""
 import json
 import logging
+import queue
 import random
 import threading
 import time
@@ -15,9 +17,10 @@ from itertools import chain, zip_longest
 from . import accounts, lastfm, missing, playlists, worker
 from .forward import LISTENBRAINZ
 from .artists import linked
+from .formats import LOSSLESS
 from .playlists import LISTENING_RADIO, PLAIN, set_entries
 from .tracks import BY_ARTIST_NAME, IDS, outside_names
-from .youtube import remember_song, video_of
+from .youtube import BITRATE, remember_song, video_of
 
 
 log = logging.getLogger(__name__)
@@ -30,8 +33,11 @@ SOURCES = {"all": "Everything mixed", "lastfm": "Last.fm", "ytm": "YouTube Music
 STATIONS = {"lastfm-top": "Last.fm top tracks", "lastfm-loved": "Last.fm loved tracks"}
 PERIODS = ("7day", "1month", "3month", "6month", "12month", "overall")  # Last.fm's periods for top tracks
 PERIOD = "3month"
-FINDS = 6       # YouTube Music searches resolve runs at once (ytm.ANONYMOUS)
+FINDS = 6       # songs resolve looks for at once (ytm.ANONYMOUS)
+ASKS = 64       # services asked at once, across every song looked for
 KEPT = 3600     # seconds a source's answer is kept (Recommender.answer)
+# After the best answer so far came at t seconds, a better one is waited for min(GRACE·t, GRACE_MOST) seconds more.
+GRACE, GRACE_MOST = 0.3, 3.0
 LASTFM_SIMILAR = 15  # similar tracks asked of Last.fm, the most a method uses
 
 
@@ -41,8 +47,9 @@ class Recommender:
         services (sources.Sources): a user gets songs only from the services they have on."""
         self.connect, self.ytm, self.lastfm, self.services = connect, ytm, lastfm, services
         self.woken = threading.Event()
-        self.answers: dict[tuple, tuple[float, object]] = {}  # (expiry, answer) by question (answer)
+        self.answers: dict[tuple, tuple[float, object]] = {}  # (expiry, answer) by question (answer, find)
         self.answers_lock = threading.Lock()
+        self.asking = ThreadPoolExecutor(ASKS)
 
     def sources(self, db, user) -> list[str]:
         """The sources that can give this user anything: YouTube Music, Last.fm and ListenBrainz when the user has them
@@ -109,15 +116,22 @@ class Recommender:
     def answer(self, question: tuple, ask):
         """ask(), the answer of a source on the network to question, kept for KEPT seconds. The radio that follows
         listening asks about each song played (top_up), so an instant mix of a song just played finds the answers here."""
-        now = time.monotonic()
-        kept = self.answers.get(question)
-        if kept and kept[0] > now:
-            return kept[1]
+        if kept := self.kept(question):
+            return kept[0]
         found = ask()
+        self.keep(question, found)
+        return found
+
+    def kept(self, question: tuple) -> tuple | None:
+        """The answer kept for question, in a tuple; None when there is none."""
+        kept = self.answers.get(question)
+        return (kept[1],) if kept and kept[0] > time.monotonic() else None
+
+    def keep(self, question: tuple, answer):
+        now = time.monotonic()
         with self.answers_lock:
             self.answers = {q: a for q, a in self.answers.items() if a[0] > now}
-            self.answers[question] = (now + KEPT, found)
-        return found
+            self.answers[question] = (now + KEPT, answer)
 
     def from_youtube(self, db, seed, count: int, ytm) -> list[str]:
         """ytm: YouTube Music's client, None when the user doesn't have it on."""
@@ -212,10 +226,7 @@ class Recommender:
         searched = {}  # index: what the search found, None for nothing
         if unknown and (ytm or clients or previews):
             pool = ThreadPoolExecutor(FINDS)
-            # The services asked: an answer from other services (another user's, or before one was turned on) doesn't count.
-            asked = (*(["ytm"] if ytm else []), *(c.name for c in clients + previews))
-            searches = {i: pool.submit(self.answer, ("find", *pairs[i][:2], asked),
-                                       lambda pair=pairs[i]: self.find(ytm, clients, pair[0], pair[1], previews)) for i in unknown}
+            searches = {i: pool.submit(self.find, ytm, clients, *pairs[i][:2], previews, deadline) for i in unknown}
             done, _ = wait_for(searches.values(), timeout=deadline - time.monotonic() if deadline else None)
             pool.shutdown(wait=False, cancel_futures=True)
             for i, search in searches.items():
@@ -237,33 +248,56 @@ class Recommender:
                 ids[i] = missing.remember(db, pair[0], pair[1], pair[2] if len(pair) > 2 else None)
         return [ids[i] for i in sorted(ids)]
 
-    def find(self, ytm, clients: list, artist: str, title: str, previews: list = ()):
-        """The song on YouTube Music (ytm, None to skip it), as ("ytm", song), else on the first other service that has
-        it, as (client, song), else a clip of it from the first preview service that has one, as ("preview",
-        "<service>:<its id>"); None when none has it. OSError when every service asked for the whole song failed."""
-        failed = 0
-        if ytm:
+    def find(self, ytm, clients: list, artist: str, title: str, previews: list = (), deadline: float | None = None):
+        """The best answer (rank) of the services asked, all at once: ("ytm", song) from YouTube Music (ytm, None to
+        skip it), (client, song) from another streaming service, ("preview", "<service>:<its id>") from a preview
+        service; None when none has the song. A full lossless song ends the wait. Otherwise, after the best answer so
+        far came at t seconds, a better one is waited for till t + min(GRACE·t, GRACE_MOST), and never past deadline
+        (time.monotonic). Each service's answer, a miss too, is kept with the time it took, and counts as coming then.
+        OSError when every service asked for the whole song failed; TimeoutError when the deadline came first."""
+        start, answers = time.monotonic(), queue.Queue()
+        asks = [("YouTube Music", ("ytm", ""), True, lambda: ("ytm", found) if (found := ytm.find(artist, title)) else None)] if ytm else []
+        asks += [(c.title, (c.name, getattr(c, "variant", "")), True, lambda c=c: (c, found) if (found := c.find(artist, title)) else None)
+                 for c in clients]
+        asks += [(f"{s.title} previews", ("preview", s.name), False,
+                  lambda s=s: ("preview", f"{s.name}:{found}") if (found := s.find(artist, title)) else None) for s in previews]
+
+        def answered(future, label: str, question: tuple, full: bool):
+            took, error = time.monotonic() - start, future.exception()
+            if error is None:
+                self.keep(question, (future.result(), took))
+            log.info("%s - %s: %s answered %s in %.2fs", artist, title, label, f"with an error ({error})" if error else said(future.result()), took)
+            answers.put((full, None if error else future.result(), error, took))
+
+        for label, service, full, ask in asks:
+            question = ("find", *service, artist, title)
+            if kept := self.kept(question):
+                found, took = kept[0]
+                log.info("%s - %s: %s answered %s in %.2fs before", artist, title, label, said(found), took)
+                answers.put((full, found, None, took))
+            else:
+                self.asking.submit(ask).add_done_callback(lambda f, l=label, q=question, full=full: answered(f, l, q, full))
+        best, pending, failed = None, len(asks), 0
+        while pending:
+            waits = [deadline - time.monotonic()] if deadline else []
+            if best:
+                waits.append(start + best[1] + min(GRACE * best[1], GRACE_MOST) - time.monotonic())
             try:
-                if found := ytm.find(artist, title):
-                    return "ytm", found
-            except Exception as e:
-                log.info("YouTube Music search for %s - %s failed: %s", artist, title, e)
-                failed += 1
-        for client in clients:
-            try:
-                if found := client.find(artist, title):
-                    return client, found
-            except Exception as e:
-                log.info("%s search for %s - %s failed: %s", client.title, artist, title, e)
-                failed += 1
-        if failed and failed == bool(ytm) + len(clients):
+                full, found, error, took = answers.get(timeout=max(0.0, min(waits)) if waits else None)
+            except queue.Empty:
+                break
+            pending -= 1
+            failed += bool(error) and full
+            if found and (best is None or rank(found) > rank(best[0])):
+                best = (found, took)
+                if rank(found)[0] == LOSSLESS_RANK:
+                    break
+        if failed and failed == sum(full for _, _, full, _ in asks):
             raise OSError("every service failed")
-        for service in previews:
-            try:
-                if key := service.find(artist, title):
-                    return "preview", f"{service.name}:{key}"
-            except Exception as e:
-                log.info("%s preview search for %s - %s failed: %s", service.title, artist, title, e)
+        if best:
+            return best[0]
+        if pending:
+            raise TimeoutError("no service answered by the deadline")
         return None
 
     def start(self):
@@ -370,6 +404,29 @@ class Recommender:
             for id in ids:
                 if row := db.execute("select * from track where id = ?", (id,)).fetchone():
                     yield row
+
+
+LOSSLESS_RANK = 2
+
+
+def rank(found: tuple) -> tuple:
+    """How good a service's answer (Recommender.find) is, best highest: a full lossless song, then a full lossy song by
+    bitrate (YouTube Music's winning a tie), then a preview."""
+    kind, song = found
+    if kind == "preview":
+        return 0, 0, 0
+    if kind == "ytm":
+        return 1, BITRATE, 1
+    return LOSSLESS_RANK if kind.suffix in LOSSLESS else 1, song.get("bitrate") or kind.bitrate, 0
+
+
+def said(found: tuple | None) -> str:
+    """A service's answer as a log line says it."""
+    if found is None:
+        return "nothing"
+    if found[0] == "preview":
+        return "a preview"
+    return "the song" if found[0] == "ytm" else f"the song ({found[1].get('bitrate') or found[0].bitrate} kbit/s {found[0].suffix})"
 
 
 def keep_playable(ids: list[str], count: int) -> list[str]:

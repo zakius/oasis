@@ -78,9 +78,10 @@ they are played. Both take their songs from a **source**:
 | `library` | The library alone: the artist's linked artists, the same artist, songs played around it, the same genre | always |
 | `listenbrainz` | ListenBrainz's LB Radio for the song's artist and artists ListenBrainz finds similar | the user has ListenBrainz on, with a token |
 
-Last.fm's and ListenBrainz's picks become library songs where the library has them, else YouTube Music streaming
-songs (`yt-…`), else songs of the other streaming services the user has on (Qobuz `qb-…`, Tidal `td-…`, Bandcamp
-`bc-…`, SoundCloud `sc-…`). A pick that none of them has is left out, unless the client asks for unplayable songs
+Last.fm's and ListenBrainz's picks become library songs where the library has them, else the best of what the
+streaming services the user has on answer, all asked at once: YouTube Music (`yt-…`), Qobuz (`qb-…`), Tidal (`td-…`),
+Bandcamp (`bc-…`), SoundCloud (`sc-…`). A full lossless song beats a lossy one, and a lossy one a higher bitrate (see the
+README). A pick that none of them has is left out, unless the client asks for unplayable songs
 (the extension `unavailableSongs`, [unavailable-songs-extension.md](unavailable-songs-extension.md)). A source that
 finds nothing, or fails, gives nothing: no other source stands in, so an empty list means that source had nothing for
 this song.

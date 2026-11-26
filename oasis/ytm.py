@@ -40,11 +40,13 @@ LIKED = "LM"  # Liked Music: its songs stay in the library even with the playlis
 
 @dataclass
 class Stream:
+    """Audio a service serves over HTTP, which oasis sends on to clients as it comes (api.py), Range requests and all."""
     url: str
     content_type: str
     size: int
     expires: float
     headers: dict = field(default_factory=dict)  # what a request for url must send: the URL only works with them
+    parts: list[tuple[str, int]] | None = None  # the audio as segments (url, size) sent one after another, in place of url
 
 
 def big_cover(thumbnails) -> str | None:
@@ -78,13 +80,20 @@ def is_mix(playlist_id: str | None) -> bool:
 
 
 def read_range(stream: Stream, start: int, end: int):
-    """Yields the stream's bytes start..end (inclusive) in chunks."""
+    """Yields the stream's bytes start..end (inclusive) in chunks, across its parts when it has them."""
+    offset = 0
+    for url, size in stream.parts or [(stream.url, stream.size)]:
+        if start < offset + size and end >= offset:
+            yield from read_url(url, stream.headers, max(start - offset, 0), min(end - offset, size - 1))
+        offset += size
+
+
+def read_url(url: str, headers: dict, start: int, end: int):
     for pos in range(start, end + 1, CHUNK):
-        response = HTTP.request("GET", stream.url, headers={**stream.headers, "Range": f"bytes={pos}-{min(end, pos + CHUNK - 1)}"},
-                                preload_content=False)
+        response = HTTP.request("GET", url, headers={**headers, "Range": f"bytes={pos}-{min(end, pos + CHUNK - 1)}"}, preload_content=False)
         try:
             if response.status not in (200, 206):
-                raise OSError(f"HTTP {response.status} from googlevideo")
+                raise OSError(f"HTTP {response.status} from {url.split('?')[0]}")
             yield from response.stream(1 << 16)
         except BaseException:  # also the client leaving mid-song: a connection with unread bytes can't be reused
             response.close()

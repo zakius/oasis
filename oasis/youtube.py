@@ -17,6 +17,7 @@ ARTIST_PAGE_KEPT = 86400  # seconds an artist's YouTube Music page is used befor
 WARMED = 3600             # seconds before a video is readied (warm) again
 ALBUM_GAP = 5             # seconds between the album pages complete_next_album reads
 ALBUM_IDLE = 600          # seconds before looking again when every album page was read
+BITRATE = 128             # kbit/s of the m4a audio a streaming track plays
 
 
 def track_row(song: dict) -> dict:
@@ -27,7 +28,7 @@ def track_row(song: dict) -> dict:
         "title": song["title"], "artist": song["artist"], "album_artist": song["album_artist"], "album": song["album"],
         "artist_id": name_id(song["album_artist"]), "album_id": album_id(song["album_artist"], song["album"]),
         "year": song["year"], "duration": song["duration"],
-        "bitrate": 128, "suffix": "m4a", "content_type": "audio/mp4",  # the m4a audio resolve() picks and the cache keeps
+        "bitrate": BITRATE, "suffix": "m4a", "content_type": "audio/mp4",  # the m4a audio resolve() picks and the cache keeps
         "cover": song["cover"],
         "created": time.time(),
     }

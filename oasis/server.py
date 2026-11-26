@@ -1,15 +1,18 @@
 """The running oasis: the loaded config, the database, YouTube Music and every background worker, wired once and shared
 by both front ends, the Subsonic API (api.py) and the dashboard (web.py). What both front ends do alike lives here too:
-wanting music, linking YouTube Music, connecting the Last.fm app oasis signs users in with, recording plays."""
+wanting music, linking YouTube Music, SoundCloud and Bandcamp, connecting the Last.fm app oasis signs users in with,
+recording plays."""
 import json
 import logging
 import threading
+import time
 from contextlib import asynccontextmanager
 
 from starlette.applications import Starlette
 
 from . import accounts, acquire, api, artists, download, forward, lastfm, missing, mixes, playlists, remove, translate, web, worker, youtube
 from .acquire import Acquire
+from .bandcamp import Bandcamp, Fan
 from .config import Config
 from .enrich import Enrichment
 from .db import connect, record_play, set_stat
@@ -21,7 +24,7 @@ from .library import Scanner
 from .mixes import Mixes
 from .prowlarr import Prowlarr
 from .recommend import Recommender
-from .sources import Sources
+from .sources import SoundCloud, Sources
 from .torbox import from_rdtclient
 from .upload import Uploads
 from .youtube import YouTubeCatalogue
@@ -40,7 +43,7 @@ class Oasis:
         # YouTube Music's client exists whatever an admin allows: the switch on the dashboard works while oasis runs.
         self.ytm = ytm or (YouTubeMusic(config.ytm_cache) if config.ytm_cache else None)
         # Each user's services and other streaming services' audio, cached when played
-        self.sources = Sources(config.database.parent / "streams", config.ytm_allowed)
+        self.sources = Sources(config.database.parent / "streams", config.ytm_allowed, self.connect)
         self.youtube = YouTubeCatalogue(self.ytm, lambda db: self.sources.allowed(db, "ytm"))
         self.throttle = accounts.Throttle()  # the API's and the dashboard's sign-ins
         self.translations = translate.Translations(translate.Google())
@@ -59,8 +62,11 @@ class Oasis:
         self.recommender = Recommender(self.connect, self.ytm, lambda: self.lastfm, self.sources)
         self.uploads = Uploads(self.connect, config.library[0], config.database.parent / "uploads")
         self.mixes = Mixes(self.connect, self.ytm, self.sources, self.youtube.fetch_soon)
+        self.soundcloud = mixes.SoundCloudPlaylists(self.connect, self.sources)
         self.enrichment = Enrichment(self.connect)
         self.scanner = Scanner(self.connect, config.library, config.dedupe, self.enrichment.wake.set)
+        self.bandcamp = Bandcamp(self.connect, self.sources, Importer(self.connect, config.library[0]), config.database.parent / "bandcamp",
+                                 lambda db, user, ids: self.want(db, user, "album", ids, time.time()), self.scanner.start)
         torbox, prowlarr = config.torbox, config.prowlarr
         self.doctor = Doctor(self.connect, torbox, download.tracked) if torbox else None
         self.downloads = self.acquire = None
@@ -93,6 +99,8 @@ class Oasis:
         if self.ytm:
             self.mixes.start()
             worker.start("album fill", self.complete_next_album, youtube.ALBUM_IDLE)
+        self.soundcloud.start()
+        self.bandcamp.start()
         self.recommender.start()
         worker.start("missing songs", self.fill_missing, MISSING_IDLE)
         worker.start("stream cache", self.prune_streams, 86400)
@@ -177,6 +185,39 @@ class Oasis:
     def unlink_youtube(self, db, user: str):
         accounts.set_field(db, user, ytm_auth=None, ytm_name=None)
         self.mixes.drop(db, user)
+
+    def link_soundcloud(self, db, user: str, token: str) -> str:
+        """Keeps the user's SoundCloud sign-in once SoundCloud accepts it, and mirrors their likes and playlists; the
+        account's name. ValueError saying why when it can't."""
+        if not (self.sources.allowed(db, "soundcloud", "signed-in") or self.sources.allowed(db, "soundcloud", "account")):
+            raise ValueError("SoundCloud sign-ins aren't offered on this server")
+        account = SoundCloud.link(token.strip().removeprefix("OAuth ").strip())
+        self.sources.link(db, user, "soundcloud", account)
+        if self.background:
+            threading.Thread(target=self.soundcloud.refresh, args=(user,), daemon=True).start()
+        return account["name"]
+
+    def link_bandcamp(self, db, user: str, identity: str) -> str:
+        """Keeps the user's Bandcamp sign-in once Bandcamp accepts it, and reads their purchases and wishlist; the fan's
+        name. ValueError saying why when it can't."""
+        if not self.sources.allowed(db, "bandcamp", "account"):
+            raise ValueError("Bandcamp accounts aren't offered on this server")
+        identity = identity.strip().removeprefix("identity=")
+        try:
+            found = Fan(identity).summary()
+        except OSError as e:
+            raise ValueError(f"Bandcamp didn't answer: {e}")
+        name = (found.get("collection_summary") or {}).get("username") or "Bandcamp"
+        self.sources.link(db, user, "bandcamp", {"identity": identity, "fan_id": found["fan_id"], "name": name})
+        if self.background:
+            threading.Thread(target=self.bandcamp.refresh, args=(user,), daemon=True).start()
+        return name
+
+    def unlink(self, db, user: str, name: str):
+        """Forgets the user's sign-in to SoundCloud or Bandcamp, which stay on; SoundCloud's mirrored playlists go."""
+        self.sources.unlink(db, user, name)
+        if name == "soundcloud":
+            self.soundcloud.drop(db, user)
 
     def set_lastfm_app(self, db, key: str, secret: str):
         """Checks a Last.fm API key and secret, then keeps and uses them."""

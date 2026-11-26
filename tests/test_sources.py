@@ -41,7 +41,7 @@ class LastFmWithGaps(FakeLastFm):
         return [("Nobody Has", "Lost Song", None), ("Nobody At All", "Gone", None)]
 
 
-class FakePreview:
+class FakePreview(sources.Preview):
     """A preview service that has a clip of one song."""
     name, title, suffix, content_type = "clips", "Clips", "mp3", "audio/mpeg"
 
