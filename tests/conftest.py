@@ -7,7 +7,7 @@ import pytest
 from mutagen.flac import FLAC, Picture
 from starlette.testclient import TestClient
 
-from oasis import accounts, download
+from oasis import accounts, download, pace
 from oasis.server import create_app
 from oasis.config import Config, TorBox as TorBoxSettings
 from oasis.db import connect
@@ -64,6 +64,13 @@ def edition(id, *media, title="First", status="Official", fmt="CD"):
                 {"id": f"{id}-t{d + 1}{n + 1}", "position": n + 1, "title": title, "length": seconds * 1000,
                  "recording": {"id": f"rec-{title}", "length": seconds * 1000, "isrcs": [f"ISRC{n}"]}}
                 for n, (title, seconds) in enumerate(tracks)]} for d, tracks in enumerate(media)]}
+
+
+@pytest.fixture(autouse=True)
+def own_rate_limits():
+    """Each test's rate limits start afresh, in memory until it starts a server."""
+    pace.path = None
+    pace.forget()
 
 
 @pytest.fixture(scope="session")

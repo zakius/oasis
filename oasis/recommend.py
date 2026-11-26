@@ -8,16 +8,16 @@ import json
 import logging
 import queue
 import random
-import threading
 import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait as wait_for
 from itertools import chain, zip_longest
 
-from . import accounts, lastfm, missing, playlists, worker
+from . import accounts, lastfm, missing, playlists, tasks
 from .forward import LISTENBRAINZ
 from .artists import linked
+from .db import transaction
 from .formats import LOSSLESS
 from .playlists import LISTENING_RADIO, PLAIN, set_entries
 from .sources import Deezer
@@ -43,6 +43,8 @@ KEPT = 3600     # seconds a source's answer is kept (Recommender.answer)
 GRACE, GRACE_MOST = 0.3, 3.0
 LASTFM_SIMILAR = 15  # similar tracks asked of Last.fm, the most a method uses
 RADIOS = ("deezer", "tidal", "soundcloud")  # the services a user's radio capability (sources.CAPABILITIES) makes sources
+JOB = "radio"
+EVERY = 600  # seconds between top-ups of every radio when nothing woke them
 
 
 class Recommender:
@@ -50,9 +52,6 @@ class Recommender:
         """lastfm(): oasis's Last.fm app as it is now, or None. services: each user's services and the other streaming
         services (sources.Sources): a user gets songs only from the services they have on."""
         self.connect, self.ytm, self.lastfm, self.services = connect, ytm, lastfm, services
-        self.woken = threading.Event()
-        self.answers: dict[tuple, tuple[float, object]] = {}  # (expiry, answer) by question (answer, find)
-        self.answers_lock = threading.Lock()
         self.asking = ThreadPoolExecutor(ASKS)
 
     def sources(self, db, user) -> list[str]:
@@ -134,8 +133,9 @@ class Recommender:
         return list(dict.fromkeys(picks))[:count]
 
     def answer(self, question: tuple, ask):
-        """ask(), the answer of a source on the network to question, kept for KEPT seconds. The radio that follows
-        listening asks about each song played (top_up), so an instant mix of a song just played finds the answers here."""
+        """ask(), the answer of a source on the network to question, kept for KEPT seconds in the database, for every
+        worker. The radio that follows listening asks about each song played (top_up), so an instant mix of a song just
+        played finds the answers here."""
         if kept := self.kept(question):
             return kept[0]
         found = ask()
@@ -143,15 +143,26 @@ class Recommender:
         return found
 
     def kept(self, question: tuple) -> tuple | None:
-        """The answer kept for question, in a tuple; None when there is none."""
-        kept = self.answers.get(question)
-        return (kept[1],) if kept and kept[0] > time.monotonic() else None
+        """The answer kept for question (as JSON has it: lists for tuples), in a tuple; None when there is none."""
+        return self.all_kept([question]).get(question)
+
+    def all_kept(self, questions: list[tuple]) -> dict[tuple, tuple]:
+        """kept for each of the questions, read at once; those without one left out."""
+        db = self.connect()
+        try:
+            rows = db.execute("select question, answer from answer where question in (select value from json_each(?)) and expires > ?",
+                              (json.dumps([json.dumps(q) for q in questions]), time.time())).fetchall()
+        finally:
+            db.close()
+        found = {r[0]: (json.loads(r[1]),) for r in rows}
+        return {q: found[json.dumps(q)] for q in questions if json.dumps(q) in found}
 
     def keep(self, question: tuple, answer):
-        now = time.monotonic()
-        with self.answers_lock:
-            self.answers = {q: a for q, a in self.answers.items() if a[0] > now}
-            self.answers[question] = (now + KEPT, answer)
+        db = self.connect()
+        try:
+            db.execute("insert or replace into answer values (?, ?, ?)", (json.dumps(question), json.dumps(answer), time.time() + KEPT))
+        finally:
+            db.close()
 
     def from_youtube(self, db, seed, count: int, ytm) -> list[str]:
         """ytm: YouTube Music's client, None when the user doesn't have it on."""
@@ -256,16 +267,17 @@ class Recommender:
                     searched[i] = search.result()
         elif unknown:
             searched = dict.fromkeys(unknown)
-        for i, found in searched.items():
-            pair = pairs[i]
-            if found and found[0] == "ytm":
-                ids[i] = remember_song(db, found[1])
-            elif found and found[0] == "preview":
-                ids[i] = missing.remember(db, pair[0], pair[1], pair[2] if len(pair) > 2 else None, preview=found[1])
-            elif found:
-                ids[i] = self.services.remember(db, *found)
-            elif unplayable:
-                ids[i] = missing.remember(db, pair[0], pair[1], pair[2] if len(pair) > 2 else None)
+        with transaction(db):  # the songs found at once
+            for i, found in searched.items():
+                pair = pairs[i]
+                if found and found[0] == "ytm":
+                    ids[i] = remember_song(db, found[1])
+                elif found and found[0] == "preview":
+                    ids[i] = missing.remember(db, pair[0], pair[1], pair[2] if len(pair) > 2 else None, preview=found[1])
+                elif found:
+                    ids[i] = self.services.remember(db, *found)
+                elif unplayable:
+                    ids[i] = missing.remember(db, pair[0], pair[1], pair[2] if len(pair) > 2 else None)
         return [ids[i] for i in sorted(ids)]
 
     def find(self, ytm, clients: list, artist: str, title: str, previews: list = (), deadline: float | None = None):
@@ -275,24 +287,28 @@ class Recommender:
         far came at t seconds, a better one is waited for till t + min(GRACE·t, GRACE_MOST), and never past deadline
         (time.monotonic). Each service's answer, a miss too, is kept with the time it took, and counts as coming then.
         OSError when every service asked for the whole song failed; TimeoutError when the deadline came first."""
-        start, answers = time.monotonic(), queue.Queue()
         asks = [("YouTube Music", ("ytm", ""), True, lambda: ("ytm", found) if (found := ytm.find(artist, title)) else None)] if ytm else []
         asks += [(c.title, (c.name, getattr(c, "variant", "")), True, lambda c=c: (c, found) if (found := c.find(artist, title)) else None)
                  for c in clients]
         asks += [(f"{s.title} previews", ("preview", s.name), False,
                   lambda s=s: ("preview", f"{s.name}:{found}") if (found := s.find(artist, title)) else None) for s in previews]
+        by_service = {(c.name, getattr(c, "variant", "")): c for c in clients}  # a kept answer names its client
+        known = self.all_kept([("find", *service, artist, title) for _, service, _, _ in asks])
+        start, answers = time.monotonic(), queue.Queue()
 
         def answered(future, label: str, question: tuple, full: bool):
             took, error = time.monotonic() - start, future.exception()
             if error is None:
-                self.keep(question, (future.result(), took))
+                found = future.result()
+                self.keep(question, ([found[0] if isinstance(found[0], str) else found[0].name, found[1]] if found else None, took))
             log.info("%s - %s: %s answered %s in %.2fs", artist, title, label, f"with an error ({error})" if error else said(future.result()), took)
             answers.put((full, None if error else future.result(), error, took))
 
         for label, service, full, ask in asks:
             question = ("find", *service, artist, title)
-            if kept := self.kept(question):
+            if kept := known.get(question):
                 found, took = kept[0]
+                found = found and (found[0] if found[0] in ("ytm", "preview") else by_service[service], found[1])
                 log.info("%s - %s: %s answered %s in %.2fs before", artist, title, label, said(found), took)
                 answers.put((full, found, None, took))
             else:
@@ -320,16 +336,15 @@ class Recommender:
             raise TimeoutError("no service answered by the deadline")
         return None
 
-    def start(self):
-        worker.start("radio", self.top_up_pass, 600, self.woken)
-
-    def wake(self):
+    @staticmethod
+    def wake(db):
         """Tops radios up now: a playlist was made or changed."""
-        self.woken.set()
+        tasks.wake(db, JOB)
 
     def top_up_pass(self):
         db = self.connect()
         try:
+            db.execute("delete from answer where expires < ?", (time.time(),))
             self.top_up_all(db)
         finally:
             db.close()
@@ -349,7 +364,7 @@ class Recommender:
             db.execute("update playlist set played_pos = max(played_pos, (select max(pos) from playlist_entry e "
                        "where e.playlist_id = playlist.id and e.track_id = ?)) where radio != ? and owner = ? and exists "
                        "(select 1 from playlist_entry e where e.playlist_id = playlist.id and e.track_id = ?)", (id, PLAIN, owner, id))
-        self.woken.set()
+        tasks.wake(db, JOB)
 
     def top_up(self, db, playlist):
         """Adds songs to a radio until it has AHEAD playable ones after the last played. Songs nothing plays come too
@@ -404,8 +419,9 @@ class Recommender:
         added = keep_playable(added, max(needed, 10))
         entries += added
         dropped = max(0, len(entries) - KEEP)
-        set_entries(db, playlist["id"], entries[dropped:])
-        db.execute("update playlist set played_pos = ? where id = ?", (played_pos - dropped, playlist["id"]))
+        with transaction(db):
+            set_entries(db, playlist["id"], entries[dropped:])
+            db.execute("update playlist set played_pos = ? where id = ?", (played_pos - dropped, playlist["id"]))
         log.info("radio %s: added %d tracks", playlist["name"], len(added))
 
     def station_seeds(self, db, user, station: str, period: str):

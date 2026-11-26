@@ -16,12 +16,13 @@ import subprocess
 import threading
 import time
 import urllib.parse
-from collections import defaultdict, deque
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import urllib3
 
+from . import pace
 from .remote import Rejected
 from .text import fold
 from .tracks import album_id, make_id, name_id, remember
@@ -736,25 +737,16 @@ class ApplePreview(Preview):
     skipped at once, as an error, which isn't kept as a miss."""
     name, title, suffix, content_type = "apple", "Apple Music", "m4a", "audio/mp4"
     API = "https://itunes.apple.com/"
-    LIMIT = 20  # searches a minute
-    asked: deque = deque()  # when each search of the last minute was made, from every user's lookups
-    lock = threading.Lock()
+    LIMIT = 20  # searches a minute, from every user's lookups
 
     @classmethod
     def take_turn(cls):
-        with cls.lock:
-            now = time.time()
-            while cls.asked and cls.asked[0] < now - 60:
-                cls.asked.popleft()
-            if len(cls.asked) >= cls.LIMIT:
-                raise OSError(f"skipped: Apple Music's search takes {cls.LIMIT} searches a minute")
-            cls.asked.append(now)
+        pace.take_turn("Apple Music's search", 60 / cls.LIMIT, cls.LIMIT)
 
-    @classmethod
-    def refused(cls):
+    @staticmethod
+    def refused():
         """Apple refused anyway (429): no search for a minute."""
-        with cls.lock:
-            cls.asked.extend([time.time()] * cls.LIMIT)
+        pace.hold("Apple Music's search", 60)
 
     def find(self, artist: str, title: str) -> str | None:
         self.take_turn()

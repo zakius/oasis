@@ -1,16 +1,18 @@
-"""The running oasis: the loaded config, the database, YouTube Music and every background worker, wired once and shared
-by both front ends, the Subsonic API (api.py) and the dashboard (web.py). What both front ends do alike lives here too:
+"""The running oasis: the loaded config, the database, YouTube Music and every periodic job and task the workers run
+(worker.py), wired once and shared by both front ends, the Subsonic API (api.py) and the dashboard (web.py), and by the
+workers. What both front ends do alike lives here too:
 wanting music, linking YouTube Music, SoundCloud and Bandcamp, turning services off, connecting the Last.fm app oasis
 signs users in with, recording plays."""
 import json
 import logging
-import threading
 import time
-from contextlib import asynccontextmanager
+import uuid
+from contextlib import asynccontextmanager, contextmanager
 
 from starlette.applications import Starlette
 
-from . import accounts, acquire, api, artists, download, forward, lastfm, missing, mixes, playlists, remove, servers, translate, web, worker, youtube
+from . import accounts, acquire, api, artists, download, doctor, enrich, forward, lastfm, latin, library, lyrics, missing, mixes, musicbrainz, pace, playlists, \
+    recommend, ready, remove, servers, sources, tasks, translate, upload, web, youtube
 from .acquire import Acquire
 from .bandcamp import Bandcamp, Fan
 from .config import Config
@@ -25,8 +27,10 @@ from .mixes import Mixes
 from .prowlarr import Prowlarr
 from .ready import ReadyMade
 from .recommend import Recommender
+from .lastfm import elsewhere
 from .sources import SoundCloud, Sources
 from .torbox import from_rdtclient
+from .worker import ASK_WAIT, THREADS, Answer, Job, Worker
 from .upload import Uploads
 from .youtube import YouTubeCatalogue
 from .ytm import YouTubeMusic
@@ -34,13 +38,20 @@ from .ytm import YouTubeMusic
 log = logging.getLogger(__name__)
 
 MISSING_IDLE = 300  # seconds between looks for songs nothing can play whose album isn't known yet
+STREAMS_EVERY = 86400  # seconds between prunes of other services' cached audio
+INDEX_EVERY = 60  # seconds between updates of the romanized names search matches (latin.index), besides each scan's
+LASTFM_READ = 60  # seconds the Last.fm app read from the database is used: an admin may connect another in another process
+LOOKUPS = {"find", "artist", "release_groups", "release_group", "editions"}  # musicbrainz.py's lookups the front ends ask workers for
+CATALOGUE = {"complete_album", "artist_page", "search", "top_songs"}  # youtube.py's
+PROWLARR = {"overview", "indexer", "test", "every", "save"}  # prowlarr.py's, for the indexers page
 
 
 class Oasis:
     def __init__(self, config: Config, ytm=None, services=None, background=True):
         """services: every user's play-forwarding services, by name, in place of what they linked (tests). background:
-        starts threads as users act (loading a user's mixes); tests run those themselves."""
+        queues tasks as users act (loading a user's mixes); tests run those themselves."""
         self.config, self.background = config, background
+        pace.path = config.database  # rate limits are kept with every other process's
         # YouTube Music's client exists whatever an admin allows: the switch on the dashboard works while oasis runs.
         self.ytm = ytm or (YouTubeMusic(config.ytm_cache) if config.ytm_cache else None)
         # Each user's services and other streaming services' audio, cached when played
@@ -51,7 +62,7 @@ class Oasis:
         db = self.connect()
         accounts.hash_plain_passwords(db)
         accounts.sync_config_users(db, config.users)
-        self.lastfm = lastfm.app(db, config.lastfm_key, config.lastfm_secret)  # oasis's Last.fm app, or None
+        self.lastfm_app, self.lastfm_read = None, 0.0
         artists.from_config(db, config.artists)
         artists.configure(db, artists.load_settings(db, config.artists))
         playlists.demix(db)
@@ -67,7 +78,7 @@ class Oasis:
         self.tidal_mixes = mixes.TidalMixes(self.connect, self.sources, self.recommender)
         self.ready = ReadyMade(self.connect, self.recommender)
         self.enrichment = Enrichment(self.connect)
-        self.scanner = Scanner(self.connect, config.library, config.dedupe, self.enrichment.wake.set)
+        self.scanner = Scanner(self.connect, config.library, config.dedupe, lambda db: tasks.wake(db, enrich.JOB))
         self.bandcamp = Bandcamp(self.connect, self.sources, Importer(self.connect, config.library[0]), config.database.parent / "bandcamp",
                                  lambda db, user, ids: self.want(db, user, "album", ids, time.time()), self.scanner.start)
         torbox, prowlarr = config.torbox, config.prowlarr
@@ -82,6 +93,28 @@ class Oasis:
     def connect(self):
         return connect(self.config.database)
 
+    @contextmanager
+    def opened(self):
+        """A connection of its own, for a task."""
+        db = self.connect()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    @property
+    def lastfm(self):
+        """oasis's Last.fm app, or None."""
+        if time.time() - self.lastfm_read > LASTFM_READ:
+            with self.opened() as db:
+                self.lastfm_app = lastfm.app(db, self.config.lastfm_key, self.config.lastfm_secret)
+            self.lastfm_read = time.time()
+        return self.lastfm_app
+
+    @lastfm.setter
+    def lastfm(self, app):
+        self.lastfm_app, self.lastfm_read = app, time.time()
+
     def user_services(self, db, user: str) -> dict:
         """The services the user's plays and likes go to, by name (forward.user_services)."""
         return forward.user_services(self.lastfm, self.ytm, accounts.get(db, user), self.sources.usable(db, user),
@@ -95,28 +128,178 @@ class Oasis:
         on = self.sources.uses(db, user, "ytm", "songs") if user else self.sources.allowed(db, "ytm")
         return self.ytm if on else None
 
-    def start(self):
-        self.scanner.start()
-        self.forwarder.start()
-        if self.acquire:
-            self.acquire.start()
-        if self.doctor:
-            self.doctor.start()
-        if self.downloads:
-            self.downloads.start()
+    def jobs(self) -> list[Job]:
+        """The periodic jobs. Acquisition's keep what they learn between runs in memory (download.py's failed polls in a row,
+        its recent searches), so they share a lane: one worker runs them."""
+        found = [Job(library.JOB, self.scanner.step, None), Job(forward.JOB, self.forwarder.flush, 60),
+                 Job("soundcloud playlists", self.soundcloud.refresh_all, mixes.REFRESH),
+                 *(Job(f"{w.name} playlists", w.refresh_all, mixes.REFRESH) for w in (self.listenbrainz_playlists, self.tidal_mixes)),
+                 Job("bandcamp", self.bandcamp.refresh_all, mixes.REFRESH), Job(recommend.JOB, self.recommender.top_up_pass, recommend.EVERY),
+                 Job("ready-made playlists", self.ready.refresh_all, ready.DAY), Job("missing songs", self.fill_missing, MISSING_IDLE),
+                 Job("stream cache", self.prune_streams, STREAMS_EVERY), Job("upload cleanup", self.uploads.clean_up, upload.CLEAN_EVERY),
+                 Job(enrich.JOB, self.enrichment.fill, enrich.IDLE), Job("search index", self.index, INDEX_EVERY)]
         if self.ytm:
-            self.mixes.start()
-            worker.start("album fill", self.complete_next_album, youtube.ALBUM_IDLE)
-        self.soundcloud.start()
-        self.listenbrainz_playlists.start()
-        self.tidal_mixes.start()
-        self.bandcamp.start()
-        self.recommender.start()
-        self.ready.start()
-        worker.start("missing songs", self.fill_missing, MISSING_IDLE)
-        worker.start("stream cache", self.prune_streams, 86400)
-        self.uploads.start()
-        self.enrichment.start()
+            found += [Job("mix refresh", self.mixes.refresh_all, mixes.REFRESH), Job("album fill", self.complete_next_album, youtube.ALBUM_IDLE)]
+        if self.acquire:
+            found.append(Job(acquire.JOB, self.acquire.step, 60, "acquisition"))
+        if self.downloads:
+            found.append(Job("downloads poll", self.downloads.cycle, download.INTERVAL, "acquisition"))  # TorBox down: next poll
+        if self.doctor:
+            found.append(Job("doctor cycle", self.doctor.cycle, doctor.INTERVAL, "acquisition"))  # TorBox restarts: next cycle
+        return found
+
+    def kinds(self) -> dict:
+        """The one-off tasks' functions, by kind (worker.Worker): the background ones, and the interactive ones the front
+        ends ask workers for (ask), which call other services: a slow service holds up a worker's thread, not the API."""
+        return {"refresh playlists": self.refresh_playlists, "now playing": self.now_playing, "youtube": self.youtube_call,
+                "musicbrainz": self.musicbrainz, "lyrics": self.fetch_lyrics, "translate lyrics": self.translate_lyrics,
+                "similar": self.similar, "radio": self.fill_radio, "artist info": self.artist_info, "link": self.link,
+                "listenbrainz token": self.listenbrainz_token, "lastfm sign-in": self.lastfm_sign_in, "server sign-in": self.server_sign_in,
+                "lastfm app": self.connect_lastfm_app, "qobuz sign-in": self.qobuz_sign_in, "prowlarr": self.prowlarr,
+                "block download": self.block_download, "scan": self.scan, "tidal sign-in": self.tidal_sign_in}
+
+    def asking(self, kind: str, key: str | None = None, /, **args) -> Answer:
+        """An interactive task (kinds), its result to come; key: see tasks.add."""
+        return Answer(self.connect, kind, args, self.kinds()[kind], key)
+
+    def ask(self, kind: str, /, **args):
+        """An interactive task's result, waited for up to ASK_WAIT."""
+        return self.asking(kind, **args).result(ASK_WAIT)
+
+    def now_playing(self, user: str, track_id: str, at: float):
+        with self.opened() as db:
+            if r := db.execute("select * from track where id = ?", (track_id,)).fetchone():
+                self.forwarder.now_playing(db, user, forward.listen_for(r, at))
+
+    def youtube_call(self, call: str, args: list):
+        """One of CATALOGUE: YouTube Music's catalogue as oasis keeps it (youtube.py)."""
+        if call not in CATALOGUE:
+            raise ValueError(call)
+        with self.opened() as db:
+            return getattr(self.youtube, call)(db, *args)
+
+    def musicbrainz(self, call: str, args: list):
+        """One of LOOKUPS, cached in mb_cache as musicbrainz.py keeps them."""
+        if call not in LOOKUPS:
+            raise ValueError(call)
+        with self.opened() as db:
+            return getattr(musicbrainz, call)(*args, db=db)
+
+    def fetch_lyrics(self, track_id: str):
+        """Fetches the song's lyrics into the lyrics table (lyrics.for_track), for the front end to read."""
+        with self.opened() as db:
+            if r := db.execute("select * from track where id = ?", (track_id,)).fetchone():
+                lyrics.found_for_track(db, r, self.youtube_music(db))
+
+    def translate_lyrics(self, track_id: str, texts: list[str], lang: str) -> list[str] | None:
+        with self.opened() as db:
+            return self.translations.lines(db, track_id, texts, lang)
+
+    def similar(self, seed: str, count: int, user: str, source: str, wait: float | None = None, unplayable: bool = False) -> list[str]:
+        """Recommender.similar for the song seed (its id) and the user (their name)."""
+        with self.opened() as db:
+            r = db.execute("select * from track where id = ?", (seed,)).fetchone()
+            return self.recommender.similar(db, r, count, accounts.get(db, user), source=source, wait=wait, unplayable=unplayable) if r else []
+
+    def fill_radio(self, playlist: int):
+        """Fills a radio just made (Recommender.top_up)."""
+        with self.opened() as db:
+            if row := db.execute("select * from playlist where id = ?", (playlist,)).fetchone():
+                self.recommender.top_up(db, row)
+
+    def artist_info(self, artist_id: str, name: str, user: str) -> dict:
+        """What the other services say of an artist, for getArtistInfo: its YouTube Music page fetched (artist_page),
+        Last.fm's info (lastfm: None when it has none or failed), the names of Deezer's related artists for a user with
+        Deezer's radio (deezer)."""
+        with self.opened() as db:
+            self.youtube.artist_page(db, artist_id, name)
+            related = []
+            if self.sources.uses(db, user, "deezer", "radio"):
+                try:
+                    related = self.recommender.answer(("deezer artists", name), lambda: sources.Deezer().related(name))
+                except Exception as e:
+                    log.info("Deezer related artists failed: %s", e)
+        info = None
+        if self.lastfm:
+            try:
+                info = self.lastfm.artist_info(name)
+            except Exception as e:
+                log.info("Last.fm artist info failed: %s", e)
+        return {"lastfm": info, "deezer": related}
+
+    def link(self, service: str, user: str, secret) -> str:
+        """A sign-in to YouTube Music, SoundCloud or Bandcamp pasted on the dashboard (link_youtube...); the account's name."""
+        with self.opened() as db:
+            return {"ytm": self.link_youtube, "soundcloud": self.link_soundcloud, "bandcamp": self.link_bandcamp}[service](db, user, secret)
+
+    @staticmethod
+    def listenbrainz_token(token: str, api: str | None = None) -> bool:
+        return forward.ListenBrainz(token, *([api] if api else [])).valid()
+
+    def lastfm_sign_in(self, token: str) -> list[str]:
+        """The session key and account name of a Last.fm sign-in through oasis's app."""
+        return list(self.lastfm.sign_in(token))
+
+    @staticmethod
+    def server_sign_in(api: str, auth: str, token: str) -> list[str]:
+        """The session and account name of a sign-in to a Last.fm-like server (servers.py)."""
+        return list(elsewhere(api, auth).sign_in(token))
+
+    def connect_lastfm_app(self, key: str, secret: str):
+        with self.opened() as db:
+            self.set_lastfm_app(db, key, secret)
+
+    def tidal_sign_in(self, user: str):
+        """Starts the user's Tidal sign-in on a device: its page and code wait in sign_in for the dashboard, and a thread
+        of this process links the account once the user allowed it there. One started later replaces it."""
+        attempt = uuid.uuid4().hex
+
+        def done(account):
+            with self.opened() as db:
+                latest = accounts.signing_in(db, user, "tidal").get("attempt") == attempt
+                if account is None:
+                    if latest:
+                        accounts.set_signing_in(db, user, "tidal", {"error": "Tidal's sign-in expired before it was allowed. Link again."})
+                    return
+                self.sources.link(db, user, "tidal", account)
+                self.refresh_soon(db, "tidal", user)
+                if latest:
+                    accounts.set_signing_in(db, user, "tidal", None)
+        started = sources.Tidal.link_start(done)
+        with self.opened() as db:
+            accounts.set_signing_in(db, user, "tidal", {**started, "attempt": attempt})
+
+    @staticmethod
+    def qobuz_sign_in(email: str, password: str, samples: bool) -> dict:
+        return sources.Qobuz.link(email, password, samples)
+
+    def prowlarr(self, call: str, args: list):
+        """One of PROWLARR, for the indexers page. Its answers keyed by indexer id come back keyed by the id as text (JSON)."""
+        if call not in PROWLARR:
+            raise ValueError(call)
+        return getattr(self.downloads.prowlarr, call)(*args)
+
+    def block_download(self, rg: str) -> bool:
+        with self.opened() as db:
+            return self.downloads.block(db, rg)
+
+    def scan(self):
+        """A scan, done on return (Scanner.now)."""
+        with self.opened() as db:
+            self.scanner.now(db)
+
+    def worker(self, threads: int = THREADS) -> Worker:
+        return Worker(self.connect, self.jobs(), self.kinds(), threads)
+
+    def refresh_playlists(self, service: str, user: str):
+        """Mirrors the user's playlists of a service (one of mixes.py's, or Bandcamp's), as they were just linked."""
+        {"ytm": self.mixes, "soundcloud": self.soundcloud, "listenbrainz": self.listenbrainz_playlists, "tidal": self.tidal_mixes,
+         "bandcamp": self.bandcamp}[service].refresh(user)
+
+    def refresh_soon(self, db, service: str, user: str):
+        """refresh_playlists in a worker."""
+        if self.background:
+            tasks.add(db, "refresh playlists", {"service": service, "user": user}, f"refresh playlists {service} {user}")
 
     def complete_next_album(self) -> float | None:
         """One album page for the album fill worker: the next comes ALBUM_GAP later, or ALBUM_IDLE when none was left."""
@@ -136,6 +319,11 @@ class Oasis:
             db.close()
         return None
 
+    def index(self):
+        """The romanized names of library songs that came other than by a scan (mixes, imports of streams), for search."""
+        with self.opened() as db:
+            latin.index(db)
+
     def prune_streams(self):
         """Deletes the cached audio of other services' songs that no track plays any more (Sources.prune), daily."""
         db = self.connect()
@@ -151,7 +339,7 @@ class Oasis:
             set_stat(db, user, id, "starred", value)
         acquire.want(db, user, kind, ids, bool(value))
         if self.acquire and ids:
-            self.acquire.wake()
+            self.acquire.wake(db)
 
     def give_up(self, db, user: str, rg: str):
         """No more searches for the album: the user's stars of it are taken back, and its followed artist's catalogue
@@ -181,16 +369,15 @@ class Oasis:
             raise ValueError("YouTube Music didn't accept that sign-in. Sign in again and retry.")
         accounts.set_field(db, user, ytm_auth=auth, ytm_name=name)
         self.sources.turn_on(db, user, "ytm")
-        if self.background:
-            threading.Thread(target=self.mixes.refresh, args=(user,), daemon=True).start()
+        self.refresh_soon(db, "ytm", user)
         return name
 
     def show_youtube_playlists(self, db, user: str, shown: set[int], new_shown: bool) -> bool:
         """Shows the user's YouTube Music library playlists in shown and hides the others (mixes.show); one shown again
         has its songs read now. True when one was."""
         again = mixes.show(db, user, shown, new_shown)
-        if again and self.background:
-            threading.Thread(target=self.mixes.refresh, args=(user,), daemon=True).start()
+        if again:
+            self.refresh_soon(db, "ytm", user)
         return again
 
     def unlink_youtube(self, db, user: str):
@@ -204,8 +391,7 @@ class Oasis:
             raise ValueError("SoundCloud sign-ins aren't offered on this server")
         account = SoundCloud.link(token.strip().removeprefix("OAuth ").strip())
         self.sources.link(db, user, "soundcloud", account)
-        if self.background:
-            threading.Thread(target=self.soundcloud.refresh, args=(user,), daemon=True).start()
+        self.refresh_soon(db, "soundcloud", user)
         return account["name"]
 
     def link_bandcamp(self, db, user: str, identity: str) -> str:
@@ -220,8 +406,7 @@ class Oasis:
             raise ValueError(f"Bandcamp didn't answer: {e}")
         name = (found.get("collection_summary") or {}).get("username") or "Bandcamp"
         self.sources.link(db, user, "bandcamp", {"identity": identity, "fan_id": found["fan_id"], "name": name})
-        if self.background:
-            threading.Thread(target=self.bandcamp.refresh, args=(user,), daemon=True).start()
+        self.refresh_soon(db, "bandcamp", user)
         return name
 
     def unlink(self, db, user: str, name: str):
@@ -246,14 +431,13 @@ class Oasis:
             self.tidal_mixes.drop(db, user)
         self.sources.turn_off(db, user, name)
 
-    def refresh_soon(self, worker, user: str):
-        """Mirrors the user's playlists of a service in the background (one of mixes.py's), as they were just linked."""
-        if self.background:
-            threading.Thread(target=worker.refresh, args=(user,), daemon=True).start()
-
     def set_lastfm_app(self, db, key: str, secret: str):
         """Checks a Last.fm API key and secret, then keeps and uses them."""
         self.lastfm = lastfm.connect_app(db, key, secret)
+
+    def forget_lastfm_app(self):
+        """The Last.fm app is read again: a worker connected another."""
+        self.lastfm_read = 0.0
 
     def played(self, db, user: str, plays: list[tuple[str, float]]):
         """Counts the user's plays of tracks (id, when), forwards them to the services the user linked and moves
@@ -264,15 +448,24 @@ class Oasis:
         self.recommender.played(db, user, [id for id, _ in plays])
 
 
-def create_app(config: Config, background: bool = True, ytm=None, services=None) -> Starlette:
-    """background starts every worker (Oasis.start); tests drive those themselves."""
+def create_app(config: Config, background: bool = True, ytm=None, services=None, worker: bool = True) -> Starlette:
+    """background: a scan at start, and with worker the periodic jobs and tasks in threads of this process (a worker of
+    its own); without, worker processes (`oasis worker`) run them. Tests drive those themselves."""
     oasis = Oasis(config, ytm, services, background)
 
     @asynccontextmanager
     async def lifespan(app):
         if background:
-            oasis.start()
+            db = oasis.connect()
+            tasks.schedule(db, oasis.jobs())
+            db.close()
+            oasis.scanner.start()
+            if worker:
+                running = oasis.worker()
+                running.start()
         yield
+        if background and worker:
+            running.stop()
 
     app = Starlette(routes=[*api.routes(oasis), *web.routes(oasis)], lifespan=lifespan)
     app.state.oasis = oasis

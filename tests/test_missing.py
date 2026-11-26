@@ -160,7 +160,7 @@ def test_keep_playable_keeps_ids_up_to_the_count_th_playable_one():
 
 
 class Acquiring:
-    def wake(self):
+    def wake(self, db):
         pass
 
 

@@ -5,7 +5,6 @@ import json
 import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, wait as wait_for
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -17,13 +16,14 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import accounts, acquire, artists, cover, forward, lastfm, latin, lyrics, missing, mixes, musicbrainz, playlists, romanize, sources, tracks, transcode, translate, upload, youtube, ytm
+from . import accounts, acquire, artists, cover, lastfm, latin, lyrics, missing, mixes, musicbrainz, playlists, romanize, sources, tracks, transcode, translate, upload, youtube, ytm
 from .credits import credits_of, people
 from .db import as_user, set_stat
 from .playlists import RADIO, is_radio, set_entries, touch
 from .recommend import PERIOD, PERIODS, SOURCES, STATIONS
 from .text import fold
 from .tracks import BY_ARTIST_NAME, IDS, MB_IDS, id_column, resolve
+from .worker import ASK_WAIT
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +69,7 @@ YTM_SEARCH = 50  # YouTube Music songs a search asks for at most
 FIND_WAIT = 3  # seconds a search waits for MusicBrainz, from its start: free, it answers a search's two requests in about 2;
                # busy (503) or behind other requests, in up to a minute
 SIMILAR_WAIT = 6  # seconds getSimilarSongs waits for its slowest source: YouTube Music answers in about 2, Last.fm in up to 6
+ANSWER_MORE = 2  # seconds an answer may take beyond what a task waits itself, to come back from a worker
 WARM = 3  # songs at the head of a radio or similar songs: the first from YouTube is readied before a client asks (youtube.warm)
 
 
@@ -492,7 +493,6 @@ class Api:
 
     def __init__(self, oasis):
         self.oasis = oasis
-        self.finder = ThreadPoolExecutor(4)  # MusicBrainz searches, made while the rest of a search3 is looked up
 
     def _authenticate(self, db, p: Params) -> str:
         """The user an app password signs in, given with the user's name (u, with t and s or with p) or alone as an API key
@@ -579,7 +579,7 @@ class Api:
         return {"musicFolders": {"musicFolder": [{"id": 1, "name": "Music"}]}}
 
     def getScanStatus(self, db, p, user):
-        return {"scanStatus": {"scanning": self.oasis.scanner.scanning, "count": db.execute("select count(*) from track").fetchone()[0]}}
+        return {"scanStatus": {"scanning": self.oasis.scanner.scanning(db), "count": db.execute("select count(*) from track").fetchone()[0]}}
 
     def startScan(self, db, p, user):
         self.oasis.scanner.start()
@@ -610,8 +610,8 @@ class Api:
 
     def getArtist(self, db, p, user):
         if tracks.mbid_of(id := p.need("id")):
-            info = self._musicbrainz(musicbrainz.artist, tracks.mbid_of(id), db)
-            groups = self._musicbrainz(musicbrainz.release_groups, tracks.mbid_of(id), db)
+            info = self._musicbrainz("artist", tracks.mbid_of(id))
+            groups = self._musicbrainz("release_groups", tracks.mbid_of(id))
             albums = [self._mb_album(db, g) for g in musicbrainz.by_date(groups)]
             return {"artist": {**self._mb_artist(db, info), "albumCount": len(albums), "album": albums}}
         r = artist_row(db, p.need("id"))
@@ -619,7 +619,7 @@ class Api:
             return self._credited_artist(db, p.need("id"))
         albums = self._artist_albums(db, r["id"])
         known = {a["id"] for a in albums}
-        self.oasis.youtube.artist_page(db, r["id"], r["name"])
+        self._artist_page(db, r)
         # The rest of the artist's discography on YouTube Music, newest first; opening one fetches its tracks.
         listed = {a: (n, d) for a, n, d in db.execute("select at.album_id, count(*), sum(t.duration) from album_track at join track t "
                                                        "on t.id = at.track_id join ytm_release x on x.album_id = at.album_id "
@@ -628,6 +628,27 @@ class Api:
                    for x in db.execute("select * from ytm_release where artist_id = ? order by coalesce(year, 0) desc, title", (r["id"],))
                    if x["album_id"] not in known]
         return {"artist": {**artist(r), "albumCount": len(albums), "album": albums}}
+
+    def _artist_page(self, db, r):
+        """The artist's YouTube Music page when it is due (youtube.artist_page), fetched by a worker."""
+        if self.oasis.youtube.page_due(db, r["id"]):
+            self._wait(self.oasis.asking("youtube", f"artist page {r['id']}", call="artist_page", args=[r["id"], r["name"]]), "YouTube Music artist page")
+
+    def _complete_album(self, db, album_id):
+        """The rest of an album known only from streaming songs or an artist's page (youtube.complete_album), fetched
+        by a worker."""
+        if self.oasis.youtube.browse_id(db, album_id) and \
+                self._wait(self.oasis.asking("youtube", f"complete album {album_id}", call="complete_album", args=[album_id]), "YouTube Music album"):
+            self.oasis.youtube.completed.add(album_id)
+
+    @staticmethod
+    def _wait(answer, what: str, timeout: float = ASK_WAIT):
+        """An interactive task's result; None when it failed or took too long (logged), as a service that failed gives nothing."""
+        try:
+            return answer.result(timeout)
+        except Exception as e:
+            log.info("%s failed: %s", what, e)
+            return None
 
     @staticmethod
     def _release_album(x, artist_name, song_count=None, duration=None) -> dict:
@@ -646,11 +667,11 @@ class Api:
 
     def getAlbum(self, db, p, user):
         if tracks.mbid_of(id := p.need("id")):
-            found = self._mb_album(db, self._musicbrainz(musicbrainz.release_group, tracks.mbid_of(id), db))
+            found = self._mb_album(db, self._musicbrainz("release_group", tracks.mbid_of(id)))
             # Nothing to play until it arrives; clients that take songs nothing plays get its songs to see and star.
-            ids = self._musicbrainz(missing.album_songs, db, tracks.mbid_of(id)) if p.missing else []
+            ids = self._lookup(missing.album_songs, db, tracks.mbid_of(id)) if p.missing else []
             return {"album": {**found, "song": [song(required(song_row(db, i))) for i in ids]}}
-        self.oasis.youtube.complete_album(db, id)
+        self._complete_album(db, id)
         songs = self._album_songs(db, id)
         if found := self._library_album(db, id, songs):
             return found
@@ -745,9 +766,8 @@ class Api:
         # other. Only for the oasis extension: they have no songs until they arrive, which other clients don't expect.
         # Asked first, as it answers slowest (a second between requests), while the rest is looked up.
         started = time.monotonic()
-        finding = {kind: self.finder.submit(self._find, kind, text) for kind in ("artist", "album")
+        finding = {kind: self.oasis.asking("musicbrainz", call="find", args=[kind, text]) for kind in ("artist", "album")
                    if self.oasis.acquire and p.oasis and len(text) >= FIND_FROM and p.int(kind + "Offset", 0) == 0 and p.int(kind + "Count", 20) > 0}
-        latin.index(db)
 
         def match(columns: str, latin: str):
             """Each term in the names or in their romanized forms (track_latin, folded: "tokyo" finds 東京)."""
@@ -755,8 +775,6 @@ class Api:
                 [x for t in terms for x in (f"%{t}%", f"%{fold(t)}%" if fold(t) else None)]
         joined = " left join track_latin l on l.id = t.id"
 
-        # Every row is read before YouTube Music is asked: a cursor left open keeps its read snapshot, and remember()
-        # can't write from a snapshot that another connection's write (the mix refresh's) made stale: "database is locked".
         cond, args = match("t.album_artist", "l.album_artist")
         artists = [artist(r) for r in db.execute(ARTISTS + joined + f" where {cond} group by t.artist_id order by t.album_artist collate nocase "
                                                  "limit ? offset ?", (*args, p.int("artistCount", 20), p.int("artistOffset", 0)))]
@@ -770,7 +788,8 @@ class Api:
             known = {s["id"] for s in songs}
             # Capped: a client asking for 500 songs would otherwise wait on YouTube Music's paging for many seconds.
             # At least 20, for the artists and albums of a client asking for those alone (songCount=0).
-            found = self.oasis.youtube.search(db, " ".join(terms), max(min(p.int("songCount", 20), YTM_SEARCH), 20))
+            found = self._wait(self.oasis.asking("youtube", call="search", args=[" ".join(terms), max(min(p.int("songCount", 20), YTM_SEARCH), 20)]),
+                               "YouTube Music search") or []
             found = [song(required(song_row(db, id))) for id in dict.fromkeys(found) if id not in known]
             songs += found[:p.int("songCount", 20)]
             # The artists and albums of YouTube Music's songs that the query names, as the library's are matched, after
@@ -789,18 +808,23 @@ class Api:
         if finding:
             # A lookup still busy after FIND_WAIT is left out, so the library's and YouTube Music's results don't wait
             # for it. It finishes in the background and is kept (mb_cache): the next search for this text has it.
-            done, late = wait_for(finding.values(), timeout=max(0.0, started + FIND_WAIT - time.monotonic()))
-            if late:
-                log.info("MusicBrainz took over %ss for %r, left out", FIND_WAIT, text)
-            finding = {kind: future for kind, future in finding.items() if future in done}
+            for kind, answer in list(finding.items()):
+                try:
+                    finding[kind] = answer.result(max(0.0, started + FIND_WAIT - time.monotonic()))
+                except TimeoutError:
+                    log.info("MusicBrainz took over %ss for %r, left out", FIND_WAIT, text)
+                    del finding[kind]
+                except (OSError, LookupError) as e:
+                    log.warning("MusicBrainz search failed: %s", e)
+                    finding[kind] = []
             names = {fold(x) for x in [*(a["name"] for a in artists), *(s.get("artist") for s in songs)] if x}
             titles = {fold(x) for x in [*(a["name"] for a in albums), *(s.get("album") for s in songs)] if x}
             if "artist" in finding and (room := p.int("artistCount", 20) - len(artists)) > 0:
-                artists += [self._mb_artist(db, a) for a in finding["artist"].result()
+                artists += [self._mb_artist(db, a) for a in finding["artist"]
                             if not {fold(n) for n in [a["name"], *(x["name"] for x in a.get("aliases") or [])]} & names
                             and not tracks.library_id(db, MB_IDS["artist"] + a["id"])][:room]
             if "album" in finding and (room := p.int("albumCount", 20) - len(albums)) > 0:
-                albums += [self._mb_album(db, g) for g in finding["album"].result()
+                albums += [self._mb_album(db, g) for g in finding["album"]
                            if fold(g["title"]) not in titles and not tracks.library_id(db, MB_IDS["album"] + g["id"])][:room]
         return {"artist": artists, "album": albums, "song": songs}
 
@@ -812,19 +836,13 @@ class Api:
         rows = {r["id"]: r for r in db.execute(query + f" where {column} in ({','.join('?' * len(ids))}) group by {column}", ids)}
         return [shape(rows[i]) for i in ids if i in rows]
 
-    def _find(self, kind, text) -> list[dict]:
-        """MusicBrainz's artists or albums named like text, on a connection of its own (for the finder's threads)."""
-        db = self.oasis.connect()
-        try:
-            return musicbrainz.find(kind, text, db)
-        except (OSError, LookupError) as e:
-            log.warning("MusicBrainz search failed: %s", e)
-            return []
-        finally:
-            db.close()
+    def _musicbrainz(self, call: str, *args):
+        """A lookup of musicbrainz.py for a MusicBrainz-only item, made by a worker."""
+        return self._lookup(lambda: self.oasis.ask("musicbrainz", call=call, args=list(args)))
 
-    def _musicbrainz(self, get, *args):
-        """get(*args) for a MusicBrainz-only item: a lookup of musicbrainz.py."""
+    @staticmethod
+    def _lookup(get, *args):
+        """get(*args) for a MusicBrainz-only item."""
         try:
             return get(*args)
         except LookupError:
@@ -920,7 +938,8 @@ class Api:
     def scrobble(self, db, p, user):
         if p.get("submission", "true") == "false":
             for id in p.all("id")[:1]:
-                self.oasis.forwarder.now_playing(db, user, forward.listen_for(self._one(db, "select * from track where id = ?", id), time.time()))
+                self._one(db, "select 1 from track where id = ?", id)
+                self.oasis.asking("now playing", user=user, track_id=id, at=time.time())
             return {}
         # Every id is checked before anything is written, so a retried batch can't count plays twice.
         times = p.all("time")
@@ -933,9 +952,16 @@ class Api:
         self.oasis.played(db, user, known)
         return {}
 
+    def _lyrics(self, db, r) -> lyrics.Lyrics | None:
+        """The song's lyrics (lyrics.for_track), fetched by a worker when none are kept."""
+        if (found := lyrics.for_track(db, r, fetch=False)) is lyrics.UNKNOWN:
+            self._wait(self.oasis.asking("lyrics", f"lyrics {r['id']}", track_id=r["id"]), "lyrics")
+            found = lyrics.for_track(db, r, fetch=False)
+        return None if found is lyrics.UNKNOWN else found
+
     def getLyricsBySongId(self, db, p, user):
         r = self._one(db, "select * from track where id = ?", p.need("id"))
-        found = lyrics.for_track(db, r, self.oasis.youtube_music(db))
+        found = self._lyrics(db, r)
         if not found:
             return {"lyricsList": {}}
         main = {"displayArtist": r["artist"], "displayTitle": r["title"], "lang": "xxx", "offset": 0, "synced": found.synced,
@@ -962,7 +988,8 @@ class Api:
                         for lang, values in (found.translations or {}).items()]
             want = self._translate_to(db, p, user)
             if want and not any(translate.primary(lang) == translate.primary(want) for lang in found.translations or {}):  # a provider's comes first
-                if machine := self.oasis.translations.lines(db, r["id"], [text for _, text in found.lines], want):
+                if machine := self._wait(self.oasis.asking("translate lyrics", track_id=r["id"], texts=[text for _, text in found.lines], lang=want),
+                                         "lyrics translation"):
                     entries.append({**main, "kind": "translation", "lang": want, "oasisMachineTranslation": True,
                                     "line": [{**clean({"start": start}), "value": v} for (start, _), v in zip(found.lines, machine)]})
         return {"lyricsList": clean({"structuredLyrics": entries or None})}
@@ -989,7 +1016,7 @@ class Api:
         artist, title = p.get("artist", ""), p.get("title", "")
         r = db.execute(f"select * from track where title = ? collate nocase and (? = '' or {BY_ARTIST_NAME}) "
                        "order by library desc limit 1", (title, artist, artist, artist)).fetchone()
-        found = lyrics.for_track(db, r, self.oasis.youtube_music(db)) if r else None
+        found = self._lyrics(db, r) if r else None
         text = found.text() if found else None
         return {"lyrics": clean({"artist": r["artist"] if r else artist, "title": r["title"] if r else title, "value": text})}
 
@@ -1001,17 +1028,12 @@ class Api:
         if r is None:  # only credited on others' songs
             self._one(db, "select 1 from credit where artist_id = ? limit 1", p.need("id"))
             return clean({"similarArtist": self._linked_artists(db, p.need("id")) or None})
-        self.oasis.youtube.artist_page(db, r["id"], r["name"])
+        asked = self._wait(self.oasis.asking("artist info", artist_id=r["id"], name=r["name"], user=user), "artist info") or {}
         page = db.execute("select description, image from ytm_artist where artist_id = ?", (r["id"],)).fetchone()
         youtube = clean({"biography": page["description"], "smallImageUrl": page["image"], "mediumImageUrl": page["image"],
                          "largeImageUrl": page["image"]}) if page else {}
-        linked = self._linked_artists(db, r["id"]) + self._deezer_related(db, user, r["name"])
-        if not self.oasis.lastfm:
-            return {**youtube, **clean({"similarArtist": unique(linked) or None})}
-        try:
-            info = self.oasis.lastfm.artist_info(r["name"])
-        except Exception as e:
-            log.info("Last.fm artist info failed: %s", e)
+        linked = self._linked_artists(db, r["id"]) + [a for related in asked.get("deezer") or [] for a in self._library_artists(db, related)]
+        if not (info := asked.get("lastfm")):
             return {**youtube, **clean({"similarArtist": unique(linked) or None})}
         # Subsonic's includeNotPresent: the similar artists the library lacks too, those Last.fm knows the MusicBrainz id of,
         # as artists only MusicBrainz has (ar-mb-), which can be opened and followed.
@@ -1029,17 +1051,6 @@ class Api:
 
     def _library_artists(self, db, name: str) -> list[dict]:
         return [artist(a) for a in db.execute(ARTISTS + " where t.library = 1 and t.album_artist = ? collate nocase group by t.artist_id", (name,))]
-
-    def _deezer_related(self, db, user: str, name: str) -> list[dict]:
-        """The library's artists among those Deezer calls related, for a user who has Deezer's radio capability."""
-        if not self.oasis.sources.uses(db, user, "deezer", "radio"):
-            return []
-        try:
-            names = self.oasis.recommender.answer(("deezer artists", name), lambda: sources.Deezer().related(name))
-        except Exception as e:
-            log.info("Deezer related artists failed: %s", e)
-            return []
-        return [a for related in names for a in self._library_artists(db, related)]
 
     def _linked_artists(self, db, artist_id):
         """Personas, the user's related artists and band members that have songs here, closest first; oasisLink says how."""
@@ -1076,8 +1087,8 @@ class Api:
         account = accounts.get(db, user)
         source = self._source(p, account)
         # A player waits for this answer with nothing to play next, so a slow source is left out rather than waited for.
-        ids = self.oasis.recommender.similar(db, seed, min(p.int("count", 50), 200), account, source=source, wait=SIMILAR_WAIT,
-                                             unplayable=p.missing)
+        ids = self._wait(self.oasis.asking("similar", seed=seed["id"], count=min(p.int("count", 50), 200), user=user, source=source, wait=SIMILAR_WAIT,
+                                           unplayable=p.missing), "similar songs", SIMILAR_WAIT + ANSWER_MORE) or []
         self.oasis.youtube.warm(db, ids[:WARM])
         return {"song": [song(required(song_row(db, i))) for i in ids], "oasisSource": source}
 
@@ -1102,7 +1113,7 @@ class Api:
         ids = [r[0] for r in db.execute("select t.id from track t left join stat s on s.id = t.id and s.user = (select me()) where t.library = 1 and "
                                         "t.album_artist = ? collate nocase order by coalesce(s.play_count, 0) desc limit ?", (name, count))]
         if len(ids) < count and self.oasis.youtube_music(db, user):
-            ids += self.oasis.youtube.top_songs(db, name, count)
+            ids += self._wait(self.oasis.asking("youtube", call="top_songs", args=[name, count]), "YouTube Music top songs") or []
         return {"topSongs": {"song": [song(required(song_row(db, i))) for i in dict.fromkeys(ids)][:count]}}
 
     def getInternetRadioStations(self, db, p, user):
@@ -1182,11 +1193,8 @@ class Api:
             songs = with_hidden(entries_of(db, playlist_id, p.missing), songs)
         set_entries(db, playlist_id, songs, self.oasis.youtube.fetch_soon)
         if source or station:
-            try:
-                recommender.top_up(db, self._one(db, "select * from playlist where id = ?", playlist_id))
-            except Exception:
-                log.exception("radio fill failed")
-        recommender.wake()
+            self._wait(self.oasis.asking("radio", playlist=playlist_id), "radio fill")
+        recommender.wake(db)
         return {"playlist": self._playlist(db, self._own_playlist(db, playlist_id, user), True, p.missing)}
 
     def updatePlaylist(self, db, p, user):
@@ -1202,7 +1210,7 @@ class Api:
         if removed or added:
             songs = [t for i, t in enumerate(shown) if i not in removed] + added
             set_entries(db, r["id"], with_hidden(old, songs), self.oasis.youtube.fetch_soon)
-        self.oasis.recommender.wake()
+        self.oasis.recommender.wake(db)
         return {}
 
     def deletePlaylist(self, db, p, user):
@@ -1262,7 +1270,7 @@ class Api:
     def commitUpload(self, db, p, user):
         self._admin(db, user)
         placed = self.oasis.uploads.commit(db, user, p.need("uploadId"), p.get("replace") == "true")
-        self.oasis.scanner.now(db)
+        self.oasis.ask("scan")
         ids = list(dict.fromkeys(self._one(db, "select album_id from track where ref = ?", str(f))["album_id"] for f in placed))
         albums = [self._library_album(db, id, self._album_songs(db, id))["album"] for id in ids]
         return {"album": albums[0], **({"albums": albums} if len(albums) > 1 else {})}  # loose singles: each an album

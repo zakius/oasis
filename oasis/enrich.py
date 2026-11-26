@@ -3,24 +3,20 @@ release's credits (credits.py), then each credited artist's other names and link
 (latin.py). Each step reads one item and says whether there was one; while MusicBrainz is away (503 when busy), the
 worker waits longer each time."""
 import logging
-import threading
 
-from . import artists, credits, latin, worker
+from . import artists, credits, latin
 
 log = logging.getLogger(__name__)
 
 RETRY = 30, 600  # seconds before retrying after MusicBrainz errors: first, doubling up to the last
 IDLE = 300       # seconds between looks for new releases when nothing woke the worker
+JOB = "musicbrainz"
 
 
 class Enrichment:
     def __init__(self, connect):
         self.connect = connect
-        self.wake = threading.Event()
         self.retry = RETRY[0]
-
-    def start(self):
-        worker.start("musicbrainz", self.fill, IDLE, self.wake)
 
     def fill(self) -> float:
         """Steps until all is done; the seconds to wait before looking again, longer each time MusicBrainz is away."""
@@ -49,7 +45,6 @@ class Enrichment:
             done = credits.step(db) or artists.step(db) or latin.step(db)
             if done:
                 self.retry = RETRY[0]
-                db.commit()
             return done
         finally:
             db.close()

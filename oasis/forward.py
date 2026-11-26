@@ -14,7 +14,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from . import musicbrainz, worker
+from . import musicbrainz, tasks
 from .lastfm import LastFm, elsewhere, signs_in
 from .remote import Rejected, check, post, send
 from .sources import KINDS
@@ -28,6 +28,7 @@ LISTENBRAINZ = "https://api.listenbrainz.org/1/"
 JSPF_PLAYLIST = "https://musicbrainz.org/doc/jspf#playlist"  # the key of ListenBrainz's own fields in a JSPF playlist
 MADE_FOR = 100  # playlists made for a user read at most: about two weeks of daily ones, and the weekly and yearly ones
 MAX_ATTEMPTS = 20
+JOB = "forwarding"
 
 
 @dataclass
@@ -255,13 +256,12 @@ class Forwarder:
         """services_for(db, user) returns the user's services by name. ytm finds the YouTube Music video of a play
         for YouTube Music's history."""
         self.connect, self.services_for, self.ytm = connect, services_for, ytm
-        self.wake = threading.Event()
 
     def enqueue(self, db, user: str, track_id: str, played: float):
         db.executemany("insert into outbox(user, service, track_id, played, next_try) values (?, ?, ?, ?, 0)",
                        [(user, name, track_id, played) for name, service in self.services_for(db, user).items()
                         if hasattr(service, "scrobble")])
-        self.wake.set()
+        tasks.wake(db, JOB)
 
     def like(self, db, user: str, ids: list[str], on: bool):
         """Sends the user's star (on) or unstar of songs, albums and artists to each of their services that keeps such
@@ -272,7 +272,7 @@ class Forwarder:
             db.executemany("insert into outbox(user, service, track_id, action, played, next_try) values (?, ?, ?, ?, ?, 0)",
                            [(user, name, id, "like" if on else "unlike", now) for name, service in services.items()
                             if kind_of(id) in getattr(service, "likes", ())])
-        self.wake.set()
+        tasks.wake(db, JOB)
 
     def now_playing(self, db, user: str, listen: Listen):
         services = {name: s for name, s in self.services_for(db, user).items() if hasattr(s, "now_playing")}
@@ -284,9 +284,6 @@ class Forwarder:
                 except Exception as e:
                     log.info("%s now playing failed: %s", name, e)
         threading.Thread(target=send, daemon=True).start()
-
-    def start(self):
-        worker.start("forwarding", self.flush, 60, self.wake)
 
     def flush(self):
         db = self.connect()

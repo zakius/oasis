@@ -6,10 +6,11 @@ import time
 import pytest
 
 from conftest import call, make_client, make_track
-from oasis import accounts, playlists
+from oasis import accounts, playlists, recommend
 from oasis.db import connect
 from oasis.playlists import LISTENING_RADIO
 from oasis.recommend import Recommender
+from oasis.worker import Job, Worker
 from oasis.scan import scan
 from oasis.youtube import remember_song
 from oasis.ytm import song
@@ -282,9 +283,18 @@ def test_a_failing_radio_pass_leaves_the_radio_worker_running(api):
         done.set()
         return api.connect()
     recommender = Recommender(connect, None, None, api.sources)
-    recommender.start()
-    recommender.wake()
-    assert done.wait(10)
+    worker = Worker(api.connect, [Job(recommend.JOB, recommender.top_up_pass, recommend.EVERY)], {})
+    worker.start()
+    try:
+        while not passes:
+            time.sleep(0.01)
+        db = api.connect()
+        while db.execute("select state from task where key = ?", (recommend.JOB,)).fetchone()[0] != "queued":
+            time.sleep(0.01)
+        recommender.wake(db)
+        assert done.wait(10)
+    finally:
+        worker.stop()
 
 
 class LastFmUser(FakeLastFm):
@@ -337,7 +347,7 @@ def test_listenbrainz_radio_resolves_like_lastfm_and_its_failures_give_nothing(a
         raise OSError("HTTP 500")
     monkeypatch.setattr(recommend, "lb_radio", broken)
     assert titles(similar(client, "listenbrainz")["similarSongs2"]["song"]) == ["Song B", "Tune"]  # the answer is kept a while
-    api.recommender.answers.clear()
+    api.connect().execute("delete from answer")
     assert similar(client, "listenbrainz")["similarSongs2"]["song"] == []
     assert "one-yt song 0" in titles(similar(client)["similarSongs2"]["song"])  # the mix goes on without it
 
@@ -418,3 +428,30 @@ def test_a_slow_source_gives_the_songs_it_found_by_the_deadline(api, client, ytm
     release.set()
     assert time.monotonic() - started < 1.5
     assert [db.execute("select title from track where id = ?", (i,)).fetchone()[0] for i in ids] == ["Tune"]
+
+
+def test_a_worker_asks_the_other_services_and_the_api_answers_the_same(library, tmp_path):
+    """search3's YouTube Music search, getAlbum's completion, getArtist's page, getArtistInfo2 and getSimilarSongs2 ask
+    other services through a worker when one is alive, and answer as when the API asks them itself."""
+    answers = []
+    for through_worker in (False, True):
+        with make_client(library, tmp_path / f"{through_worker}.db", FakeYtm(), turned_on=["ytm", "lastfm"]) as client:
+            api = client.app.state.oasis
+            api.lastfm = FakeLastFm()
+            worker = Worker(api.connect, [], api.kinds())
+            if through_worker:
+                worker.start()
+            try:
+                found = call(client, "search3", query="gamma")["searchResult3"]
+                album = call(client, "getAlbum", id=found["album"][0]["id"])["album"]
+                artist = call(client, "getArtist", id=found["artist"][0]["id"])["artist"]
+                beta = call(client, "search3", query="beta")["searchResult3"]["artist"][0]
+                info = call(client, "getArtistInfo2", id=beta["id"])["artistInfo2"]
+                similar = call(client, "getSimilarSongs2", id=song_id(client, "One"), count=5, oasisSource="ytm")["similarSongs2"]
+            finally:
+                worker.stop()
+            answers.append((titles(found["song"]), titles(album["song"]), [a["name"] for a in artist["album"]], info["biography"],
+                            sorted(a["name"] for a in info["similarArtist"]), titles(similar["song"])))
+            kinds = {r[0] for r in api.connect().execute("select kind from task where worker = ? and state = 'done'", (worker.id,))}
+            assert kinds == ({"youtube", "artist info", "similar"} if through_worker else set())
+    assert answers[0] == answers[1] and answers[0][1] == ["Track 1", "Track 2", "Track 3", "Gamma Hit"]

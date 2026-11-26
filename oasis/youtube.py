@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 
+from .db import transaction
 from .tracks import IDS, album_id, name_id, remember
 from .ytm import Stream
 
@@ -123,27 +124,34 @@ class YouTubeCatalogue:
         if not self.on(db):
             return []
         try:
-            return [remember_song(db, song) for song in self.ytm.search(query, limit)]
+            found = self.ytm.search(query, limit)
+            with transaction(db):  # the songs found at once: one write lock, not one per statement
+                return [remember_song(db, song) for song in found]
         except Exception as e:
             log.warning("YouTube Music search failed: %s", e)
             return []
 
+    def page_due(self, db, artist_id: str) -> bool:
+        """Whether artist_page would fetch the artist's page: none was, or not within ARTIST_PAGE_KEPT."""
+        page = db.execute("select fetched from ytm_artist where artist_id = ?", (artist_id,)).fetchone()
+        return self.on(db) and not (page and page["fetched"] > time.time() - ARTIST_PAGE_KEPT)
+
     def artist_page(self, db, artist_id: str, name: str):
         """Fetches the artist's YouTube Music page into ytm_artist and ytm_release, at most once per ARTIST_PAGE_KEPT."""
-        page = db.execute("select fetched from ytm_artist where artist_id = ?", (artist_id,)).fetchone()
-        if not self.on(db) or (page and page["fetched"] > time.time() - ARTIST_PAGE_KEPT):
+        if not self.page_due(db, artist_id):
             return
         try:
             found = self.ytm.artist(name)
         except Exception as e:
             log.info("YouTube Music artist %s unavailable: %s", name, e)
             return
-        db.execute("insert or replace into ytm_artist values (?, ?, ?, ?, ?, ?)", (artist_id, *(
-            (found["name"], found["description"], found["image"], found["songs"]) if found else (name, None, None, None)), time.time()))
-        for x in (found or {}).get("releases", []):
+        with transaction(db):
+            db.execute("insert or replace into ytm_artist values (?, ?, ?, ?, ?, ?)", (artist_id, *(
+                (found["name"], found["description"], found["image"], found["songs"]) if found else (name, None, None, None)), time.time()))
             # Ids follow the oasis artist, so these albums sit with the local ones and merge with an album of the same title.
-            db.execute("insert or replace into ytm_release values (?, ?, ?, ?, ?, ?, ?)",
-                       (album_id(name, x["title"]), artist_id, x["browse_id"], x["title"], x["year"], x["type"], x["cover"]))
+            db.executemany("insert or replace into ytm_release values (?, ?, ?, ?, ?, ?, ?)",
+                           [(album_id(name, x["title"]), artist_id, x["browse_id"], x["title"], x["year"], x["type"], x["cover"])
+                            for x in (found or {}).get("releases", [])])
 
     def top_songs(self, db, name: str, count: int) -> list[str]:
         """The ids of the artist's top songs on YouTube Music, kept as streaming tracks: its page's list, or a search
@@ -157,33 +165,41 @@ class YouTubeCatalogue:
             page = owner and db.execute("select songs from ytm_artist where artist_id = ?", (owner[0],)).fetchone()
             songs = self.ytm.playlist_rows(page["songs"], count) if page and page["songs"] else \
                 [s for s in self.ytm.search(name, count) if name.casefold() in (s["album_artist"].casefold(), s["artist"].casefold())]
-            return [remember_song(db, song) for song in songs]
+            with transaction(db):
+                return [remember_song(db, song) for song in songs]
         except Exception as e:
             log.warning("YouTube Music top songs failed: %s", e)
             return []
 
-    def complete_album(self, db, album_id: str):
-        """Fetches the rest of an album that is only known from streaming tracks seen in search or radio, or only
-        from an artist's YouTube Music page."""
+    def browse_id(self, db, album_id: str) -> str | None:
+        """The YouTube Music album page complete_album would read for the album; None when it would read none."""
         if album_id in self.completed or not self.on(db):
-            return
+            return None
         sources = db.execute("select source, ytm_album from track where album_id = ?", (album_id,)).fetchall()
-        release = db.execute("select * from ytm_release where album_id = ?", (album_id,)).fetchone()
+        release = db.execute("select browse_id from ytm_release where album_id = ?", (album_id,)).fetchone()
         browse_id = next((r["ytm_album"] for r in sources if r["ytm_album"]), None) or (release and release["browse_id"])
-        if not browse_id or any(r["source"] == "local" for r in sources):
-            return
+        return None if any(r["source"] == "local" for r in sources) else browse_id
+
+    def complete_album(self, db, album_id: str) -> bool:
+        """Fetches the rest of an album that is only known from streaming tracks seen in search or radio, or only
+        from an artist's YouTube Music page; whether it has all of it now."""
+        if not (browse_id := self.browse_id(db, album_id)):
+            return album_id in self.completed
+        release = db.execute("select * from ytm_release where album_id = ?", (album_id,)).fetchone()
         try:
             songs = self.ytm.album(browse_id)
         except Exception as e:
             log.info("album %s unavailable: %s", browse_id, e)
-            return
-        ids = [remember_song(db, song) for song in songs]
-        db.executemany("insert or replace into album_track select ?, id, ?, ? from track where id = ? and source = 'ytm'",
-                       [(album_id, song.get("disc_no"), song.get("track_no"), id) for id, song in zip(ids, songs)])
-        if release:  # file this album's own songs under the artist page's album, whatever spelling YouTube credits them with
-            db.executemany("update track set album_id = ?, artist_id = ? where id = ? and source = 'ytm' and ytm_album = ?",
-                           [(album_id, release["artist_id"], id, browse_id) for id in ids])
+            return False
+        with transaction(db):
+            ids = [remember_song(db, song) for song in songs]
+            db.executemany("insert or replace into album_track select ?, id, ?, ? from track where id = ? and source = 'ytm'",
+                           [(album_id, song.get("disc_no"), song.get("track_no"), id) for id, song in zip(ids, songs)])
+            if release:  # file this album's own songs under the artist page's album, whatever spelling YouTube credits them with
+                db.executemany("update track set album_id = ?, artist_id = ? where id = ? and source = 'ytm' and ytm_album = ?",
+                               [(album_id, release["artist_id"], id, browse_id) for id in ids])
         self.completed.add(album_id)
+        return True
 
     def complete_next_album(self, db) -> bool:
         """Reads the YouTube Music album page of one library streaming song's album not read yet, for its album

@@ -118,7 +118,7 @@ Lidarr searched and imported before oasis did. Its tables `lidarr_rescue` and `c
 python3 -m venv .venv
 .venv/bin/pip install -e .
 cp oasis.example.toml oasis.toml   # set library paths and a password
-.venv/bin/oasis -c oasis.toml       # scans in the background, serves on port 4533
+.venv/bin/oasis -c oasis.toml       # serves on port 4533, and scans and runs the background jobs
 ```
 
 Or in a container. Put `oasis.toml` in `./config`, set its library path to `/music`, and run:
@@ -128,6 +128,8 @@ docker compose up -d --build
 ```
 
 `compose.yaml` mounts `~/Music` read-only at `/music`. The container runs as UID 1000, so `./config` must be writable by that user; set `user:` in `compose.yaml` otherwise.
+
+`oasis serve` runs everything in one process: the Subsonic API and the dashboard, and a worker that runs the background jobs (scan, dedupe, MusicBrainz, acquisition, mixes, radios, forwarding plays) and the calls to other services that requests wait for. For a busy server, run the worker separately: `oasis serve --no-worker` for the API, and `oasis worker` in as many other processes or containers as you like, on the same database. Requests then only read the database and stream, and a worker hands each answer back within a few milliseconds. When no worker is running, the API calls the other services itself, as `oasis serve` does. [docs/workers.md](docs/workers.md) explains how the work is shared and gives a compose file with one API container and several workers.
 
 Point a Subsonic client at `http://<host>:4533`, with an app password. `oasis scan` runs a scan without serving. `oasis relocate` moves files placed under an older scheme (Lidarr's `Artist/Album (Year)`) to the import's names by their MusicBrainz tags; it only plans and checks the moves until given `--apply`, and should run while the server is stopped. Tracks keep their ids, so stars, plays and playlists stay, and the moves are written to `.oasis-renames-<date>.tsv` in the library. `oasis quality` runs the same checks over the library, beside the server and at the lowest CPU and I/O priority (`docker compose exec -d oasis sh -c 'oasis -c /config/oasis.toml quality >> /config/quality.log 2>&1'`); it resumes where it stopped and skips files dedupe shares. It lists lossy-sourced FLACs, and with `--delete-lossy` deletes them (their whole album when most of it is) and wants the album again; files without a MusicBrainz release group stay. The server rescans when a client calls `startScan`.
 

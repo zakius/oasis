@@ -2,20 +2,23 @@ import argparse
 import datetime
 import logging
 import os
+import signal
 import subprocess
 from pathlib import Path
 
 import uvicorn
 
-from . import config as configuration, library, quality, relocate, scan
-from .server import create_app
+from . import config as configuration, library, quality, relocate, scan, worker
+from .server import Oasis, create_app
 from .db import connect
 
 
 def main():
     parser = argparse.ArgumentParser(prog="oasis", description="OpenSubsonic server for a merged local and streaming library")
     parser.add_argument("-c", "--config", type=Path, default=Path("oasis.toml"))
-    parser.add_argument("command", choices=["serve", "scan", "relocate", "quality"], nargs="?", default="serve")
+    parser.add_argument("command", choices=["serve", "worker", "scan", "relocate", "quality"], nargs="?", default="serve")
+    parser.add_argument("--no-worker", action="store_true", help="serve: leave the periodic jobs and tasks to `oasis worker` processes")
+    parser.add_argument("--threads", type=int, default=worker.THREADS, help="worker: tasks run at once")
     parser.add_argument("--apply", action="store_true", help="relocate: move the files (else only plan and check the moves)")
     parser.add_argument("--out", type=Path, help="relocate: where the old and new paths go (TSV)")
     parser.add_argument("--jobs", type=int, default=quality.JOBS, help="quality: files checked at once")
@@ -34,8 +37,12 @@ def main():
         subprocess.run(["ionice", "-c", "3", "-p", str(os.getpid())], check=False)
         db = connect(config.database)
         library.check_quality(db, config.library, args.jobs, args.delete_lossy)
+    elif args.command == "worker":  # as many as wanted, beside `oasis serve --no-worker`
+        running = Oasis(config).worker(args.threads)
+        signal.signal(signal.SIGTERM, lambda *_: running.stop())  # its periodic jobs' lanes are free at once for the other workers
+        running.run()
     else:
-        uvicorn.run(create_app(config), host=config.host, port=config.port, access_log=False)  # Subsonic puts credentials in query strings
+        uvicorn.run(create_app(config, worker=not args.no_worker), host=config.host, port=config.port, access_log=False)  # Subsonic puts credentials in query strings
 
 
 if __name__ == "__main__":

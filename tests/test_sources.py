@@ -1,4 +1,3 @@
-from collections import deque
 import base64
 import hashlib
 import json
@@ -7,7 +6,7 @@ import pytest
 import urllib3
 
 from conftest import call, make_client, sign_in
-from oasis import sources
+from oasis import pace, sources
 from oasis.sources import Bandcamp, Qobuz
 from test_missing import Acquiring
 from test_recommend import FakeLastFm, FakeYtm
@@ -250,7 +249,7 @@ def test_deezer_and_apple_find_a_clip_of_the_artists_song(monkeypatch):
                    {"trackId": 3, "trackName": "Dancing Creek", "artistName": "Hiroshi Yoshimura", "trackTimeMillis": 449027, "previewUrl": "z"}]}}
     monkeypatch.setattr(sources, "get_json", lambda url, **k: answers[url])
     monkeypatch.setattr(sources, "request", lambda method, url, **k: AppleAnswer(200, answers[url]))
-    monkeypatch.setattr(sources.ApplePreview, "asked", deque())
+    pace.forget()
     assert sources.DeezerPreview().find("Hiroshi Yoshimura", "dancing creek") == "2"
     assert sources.DeezerPreview().find("Someone Else Again", "Dancing Creek") is None
     assert sources.ApplePreview().find("Hiroshi Yoshimura", "Dancing Creek") == "3"
@@ -267,14 +266,14 @@ class AppleAnswer:
 def test_apple_is_searched_at_most_twenty_times_a_minute_and_pauses_when_it_refuses(monkeypatch):
     statuses = []
     monkeypatch.setattr(sources, "request", lambda method, url, **k: AppleAnswer(statuses.pop(0) if statuses else 200, {"results": []}))
-    monkeypatch.setattr(sources.ApplePreview, "asked", deque())
+    pace.forget()
     apple = sources.ApplePreview()
     for _ in range(20):
         assert apple.find("A", "B") is None
     with pytest.raises(OSError, match="skipped"):
         apple.find("A", "B")  # the 21st within a minute isn't sent
 
-    monkeypatch.setattr(sources.ApplePreview, "asked", deque())
+    pace.forget()
     statuses.append(429)
     with pytest.raises(OSError, match="429"):
         apple.find("A", "B")

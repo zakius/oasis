@@ -20,6 +20,7 @@ def names(tmp_path_factory):
 @pytest.fixture
 def client(names, tmp_path):
     with make_client(names, tmp_path / "oasis.db") as c:
+        c.app.state.oasis.index()  # as the search index job does
         yield c
 
 

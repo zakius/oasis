@@ -148,10 +148,13 @@ def test_oasis_fields_only_with_the_oasis_extension(client):
         assert fields & oasis == (oasis if params == {"oasis": "1"} else set())
 
 
-def test_search_romanizes_each_track_once_and_keeps_it(client, tmp_path):
+def test_search_reads_the_romanized_names_the_search_index_job_keeps(client, tmp_path):
     from oasis.latin import SOURCE
-    call(client, "search3", query="")
     other = connect(tmp_path / "oasis.db")  # another connection: it sees only what was committed
+    call(client, "search3", query="")
+    assert other.execute("select count(*) from track_latin").fetchone()[0] == 0
+    [job] = [j for j in client.app.state.oasis.jobs() if j.name == "search index"]
+    job.step()
     stale = f"select count(*) from track t left join track_latin l on l.id = t.id where t.library = 1 and l.source is not {SOURCE}"
     assert other.execute(stale).fetchone()[0] == 0 and other.execute("select count(*) from track_latin").fetchone()[0] == 5
     assert call(client, "search3", query="", songCount=500, songOffset=500)["searchResult3"].get("song", []) == []

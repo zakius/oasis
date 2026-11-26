@@ -250,7 +250,7 @@ def test_a_search_knows_the_albums_other_titles_from_its_aliases_and_pseudo_rele
     acq, now = client.app.state.oasis.acquire, [time.time()]
     monkeypatch.setattr(time, "time", lambda: now[0])
     for rg in ("g-second", "g-ost"):
-        acq.search_soon(rg)
+        acq.search_soon(client.app.state.oasis.connect(), rg)
         now[0] += acquire.SEARCH_GAP
         sync(client)
     assert acq.downloads.found[-2:] == ["g-second", "g-ost"]
@@ -832,10 +832,11 @@ def test_the_indexers_page_shows_prowlarrs_view_oasiss_downloads_and_seeding_rul
                                                    "numberOfFailedGrabs": 0, "averageResponseTime": 900}]}}[path]
     found = Prowlarr(ProwlarrSettings("http://p", "k"))
     found.logins = {38: "Cookie-Tracker", 40: "Ratio-Tracker"}
-    found.errors = {38: (time.time(), "Prowlarr search: 400 redirected to https://cookie-tracker.example/login.php")}
     oasis.downloads = Downloads(oasis.connect, None, None, found, TorBoxSettings("", downloads=str(tmp_path / "dl")),
                                 seeding={"Ratio-Tracker": {"mode": "seed", "days": 14, "min_ratio": 0.7}})
     db = oasis.connect()
+    found.errors = {38: (time.time(), "Prowlarr search: 400 redirected to https://cookie-tracker.example/login.php")}
+    oasis.downloads.keep_errors(db)  # as a search does
     db.execute("insert into want_album(rg, artist_mbid, title, reason, state) values ('g-1', 'a', 'One', 'followed', 'have')")
     db.executemany("insert into download(hash, guid, album_id, album_mbid, title, state, error, created, updated, indexer, tracker, downloaded, uploaded) "
                    "values (?, ?, 0, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)", [

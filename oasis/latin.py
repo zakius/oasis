@@ -10,6 +10,7 @@ import time
 import unicodedata
 
 from . import musicbrainz, romanize
+from .db import transaction
 from .text import fold
 
 REFRESH = 180 * 86400   # seconds an artist's or release's Latin names stay before MusicBrainz is asked again
@@ -85,12 +86,13 @@ def step(db) -> bool:
             names = transliteration(db, ref, musicbrainz.release(ref, db))
     except LookupError:
         pass
-    old = [r[0] for r in db.execute("select original from mb_latin where ref = ?", (ref,))]
-    db.execute("delete from mb_latin where ref = ?", (ref,))
-    db.executemany("insert or replace into mb_latin values (?, ?, ?, ?)", [("artist" if kind == "artist" else "title", o, l, ref) for o, l in names.items()])
-    for original in {*old, *names}:  # the songs they name are indexed again
-        db.execute("delete from track_latin where instr(source, ?) > 0", (original,))
-    db.execute("insert or replace into mb_latin_seen values (?, ?)", (ref, time.time()))
+    with transaction(db):
+        old = [r[0] for r in db.execute("select original from mb_latin where ref = ?", (ref,))]
+        db.execute("delete from mb_latin where ref = ?", (ref,))
+        db.executemany("insert or replace into mb_latin values (?, ?, ?, ?)", [("artist" if kind == "artist" else "title", o, l, ref) for o, l in names.items()])
+        for original in {*old, *names}:  # the songs they name are indexed again
+            db.execute("delete from track_latin where instr(source, ?) > 0", (original,))
+        db.execute("insert or replace into mb_latin_seen values (?, ?)", (ref, time.time()))
     return True
 
 
@@ -140,10 +142,5 @@ def index(db):
     values = [(
         r["id"], r["latin_source"], folded(r["title"], r["artist"], r["album"], title_of=True), folded(r["artist"], r["title"], r["album"]),
         folded(r["album"], r["title"], r["artist"], title_of=True), folded(r["album_artist"], r["title"], r["album"])) for r in rows]
-    db.execute("begin")  # one commit, not one per row: the connection autocommits
-    try:
+    with transaction(db):  # one commit, not one per row: the connection autocommits
         db.executemany("insert or replace into track_latin values (?, ?, ?, ?, ?, ?)", values)
-        db.execute("commit")
-    except BaseException:
-        db.execute("rollback")
-        raise

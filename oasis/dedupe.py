@@ -27,6 +27,7 @@ from mutagen.mp3 import MP3
 
 from . import audiorecords
 from .audio import COMPARE_RATE, decode, stream_info
+from .db import transaction
 from .files import reflink
 from .formats import lossless_codec, suffix
 from .tags import pictures, values
@@ -219,7 +220,7 @@ def dedupe_song(db, rows) -> list[tuple[str, str]]:
         s = shared.get(path)
         return s is not None and s["kept"] == of and s["mtime"] == mtimes[path] and s["kept_mtime"] == mtimes.get(of)
 
-    infos, levels = {}, {}
+    infos, levels, compared = {}, {}, []
 
     def info(path):
         if path not in infos:
@@ -238,14 +239,16 @@ def dedupe_song(db, rows) -> list[tuple[str, str]]:
                 ia, ib = info(a), info(b)
                 live = "live" in (ia["release_type"] + ib["release_type"]).lower()
                 result = 0 if live else compare(ia, ib)
-            audiorecords.store_pair(db, a, b, mtimes[a], mtimes[b], result)
-            db.commit()
+            compared.append((a, b, mtimes[a], mtimes[b], result))
         levels[a, b] = result
         return result
 
     pool = [r for r in rows if not VERSION.search(r["title"] or "") and not VERSION.search(r["album"] or "")]
     pairs = [(x, y) for x, y in itertools.combinations(pool, 2) if abs((x["duration"] or 0) - (y["duration"] or 0)) <= LENGTH_SLACK]
     matched = {(x["ref"], y["ref"]) for x, y in pairs if level(x["ref"], y["ref"])}
+    with transaction(db):  # the song's verdicts at once, after its files were read
+        for pair in compared:
+            audiorecords.store_pair(db, *pair)
     if not matched:
         return []
     changed, done = [], set()
@@ -266,8 +269,8 @@ def dedupe_song(db, rows) -> list[tuple[str, str]]:
         kept_mtime = os.path.getmtime(kept)
         for path in todo:
             new = clone(Path(kept), Path(path))
-            audiorecords.store_clone(db, path, str(new), kept, os.path.getmtime(new), kept_mtime)
+            with transaction(db):  # recorded as soon as the file is replaced: a failure of the next leaves this one known
+                audiorecords.store_clone(db, path, str(new), kept, os.path.getmtime(new), kept_mtime)
             changed.append((path, str(new)))
-        db.commit()
         log.info("dedupe: %s: %d copies now share %s", Path(kept).stem, len(todo), Path(kept).name)
     return changed

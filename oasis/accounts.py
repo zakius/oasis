@@ -3,6 +3,7 @@ with app passwords: Subsonic's token login needs the secret itself, so these are
 one read from the database opens oasis's API and nothing else."""
 import hashlib
 import hmac
+import json
 import re
 import secrets
 import threading
@@ -124,6 +125,20 @@ def set_field(db, name: str, **values):
         db.execute(f"update user set {column} = ? where name = ?", (value, name))
     if "password" in values:
         db.execute("delete from session where user = ?", (name,))
+
+
+def signing_in(db, name: str, service: str) -> dict:
+    """The user's sign-in to the service under way, as set_signing_in kept it; {} when none is."""
+    row = db.execute("select state from sign_in where user = ? and service = ?", (name, service)).fetchone()
+    return json.loads(row[0]) if row else {}
+
+
+def set_signing_in(db, name: str, service: str, state: dict | None):
+    """Keeps where the user's sign-in to the service is, for whichever process takes its next step; None: it is over."""
+    if state is None:
+        db.execute("delete from sign_in where user = ? and service = ?", (name, service))
+    else:
+        db.execute("insert or replace into sign_in values (?, ?, ?)", (name, service, json.dumps(state)))
 
 
 def same(a: str, b: str) -> bool:

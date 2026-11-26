@@ -137,3 +137,20 @@ def test_a_tagged_performer_and_the_same_audios_musicbrainz_performer_of_that_na
     tagged = next(s for s in call(client, "search3", query="Run")["searchResult3"]["song"] if s["album"] == "Tagged")
     found = [(c["role"], c.get("subRole"), c["artist"]["name"]) for c in tagged["contributors"]]
     assert found.count(("performer", "guitar", "Dave Grohl")) == 1 and ("performer", "lead vocals", "Dave Grohl") in found
+
+
+def test_a_releases_credits_are_written_at_once_and_its_tags_after(client, tmp_path, monkeypatch):
+    from oasis import credits, db as database
+    other, seen, begun = connect(tmp_path / "oasis.db"), [], []
+    write_tags = credits.write_tags
+
+    def watched(path, fields, found):
+        # another connection sees every credit when the files are written: the transaction is over
+        seen.append(other.execute("select count(*) from credit where source = 'musicbrainz'").fetchone()[0])
+        return write_tags(path, fields, found)
+    monkeypatch.setattr(credits, "write_tags", watched)
+    transaction = database.transaction
+    monkeypatch.setattr(credits, "transaction", lambda db: begun.append(1) or transaction(db))
+    db = connect(tmp_path / "oasis.db")
+    assert credits.step(db)
+    assert seen == [9] and len(begun) == 2  # the credits, then the files' records after their tags were written

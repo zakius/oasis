@@ -34,6 +34,7 @@ WORD_TIME = re.compile(r"<(\d+):(\d+(?:[.:]\d+)?)>")
 SAME_LYRICS = 0.6
 TIMEOUT = 5
 MISS_KEPT = 86400  # seconds a track no provider had lyrics for is left before asking again
+UNKNOWN = object()  # lyrics nobody asked the providers for yet (for_track without fetch)
 
 
 @dataclass
@@ -469,20 +470,22 @@ def youtube_music(db, ytm, r):
     return youtube if video_id else None
 
 
-def for_track(db, r, ytm=None) -> Lyrics | None:
+def for_track(db, r, ytm=None, fetch: bool = True):
     """The song's lines, with the translations a file or provider merged into them taken out (separate): files, and
-    lyrics cached before oasis did that, still have them in."""
-    found = found_for_track(db, r, ytm)
-    return separate(found) if found else None
+    lyrics cached before oasis did that, still have them in. Without fetch, UNKNOWN when the providers would be asked."""
+    found = found_for_track(db, r, ytm, fetch)
+    return separate(found) if found and found is not UNKNOWN else found
 
 
-def found_for_track(db, r, ytm=None) -> Lyrics | None:
+def found_for_track(db, r, ytm=None, fetch: bool = True):
     """The track's own lyrics first; otherwise the providers' pick, cached in the lyrics table (misses for MISS_KEPT)."""
     if r["source"] == "local" and (found := local(r["ref"])):
         return found
     cached = db.execute("select found, fetched from lyrics where track_id = ?", (r["id"],)).fetchone()
     if cached and (cached["found"] or cached["fetched"] > time.time() - MISS_KEPT):
         return Lyrics(**json.loads(cached["found"])) if cached["found"] else None
+    if not fetch:
+        return UNKNOWN
     artist, _ = outside_names(r)
     found = find(Query(r["title"], artist, r["duration"] or 0), youtube_music(db, ytm, r) if ytm else None)
     db.execute("insert or replace into lyrics values (?, ?, ?)",

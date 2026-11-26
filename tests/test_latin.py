@@ -46,6 +46,7 @@ def fill(client):
     enrichment = Enrichment(client.app.state.oasis.connect)
     while enrichment.step():
         pass
+    client.app.state.oasis.index()  # as the search index job does
 
 
 def songs(client, query="", **params):

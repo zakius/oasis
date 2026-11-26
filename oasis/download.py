@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
-from . import releases, wants, worker
+from . import pace, releases, wants
 from .files import need_room
 from .formats import ARCHIVES, AUDIO, IMAGES, suffix
 from .musicbrainz import editions
@@ -35,6 +35,7 @@ from .unpack import UNPACK_ROOM, UNPACKED, unpack
 log = logging.getLogger(__name__)
 
 INTERVAL = 60
+RULES_KEPT = 60          # seconds the seeding rules read from the database are used
 SLOWEST = 12 * 3600     # seconds a download may take at its pace so far
 WARM_UP = 30 * 60        # seconds a download runs before its pace counts: finding peers takes a while
 PATIENT = 30 * 60        # seconds those waits last while TorBox has slots free: a dead torrent keeps its album from another release
@@ -45,6 +46,7 @@ KEEP = (*AUDIO, *ARCHIVES, "cue", *IMAGES)  # music (perhaps packed), cue sheets
 PACE = 3                 # seconds between file download requests: bursts of them get TorBox's 429
 PARALLEL = 2             # files fetched at once
 PAUSE = 300              # seconds without file downloads after a 429
+LINKS = "TorBox's file links"  # their rate limit (pace.py)
 FETCH_TRIES = 5          # polls in a row a file may fail to download before the release counts as broken
 GONE_AFTER = 3           # polls in a row TorBox may leave a download out of its list before it counts as gone: the list comes back empty or short now and then
 KEEP_FAILED = 2 * 86400  # seconds a failed download's files stay for inspection
@@ -99,6 +101,11 @@ def source(release: dict) -> dict:
             if not hash_of(release):
                 raise OSError(f"{url.split('?')[0]}: unreachable") from None
     return {"magnet": magnet(hash_of(release))}
+
+
+def indexer_errors(db) -> dict[int, tuple[float, str]]:
+    """Each Prowlarr indexer's last failed search: when, and what Prowlarr said."""
+    return {r[0]: (r[1], r[2]) for r in db.execute("select * from indexer_error")}
 
 
 def under_way(db) -> list:
@@ -215,22 +222,16 @@ class Downloads:
         self.connect, self.torbox_for, self.own, self.prowlarr, self.imported = connect, torbox, importer, prowlarr, imported
         self.folder, self.max_active, self.stall = Path(settings.downloads), settings.max_active, settings.stall_hours * 3600
         self.rules, self.said_low, self.totals_said = seeding or {}, set(), 0.0
-        self.saved = None    # the seed_rule rows, tracker -> rule, read once: see rule, and forget after a change
+        self.saved, self.read = None, 0.0  # the seed_rule rows, tracker -> rule, and when they were read: see rule
         self.client = None
-        self.seen = {}       # hash -> (progress, since when)
         self.failures = {}   # hash -> polls in a row its files failed to download
         self.missing = {}    # hash -> polls in a row TorBox's list left it out
-        self.copying = {}    # hash -> [(path, size)]: the files being fetched here, for copied()
         self.crowded = False  # TorBox's slots are all taken and albums wait: see step
-        self.pace, self.last_request, self.paused_until = threading.Lock(), 0.0, 0.0
         self.kept = {}       # (kind, key) -> (when, value): see recall
 
     def torbox(self):
         self.client = self.client or self.torbox_for()
         return self.client
-
-    def start(self):
-        worker.start("downloads poll", self.cycle, INTERVAL)  # TorBox down: next poll
 
     def room(self) -> bool:
         """Whether another download may start. Every active torrent of the account takes one of the plan's slots,
@@ -248,7 +249,8 @@ class Downloads:
     def rule(self, tracker: str, login: bool | None = None) -> dict:
         """The indexer's seeding rule: its mode (torbox, seed, off) with seed's limits. login: whether it is a login
         tracker, for its default mode; by Prowlarr's word when not given."""
-        if self.saved is None:
+        if self.saved is None or time.time() - self.read > RULES_KEPT:  # the indexers page may change them in another process
+            self.read = time.time()
             db = self.connect()
             try:
                 self.saved = {r["tracker"]: {k: r[k] for k in ("mode", *SEEDING)} for r in db.execute("select * from seed_rule")}
@@ -288,13 +290,16 @@ class Downloads:
         """The release groups being downloaded (by_group)."""
         return set(by_group(db))
 
-    def progress(self, hash: str) -> float | None:
+    @staticmethod
+    def progress(db, hash: str) -> float | None:
         """The share of a download TorBox had at the last poll; None before one saw it downloading."""
-        return self.seen.get(hash, (None,))[0]
+        row = db.execute("select progress from download where hash = ?", (hash,)).fetchone()
+        return row and row[0]
 
-    def paused(self) -> bool:
+    @staticmethod
+    def paused() -> bool:
         """Whether file downloads wait out TorBox's rate limit."""
-        return time.time() < self.paused_until
+        return pace.held(LINKS)
 
     def recall(self, kind: str, key: str, make):
         """make(), kept FRESH: an artist's bundle searches run a pass apart while they send one bundle each."""
@@ -329,6 +334,7 @@ class Downloads:
             picks = releases.find(self.prowlarr, want, blocked, self.torbox().cached, self.unreliable(db), self.slow(db), low_ids, tally)
         finally:
             count_searches(db, tally)
+            self.keep_errors(db)
         sent = self.send(db, picks, blocked, group, label)
         return Outcome.REFUSED if sent is Outcome.NOTHING_SENT and kept is Outcome.REFUSED else sent
 
@@ -346,8 +352,11 @@ class Downloads:
         blocked = self.blocked(db) | {r["hash"] for r in under_way(db)} | \
             {r[0] for r in db.execute("select hash from download where state != 'failed' and hash in (select hash from download_target)")}
         prowlarr = SimpleNamespace(search=lambda query: self.recall("search", query, lambda: self.prowlarr.search(query)))
-        picks = releases.bundles(prowlarr, want, groups, wanted, blocked, self.torbox().cached_files, lambda rg: editions(rg, db),
-                                 not self.crowded, self.slow(db), self.torrent)
+        try:
+            picks = releases.bundles(prowlarr, want, groups, wanted, blocked, self.torbox().cached_files, lambda rg: editions(rg, db),
+                                     not self.crowded, self.slow(db), self.torrent)
+        finally:
+            self.keep_errors(db)
         search = {"want": want, "wanted": sorted(wanted), "groups": [{k: g[k] for k in ("id", "title", "other_titles", "first-release-date", "primary-type")
                                                                        if k in g} for g in groups]}
         for release, targets, holds in picks[:GRAB_TRIES]:
@@ -358,6 +367,10 @@ class Downloads:
             if sent is Outcome.REFUSED:
                 outcome = Outcome.REFUSED
         return outcome
+
+    def keep_errors(self, db):
+        """Each indexer's last failed search, for the indexers page (indexer_errors)."""
+        db.executemany("insert or replace into indexer_error values (?, ?, ?)", [(i, *e) for i, e in getattr(self.prowlarr, "errors", {}).items()])
 
     def remembered(self, db, wanted: set[str], label: str) -> Outcome:
         """Sends the remembered bundle (bundle_kept) that holds the most of these albums, when TorBox still has it
@@ -489,13 +502,13 @@ class Downloads:
                 return Outcome.NO_SLOT
             now = time.time()
             later = [{k: r[k] for k in ("title", "guid", "infoHash", "magnetUrl", "downloadUrl", "seeders") if k in r} for r in picks[i + 1:i + 1 + GRAB_TRIES]]
+            # Added again after a failure: its row is new, and its stall timer starts anew.
             db.execute("insert or replace into download(hash, guid, album_id, album_mbid, title, torbox_id, state, created, updated, bundle, picks, catalogue, kept, "
                        "tracker, indexer, mode) values (?, ?, 0, ?, ?, ?, 'added', ?, ?, ?, ?, ?, ?, ?, ?, ?)", (added["hash"].lower(), release.get("guid"), group, release["title"],
                                                                                             added["torrent_id"], now, now, search and json.dumps(search),
                                                                                             json.dumps(later) if group and later else None,
                                                                                             catalogue and json.dumps(catalogue), int(kept), tracker,
                                                                                             release.get("indexerId"), mode))
-            self.seen.pop(added["hash"].lower(), None)  # added again after a failure: its stall timer starts anew
             self.failures.pop(added["hash"].lower(), None)
             self.missing.pop(added["hash"].lower(), None)
             db.execute("delete from download_target where hash = ?", (added["hash"].lower(),))
@@ -551,10 +564,10 @@ class Downloads:
                 row = db.execute("select * from download where hash = ?", (row["hash"],)).fetchone()
             # TorBox lists a torrent it is checking (one re-added, say) with no files, even when it calls it finished.
             if not (torrent["download_finished"] and torrent["download_present"] and torrent.get("files")):
-                progress, since = self.seen.get(row["hash"], (None, 0))
-                if progress != torrent["progress"]:  # a torrent still at 0% has made no progress since it was added, restart or not
+                progress, since = row["progress"], row["progressed"] or 0
+                if progress != torrent["progress"]:  # a torrent still at 0% has made no progress since it was added
                     since = row["created"] if progress is None and not torrent["progress"] else time.time()
-                    self.seen[row["hash"]] = (torrent["progress"], since)
+                    db.execute("update download set progress = ?, progressed = ? where hash = ?", (torrent["progress"], since, row["hash"]))
                 # Waits for seeders are short while others need the slot, and PATIENT while slots are free: a late seeder
                 # (someone's PC that is on in the evening) still has a chance then, and costs nothing.
                 wait = lambda short: short if self.crowded else max(short, PATIENT)
@@ -650,10 +663,13 @@ class Downloads:
             todo += [(listed[n], self.folder / row["hash"] / rg / inside(posixpath.relpath(n, top))) for n in names]
         return todo
 
-    def copied(self, hash: str) -> float | None:
+    @staticmethod
+    def copied(db, hash: str) -> float | None:
         """The share of a download's files fetched here so far, partly fetched ones too; None when none is being fetched."""
-        if not (files := self.copying.get(hash)):
+        row = db.execute("select fetching from download where hash = ?", (hash,)).fetchone()
+        if not (row and row[0]):
             return None
+        files = [(Path(p), size) for p, size in json.loads(row[0])]
         size = lambda p: p.stat().st_size if p.exists() else 0
         return sum(min(total, size(path) or size(path.with_name(path.name + ".part"))) for path, total in files) / (sum(t for _, t in files) or 1)
 
@@ -671,7 +687,7 @@ class Downloads:
         if not any(suffix(f["name"]) in (*AUDIO, *ARCHIVES) for f, _ in todo):
             self.fail(db, row, "no audio files in the torrent")
             return False
-        self.copying[row["hash"]] = [(path, f["size"]) for f, path in todo]
+        db.execute("update download set fetching = ? where hash = ?", (json.dumps([(str(path), f["size"]) for f, path in todo]), row["hash"]))
         todo = [(f, path) for f, path in todo if not (path.exists() and path.stat().st_size == f["size"])]
         self.folder.mkdir(parents=True, exist_ok=True)
         need = sum(f["size"] for f, _ in todo) + UNPACK_ROOM * sum(f["size"] for f in archives([f for f, _ in todo]))
@@ -691,12 +707,10 @@ class Downloads:
 
     def fetch_file(self, torrent_id: int, file: dict, path: Path) -> Exception | None:
         try:
-            with self.pace:
-                if time.time() < self.paused_until:
-                    raise RateLimited("TorBox rate limit: paused")
-                time.sleep(max(0.0, self.last_request + PACE - time.time()))
-                self.last_request = time.time()
-                url = self.torbox().link(torrent_id, file["id"])
+            if pace.held(LINKS):
+                raise RateLimited("TorBox rate limit: paused")
+            pace.wait_turn(LINKS, PACE)
+            url = self.torbox().link(torrent_id, file["id"])
             path.parent.mkdir(parents=True, exist_ok=True)
             part = path.with_name(path.name + ".part")
             try:
@@ -711,7 +725,7 @@ class Downloads:
             part.rename(path)
             return None
         except RateLimited as e:
-            self.paused_until = time.time() + PAUSE
+            pace.hold(LINKS, PAUSE)
             return e
         except OSError as e:
             return e

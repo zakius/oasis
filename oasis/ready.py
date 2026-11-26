@@ -6,7 +6,7 @@ station does; hiding one deletes it."""
 import logging
 import time
 
-from . import accounts, playlists, worker
+from . import accounts, playlists
 from .mixes import OASIS, drop, mirror
 from .playlists import RADIO
 from .recommend import PERIOD, STATIONS
@@ -30,9 +30,6 @@ class ReadyMade:
     def __init__(self, connect, recommender):
         """recommender: for the stations, and the user's services (Sources) and YouTube Music, which say what plays."""
         self.connect, self.recommender = connect, recommender
-
-    def start(self):
-        worker.start("ready-made playlists", self.refresh_all, DAY)
 
     def refresh_all(self):
         db = self.connect()
@@ -76,7 +73,7 @@ class ReadyMade:
             if not db.execute("select 1 from playlist where owner = ? and mix = ?", (user, OASIS + kind)).fetchone():
                 playlists.create(db, user, STATIONS[kind], RADIO, mix=OASIS + kind, source=account["radio_source"], station=kind,
                                  period=PERIOD if kind == "lastfm-top" else None)
-                self.recommender.wake()
+                self.recommender.wake(db)
 
     def songs(self, db, user: str, kind: str) -> list[str]:
         """The songs of one of FROM_PLAYS for the user, most played first, those that don't play for the user left out."""

@@ -9,6 +9,7 @@ from collections import Counter, defaultdict
 from itertools import combinations
 
 from . import musicbrainz
+from .db import transaction
 from .text import fold
 from .tracks import artist_id, move, name_id, resolve
 
@@ -28,10 +29,15 @@ def step(db) -> bool:
         return False
     mbid = row["mbid"]
     try:
-        learn(db, musicbrainz.artist(mbid, db))
+        data = musicbrainz.artist(mbid, db)
     except LookupError:
-        db.execute("update mb_artist set fetched = ? where mbid = ?", (NOT_FOUND, mbid))
-    merge(db)
+        data = None
+    with transaction(db):
+        if data:
+            learn(db, data)
+        else:
+            db.execute("update mb_artist set fetched = ? where mbid = ?", (NOT_FOUND, mbid))
+        merge(db)
     return True
 
 
@@ -240,10 +246,11 @@ def unify(db):
                 db.execute("update artist_alias set artist_id = ? where artist_id = ? and source != 'config'", (target, id))
         if resolve(db, target) != target:
             db.execute("delete from artist_alias where id = ? and source = 'spelling'", (target,))
-    if spelled != spelled_as(db):
-        db.execute("delete from spelling")
-        db.executemany("insert into spelling values (?, ?)", spelled.items())
-    merge(db)
+    with transaction(db):  # no reader sees the spellings half written
+        if spelled != spelled_as(db):
+            db.execute("delete from spelling")
+            db.executemany("insert into spelling values (?, ?)", spelled.items())
+        merge(db)
 
 
 def spelled_as(db) -> dict[str, str]:

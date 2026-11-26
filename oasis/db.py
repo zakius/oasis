@@ -171,7 +171,9 @@ create table if not exists download(  -- releases oasis downloads through TorBox
     uploaded int, downloaded int,           -- TorBox's last totals for it, kept after it is deleted: the tracker's running ratio
     seeding int not null default 0,         -- 1: imported and still seeding on TorBox (see download.py)
     mode text,                              -- seeding as sent to TorBox: torbox (its account's setting), seed (oasis stops it), off; null: seed if tracker, else off
-    indexer int                             -- the Prowlarr indexer it came from; null before oasis noted it (by_indexer goes by the guid's site then)
+    indexer int,                            -- the Prowlarr indexer it came from; null before oasis noted it (by_indexer goes by the guid's site then)
+    progress real, progressed real,         -- TorBox's share of it at the last poll, and since when it is at that share
+    fetching text                           -- the files being fetched here (JSON: [path, size]), for the dashboard (copied)
 );
 create table if not exists search_stat(  -- each indexer's answers to album searches, a day at a time: results, the album, usable
     day text not null, indexer int not null, results int not null, album int not null, usable int not null, primary key(day, indexer)
@@ -227,7 +229,8 @@ create table if not exists want_album(  -- albums oasis looks for: starred ones 
     reason text not null,                   -- starred, followed
     state text not null,                    -- missing, downloading, have
     searched real, next_search real, tries int not null default 0,
-    error text                              -- what its last search found
+    error text,                             -- what its last search found
+    soon real                               -- when the dashboard asked for it to be searched before any other
 );
 create index if not exists want_album_artist on want_album(artist_mbid);
 create table if not exists given_up(rg text primary key, at real not null);  -- albums users gave up on: followed artists' catalogues leave them out
@@ -278,6 +281,30 @@ create table if not exists playlist_entry(
     playlist_id int not null references playlist(id) on delete cascade,
     pos int not null, track_id text not null
 );
+create table if not exists task(  -- the workers' queue (see tasks.py): periodic jobs, one row each, and one-off tasks
+    id integer primary key,
+    kind text not null,                -- a periodic job's name, or the kind of a one-off task (worker.py)
+    args text not null default '{}',   -- JSON
+    key text,                          -- a periodic job's name; a one-off task's, when another with it would do the same
+    lane text,                         -- periodic jobs of one lane run in one worker process while it lives
+    priority int not null default 0,   -- interactive tasks, someone waiting for them, come first
+    state text not null default 'queued',  -- queued, running, done or failed
+    due real,                          -- claimed from then; a periodic job without a schedule waits for a wake (null)
+    woken int not null default 0,      -- a periodic job woken while it ran: due again once it ends
+    worker text, lease real,           -- who claimed it last, and till when the claim holds unless renewed
+    attempts int not null default 0,
+    result text, error text,           -- JSON
+    created real not null, finished real
+);
+create unique index if not exists task_key on task(key) where state in ('queued', 'running');
+create index if not exists task_due on task(state, due);
+create table if not exists worker(id text primary key, seen real not null);  -- each worker process's last heartbeat
+create table if not exists sign_in(  -- each user's sign-ins under way: Tidal's on a device, a Last.fm-like server's on its page
+    user text not null, service text not null, state text not null, primary key(user, service)  -- state: JSON
+);
+create table if not exists answer(question text primary key, answer text not null, expires real not null);  -- see recommend.py's answer
+create table if not exists indexer_error(indexer int primary key, at real not null, error text not null);  -- each Prowlarr indexer's last failed search
+create table if not exists pace(service text primary key, next real not null, held real not null);  -- rate limits (see pace.py)
 """
 
 
@@ -301,7 +328,10 @@ def connect(path: Path) -> sqlite3.Connection:
 def transaction(db: sqlite3.Connection):
     """The statements in the block as one transaction, on a connection that otherwise commits each statement. It takes
     the write lock at once: a transaction that read first can't write after another connection has ("database is
-    locked")."""
+    locked"). Inside another, the block is part of that one."""
+    if db.in_transaction:
+        yield
+        return
     db.execute("begin immediate")
     try:
         yield
@@ -414,18 +444,20 @@ NOT_FROM_FILES = {"looked_up", "preview"}  # track columns of songs nothing can 
 
 
 def migrate(db: sqlite3.Connection):
-    """Adds the columns a database from an older oasis lacks, as SCHEMA defines them."""
+    """Adds the columns a database from an older oasis lacks, as SCHEMA defines them. In one transaction: the API and
+    the workers may start at once, and only the first adds them."""
     current = sqlite3.connect(":memory:")
     current.executescript(SCHEMA)
-    for (table,) in current.execute("select name from sqlite_master where type = 'table'"):
-        have = {row[1] for row in db.execute(f"pragma table_info({table})")}
-        for _, name, kind, not_null, default, _ in current.execute(f"pragma table_info({table})"):
-            if name not in have:
-                # SQLite adds a NOT NULL column only with a default.
-                constraint = (f" not null default {default}" if not_null else f" default {default}") if default is not None else ""
-                db.execute(f"alter table {table} add column {name} {kind}{constraint}")
-                if table == "track" and name not in NOT_FROM_FILES:
-                    db.execute("update track set mtime = null where source = 'local'")  # the next scan reads files for it
+    with transaction(db):
+        for (table,) in current.execute("select name from sqlite_master where type = 'table'"):
+            have = {row[1] for row in db.execute(f"pragma table_info({table})")}
+            for _, name, kind, not_null, default, _ in current.execute(f"pragma table_info({table})"):
+                if name not in have:
+                    # SQLite adds a NOT NULL column only with a default.
+                    constraint = (f" not null default {default}" if not_null else f" default {default}") if default is not None else ""
+                    db.execute(f"alter table {table} add column {name} {kind}{constraint}")
+                    if table == "track" and name not in NOT_FROM_FILES:
+                        db.execute("update track set mtime = null where source = 'local'")  # the next scan reads files for it
     current.close()
 
 

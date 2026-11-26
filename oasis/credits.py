@@ -9,6 +9,7 @@ import logging
 import time
 
 from . import musicbrainz
+from .db import transaction
 from .tracks import artist_id
 from .audiorecords import retagged, same_audio, same_audio_of
 from .tags import write_tags
@@ -110,12 +111,17 @@ def step(db) -> bool:
     except LookupError:
         db.execute("update track set credits_at = ? where mb_release = ?", (NOT_FOUND, release))
         return True
-    apply(db, data)
+    with transaction(db):  # the release's credits at once: the write lock is taken once, not for every statement
+        retags = apply(db, data)
+    retag(db, retags)
     return True
 
 
-def apply(db, data: dict):
+def apply(db, data: dict) -> list[tuple[str, dict, list[dict]]]:
+    """Stores a release's credits and fields on its tracks; the tags to write to their files and to those of other
+    releases of the same audio (retag)."""
     release, tracks = release_metadata(data)
+    retags = []
     for row in db.execute("select id, ref, mb_track, mb_recording from track where source = 'local' and mb_release = ?",
                           (release["mb_release"],)).fetchall():
         entry = tracks.get(row["mb_track"]) or tracks.get(row["mb_recording"])
@@ -124,17 +130,18 @@ def apply(db, data: dict):
             continue
         fields = {**release, **entry["fields"]}
         store(db, row["id"], entry["credits"], "musicbrainz")
-        retag(db, row["ref"], fields, performance_credits(db, same_audio(db, row["ref"]), entry["credits"]))
+        retags.append((row["ref"], fields, performance_credits(db, same_audio(db, row["ref"]), entry["credits"])))
         for other in same_audio(db, row["ref"]):  # releases filled earlier gain what this one adds
             own = [dict(c) for c in db.execute("select c.* from credit c join track t on t.id = c.track_id where t.ref = ? "
                                                "and c.source = 'musicbrainz' order by c.position", (other,))]
             if own:
-                retag(db, other, {}, performance_credits(db, same_audio(db, other), own))
+                retags.append((other, {}, performance_credits(db, same_audio(db, other), own)))
         columns = [k for k in ("label", "release_types", "isrc", "original_date", "mb_recording", "genres") if fields.get(k)]
         genres = json.loads(fields.get("genres") or "[]")
         db.execute(f"update track set {', '.join(f'{c} = ?' for c in columns)}{', ' if columns else ''}"
                    "genre = coalesce(genre, ?), credits_at = ? where id = ?",
                    [*(fields[c] for c in columns), genres[0] if genres else None, time.time(), row["id"]])
+    return retags
 
 
 # Credits that describe the performance itself, the same for every release of one stream; the artist credit, album
@@ -153,12 +160,18 @@ def performance_credits(db, others: list[str], credits: list[dict], key=same_cre
     return dedupe_credits(credits + shared, key)
 
 
-def retag(db, path: str, fields: dict, credits: list[dict]):
-    try:
-        if write_tags(path, fields, credits):
+def retag(db, retags: list[tuple[str, dict, list[dict]]]):
+    """Writes the tags (path, fields, credits) to the files, outside any transaction: a file write holds no lock."""
+    written = []
+    for path, fields, credits in retags:
+        try:
+            if write_tags(path, fields, credits):
+                written.append(path)
+        except OSError as e:  # read-only library: the database still has it all
+            log.info("can't write tags to %s: %s", path, e)
+    with transaction(db):
+        for path in written:
             retagged(db, path)
-    except OSError as e:  # read-only library: the database still has it all
-        log.info("can't write tags to %s: %s", path, e)
 
 
 def store(db, track_id: str, credits: list[dict], source: str):

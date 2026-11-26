@@ -24,7 +24,7 @@ from mutagen.oggflac import OggFLAC
 from mutagen.oggopus import OggOpus
 from mutagen.oggvorbis import OggVorbis
 
-from . import musicbrainz, quality, worker
+from . import musicbrainz, quality
 from .audio import check_decodes
 from .files import NoSpace, copy, need_room
 from .layout import album_folder, edition_file, given_tags, release_folder, tags_for, track_file
@@ -246,9 +246,6 @@ class Uploads:
     def remove(self, db, id: str):
         db.execute("delete from upload where id = ?", (id,))
         shutil.rmtree(self.folder / id, ignore_errors=True)
-
-    def start(self):
-        worker.start("upload cleanup", self.clean_up, CLEAN_EVERY)
 
     def clean_up(self):
         db = self.connect()
