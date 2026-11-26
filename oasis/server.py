@@ -46,7 +46,7 @@ class Oasis:
         accounts.hash_plain_passwords(db)
         accounts.sync_config_users(db, config.users)
         self.lastfm = lastfm.app(db, config.lastfm_key, config.lastfm_secret)  # oasis's Last.fm app, or None
-        artists.from_config(db, config.artists.get("merge", []))
+        artists.from_config(db, config.artists)
         artists.configure(db, artists.load_settings(db, config.artists))
         playlists.demix(db)
         artists.unify(db)

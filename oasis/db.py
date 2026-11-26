@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from itertools import combinations
 from pathlib import Path
 
 from .tracks import artist_id
@@ -63,6 +64,11 @@ create table if not exists spelling(  -- artist names shown as another spelling 
 create table if not exists same_artist(  -- other names the user gives artists, which MusicBrainz doesn't know (artists.py)
     name text primary key, artist text not null,
     source text not null            -- dashboard, or config (oasis.toml's merge lists)
+);
+create table if not exists related_artist(  -- separate artists the user says belong together, either way round (artists.py)
+    artist text not null, other text not null,
+    source text not null,           -- dashboard, or config (oasis.toml's related groups)
+    primary key(artist, other)
 );
 create table if not exists setting(key text primary key, value text);  -- settings made on the dashboard
 create table if not exists stat(  -- each user's stars, ratings and plays, as Subsonic keeps them
@@ -313,13 +319,16 @@ def drop_left_out(db: sqlite3.Connection):
     db.execute("delete from want_album where state = 'skipped'")
 
 
-def same_artists(db: sqlite3.Connection):
-    """Moves the dashboard's merge lists, kept with its other artist settings before, to same_artist."""
+def artist_tables(db: sqlite3.Connection):
+    """Moves the dashboard's merge lists and related groups, kept with its other artist settings before, to same_artist
+    and related_artist."""
     row = db.execute("select value from setting where key = 'artists'").fetchone()
     settings = json.loads(row[0]) if row else {}
-    if "merge" in settings:
-        for first, *others in settings.pop("merge"):
+    if "merge" in settings or "related" in settings:
+        for first, *others in settings.pop("merge", []):
             db.executemany("insert or ignore into same_artist values (?, ?, 'dashboard')", [(n, first) for n in others])
+        for group in settings.pop("related", []):
+            db.executemany("insert or ignore into related_artist values (?, ?, 'dashboard')", combinations(group, 2))
         db.execute("update setting set value = ? where key = 'artists'", (json.dumps(settings, ensure_ascii=False),))
 
 
@@ -369,4 +378,4 @@ def create(db: sqlite3.Connection):
 
 # What a database from any older oasis needs, in order, each time a process first connects to it; each step does
 # nothing once done.
-MIGRATIONS = [rename, create, own_stats, lyrics_with_words, one_listening_radio, reidentify, drop_left_out, same_artists]
+MIGRATIONS = [rename, create, own_stats, lyrics_with_words, one_listening_radio, reidentify, drop_left_out, artist_tables]

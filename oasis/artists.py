@@ -69,11 +69,15 @@ def save_settings(db, settings: dict):
     configure(db, settings)
 
 
-def from_config(db, merge: list[list[str]]):
-    """oasis.toml's merge lists (each one's later names are the first's other names), as rows of same_artist the
-    dashboard shows but can't remove."""
+def from_config(db, settings: dict):
+    """oasis.toml's merge lists (each one's later names are the first's other names) and related groups, as rows of
+    same_artist and related_artist the dashboard shows but can't remove."""
     db.execute("delete from same_artist where source = 'config'")
-    db.executemany("insert or replace into same_artist values (?, ?, 'config')", [(n, first) for first, *others in merge for n in others])
+    db.executemany("insert or replace into same_artist values (?, ?, 'config')",
+                   [(n, first) for first, *others in settings.get("merge", []) for n in others])
+    db.execute("delete from related_artist where source = 'config'")
+    db.executemany("insert or replace into related_artist values (?, ?, 'config')",
+                   [pair for group in settings.get("related", []) for pair in combinations(group, 2)])
 
 
 def add_name(db, artist: str, name: str):
@@ -102,6 +106,42 @@ def declared(db, names: list[str]) -> list[str]:
     return list(dict.fromkeys(n for a, b in pairs if fold(a) in owners for n in (a, b)))
 
 
+def add_related(db, artist: str, other: str):
+    if not db.execute("select 1 from related_artist where artist = ? and other = ?", (other, artist)).fetchone():
+        db.execute("insert or ignore into related_artist values (?, ?, 'dashboard')", (artist, other))
+
+
+def remove_related(db, artist: str, other: str):
+    db.execute("delete from related_artist where source = 'dashboard' and (artist = ? and other = ? or artist = ? and other = ?)",
+               (artist, other, other, artist))
+
+
+def related_pairs(db) -> list[dict]:
+    """The separate artists the user says belong together (related_artist), by artist."""
+    return [dict(r) for r in db.execute("select artist, other, source from related_artist order by artist collate nocase, other collate nocase")]
+
+
+def known_artists(db, names: list[str], lookup: bool = False) -> list[dict]:
+    """What MusicBrainz knows of the artists going by any of names (musicbrainz.artist): those the library met, else,
+    with lookup, those MusicBrainz finds by name or alias. OSError: MusicBrainz is away."""
+    keys = {fold(n) for n in names}
+    mbids = [mbid for mbid, own in db.execute("select mbid, name from mb_artist") if fold(own) in keys]
+    if not mbids and lookup:
+        mbids = [mbid for n in names for mbid in musicbrainz.search_artist(n)]
+    found = []
+    for mbid in dict.fromkeys(mbids):
+        try:
+            found.append(musicbrainz.artist(mbid, db))
+        except LookupError:
+            continue
+    return found
+
+
+def names_of(data: dict) -> set[str]:
+    """The names oasis takes a MusicBrainz artist by: its own and the aliases it performs under, folded."""
+    return {fold(data["name"]), *(fold(a["name"]) for a in data.get("aliases") or [] if a.get("type") in ALIAS_TYPES)}
+
+
 def needless(db, artist: str, name: str, lookup: bool = False) -> str | None:
     """Why the user needn't give the artist this name, or None: oasis takes the two for one spelling, or MusicBrainz
     lists both as names of one artist. lookup: also asks MusicBrainz about artists the library hasn't met. OSError:
@@ -109,23 +149,28 @@ def needless(db, artist: str, name: str, lookup: bool = False) -> str | None:
     keys = {fold(artist), fold(name)}
     if len(keys) == 1:
         return "Only case, accents or punctuation differ, and oasis already treats such names as one."
-    mbids = [mbid for mbid, own in db.execute("select mbid, name from mb_artist") if fold(own) in keys]
-    if not mbids and lookup:
-        mbids = musicbrainz.search_artist(artist) + musicbrainz.search_artist(name)
-    for mbid in dict.fromkeys(mbids):
-        try:
-            data = musicbrainz.artist(mbid, db)
-        except LookupError:
-            continue
-        known = {fold(data["name"]), *(fold(a["name"]) for a in data.get("aliases") or [] if a.get("type") in ALIAS_TYPES)}
-        if keys <= known:
+    for data in known_artists(db, [artist, name], lookup):
+        if keys <= names_of(data):
             return f"MusicBrainz already lists both as names of {data['name']}."
     return None
 
 
+def needless_link(db, artist: str, other: str, lookup: bool = False) -> str | None:
+    """Why the user needn't relate the two artists, or None: one name, or MusicBrainz links them already (LINKS)."""
+    if fold(artist) == fold(other):
+        return "That's one artist."
+    for data in known_artists(db, [artist, other], lookup):
+        if not (theirs := {fold(artist), fold(other)} - names_of(data)):
+            return f"MusicBrainz lists both as names of {data['name']}: that's one artist."
+        for r in data.get("relations") or []:
+            if r.get("type") in LINKS and r.get("artist") and fold(r["artist"]["name"]) in theirs:
+                return f"MusicBrainz already links {data['name']} and {r['artist']['name']} ({r['type']})."
+    return None
+
+
 def configure(db, settings: dict):
-    """Applies the user's artist settings: the other names of artists (same_artist), separate (names never merged
-    into another artist) and related (groups of separate artists that belong together)."""
+    """Applies the user's artist settings: the other names of artists (same_artist), the separate artists that belong
+    together (related_artist), and separate (names never merged into another artist)."""
     before = dict(db.execute("select id, artist_id from artist_alias where id != artist_id").fetchall())
     db.execute("delete from artist_alias where source = 'config'")
     db.execute("delete from artist_link where source = 'config'")
@@ -133,9 +178,8 @@ def configure(db, settings: dict):
         db.execute("insert or replace into artist_alias values (?, ?, 'config')", (name_id(name), name_id(name)))
     for name, first in db.execute("select name, artist from same_artist").fetchall():
         db.execute("insert or replace into artist_alias values (?, ?, 'config')", (name_id(name), artist_id(db, first)))
-    for group in settings.get("related", []):
-        for a, b in combinations([artist_id(db, name) for name in group], 2):
-            link(db, a, b, RELATED, "config")
+    for a, b in db.execute("select artist, other from related_artist").fetchall():
+        link(db, artist_id(db, a), artist_id(db, b), RELATED, "config")
     for id, target in before.items():  # a merge taken back or overridden: that name's songs and credits leave the artist
         if (now := resolve(db, id)) != target:
             for table, name, own in (("track", "album_artist", ""), ("credit", "artist_name", " and mbid is null")):
