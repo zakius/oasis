@@ -16,7 +16,7 @@ import threading
 import time
 from collections import Counter
 
-from . import musicbrainz, releases, worker
+from . import artists, musicbrainz, releases, worker
 from .wants import Outcome
 from .formats import LOSSLESS
 from .musicbrainz import lucene, search_artist
@@ -501,7 +501,8 @@ class Acquire:
             groups = [{**g, "other_titles": alternatives.get(g["id"], [])} for g in musicbrainz.release_groups(mbid, db) if g["id"] in kept]
             titles = [g["title"] for g in groups if g["primary-type"] != "Single"]
             names = releases.aliases(db, row["artist"], mbid, titles)
-            sent = self.downloads.bundle(db, {"artist": row["artist"], "names": names, "native": releases.native(names), "albums": titles},
+            sent = self.downloads.bundle(db, {"artist": row["artist"], "names": names, "native": releases.native(names), "albums": titles,
+                                              "declared": artists.declared(db, names)},
                                          groups, wanted)
         except (OSError, LookupError) as e:
             log.warning("bundle search for %s failed: %s", row["artist"], e)
@@ -573,7 +574,7 @@ class Acquire:
             log.info("other titles of %s: %s", row["title"], e)
             alternatives = []
         return {"artist": row["artist"], "names": names, "title": row["title"], "other_titles": alternatives, "year": (row["first_date"] or "")[:4],
-                "native": releases.native(names), "discs": discs, "others": others, "upgrade": row["state"] == "have",
+                "native": releases.native(names), "declared": artists.declared(db, names), "discs": discs, "others": others, "upgrade": row["state"] == "have",
                 "type": row["primary_type"], "namesakes": namesakes}
 
 

@@ -10,8 +10,9 @@ dedupe = false    # store each audio stream once: copies of a song in several ed
 
 [artists]
 # One MusicBrainz artist is one artist whatever the spelling; these settle what MusicBrainz can't. Admins edit them on
-# the dashboard (Artist settings); these are used until saved there.
-# merge = [["米津玄師", "Kenshi Yonezu"]]              # the later names become the first
+# the dashboard (Artist settings). separate and related are used until saved there; merge always applies, beside the
+# other names added there.
+# merge = [["Stachursky", "Stachurski"]]              # the later names become the first; downloads search by them too
 # separate = ["Phoenix"]                              # never merged into an artist that goes by it too
 # related = [["Mori Calliope", "DEMONDICE"]]          # separate artists that belong together: shown first among
                                                       # similar artists and mixed into each other's radios

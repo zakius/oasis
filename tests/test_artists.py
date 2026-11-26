@@ -4,7 +4,7 @@ from starlette.testclient import TestClient
 from conftest import app_for, call, make_track
 from oasis import artists
 from oasis.config import Config
-from oasis import musicbrainz
+from oasis import musicbrainz, releases
 from oasis.enrich import Enrichment
 from oasis.db import connect
 from oasis.scan import scan
@@ -106,20 +106,54 @@ def test_the_users_merges_and_splits_win(tmp_path):
         assert call(client, "getArtist", id=make_id("ar-", "Kenshi Yonezu"))["artist"]["id"] == make_id("ar-", "Kenshi Yonezu")
 
 
-def test_artist_settings_on_the_dashboard_apply_at_once_and_merges_can_be_taken_back(tmp_path):
+def test_artist_settings_on_the_dashboard_apply_at_once_and_other_names_can_be_taken_back(tmp_path, monkeypatch):
+    monkeypatch.setattr(musicbrainz, "search_artist", lambda name: [])
     with client_for(tmp_path, related=[["Mori Calliope", "DEMONDICE"]]) as client:
         client.post("/login", data={"name": "admin", "password": "secret"})
         page = client.get("/admin/artists").text
         assert "Mori Calliope; DEMONDICE" in page  # oasis.toml's groups until saved here
-        saved = client.post("/admin/artists", data={"related": "Gawr Gura; Senzawa\nlonely", "merge": "Beta; Beta Band", "separate": ""}).text
+        saved = client.post("/admin/artists", data={"related": "Gawr Gura; Senzawa\nlonely", "separate": ""}).text
         assert "Saved" in saved and "Gawr Gura; Senzawa" in saved and "lonely" not in saved
         assert "similarArtist" not in call(client, "getArtistInfo2", id=make_id("ar-", "DEMONDICE"), oasis="1")["artistInfo2"]
+        added = client.post("/admin/artists/names", data={"artist": "Beta", "name": "Beta Band"}).text
+        assert "Beta Band is Beta now" in added and "<td>Beta Band" in added
         assert len(call(client, "getArtist", id=make_id("ar-", "Beta"))["artist"]["album"]) == 2
 
-        client.post("/admin/artists", data={"related": "", "merge": "", "separate": ""})
+        client.post("/admin/artists/names/remove", data={"name": "Beta Band"})
         assert [a["name"] for a in call(client, "getArtist", id=make_id("ar-", "Beta"))["artist"]["album"]] == ["One"]
         assert [a["name"] for a in call(client, "getArtist", id=make_id("ar-", "Beta Band"))["artist"]["album"]] == ["Two"]
         assert "<span>artists</span>" in client.get("/").text and "Downloading" in client.get("/").text
+
+
+def test_names_musicbrainz_or_spelling_already_join_are_not_added(tmp_path, monkeypatch):
+    monkeypatch.setattr(musicbrainz, "search_artist", lambda name: [])
+    with client_for(tmp_path, merge=[["Beta", "Beta Band"]]) as client:
+        fill(client)
+        client.post("/login", data={"name": "admin", "password": "secret"})
+        known = client.post("/admin/artists/names", data={"artist": "米津玄師", "name": "Kenshi Yonezu"}).text
+        assert "MusicBrainz already lists both as names of 米津玄師" in known
+        spelled = client.post("/admin/artists/names", data={"artist": "Agnieszka Chylińska", "name": "Agnieszka Chylinska"}).text
+        assert "Only case, accents or punctuation differ" in spelled
+        hint = client.post("/admin/artists/names", data={"artist": "米津玄師", "name": "켄시 요네즈"}).text  # a search hint isn't a name it goes by
+        assert "켄시 요네즈 is 米津玄師 now" in hint and "from oasis.toml" in hint  # Beta Band, which only oasis.toml can take back
+        db = client.app.state.oasis.connect()
+        assert [tuple(r) for r in db.execute("select name, artist, source from same_artist order by name")] == [
+            ("Beta Band", "Beta", "config"), ("켄시 요네즈", "米津玄師", "dashboard")]
+        client.post("/admin/artists/names/remove", data={"name": "Beta Band"})
+        assert db.execute("select count(*) from same_artist").fetchone()[0] == 2
+
+
+def test_an_artists_other_names_come_with_any_of_its_names_and_search_its_albums_again(tmp_path):
+    db = connect(tmp_path / "oasis.db")
+    artists.from_config(db, [["Stachursky", "Stachurski", "Jacek Stachursky"]])
+    assert artists.declared(db, ["stachurski"]) == ["Stachursky", "Stachurski", "Jacek Stachursky"]
+    assert artists.declared(db, ["Someone"]) == []
+    assert releases.aliases(db, "Stachurski", None, []) == ["Stachurski", "Stachursky", "Jacek Stachursky"]
+
+    db.execute("insert into want_album(rg, artist_mbid, artist, title, reason, state, next_search) values "
+               "('g-1', 'mb-1', 'Agnieszka Chylińska', 'Album', 'followed', 'missing', 9e9)")
+    artists.add_name(db, "Agnieszka Chylinska", "Chylińska")
+    assert db.execute("select next_search from want_album").fetchone()[0] == 0
 
 
 def stream(id, artist, title, guest=""):

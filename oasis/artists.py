@@ -69,17 +69,70 @@ def save_settings(db, settings: dict):
     configure(db, settings)
 
 
+def from_config(db, merge: list[list[str]]):
+    """oasis.toml's merge lists (each one's later names are the first's other names), as rows of same_artist the
+    dashboard shows but can't remove."""
+    db.execute("delete from same_artist where source = 'config'")
+    db.executemany("insert or replace into same_artist values (?, ?, 'config')", [(n, first) for first, *others in merge for n in others])
+
+
+def add_name(db, artist: str, name: str):
+    """Makes name another name of the artist, and its missing albums searched for again soon: by this name too."""
+    db.execute("insert or replace into same_artist values (?, ?, 'dashboard')", (name, artist))
+    keys = {fold(artist), fold(name)}
+    rgs = [(rg,) for rg, owner in db.execute("select rg, artist from want_album where state = 'missing'") if fold(owner or "") in keys]
+    db.executemany("update want_album set next_search = 0 where rg = ?", rgs)
+
+
+def remove_name(db, name: str):
+    db.execute("delete from same_artist where name = ? and source = 'dashboard'", (name,))
+
+
+def other_names(db) -> list[dict]:
+    """The other names the user gave artists (same_artist), by artist."""
+    return [dict(r) for r in db.execute("select name, artist, source from same_artist order by artist collate nocase, name collate nocase")]
+
+
+def declared(db, names: list[str]) -> list[str]:
+    """The names the user gave an artist going by any of names, all of them, the artist's own among them: a pair
+    works either way round."""
+    keys = {fold(n) for n in names}
+    pairs = db.execute("select artist, name from same_artist").fetchall()
+    owners = {fold(a) for a, n in pairs if fold(a) in keys or fold(n) in keys}
+    return list(dict.fromkeys(n for a, b in pairs if fold(a) in owners for n in (a, b)))
+
+
+def needless(db, artist: str, name: str, lookup: bool = False) -> str | None:
+    """Why the user needn't give the artist this name, or None: oasis takes the two for one spelling, or MusicBrainz
+    lists both as names of one artist. lookup: also asks MusicBrainz about artists the library hasn't met. OSError:
+    MusicBrainz is away."""
+    keys = {fold(artist), fold(name)}
+    if len(keys) == 1:
+        return "Only case, accents or punctuation differ, and oasis already treats such names as one."
+    mbids = [mbid for mbid, own in db.execute("select mbid, name from mb_artist") if fold(own) in keys]
+    if not mbids and lookup:
+        mbids = musicbrainz.search_artist(artist) + musicbrainz.search_artist(name)
+    for mbid in dict.fromkeys(mbids):
+        try:
+            data = musicbrainz.artist(mbid, db)
+        except LookupError:
+            continue
+        known = {fold(data["name"]), *(fold(a["name"]) for a in data.get("aliases") or [] if a.get("type") in ALIAS_TYPES)}
+        if keys <= known:
+            return f"MusicBrainz already lists both as names of {data['name']}."
+    return None
+
+
 def configure(db, settings: dict):
-    """Applies the user's [artists] settings: merge (lists whose later names become the first), separate (names never
-    merged into another artist) and related (groups of separate artists that belong together)."""
+    """Applies the user's artist settings: the other names of artists (same_artist), separate (names never merged
+    into another artist) and related (groups of separate artists that belong together)."""
     before = dict(db.execute("select id, artist_id from artist_alias where id != artist_id").fetchall())
     db.execute("delete from artist_alias where source = 'config'")
     db.execute("delete from artist_link where source = 'config'")
     for name in settings.get("separate", []):
         db.execute("insert or replace into artist_alias values (?, ?, 'config')", (name_id(name), name_id(name)))
-    for first, *others in settings.get("merge", []):
-        db.executemany("insert or replace into artist_alias values (?, ?, 'config')",
-                       [(name_id(name), artist_id(db, first)) for name in others])
+    for name, first in db.execute("select name, artist from same_artist").fetchall():
+        db.execute("insert or replace into artist_alias values (?, ?, 'config')", (name_id(name), artist_id(db, first)))
     for group in settings.get("related", []):
         for a, b in combinations([artist_id(db, name) for name in group], 2):
             link(db, a, b, RELATED, "config")

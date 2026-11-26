@@ -19,7 +19,7 @@ from starlette.routing import Route
 from . import accounts, acquire, audiorecords, cover, download, formats, missing, mixes, musicbrainz, prowlarr, remove, sources, tracks, wants, ytm
 from .musicbrainz import MBID
 from .tracks import IDS, MB_IDS
-from .artists import linked, load_settings, save_settings
+from .artists import add_name, configure, linked, load_settings, needless, other_names, remove_name, save_settings
 from .credits import credits_of
 from .db import as_user
 from .forward import ListenBrainz
@@ -705,13 +705,29 @@ def routes(oasis) -> list[Route]:
     def artist_settings(db, request, user, form):
         q, settings = request.query_params, load_settings(db, oasis.config.artists)
         lines = lambda key: escape("\n".join("; ".join(group) for group in settings.get(key, [])))
-        body = ('<form method="post" action="/admin/artists">'
+
+        def why(r):
+            try:
+                reason = needless(db, r["artist"], r["name"])
+            except OSError:  # MusicBrainz is away
+                return ""
+            return f'<div class="muted">{escape(reason)}</div>' if reason else ""
+
+        rows = "".join(
+            f'<tr><td class="lead"><b>{escape(r["artist"])}</b></td><td>{escape(r["name"])}{why(r)}</td><td class="actions">'
+            + ('<span class="muted">from oasis.toml</span>' if r["source"] == "config" else
+               f'<form method="post" action="/admin/artists/names/remove"><input type="hidden" name="name" value="{escape(r["name"])}">'
+               '<button class="danger">Remove</button></form>') + '</td></tr>' for r in other_names(db))
+        body = ('<section><h2>Same artist</h2><p class="muted">Other names of an artist that MusicBrainz doesn\'t know belong '
+                'together. Songs under any of them are the artist\'s, and downloads search and match by them too.</p>'
+                + (f'<table class="grid"><thead><tr><th>Artist</th><th>Other name</th><th></th></tr></thead><tbody>{rows}</tbody></table>'
+                   if rows else '<p class="muted">None yet.</p>')
+                + '<form method="post" action="/admin/artists/names"><label>Artist<input type="text" name="artist" required></label>'
+                '<label>Other name<input type="text" name="name" required></label><button class="primary">Add</button></form></section>'
+                '<form method="post" action="/admin/artists">'
                 '<section><h2>Related artists</h2><p class="muted">One group per line, names separated by <code>;</code>. '
                 'Separate artists that belong together: they come first among each other\'s similar artists and mix into each '
                 f'other\'s radios. Clients only ever see them as related.</p><textarea name="related">{lines("related")}</textarea></section>'
-                '<section><h2>Same artist</h2><p class="muted">One artist per line: the name to show, then its other names, '
-                'separated by <code>;</code>. For names MusicBrainz doesn\'t know belong together.</p>'
-                f'<textarea name="merge">{lines("merge")}</textarea></section>'
                 '<section><h2>Keep separate</h2><p class="muted">One name per line. MusicBrainz lists it as another name of '
                 'some artist, but here it\'s someone else.</p>'
                 f'<textarea name="separate">{escape(chr(10).join(settings.get("separate", [])))}</textarea></section>'
@@ -720,10 +736,29 @@ def routes(oasis) -> list[Route]:
 
     def save_artist_settings(db, request, user, form):
         groups = lambda key: [names for line in form.get(key, "").splitlines() if len(names := [n.strip() for n in line.split(";") if n.strip()]) > 1]
-        settings = {"related": groups("related"), "merge": groups("merge"),
-                    "separate": [n.strip() for n in form.get("separate", "").splitlines() if n.strip()]}
+        settings = {"related": groups("related"), "separate": [n.strip() for n in form.get("separate", "").splitlines() if n.strip()]}
         save_settings(db, settings)
         return back("/admin/artists", message="Saved. Artist pages, similar artists and radios use it now.")
+
+    def add_artist_name(db, request, user, form):
+        artist, name = form.get("artist", "").strip(), form.get("name", "").strip()
+        if not artist or not name:
+            return back("/admin/artists", error="Give the artist and its other name.")
+        try:
+            reason = needless(db, artist, name, lookup=True)
+        except OSError:  # MusicBrainz is away: the user knows best
+            reason = None
+        if reason:
+            return back("/admin/artists", message=f"Nothing to add. {reason}")
+        add_name(db, artist, name)
+        configure(db, load_settings(db, oasis.config.artists))
+        return back("/admin/artists", message=f"{name} is {artist} now. Artist pages use it at once, and the artist's "
+                                              "missing albums are searched for again soon.")
+
+    def remove_artist_name(db, request, user, form):
+        remove_name(db, form.get("name", ""))
+        configure(db, load_settings(db, oasis.config.artists))
+        return back("/admin/artists", message=f"Removed {form.get('name', '')}.")
 
     def admin(db, request, user, form):
         q = request.query_params
@@ -1634,6 +1669,8 @@ def routes(oasis) -> list[Route]:
         Route("/login", login, methods=["GET", "POST"]),
         Route("/admin/artists", signed_in(artist_settings, admin=True)),
         Route("/admin/artists", signed_in(save_artist_settings, admin=True), methods=["POST"]),
+        Route("/admin/artists/names", signed_in(add_artist_name, admin=True), methods=["POST"]),
+        Route("/admin/artists/names/remove", signed_in(remove_artist_name, admin=True), methods=["POST"]),
         Route("/logout", signed_in(logout), methods=["POST"]),
         Route("/account/youtube", signed_in(link_youtube), methods=["POST"]),
         Route("/account/youtube/unlink", signed_in(unlink_youtube), methods=["POST"]),

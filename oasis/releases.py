@@ -17,6 +17,7 @@ from pathlib import PurePosixPath
 from urllib.parse import urlparse
 
 from . import musicbrainz
+from .artists import declared
 from .formats import ARCHIVES, AUDIO, IMAGES, LOSSLESS as LOSSLESS_FILES, suffix
 from .matching import key, match, number_of, title_of
 from .torrent import hex_hash
@@ -24,7 +25,10 @@ from .torrent import hex_hash
 log = logging.getLogger(__name__)
 
 CJK = re.compile("[぀-ヺー-ヿ㐀-䶿一-鿿가-힯豈-﫿]")  # kana, kanji, Hangul; not ・
-LETTERS = str.maketrans({"æ": "ae", "œ": "oe", "ø": "o", "ł": "l", "đ": "d", "ð": "d", "þ": "th", "ı": "i"})  # no accent to strip
+# Latin letters with no accent to strip: NFKD leaves them as they are. ASCII: also capitals, for queries.
+PLAIN_LETTERS = {"æ": "ae", "œ": "oe", "ø": "o", "ł": "l", "đ": "d", "ð": "d", "þ": "th", "ı": "i"}
+LETTERS = str.maketrans(PLAIN_LETTERS)
+ASCII = str.maketrans({**PLAIN_LETTERS, **{k.upper(): v.capitalize() for k, v in PLAIN_LETTERS.items()}, "ß": "ss"})
 BRACKETS = re.compile(r"[\[\]「」『』\"“”„«»()〈〉《》【】/／]")  # and slashes, which break some indexers' search URLs
 BRACKETED = re.compile(r"\s*[\[(（【][^\])）】]*[\])）】]")
 QUOTED = re.compile(r"[「『\"“]([^」』\"”]+)[」』\"”]")
@@ -174,7 +178,8 @@ def native(names: list[str]) -> list[str]:
 
 
 def aliases(db, name: str, mbid: str | None, titles: list[str]) -> list[str]:
-    """The artist's name and its MusicBrainz name and aliases; titles: its albums and EPs."""
+    """The artist's name, its MusicBrainz name and aliases, and the other names the user gave it (declared);
+    titles: its albums and EPs."""
     names, titles = [name], {squashed(t) for t in titles}
     try:
         if not mbid:
@@ -185,7 +190,7 @@ def aliases(db, name: str, mbid: str | None, titles: list[str]) -> list[str]:
         names += [found["name"], *(a for a in musicbrainz.aliases(found) if len(n := squashed(a)) >= (2 if CJK.search(a) else 3) and n not in titles)]
     except (OSError, LookupError, KeyError) as e:
         log.info("no MusicBrainz aliases for %s: %s", name, e)
-    return unique([n for n in names if words(n)], squashed)
+    return unique([n for n in [*names, *declared(db, names)] if words(n)], squashed)
 
 
 def other_titles(title: str, names: list[str], others: list[str]) -> list[str]:
@@ -311,20 +316,24 @@ def clean(text: str) -> str:
     return " ".join(BRACKETS.sub(" ", unicodedata.normalize("NFKC", re.sub(r"(?<=[^\W\d])([¹²³⁰⁴-⁹])(?!\w)", r" \1", text))).split())
 
 
-def spellings(artist: str) -> list[str]:
-    """The artist's name for queries: without accents first when that leaves it plain ASCII, as release names mostly
-    spell it ('JAY-Z' for 'JAŸ-Z', which indexers don't fold), then as it is."""
-    artist = clean(artist)
-    folded = "".join(c for c in unicodedata.normalize("NFKD", artist) if not unicodedata.combining(c))
-    return list(dict.fromkeys([folded, artist] if folded.isascii() else [artist]))
+def spellings(text: str) -> list[str]:
+    """A name or title for queries: in plain letters first when that leaves it ASCII, as release names mostly spell it
+    ('JAY-Z' for 'JAŸ-Z', 'Mlynarski' for 'Młynarski', which indexers don't fold), then as it is. Other scripts stay:
+    й isn't и."""
+    text = clean(text)
+    folded = "".join(c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)).translate(ASCII)
+    return list(dict.fromkeys([folded, text] if folded.isascii() else [text]))
 
 
 def queries(want: dict) -> list[str]:
-    """Artist and album; the album alone when distinctive; the album with the artist's names in other scripts; the
-    artist and the album's other titles. Brackets and quotes go: indexers find nothing for '[Rammstein]'."""
-    title, artists = clean(want["title"]), spellings(want["artist"])
-    return list(dict.fromkeys([*(f"{a} {title}" for a in artists), *([title] if len(title.split()) >= 2 or len(title) >= 8 else []),
+    """Artist and album, in plain letters, then as they are; the album alone when distinctive; the album with the
+    artist's names in other scripts, then with the other names the user gave it (declared); the artist and the
+    album's other titles. Brackets and quotes go: indexers find nothing for '[Rammstein]'."""
+    title, artists, titles = clean(want["title"]), spellings(want["artist"]), spellings(want["title"])
+    alone = [t for t in titles if len(t.split()) >= 2 or len(t) >= 8]
+    return list(dict.fromkeys([f"{artists[0]} {titles[0]}", f"{artists[-1]} {titles[-1]}", *alone,
                                *(f"{clean(n)} {title}" for n in want["native"]),
+                               *(f"{spellings(n)[0]} {titles[0]}" for n in want.get("declared", [])),
                                *(f"{artists[0]} {clean(t)}" for t in want["other_titles"][:OTHER_TITLE_QUERIES])]))
 
 
@@ -362,7 +371,8 @@ def is_bundle(release: dict, want: dict) -> bool:
 
 def bundle_queries(want: dict) -> list[str]:
     artist = spellings(want["artist"])[0]
-    return list(dict.fromkeys([f"{artist} discography", artist, f"{artist} singles", f"{artist} complete singles", *map(clean, want["native"])]))
+    return list(dict.fromkeys([f"{artist} discography", artist, f"{artist} singles", f"{artist} complete singles", *map(clean, want["native"]),
+                               *(f"{spellings(n)[0]} discography" for n in want.get("declared", []))]))
 
 
 def roman(token: str) -> int:

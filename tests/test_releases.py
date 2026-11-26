@@ -157,6 +157,19 @@ def test_queries_drop_brackets_and_try_the_album_alone_and_the_native_names():
     assert queries(want("Living Things", "Linkin Park")) == ["Linkin Park Living Things", "Living Things"]
 
 
+def test_names_and_titles_are_also_searched_in_plain_latin_letters():
+    assert queries(want("Łzy", "Wojciech Młynarski")) == ["Wojciech Mlynarski Lzy", "Wojciech Młynarski Łzy"]
+    assert queries(want("Dziewczyna z Łodzi", "Đorđe Balašević"))[:4] == [
+        "Dorde Balasevic Dziewczyna z Lodzi", "Đorđe Balašević Dziewczyna z Łodzi", "Dziewczyna z Lodzi", "Dziewczyna z Łodzi"]
+    assert queries(want("Straße", "Þursaflokkurinn"))[0] == "Thursaflokkurinn Strasse"
+
+
+def test_the_other_names_the_user_gave_an_artist_are_searched_too():
+    named = {**want("Typ Ballady", "Stachursky"), "declared": ["Stachursky", "Stachurski"]}
+    assert queries(named) == ["Stachursky Typ Ballady", "Typ Ballady", "Stachurski Typ Ballady"]
+    assert releases.bundle_queries({"artist": "Stachursky", "native": [], "declared": ["Stachursky", "Stachurski"]})[-1] == "Stachurski discography"
+
+
 def test_an_album_is_also_found_and_matched_by_its_other_titles():
     creepy = {**CREEPY, "other_titles": ["Ensemble Play"]}
     assert queries(creepy)[-1] == "Creepy Nuts Ensemble Play"
