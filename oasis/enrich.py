@@ -45,7 +45,6 @@ class Enrichment:
             done = credits.step(db) or artists.step(db) or latin.step(db)
             if done:
                 self.retry = RETRY[0]
-                db.commit()
             return done
         finally:
             db.close()

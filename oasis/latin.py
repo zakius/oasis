@@ -86,12 +86,13 @@ def step(db) -> bool:
             names = transliteration(db, ref, musicbrainz.release(ref, db))
     except LookupError:
         pass
-    old = [r[0] for r in db.execute("select original from mb_latin where ref = ?", (ref,))]
-    db.execute("delete from mb_latin where ref = ?", (ref,))
-    db.executemany("insert or replace into mb_latin values (?, ?, ?, ?)", [("artist" if kind == "artist" else "title", o, l, ref) for o, l in names.items()])
-    for original in {*old, *names}:  # the songs they name are indexed again
-        db.execute("delete from track_latin where instr(source, ?) > 0", (original,))
-    db.execute("insert or replace into mb_latin_seen values (?, ?)", (ref, time.time()))
+    with transaction(db):
+        old = [r[0] for r in db.execute("select original from mb_latin where ref = ?", (ref,))]
+        db.execute("delete from mb_latin where ref = ?", (ref,))
+        db.executemany("insert or replace into mb_latin values (?, ?, ?, ?)", [("artist" if kind == "artist" else "title", o, l, ref) for o, l in names.items()])
+        for original in {*old, *names}:  # the songs they name are indexed again
+            db.execute("delete from track_latin where instr(source, ?) > 0", (original,))
+        db.execute("insert or replace into mb_latin_seen values (?, ?)", (ref, time.time()))
     return True
 
 

@@ -16,6 +16,7 @@ import time
 from collections import Counter
 
 from . import artists, musicbrainz, releases, tasks
+from .db import transaction
 from .wants import Outcome
 from .formats import LOSSLESS
 from .musicbrainz import lucene, search_artist
@@ -383,12 +384,14 @@ class Acquire:
         given_up = {r[0] for r in db.execute("select rg from given_up")} - starred
         why.update({rg: GIVEN_UP for rg in given_up})
         skipped = {g["id"] for g in groups if not kept(g) or g["id"] in given_up}
-        for g in (g for g in groups if g["id"] not in skipped):
-            self.put(db, g, item["mbid"], name, "starred" if g["id"] in starred else "followed")
         listed = {g["id"] for g in groups} - skipped  # what's left out isn't wanted: no row
-        db.executemany("delete from want_album where rg = ?", [(rg,) for (rg,) in db.execute(
-            "select rg from want_album where artist_mbid = ? and reason = 'followed'", (item["mbid"],)).fetchall() if rg not in listed])
-        db.execute("update want_item set catalogued = ?, error = null, retry_at = null where kind = 'artist' and ref = ?", (time.time(), item["ref"]))
+        # The artist's catalogue at once. Its editions were read above: put finds them kept, and asks MusicBrainz nothing.
+        with transaction(db):
+            for g in (g for g in groups if g["id"] not in skipped):
+                self.put(db, g, item["mbid"], name, "starred" if g["id"] in starred else "followed")
+            db.executemany("delete from want_album where rg = ?", [(rg,) for (rg,) in db.execute(
+                "select rg from want_album where artist_mbid = ? and reason = 'followed'", (item["mbid"],)).fetchall() if rg not in listed])
+            db.execute("update want_item set catalogued = ?, error = null, retry_at = null where kind = 'artist' and ref = ?", (time.time(), item["ref"]))
         log.info("catalogue of %s: %d release groups, %d left out (%s)", name or item["mbid"], len(groups), len(skipped),
                  ", ".join(f"{n} {r}" for r, n in sorted(Counter(why[rg] for rg in skipped).items(), key=lambda x: (-x[1], x[0]))) or "none")
 

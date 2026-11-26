@@ -8,6 +8,7 @@ import logging
 import re
 
 from . import accounts, playlists
+from .db import transaction
 from .forward import ListenBrainz
 from .playlists import MADE_FOR, set_entries
 from .recommend import recording_of
@@ -53,14 +54,15 @@ def from_youtube(mix: str | None) -> bool:
 
 def mirror(db, user: str, mix: str, title: str, cover: str | None, ids: list[str], comment: str | None = None):
     """Keeps a service's playlist as the user's read-only playlist of that mix, with those songs."""
-    row = db.execute("select id from playlist where owner = ? and mix = ?", (user, mix)).fetchone()
-    if row:
-        playlists.rename(db, row["id"], title)
-        db.execute("update playlist set cover = ?, comment = ? where id = ?", (cover, comment, row["id"]))
-        playlist_id = row["id"]
-    else:
-        playlist_id = playlists.create(db, user, title, comment=comment, mix=mix, cover=cover)
-    set_entries(db, playlist_id, ids)
+    with transaction(db):
+        row = db.execute("select id from playlist where owner = ? and mix = ?", (user, mix)).fetchone()
+        if row:
+            playlists.rename(db, row["id"], title)
+            db.execute("update playlist set cover = ?, comment = ? where id = ?", (cover, comment, row["id"]))
+            playlist_id = row["id"]
+        else:
+            playlist_id = playlists.create(db, user, title, comment=comment, mix=mix, cover=cover)
+        set_entries(db, playlist_id, ids)
 
 
 def drop(db, user: str, prefix: str, keep=()):
@@ -114,8 +116,9 @@ class Mixes:
                     playlist_id = playlists.create(db, user, mix["title"], comment=mix["description"], mix=mix["id"], cover=mix["cover"],
                                                    hidden=hidden)
                 if not hidden:
-                    tracks = list(dict.fromkeys(remember_song(db, song) for song in self.ytm.playlist_tracks(client, mix["id"])))
-                    set_entries(db, playlist_id, tracks, self.fetch)
+                    songs = self.ytm.playlist_tracks(client, mix["id"])
+                    with transaction(db):  # a playlist's songs at once
+                        set_entries(db, playlist_id, list(dict.fromkeys(remember_song(db, song) for song in songs)), self.fetch)
             self.drop(db, user, keep=[m["id"] for m in mixes])
             log.info("mixes for %s: %d refreshed", user, len(mixes))
         except Exception as e:
@@ -158,8 +161,9 @@ class SoundCloudPlaylists:
             found = [("likes", "SoundCloud likes", None, reader.liked())]
             found += [(str(p["id"]), p.get("title") or str(p["id"]), p.get("artwork_url"), reader.playlist_tracks(p["id"])) for p in reader.playlists()]
             for key, title, cover, tracks in found:
-                ids = list(dict.fromkeys(self.services.remember(db, player, player.song(t)) for t in tracks if player.full(t)))
-                mirror(db, user, SOUNDCLOUD + key, title, cover, ids)
+                with transaction(db):  # a playlist's songs at once
+                    ids = list(dict.fromkeys(self.services.remember(db, player, player.song(t)) for t in tracks if player.full(t)))
+                    mirror(db, user, SOUNDCLOUD + key, title, cover, ids)
             self.drop(db, user, keep=[SOUNDCLOUD + key for key, *_ in found])
             log.info("soundcloud playlists for %s: %d refreshed", user, len(found))
         except Exception as e:

@@ -328,7 +328,10 @@ def connect(path: Path) -> sqlite3.Connection:
 def transaction(db: sqlite3.Connection):
     """The statements in the block as one transaction, on a connection that otherwise commits each statement. It takes
     the write lock at once: a transaction that read first can't write after another connection has ("database is
-    locked")."""
+    locked"). Inside another, the block is part of that one."""
+    if db.in_transaction:
+        yield
+        return
     db.execute("begin immediate")
     try:
         yield

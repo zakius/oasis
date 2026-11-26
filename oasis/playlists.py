@@ -6,6 +6,7 @@ keeps that up."""
 import time
 
 from . import accounts
+from .db import transaction
 from .ytm import LIKED, MIX_PREFIX, is_mix
 
 PLAIN, RADIO, LISTENING_RADIO = 0, 1, 2  # playlist.radio: a radio grows from its own tracks, a listening radio from everything played
@@ -58,13 +59,14 @@ def delete(db, playlist_id, fetch=None):
 def set_entries(db, playlist_id, track_ids, fetch=None):
     """Replaces a playlist's entries. fetch(video id) is given the streaming tracks this puts in the library to
     download."""
-    old = [r[0] for r in db.execute("select track_id from playlist_entry where playlist_id = ?", (playlist_id,))]
-    db.execute("delete from playlist_entry where playlist_id = ?", (playlist_id,))
-    db.executemany("insert into playlist_entry values (?, ?, ?)", [(playlist_id, i, t) for i, t in enumerate(track_ids)])
-    db.execute("update playlist set changed = ? where id = ?", (time.time(), playlist_id))
-    # A radio's entries don't count for the library, so writing them leaves it as it was.
-    if db.execute("select radio from playlist where id = ?", (playlist_id,)).fetchone()[0] == PLAIN:
-        touch(db, set(old) | set(track_ids), fetch)
+    with transaction(db):  # no reader sees the playlist emptied
+        old = [r[0] for r in db.execute("select track_id from playlist_entry where playlist_id = ?", (playlist_id,))]
+        db.execute("delete from playlist_entry where playlist_id = ?", (playlist_id,))
+        db.executemany("insert into playlist_entry values (?, ?, ?)", [(playlist_id, i, t) for i, t in enumerate(track_ids)])
+        db.execute("update playlist set changed = ? where id = ?", (time.time(), playlist_id))
+        # A radio's entries don't count for the library, so writing them leaves it as it was.
+        if db.execute("select radio from playlist where id = ?", (playlist_id,)).fetchone()[0] == PLAIN:
+            touch(db, set(old) | set(track_ids), fetch)
 
 
 def counts(row) -> bool:

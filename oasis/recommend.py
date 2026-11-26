@@ -17,6 +17,7 @@ from itertools import chain, zip_longest
 from . import accounts, lastfm, missing, playlists, tasks
 from .forward import LISTENBRAINZ
 from .artists import linked
+from .db import transaction
 from .formats import LOSSLESS
 from .playlists import LISTENING_RADIO, PLAIN, set_entries
 from .sources import Deezer
@@ -266,16 +267,17 @@ class Recommender:
                     searched[i] = search.result()
         elif unknown:
             searched = dict.fromkeys(unknown)
-        for i, found in searched.items():
-            pair = pairs[i]
-            if found and found[0] == "ytm":
-                ids[i] = remember_song(db, found[1])
-            elif found and found[0] == "preview":
-                ids[i] = missing.remember(db, pair[0], pair[1], pair[2] if len(pair) > 2 else None, preview=found[1])
-            elif found:
-                ids[i] = self.services.remember(db, *found)
-            elif unplayable:
-                ids[i] = missing.remember(db, pair[0], pair[1], pair[2] if len(pair) > 2 else None)
+        with transaction(db):  # the songs found at once
+            for i, found in searched.items():
+                pair = pairs[i]
+                if found and found[0] == "ytm":
+                    ids[i] = remember_song(db, found[1])
+                elif found and found[0] == "preview":
+                    ids[i] = missing.remember(db, pair[0], pair[1], pair[2] if len(pair) > 2 else None, preview=found[1])
+                elif found:
+                    ids[i] = self.services.remember(db, *found)
+                elif unplayable:
+                    ids[i] = missing.remember(db, pair[0], pair[1], pair[2] if len(pair) > 2 else None)
         return [ids[i] for i in sorted(ids)]
 
     def find(self, ytm, clients: list, artist: str, title: str, previews: list = (), deadline: float | None = None):
@@ -417,8 +419,9 @@ class Recommender:
         added = keep_playable(added, max(needed, 10))
         entries += added
         dropped = max(0, len(entries) - KEEP)
-        set_entries(db, playlist["id"], entries[dropped:])
-        db.execute("update playlist set played_pos = ? where id = ?", (played_pos - dropped, playlist["id"]))
+        with transaction(db):
+            set_entries(db, playlist["id"], entries[dropped:])
+            db.execute("update playlist set played_pos = ? where id = ?", (played_pos - dropped, playlist["id"]))
         log.info("radio %s: added %d tracks", playlist["name"], len(added))
 
     def station_seeds(self, db, user, station: str, period: str):
