@@ -156,7 +156,9 @@ def test_radio_playlist_grows_as_it_is_played(api, client):
 def test_first_play_creates_a_radio_that_follows_listening(api, client):
     call(client, "scrobble", id=song_id(client, "One"))
     radio = next(p for p in call(client, "getPlaylists")["playlists"]["playlist"] if p["name"] == "Radio")
-    assert radio["readonly"] is True  # oasis keeps it, so clients show it as a list rather than an editable playlist
+    assert radio["readonly"] is True and radio["owner"] == "oasis" and "oasisMix" not in radio
+    oasis_radio = next(p for p in call(client, "getPlaylists", oasis="1")["playlists"]["playlist"] if p["name"] == "Radio")
+    assert oasis_radio["oasisMix"] is True and oasis_radio["owner"] == "oasis"
     api.recommender.top_up_pass()
     queued = entries(client, radio["id"])
     assert queued[0] == "Two" and {"Song B", "one-yt song 0"} <= set(queued) and "One" not in queued

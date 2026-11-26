@@ -1149,11 +1149,22 @@ class Api:
         else:
             count, duration = db.execute("select count(*), coalesce(sum(t.duration), 0) from playlist_entry e join track t on t.id = e.track_id "
                                          "where e.playlist_id = ? and (? or t.source != 'missing')", (r["id"], unplayable)).fetchone()
+        cover_art = IDS["playlist"] + str(r["id"]) if r["cover"] else None
+        if cover_art is None:
+            if entries:
+                cover_art = next((s["coverArt"] for s in songs if s.get("coverArt")), None)
+            elif first := db.execute(
+                "select t.* from playlist_entry e join track t on t.id = e.track_id "
+                "where e.playlist_id = ? and (? or t.source != 'missing') and t.cover is not null order by e.pos limit 1",
+                (r["id"], unplayable),
+            ).fetchone():
+                cover_art = missing.album_of(first) if first["source"] == "missing" else first["album_id"]
+        owner = mixes.owner(r["mix"]) if r["mix"] else ("oasis" if r["radio"] == playlists.LISTENING_RADIO else r["owner"])
         result = clean({
-            "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": mixes.owner(r["mix"]) if r["mix"] else r["owner"], "public": False,
-            "coverArt": IDS["playlist"] + str(r["id"]) if r["cover"] else None,
+            "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": owner, "public": False,
+            "coverArt": cover_art,
             "readonly": True if r["mix"] or r["radio"] else None,  # OpenSubsonic: clients offer no edits; oasis keeps mixes and radios
-            "oasisMix": True if ytm.is_mix(r["mix"]) else None, "youtubeId": r["mix"] if mixes.from_youtube(r["mix"]) else None,
+            "oasisMix": True if playlists.made_for(r["mix"]) or r["radio"] else None, "youtubeId": r["mix"] if mixes.from_youtube(r["mix"]) else None,
             "oasisSource": (r["radio_source"] or accounts.get(db, r["owner"])["radio_source"]) if r["radio"] else None,
             "oasisStation": r["station"], "oasisPeriod": r["period"],
             "songCount": count, "duration": duration,

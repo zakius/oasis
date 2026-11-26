@@ -68,7 +68,9 @@ def test_top_tracks_are_the_most_played_of_the_last_three_months_that_play(api, 
     api.ready.refresh(db, "admin")
     assert shown(client)["Your top tracks"] == ["Cloud Song", "One"]
     playlist = next(p for p in call(client, "getPlaylists")["playlists"]["playlist"] if p["name"] == "Your top tracks")
-    assert playlist["readonly"] is True and playlist["comment"].startswith("Your most played")
+    assert playlist["readonly"] is True and playlist["comment"].startswith("Your most played") and "oasisMix" not in playlist
+    oasis_top = next(p for p in call(client, "getPlaylists", oasis="1")["playlists"]["playlist"] if p["name"] == "Your top tracks")
+    assert oasis_top["oasisMix"] is True and oasis_top["coverArt"].startswith("al-")  # first covered song's cover
     assert call(client, "deletePlaylist", id=playlist["id"])["error"]["message"] == "oasis's playlists are read-only"
     assert db.execute("select library from track where id = 'sc-1'").fetchone()[0] == 0  # a playlist made for the user
 
@@ -145,6 +147,7 @@ def test_the_lastfm_stations_come_while_the_user_can_have_them(api, client):
     api.recommender.top_up_all(db)  # grows as any station does
     stations = {p["name"]: p for p in call(client, "getPlaylists", oasis="1")["playlists"]["playlist"] if p.get("oasisStation")}
     assert stations["Last.fm top tracks"]["owner"] == "oasis" and stations["Last.fm top tracks"]["songCount"] > 0
+    assert stations["Last.fm top tracks"]["oasisMix"] is True and stations["Last.fm loved tracks"]["oasisMix"] is True
     assert ("me", True, PERIOD) in api.lastfm.asked
 
     client.post("/account/ready", data={"show-lastfm-top": "on"})

@@ -260,6 +260,14 @@ def test_playlists_list_mixes_first_in_youtube_order(client, ytm):
     client.app.state.oasis.mixes.refresh("admin")
     call(client, "createPlaylist", name="Zebra")
     assert list(playlists(client)) == ["My Supermix", "Bunt", "Mroczna moc", "Replay Mix", "Chill Mix", "Liked Music", "aaa", "Zebra"]
+    # oasis's own mixes and radios come before YouTube Music's, other services' mixes after YouTube Music's, and plain playlists last.
+    db = client.app.state.oasis.connect()
+    oasis_playlists.create(db, "admin", "Radio", oasis_playlists.LISTENING_RADIO)
+    oasis_playlists.create(db, "admin", "Your top tracks", mix="oasis:top")
+    oasis_playlists.create(db, "admin", "Daily Jams", mix="listenbrainz:daily-jams")
+    assert list(playlists(client)) == [
+        "Radio", "Your top tracks", "My Supermix", "Bunt", "Mroczna moc", "Replay Mix", "Chill Mix", "Daily Jams", "Liked Music", "aaa", "Zebra",
+    ]
 
 
 def test_a_worker_fetches_lyrics_for_the_api(client):

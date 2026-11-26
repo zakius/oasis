@@ -34,8 +34,10 @@ clients that know them, and other clients get plain OpenSubsonic.
   `shareUrl`, from the separate extension `shareUrl` ([share-url-extension.md](share-url-extension.md)), sent to every
   client.
 - Playlist:
-  - `oasisMix`: `true` for a YouTube Music home mix (My Supermix, My Mix 1-7, Discover Mix, New Release Mix,
-    Replay Mix). Absent for other playlists.
+  - `oasisMix`: `true` for every generated mix, station or radio: oasis's ready-made playlists and radios (including
+    the automatic `Radio`), YouTube Music personal mixes (My Supermix, My Mix 1-7, Discover Mix, New Release Mix,
+    Replay Mix), Tidal mixes and ListenBrainz made-for playlists. Absent for plain playlists and mirrored library
+    playlists (such as Liked Music).
   - `youtubeId`: the YouTube Music playlist id of a mix or library playlist mirrored from YouTube Music.
 - Artist in `getArtistInfo`/`getArtistInfo2` `similarArtist`: `oasisLink`: how the artist relates to the one asked
   about: `persona` (one person's other names or projects), `related` (grouped by the server's admin) or `member`
