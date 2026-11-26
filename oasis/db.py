@@ -185,6 +185,7 @@ create table if not exists want_album(  -- albums oasis looks for: starred ones 
 );
 create index if not exists want_album_artist on want_album(artist_mbid);
 create table if not exists given_up(rg text primary key, at real not null);  -- albums users gave up on: followed artists' catalogues leave them out
+create table if not exists removal(rg text primary key, user text not null, asked real not null);  -- library albums a user unwanted and nobody else wants (remove.py)
 create table if not exists mb_group(  -- each release group's smallest official edition, read from MusicBrainz (see acquire.py)
     rg text primary key, tracks int not null, discs int not null,  -- tracks: 0 when it has no official edition; discs: the most of any
     songs text not null, fetched real not null  -- the smallest edition's song keys (JSON)

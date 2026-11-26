@@ -1,6 +1,7 @@
 import email.message
 import io
 import json
+import shutil
 import threading
 import time
 import urllib.error
@@ -9,7 +10,7 @@ import urllib.parse
 import pytest
 
 from conftest import FakeTorBox, call, make_client, sign_in, tb
-from oasis import accounts, acquire, api, cover, musicbrainz, prowlarr
+from oasis import accounts, acquire, api, cover, musicbrainz, prowlarr, remove
 from oasis.acquire import Acquire, artist_names
 from oasis.config import Acquisition, Prowlarr as ProwlarrSettings, TorBox as TorBoxSettings
 from oasis.db import connect
@@ -681,6 +682,51 @@ def test_search3_offers_musicbrainz_artists_and_albums_that_starring_wants_and_t
     assert album_of(client, "First")["starred"] and call(client, "search3", query="Kenshi Yonezu", oasis="1")["searchResult3"]["artist"] == []
     call(client, "unstar", albumId="al-mb-" + STRAY)
     assert db.execute("select count(*) from wanted where kind = 'album'").fetchone()[0] == 0
+
+
+def album_on_artist_page(client, title: str) -> str:
+    page = client.get(f"/music/artist/{KENSHI}").text
+    return page[page.index(title):page.index("</li>", page.index(title))]
+
+
+def test_an_album_here_that_nobody_wants_any_more_is_removed_once_an_admin_confirms(library, tmp_path, mb):
+    music = tmp_path / "music"  # its files are deleted: a copy of the shared library
+    shutil.copytree(library, music)
+    kenshi(mb)
+    with make_client(music, tmp_path / "oasis.db") as client:
+        oasis = client.app.state.oasis
+        oasis.acquire = Acquire(oasis.connect, FakeDownloads(), Acquisition(bundles=False))
+        db = oasis.connect()
+        db.execute("update track set mb_release_group = ? where album = 'First'", (STRAY,))
+        accounts.create(db, "bob", "pw")
+        sign_in(client, "bob", "pw")
+        assert "Remove</button>" not in album_on_artist_page(client, "STRAY SHEEP") and "Unwant" not in album_on_artist_page(client, "STRAY SHEEP")
+        client.post("/music/want", data={"kind": "album", "mbid": STRAY, "on": "1", "next": f"/music/artist/{KENSHI}"})
+        line = album_on_artist_page(client, "STRAY SHEEP")
+        assert "Unwant</button>" in line and "Remove</button>" not in line  # bob keeps it here; only admins remove
+        page = client.post(f"/music/wanted/{STRAY}/give-up", data={"next": f"/music/artist/{KENSHI}"}).text
+        assert "an admin is asked whether to delete its files" in page
+        assert client.post(f"/music/remove/{STRAY}", data={"next": "/music/wanted"}).status_code == 200 and (music / "Beta/First").exists()
+
+        client.cookies.clear()
+        sign_in(client)
+        assert "Remove</button>" in album_on_artist_page(client, "STRAY SHEEP")
+        page = client.get("/music/wanted").text
+        assert "Asked to remove" in page and "unwanted by bob" in page
+        assert "Kept" in client.post(f"/music/remove/{STRAY}", data={"keep": "1", "next": "/music/wanted"}).text
+        assert "Asked to remove" not in client.get("/music/wanted").text and (music / "Beta/First/01.flac").exists()
+        remove.ask(db, "bob", STRAY)
+        client.post("/music/want", data={"kind": "album", "mbid": STRAY, "on": "1", "next": "/music"})
+        assert "Asked to remove" not in client.get("/music/wanted").text  # wanted again: the request is dropped
+        page = client.post(f"/music/wanted/{STRAY}/give-up", data={"next": "/music/wanted"}).text
+        assert "its files stay until you remove it" in page and db.execute("select count(*) from removal").fetchone()[0] == 0
+
+        page = client.post(f"/music/remove/{STRAY}", data={"next": f"/music/artist/{KENSHI}"}).text
+        assert "Removed: 2 files deleted" in page
+        assert not (music / "Beta").exists() and (music / "The Alpha/Second/a.mp3").exists()  # the artist's folder went with its only album
+        assert db.execute("select count(*) from track where album = 'First'").fetchone()[0] == 0
+        assert db.execute("select count(*) from given_up where rg = ?", (STRAY,)).fetchone()[0] == 1  # a follow won't bring it back
+        assert "in the library." in client.post(f"/music/remove/{STRAY}", data={"next": "/music/wanted"}).text  # nothing left to remove
 
 
 def test_search3_answers_without_musicbrainz_when_it_is_slow(client, mb, monkeypatch):

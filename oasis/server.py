@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 from starlette.applications import Starlette
 
-from . import accounts, acquire, api, artists, download, forward, lastfm, missing, mixes, playlists, translate, web, worker, youtube
+from . import accounts, acquire, api, artists, download, forward, lastfm, missing, mixes, playlists, remove, translate, web, worker, youtube
 from .acquire import Acquire
 from .config import Config
 from .enrich import Enrichment
@@ -128,6 +128,14 @@ class Oasis:
         leaves it out (acquire.give_up). Files already here stay."""
         self.want(db, user, "album", acquire.wanted_by(db, "album", rg, user), None)
         acquire.give_up(db, rg)
+
+    def remove_album(self, db, rg: str) -> int:
+        """Deletes the album's files, and nobody wants it any more: every user's stars of it are taken back, and followed
+        artists' catalogues leave it out. The number of files deleted."""
+        for (user,) in db.execute("select name from user").fetchall():
+            self.give_up(db, user, rg)
+        db.execute("delete from want_album where rg = ?", (rg,))  # one that arrived is searched again for lossless
+        return remove.delete(db, rg, self.config.library)
 
     def link_youtube(self, db, user: str, headers: dict) -> str:
         """Checks the sign-in by reading the account name, saves it, and loads the user's mixes; ValueError saying why
