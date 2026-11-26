@@ -66,6 +66,12 @@ def test_a_title_holding_the_artists_name_needs_no_other_artist(name, why):
     assert reject(result(name), want("H△G×Mili vol.2", "Mili", year="2015", others=["H△G×Mili"])) == why
 
 
+def test_a_title_holding_the_artists_name_isnt_found_in_a_longer_album_title():
+    first = want("H△G×Mili", "Mili", year="2013", others=["H△G×Mili vol.2"])
+    assert reject(result("[Some-Group] [EAC] H△G × Mili vol.2 [2CD Limited Edition] (FLAC+CUE+LOG)"), first) == "another album: H△G×Mili vol.2"
+    assert reject(result("[Some-Group] H△G × Mili [FLAC]"), first) is None
+
+
 ON_ITS_OWN = "the artist's name isn't on its own"
 
 
