@@ -83,9 +83,9 @@ class Oasis:
         return connect(self.config.database)
 
     def user_services(self, db, user: str) -> dict:
-        """The services the user's plays go to, by name (forward.user_services)."""
+        """The services the user's plays and likes go to, by name (forward.user_services)."""
         return forward.user_services(self.lastfm, self.ytm, accounts.get(db, user), self.sources.usable(db, user),
-                                     servers.sending(db, user, self.sources.offered(db)))
+                                     servers.sending(db, user, self.sources.offered(db)), self.sources.liking(db, user), self.recommender.kept)
 
     def youtube_music(self, db, user: str | None = None):
         """YouTube Music's client while an admin offers it; with user, for its full songs, while they are allowed and

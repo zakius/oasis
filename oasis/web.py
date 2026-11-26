@@ -239,12 +239,12 @@ SERVICES = [
                                      "30-second previews, or play in full with your Go+ sign-in, which also brings your likes and playlists. "
                                      "Radios from a song's related tracks.")]),
     ("Plays and recommendations", "", [
-        ("lastfm", "Last.fm", "Similar songs and radios from Last.fm. Signed in, your plays are scrobbled there."),
+        ("lastfm", "Last.fm", "Similar songs and radios from Last.fm. Signed in, your plays are scrobbled there and the songs you star are loved."),
         ("listenbrainz", "ListenBrainz", "Your plays go to ListenBrainz, radios can take songs from its LB Radio, and the playlists "
                                          "it makes for you show up in your apps."),
-        ("lastfm-servers", "Other Last.fm-compatible servers", "Your plays are scrobbled to each of these you switch on too: "
+        ("lastfm-servers", "Other Last.fm-compatible servers", "Your plays are scrobbled and the songs you star loved on each of these you switch on too: "
                                                                "Libre.fm, or any server that speaks Last.fm's API, such as one running GNU FM."),
-        ("listenbrainz-servers", "Other ListenBrainz-compatible servers", "Your plays go to each of these you switch on too: any "
+        ("listenbrainz-servers", "Other ListenBrainz-compatible servers", "Your plays and loved songs go to each of these you switch on too: any "
                                                                           "server that takes ListenBrainz's submissions, such as Maloja or Koito.")]),
     ("Previews", f"A song none of your streaming services has can still play a {sources.PREVIEW_SECONDS}-second clip from these public "
                  "catalogues, in this order. Only apps that show songs nothing can play get clips, and so does this dashboard.", [
@@ -257,12 +257,13 @@ CAPABILITY_TITLES = {"songs": "Full songs", "signed-in": "Signed-in songs", "pre
                      "account": "Account features"}  # sources.CAPABILITIES
 # What a sign-in to a service adds, by capability.
 SIGNED_IN = {("soundcloud", "signed-in"): "Songs only SoundCloud Go+ plays in full play in full, as 256 kbit/s AAC, while your account has Go+.",
-             ("soundcloud", "account"): "Your likes and playlists show up as playlists, with the songs SoundCloud plays you in full.",
+             ("soundcloud", "account"): "Your likes and playlists show up as playlists, with the songs SoundCloud plays you in full. The songs you star in oasis are liked there, and your plays go to its history.",
              ("bandcamp", "account"): "Your purchases come into the library as FLAC, and the albums on your wishlist are wanted for you.",
              ("tidal", "radio"): "Radios can take songs from Tidal's radio of a song and of its artist: choose Tidal as a radio source.",
              ("tidal", "account"): "Your mixes (My Mix, My Daily Discovery, My New Arrivals) show up as playlists, read again every 6 hours.",
              ("listenbrainz", "account"): "The playlists ListenBrainz makes for you (Weekly Jams, Weekly Exploration, Daily Jams...) show "
                                           "up as playlists, read again every 6 hours."}
+LIKES_SENT = '<p class="muted">The songs, albums and artists you star in oasis become favourites there.</p>'  # Tidal's and Qobuz's
 SERVER_LISTS = {list_key: protocol for protocol, list_key in servers.PROTOCOLS.items()}  # the services that are lists of servers
 # How a user adds a server of each protocol: Libre.fm fills in its own address.
 ADD_SERVER = {
@@ -1046,7 +1047,7 @@ def routes(oasis) -> list[Route]:
                 html += linked_as(user["ytm_name"] or "")
                 if "account" not in allowed:
                     return html + withheld("account")
-                return (html + '<p class="muted">Your mixes show up as playlists and your plays go to its history.</p>'
+                return (html + '<p class="muted">Your mixes show up as playlists and your plays go to its history. The songs and albums you star in oasis are liked there too.</p>'
                         f'<form method="post" action="/services/ytm/unlink"{confirm("Unlink YouTube Music?")}><button class="danger">Unlink</button></form>'
                         + youtube_playlists(db, user))
             if "account" not in allowed:
@@ -1057,7 +1058,7 @@ def routes(oasis) -> list[Route]:
             missing += "".join(f'<p class="muted">{text}</p>' for (service, c), text in SIGNED_IN.items() if service == key and c in allowed)
             if account:
                 samples = '<p class="muted">Without a subscription that streams, it gives samples only.</p>' if account.get("previews_only") else ""
-                return linked_as(account.get("name") or "") + samples + missing
+                return linked_as(account.get("name") or "") + samples + missing + LIKES_SENT
             if not allowed:
                 return missing
             not_yet = missing + '<p class="muted">Not used till it is linked.</p>'
@@ -1075,7 +1076,7 @@ def routes(oasis) -> list[Route]:
             if not signs_in(oasis.lastfm):
                 return LASTFM_APP_STEPS if user["admin"] else '<p class="muted">An admin needs to connect oasis to Last.fm first.</p>'
             if user["lastfm_session"]:
-                return (linked_as(user["lastfm_name"] or "") + '<p class="muted">Your plays are scrobbled there. Turn off scrobbling in your apps, '
+                return (linked_as(user["lastfm_name"] or "") + '<p class="muted">Your plays are scrobbled there and the songs you star in oasis are loved. Turn off scrobbling in your apps, '
                         f'or plays count twice.</p><form method="post" action="/services/lastfm/unlink"{confirm("Unlink Last.fm?")}>'
                         '<button class="danger">Unlink</button></form>')
             return ('<p class="muted">Sign in to scrobble your plays, and for stations of your top and loved tracks.</p>'
@@ -1089,7 +1090,7 @@ def routes(oasis) -> list[Route]:
             return html + (f'<h3>Your account</h3>{adds}' + ACCOUNT_STEPS[key] if adds else "")
         if key == "listenbrainz":
             if user["listenbrainz_token"]:
-                return '<p class="ok">Linked.</p>' + (f'<p class="muted">{SIGNED_IN[key, "account"]}</p>' if "account" in allowed else withheld("account"))
+                return '<p class="ok">Linked.</p><p class="muted">Your plays go there, and the songs you star in oasis are loved where MusicBrainz knows them.</p>' + (f'<p class="muted">{SIGNED_IN[key, "account"]}</p>' if "account" in allowed else withheld("account"))
             return ('<p class="muted">Not used till it is linked.</p><form method="post" action="/services/listenbrainz/link"><label>User token from '
                     '<a href="https://listenbrainz.org/settings/" target="_blank">listenbrainz.org/settings</a><input type="text" name="token"></label>'
                     '<button class="primary">Link</button></form>')

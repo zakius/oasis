@@ -901,6 +901,7 @@ class Api:
         touch(db, p.all("id"), self.oasis.youtube.fetch_soon)
         self.oasis.want(db, user, "album", p.all("albumId"), value)
         self.oasis.want(db, user, "artist", p.all("artistId"), value)
+        self.oasis.forwarder.like(db, user, p.all("id") + p.all("albumId") + p.all("artistId"), bool(value))
         return {}
 
     def star(self, db, p, user):

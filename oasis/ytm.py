@@ -281,6 +281,27 @@ class YouTubeMusic:
         with self.account_lock:
             client.add_history_item(client.get_song(video_id))
 
+    def album_playlist(self, artist: str, title: str, browse_id: str | None = None) -> str | None:
+        """The playlist of an album's songs, which is how YouTube Music's library saves an album: from its album page
+        when known, else from a search for the artist's album of that title. None when there is none."""
+        with self.anonymous() as api:
+            if browse_id:
+                return api.get_album(browse_id).get("audioPlaylistId")
+            for a in api.search(f"{artist} {title}", filter="albums", limit=10):
+                if fold(a.get("title") or "") == fold(title) and fold(artist) in {fold(x.get("name") or "") for x in a.get("artists") or []}:
+                    return a.get("playlistId") or api.get_album(a["browseId"]).get("audioPlaylistId")
+        return None
+
+    def rate(self, client, kind: str, target: str, on: bool):
+        """Likes a song (its video) or saves an album (its playlist) to the account's library, or takes that back."""
+        from ytmusicapi import LikeStatus
+        status = LikeStatus.LIKE if on else LikeStatus.INDIFFERENT
+        with self.account_lock:
+            if kind == "song":
+                client.rate_song(target, status)
+            else:
+                client.rate_playlist(target, status)
+
     def resolve(self, video_id: str) -> Stream:
         """A playable audio URL from one visionOS player request (about 0.3 s), reused until it expires."""
         if (stream := self.streams.get(video_id)) and stream.expires > time.time():
