@@ -107,6 +107,7 @@ def pick(releases: list[dict], files: list[dict]) -> tuple[dict, dict]:
         if best is None or score > best[0]:
             best = score, release, mapping
     if best is None:
-        raise LookupError("no edition matches")
+        counts = sorted({sum(len(m.get("tracks") or []) for m in r.get("media") or []) for r in releases if not musicbrainz.is_pseudo(r)})
+        raise LookupError(f"no edition matches: {len(files)} audio files, editions of {', '.join(map(str, counts)) or 'no'} tracks")
     return best[1], best[2]
 

@@ -30,6 +30,9 @@ RECATALOGUE = 86400                  # seconds between reads of a followed artis
 KEEP_EDITIONS = 30 * 86400           # seconds a release group's edition (mb_group) stays
 RESEARCH, RESEARCH_MOST = 6 * 3600, 7 * 86400       # a missing album is searched again after 6 h, then twice as long each time
 SINGLE_RESEARCH, SINGLE_MOST = 7 * 86400, 28 * 86400
+# A release out less than NEW_RELEASE seconds gets its first copies in those days: searched again after RESEARCH, then
+# at most daily, single or not.
+NEW_RELEASE, NEW_MOST = 28 * 86400, 86400
 BUNDLE_AGAIN = 7 * 86400             # seconds between an artist's bundle searches
 # Releases far likelier found in an artist's bundles than on their own (fan-club and live EPs, singles, demos, B-sides
 # and rarities): searched on their own only after their artist's bundle search.
@@ -539,6 +542,8 @@ class Acquire:
             db.execute("update want_album set next_search = ? where rg = ?", (now + RETRY_FULL, row["rg"]))
             return
         first, most = (SINGLE_RESEARCH, SINGLE_MOST) if row["primary_type"] == "Single" else (RESEARCH, RESEARCH_MOST)
+        if (row["first_date"] or "") >= time.strftime("%Y-%m-%d", time.gmtime(now - NEW_RELEASE)):
+            first, most = RESEARCH, NEW_MOST
         db.execute("update want_album set searched = ?, tries = tries + 1, next_search = ?, error = ? where rg = ?",
                    (now, now + min(first * 2 ** row["tries"], most), error, row["rg"]))
 

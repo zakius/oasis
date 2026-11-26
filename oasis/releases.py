@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 from . import musicbrainz
 from .formats import ARCHIVES, AUDIO, IMAGES, LOSSLESS as LOSSLESS_FILES, suffix
 from .matching import key, match, number_of, title_of
+from .torrent import hex_hash
 
 log = logging.getLogger(__name__)
 
@@ -143,7 +144,7 @@ def unique(items: list, key) -> list:
 
 
 def hash_of(release: dict) -> str:
-    return (release.get("infoHash") or "").lower()
+    return hex_hash(release.get("infoHash") or "")
 
 
 def ids(release: dict) -> set:
@@ -214,8 +215,11 @@ def reject_title(release: dict, want: dict) -> str | None:
     # The artist and the title must be in different places, even when they are the same word (self-titled albums).
     apart = lambda found: [t for t in found if any(t[1] <= a or b <= t[0] for a, b in artists)]
     titles = apart([t for v in variants for t in spans(tokens, v)])
-    if not titles:
+    # A title holding the artist's name and more names the artist itself: 'H△G × Mili vol.2' is Mili's H△G×Mili vol.2.
+    holds = [t for v in variants if any(len(v) > len(words(n)) and spans(v, words(n)) for n in want["names"]) for t in spans(tokens, v)]
+    if not titles and not holds:
         return "no title"
+    inside, titles = not titles, titles or holds
     # 'Torsten Rasch - Mein Herz Brennt (Based on Music of Rammstein)': the artist is only the source of another's work.
     if all(m := CREDITED_AS_SOURCE.search(" ".join(tokens[:a])) for a, _ in artists):
         return f"another artist's: {m[1]}"
@@ -229,7 +233,7 @@ def reject_title(release: dict, want: dict) -> str | None:
     for other in want["others"]:  # 'Korn III: Remember Who You Are' holds 'Korn', and is another album
         if len(o := words(other)) > len(words(title)) and spans(o, words(title)) and apart(spans(tokens, o)):
             return f"another album: {other}"
-    if not placed(name, tokens, artists, titles, variants):
+    if not inside and not placed(name, tokens, artists, titles, variants):
         return "the artist's name isn't on its own"
     if why := namesake(tokens, title_text, want):
         return why

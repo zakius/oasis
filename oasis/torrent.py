@@ -1,5 +1,6 @@
 """Torrents as oasis reads them without a client: magnet links by info hash, and .torrent files' bencoded data, for the
 hash TorBox will know a release by and the files it will list."""
+import base64
 import hashlib
 import re
 
@@ -8,11 +9,18 @@ def magnet(hash: str) -> str:
     return f"magnet:?xt=urn:btih:{hash}"
 
 
+def hex_hash(hash: str) -> str:
+    """An info hash as TorBox knows it, 40 hex digits in lower case; some indexers give it in base32 (32 letters and digits)."""
+    if re.fullmatch(r"[a-z2-7]{32}", hash, re.I):
+        return base64.b32decode(hash.upper()).hex()
+    return hash.lower()
+
+
 def info_hash(found: dict) -> str:
     """The hash of a magnet link or .torrent ({magnet} or {torrent}, as download.source finds them): the link's, or
     the hash of the .torrent's info dictionary."""
-    if m := re.search(r"btih:([0-9a-f]{40})", found.get("magnet") or "", re.I):
-        return m[1].lower()
+    if m := re.search(r"btih:([0-9a-f]{40}|[a-z2-7]{32})\b", found.get("magnet") or "", re.I):
+        return hex_hash(m[1])
     data, i = found.get("torrent") or b"", 1
     try:
         while data[:1] == b"d" and data[i:i + 1] != b"e":
