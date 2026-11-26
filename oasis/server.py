@@ -129,7 +129,8 @@ class Oasis:
         return self.ytm if on else None
 
     def jobs(self) -> list[Job]:
-        """The periodic jobs. Acquisition's share what they learn between runs (download.py's progress), so they share a lane."""
+        """The periodic jobs. Acquisition's keep what they learn between runs in memory (download.py's failed polls in a row,
+        its recent searches), so they share a lane: one worker runs them."""
         found = [Job(library.JOB, self.scanner.step, None), Job(forward.JOB, self.forwarder.flush, 60),
                  Job("soundcloud playlists", self.soundcloud.refresh_all, mixes.REFRESH),
                  *(Job(f"{w.name} playlists", w.refresh_all, mixes.REFRESH) for w in (self.listenbrainz_playlists, self.tidal_mixes)),
@@ -273,7 +274,7 @@ class Oasis:
         return sources.Qobuz.link(email, password, samples)
 
     def prowlarr(self, call: str, args: list):
-        """One of PROWLARR, for the indexers page. Prowlarr's answers keyed by indexer id come keyed by its text."""
+        """One of PROWLARR, for the indexers page. Its answers keyed by indexer id come back keyed by the id as text (JSON)."""
         if call not in PROWLARR:
             raise ValueError(call)
         return getattr(self.downloads.prowlarr, call)(*args)

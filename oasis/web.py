@@ -1029,7 +1029,6 @@ def routes(oasis) -> list[Route]:
         accounts.delete(db, name)
         return back("/admin", message=f"Deleted {name}.")
 
-
     def withheld(capability: str) -> str:
         return f'<p class="muted">{CAPABILITY_TITLES[capability]} aren\'t offered on this server now.</p>'
 
