@@ -8,7 +8,10 @@ from oasis import tasks
 from oasis.config import Config
 from oasis.db import connect
 from oasis.server import create_app
-from oasis.worker import Job, Worker
+import pytest
+
+from oasis import worker as workers
+from oasis.worker import Answer, Job, Worker
 
 
 def wait_for(check, seconds=10):
@@ -167,3 +170,44 @@ def test_serve_with_no_worker_leaves_the_jobs_to_worker_processes(library, tmp_p
             wait_for(lambda: db.execute("select 1 from track").fetchone())
         finally:
             worker.stop()
+
+
+def where(**args):
+    """A task that says where it ran."""
+    return threading.current_thread().name
+
+
+def test_an_interactive_task_is_answered_by_a_worker(tmp_path):
+    db, open_ = connect(tmp_path / "oasis.db"), lambda: connect(tmp_path / "oasis.db")
+    worker = Worker(open_, [], {"where": where, "fail": lambda: int("x")})
+    worker.start()
+    try:
+        wait_for(lambda: tasks.alive(db))
+        start = time.monotonic()
+        assert Answer(open_, "where", {}, lambda: "here").result(5) == "where"  # the worker's thread is named after the task
+        assert time.monotonic() - start < 1
+        with pytest.raises(ValueError, match="invalid literal"):  # the error as it was raised
+            Answer(open_, "fail", {}, lambda: "here").result(5)
+    finally:
+        worker.stop()
+
+
+def test_an_interactive_task_runs_where_it_was_asked_when_no_worker_is_alive(tmp_path):
+    open_ = lambda: connect(tmp_path / "oasis.db")
+    assert Answer(open_, "where", {}, where).result(5).startswith("task")
+    assert not open_().execute("select 1 from task").fetchone()
+
+
+def test_an_interactive_task_no_worker_takes_runs_where_it_was_asked(tmp_path, monkeypatch):
+    monkeypatch.setattr(workers, "CLAIM_WAIT", 0.2)
+    open_ = lambda: connect(tmp_path / "oasis.db")
+    tasks.beat(open_(), "busy", [])  # alive, but taking nothing
+    answer = Answer(open_, "where", {}, where)
+    assert answer.result(5).startswith("task")
+    assert not open_().execute("select 1 from task").fetchone()
+
+
+def test_an_answer_too_slow_is_a_timeout(tmp_path):
+    open_ = lambda: connect(tmp_path / "oasis.db")
+    with pytest.raises(TimeoutError):
+        Answer(open_, "sleep", {}, lambda: time.sleep(1)).result(0.1)

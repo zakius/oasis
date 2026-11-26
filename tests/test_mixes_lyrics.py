@@ -8,6 +8,7 @@ from mutagen.id3 import ID3, USLT
 from conftest import call, make_client, make_track
 from oasis import playlists as oasis_playlists
 from oasis.transcode import target as transcode_target
+from oasis.worker import Worker
 from oasis.ytm import YouTubeMusic, song
 
 
@@ -259,3 +260,16 @@ def test_playlists_list_mixes_first_in_youtube_order(client, ytm):
     client.app.state.oasis.mixes.refresh("admin")
     call(client, "createPlaylist", name="Zebra")
     assert list(playlists(client)) == ["My Supermix", "Bunt", "Mroczna moc", "Replay Mix", "Chill Mix", "Liked Music", "aaa", "Zebra"]
+
+
+def test_a_worker_fetches_lyrics_for_the_api(client):
+    oasis = client.app.state.oasis
+    worker = Worker(oasis.connect, [], oasis.kinds())
+    worker.start()
+    try:
+        test_lyrics_from_youtube_music_are_synced(client)
+    finally:
+        worker.stop()
+    db = oasis.connect()
+    assert db.execute("select count(*) from task where kind = 'lyrics' and worker = ? and state = 'done'", (worker.id,)).fetchone()[0] == 2
+    assert db.execute("select count(*) from lyrics").fetchone()[0] == 2

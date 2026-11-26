@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable
 
@@ -17,6 +18,9 @@ from . import tasks
 log = logging.getLogger(__name__)
 
 THREADS = 32  # tasks a worker runs at once
+ASK_WAIT = 120  # seconds an interactive task is waited for at most: each of its calls has its own, shorter timeout
+CLAIM_WAIT = 2  # seconds an interactive task waits for a worker to take it before the process that asked runs it
+here = ThreadPoolExecutor(THREADS, "task")  # interactive tasks run in the process that asked for them
 
 
 @dataclass
@@ -42,8 +46,9 @@ class Worker:
         self.thread = None
 
     def start(self):
-        """Runs in threads of this process."""
-        self.thread = threading.Thread(target=self.run, name="worker", daemon=True)
+        """Runs in threads of this process; alive on return."""
+        self.begin()
+        self.thread = threading.Thread(target=self.claim, name="worker", daemon=True)
         self.thread.start()
 
     def stop(self):
@@ -53,11 +58,23 @@ class Worker:
             self.thread.join()
 
     def run(self):
+        self.begin()
+        self.claim()
+
+    def begin(self):
+        """The periodic jobs' rows, and the heartbeat."""
         db = self.connect()
-        tasks.schedule(db, self.jobs.values())
-        tasks.beat(db, self.id, [])
+        try:
+            tasks.schedule(db, self.jobs.values())
+            tasks.beat(db, self.id, [])
+        finally:
+            db.close()
         threading.Thread(target=self.beat, name="heartbeat", daemon=True).start()
         log.info("worker %s runs %d periodic jobs and %d kinds of tasks", self.id, len(self.jobs), len(self.kinds))
+
+    def claim(self):
+        """Claims tasks and runs each in a thread, till stopped."""
+        db = self.connect()
         kinds = [*self.jobs, *self.kinds]
         try:
             while not self.stopped.is_set():
@@ -122,3 +139,42 @@ class Worker:
             db.close()
             self.running.discard(task["id"])
             self.ended.set()
+
+
+class Answer:
+    """The result of an interactive task to come. A worker runs it; or this process does, when no worker is alive or
+    none takes it within CLAIM_WAIT, as all of oasis runs in one process when there is no worker."""
+
+    def __init__(self, connect, kind: str, args: dict, run: Callable, key: str | None = None):
+        """run: the task's function, for running it here."""
+        self.connect, self.args, self.run = connect, args, run
+        db = connect()
+        try:
+            self.id = tasks.add(db, kind, args, key, tasks.INTERACTIVE) if tasks.alive(db) else None
+        finally:
+            db.close()
+        self.asked, self.future = time.monotonic(), None if self.id else here.submit(run, **args)
+
+    def result(self, timeout: float):
+        """The task's result, or the error it raised; TimeoutError when it isn't done in timeout seconds."""
+        end = time.monotonic() + timeout
+        if self.future is None:
+            db = self.connect()
+            try:
+                while not (row := db.execute("select * from task where id = ?", (self.id,)).fetchone()) or row["state"] not in ("done", "failed"):
+                    if not row or row["state"] == "queued" and time.monotonic() > self.asked + CLAIM_WAIT and \
+                            db.execute("delete from task where id = ? and state = 'queued'", (self.id,)).rowcount:
+                        log.info("no worker took a %s task: run here", row and row["kind"])
+                        self.future = here.submit(self.run, **self.args)
+                        break
+                    if time.monotonic() > end:
+                        raise TimeoutError(f"{row['kind']} took over {timeout} s")
+                    time.sleep(tasks.POLL)
+            finally:
+                db.close()
+        if self.future is not None:
+            return self.future.result(max(0.0, end - time.monotonic()))
+        if row["state"] == "failed":
+            error = json.loads(row["error"])
+            raise {e.__name__: e for e in tasks.ERRORS}.get(error["type"], RuntimeError)(error["message"])
+        return json.loads(row["result"])

@@ -58,12 +58,14 @@ def claim(db, me: str, kinds) -> dict | None:
 
 
 def done(db, task: dict, result=None):
-    db.execute("update task set state = 'done', result = ?, finished = ?, lease = null where id = ?", (json.dumps(result), time.time(), task["id"]))
+    """The task's result. Its arguments go: a sign-in's are secrets."""
+    db.execute("update task set state = 'done', args = '{}', result = ?, finished = ?, lease = null where id = ?",
+               (json.dumps(result), time.time(), task["id"]))
 
 
 def failed(db, task: dict, error: Exception):
     kind = next((e.__name__ for e in ERRORS if isinstance(error, e)), "RuntimeError")
-    db.execute("update task set state = 'failed', error = ?, finished = ?, lease = null where id = ?",
+    db.execute("update task set state = 'failed', args = '{}', error = ?, finished = ?, lease = null where id = ?",
                (json.dumps({"type": kind, "message": str(error)}), time.time(), task["id"]))
 
 

@@ -2,6 +2,7 @@ import argparse
 import datetime
 import logging
 import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -37,7 +38,9 @@ def main():
         db = connect(config.database)
         library.check_quality(db, config.library, args.jobs, args.delete_lossy)
     elif args.command == "worker":  # as many as wanted, beside `oasis serve --no-worker`
-        Oasis(config).worker(args.threads).run()
+        running = Oasis(config).worker(args.threads)
+        signal.signal(signal.SIGTERM, lambda *_: running.stop())  # its periodic jobs' lanes are free at once for the other workers
+        running.run()
     else:
         uvicorn.run(create_app(config, worker=not args.no_worker), host=config.host, port=config.port, access_log=False)  # Subsonic puts credentials in query strings
 

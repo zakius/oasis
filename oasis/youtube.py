@@ -128,10 +128,14 @@ class YouTubeCatalogue:
             log.warning("YouTube Music search failed: %s", e)
             return []
 
+    def page_due(self, db, artist_id: str) -> bool:
+        """Whether artist_page would fetch the artist's page: none was, or not within ARTIST_PAGE_KEPT."""
+        page = db.execute("select fetched from ytm_artist where artist_id = ?", (artist_id,)).fetchone()
+        return self.on(db) and not (page and page["fetched"] > time.time() - ARTIST_PAGE_KEPT)
+
     def artist_page(self, db, artist_id: str, name: str):
         """Fetches the artist's YouTube Music page into ytm_artist and ytm_release, at most once per ARTIST_PAGE_KEPT."""
-        page = db.execute("select fetched from ytm_artist where artist_id = ?", (artist_id,)).fetchone()
-        if not self.on(db) or (page and page["fetched"] > time.time() - ARTIST_PAGE_KEPT):
+        if not self.page_due(db, artist_id):
             return
         try:
             found = self.ytm.artist(name)
@@ -162,21 +166,26 @@ class YouTubeCatalogue:
             log.warning("YouTube Music top songs failed: %s", e)
             return []
 
-    def complete_album(self, db, album_id: str):
-        """Fetches the rest of an album that is only known from streaming tracks seen in search or radio, or only
-        from an artist's YouTube Music page."""
+    def browse_id(self, db, album_id: str) -> str | None:
+        """The YouTube Music album page complete_album would read for the album; None when it would read none."""
         if album_id in self.completed or not self.on(db):
-            return
+            return None
         sources = db.execute("select source, ytm_album from track where album_id = ?", (album_id,)).fetchall()
-        release = db.execute("select * from ytm_release where album_id = ?", (album_id,)).fetchone()
+        release = db.execute("select browse_id from ytm_release where album_id = ?", (album_id,)).fetchone()
         browse_id = next((r["ytm_album"] for r in sources if r["ytm_album"]), None) or (release and release["browse_id"])
-        if not browse_id or any(r["source"] == "local" for r in sources):
-            return
+        return None if any(r["source"] == "local" for r in sources) else browse_id
+
+    def complete_album(self, db, album_id: str) -> bool:
+        """Fetches the rest of an album that is only known from streaming tracks seen in search or radio, or only
+        from an artist's YouTube Music page; whether it has all of it now."""
+        if not (browse_id := self.browse_id(db, album_id)):
+            return album_id in self.completed
+        release = db.execute("select * from ytm_release where album_id = ?", (album_id,)).fetchone()
         try:
             songs = self.ytm.album(browse_id)
         except Exception as e:
             log.info("album %s unavailable: %s", browse_id, e)
-            return
+            return False
         ids = [remember_song(db, song) for song in songs]
         db.executemany("insert or replace into album_track select ?, id, ?, ? from track where id = ? and source = 'ytm'",
                        [(album_id, song.get("disc_no"), song.get("track_no"), id) for id, song in zip(ids, songs)])
@@ -184,6 +193,7 @@ class YouTubeCatalogue:
             db.executemany("update track set album_id = ?, artist_id = ? where id = ? and source = 'ytm' and ytm_album = ?",
                            [(album_id, release["artist_id"], id, browse_id) for id in ids])
         self.completed.add(album_id)
+        return True
 
     def complete_next_album(self, db) -> bool:
         """Reads the YouTube Music album page of one library streaming song's album not read yet, for its album

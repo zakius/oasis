@@ -10,6 +10,7 @@ import time
 import unicodedata
 
 from . import musicbrainz, romanize
+from .db import transaction
 from .text import fold
 
 REFRESH = 180 * 86400   # seconds an artist's or release's Latin names stay before MusicBrainz is asked again
@@ -140,10 +141,5 @@ def index(db):
     values = [(
         r["id"], r["latin_source"], folded(r["title"], r["artist"], r["album"], title_of=True), folded(r["artist"], r["title"], r["album"]),
         folded(r["album"], r["title"], r["artist"], title_of=True), folded(r["album_artist"], r["title"], r["album"])) for r in rows]
-    db.execute("begin")  # one commit, not one per row: the connection autocommits
-    try:
+    with transaction(db):  # one commit, not one per row: the connection autocommits
         db.executemany("insert or replace into track_latin values (?, ?, ?, ?, ?, ?)", values)
-        db.execute("commit")
-    except BaseException:
-        db.execute("rollback")
-        raise

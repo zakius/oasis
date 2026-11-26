@@ -24,7 +24,6 @@ from .artists import (ALIAS_TYPES, LINKS, add_name, add_related, configure, know
 from .credits import credits_of
 from .text import fold
 from .db import as_user
-from .forward import ListenBrainz
 from .lastfm import LIBREFM, LIBREFM_AUTH, elsewhere, gnufm_auth, signs_in
 from .remote import api_root, web_address
 from .recommend import SOURCES, STATIONS
@@ -612,7 +611,7 @@ def routes(oasis) -> list[Route]:
 
     def link_youtube(db, request, user, form):
         try:
-            name = oasis.link_youtube(db, user["name"], ytm.youtube_headers(form.get("headers", "")))
+            name = oasis.ask("link", service="ytm", user=user["name"], secret=ytm.youtube_headers(form.get("headers", "")))
         except ValueError as e:
             return back("/services", error=str(e), anchor="service-ytm")
         return back("/services", message=f"YouTube Music linked as {name}. Your mixes are loading.", anchor="service-ytm")
@@ -651,7 +650,7 @@ def routes(oasis) -> list[Route]:
         if not accounts.same(request.query_params.get("state", ""), sign_in_state(request, "lastfm")):
             return back("/services", error="That Last.fm sign-in didn't start here. Sign in with Last.fm again.")
         try:
-            key, name = oasis.lastfm.sign_in(request.query_params.get("token", ""))
+            key, name = oasis.ask("lastfm sign-in", token=request.query_params.get("token", ""))
         except Exception as e:
             return back("/services", error=f"Last.fm sign-in failed: {e}")
         accounts.set_field(db, user["name"], lastfm_session=key, lastfm_name=name)
@@ -662,9 +661,10 @@ def routes(oasis) -> list[Route]:
     def lastfm_app(db, request, user, form):
         key, secret = form.get("key", "").strip(), form.get("secret", "").strip()
         try:
-            oasis.set_lastfm_app(db, key, secret)
+            oasis.ask("lastfm app", key=key, secret=secret)
         except Exception as e:
             return back("/services", error=f"Last.fm didn't accept these: {e}")
+        oasis.forget_lastfm_app()
         return back("/services", message="oasis is connected to Last.fm. Now sign in with your Last.fm account.", anchor="service-lastfm")
 
     def unlink_lastfm(db, request, user, form):
@@ -677,7 +677,7 @@ def routes(oasis) -> list[Route]:
         if not token:
             return back("/services", error="Paste your ListenBrainz user token.", anchor="service-listenbrainz")
         try:
-            valid = ListenBrainz(token).valid()
+            valid = oasis.ask("listenbrainz token", token=token)
         except Exception as e:
             return back("/services", error=f"ListenBrainz didn't answer: {e}")
         if not valid:
@@ -727,7 +727,7 @@ def routes(oasis) -> list[Route]:
         if not token:
             return back("/services", error="Paste your token from that server.", anchor=anchor)
         try:
-            valid = ListenBrainz(token, api).valid()
+            valid = oasis.ask("listenbrainz token", token=token, api=api)
         except Exception as e:
             return back("/services", error=f"{api} didn't answer: {e}", anchor=anchor)
         if not valid:
@@ -742,7 +742,7 @@ def routes(oasis) -> list[Route]:
             return back("/services", error="That sign-in didn't start here. Add the server again.")
         name, api, auth = pending
         try:
-            session, signed = elsewhere(api, auth).sign_in(request.query_params.get("token", ""))
+            session, signed = oasis.ask("server sign-in", api=api, auth=auth, token=request.query_params.get("token", ""))
         except Exception as e:
             return back("/services", error=f"Signing in at {api} failed: {e}", anchor="service-lastfm-servers")
         servers.add(db, user["name"], "lastfm", name, api, {"session": session, "user": signed, "auth": auth})
@@ -1177,10 +1177,10 @@ def routes(oasis) -> list[Route]:
         if not (oasis.sources.allowed(db, "qobuz", "songs") or samples):
             return back("/services", error="Qobuz isn't offered on this server.")
         try:
-            account = sources.Qobuz.link(form.get("email", "").strip(), form.get("password", ""), samples)
+            account = oasis.ask("qobuz sign-in", email=form.get("email", "").strip(), password=form.get("password", ""), samples=samples)
         except ValueError as e:
             return back("/services", error=str(e), anchor="service-qobuz")
-        except (OSError, LookupError, KeyError) as e:
+        except (OSError, LookupError, RuntimeError) as e:
             return back("/services", error=f"Qobuz didn't answer as expected: {e}", anchor="service-qobuz")
         oasis.sources.link(db, user["name"], "qobuz", account)
         return back("/services", message=f"Qobuz linked as {account['name']}.", anchor="service-qobuz")
@@ -1188,9 +1188,8 @@ def routes(oasis) -> list[Route]:
     def account_link(db, request, user, form):
         """The user's SoundCloud or Bandcamp sign-in, pasted from their browser."""
         key = request.url.path.split("/")[2]
-        link = {"soundcloud": oasis.link_soundcloud, "bandcamp": oasis.link_bandcamp}[key]
         try:
-            name = link(db, user["name"], form.get("cookie", ""))
+            name = oasis.ask("link", service=key, user=user["name"], secret=form.get("cookie", ""))
         except (ValueError, LookupError, OSError) as e:
             return back("/services", error=str(e), anchor=f"service-{key}")
         return back("/services", message=f"{SERVICE_TITLES[key]} linked as {name}.", anchor=f"service-{key}")
@@ -1300,7 +1299,7 @@ def routes(oasis) -> list[Route]:
                 f'<span>Albums</span></label></div><button class="primary right">Search MusicBrainz</button></div></form>')
         if text:
             try:
-                found = musicbrainz.find(kind, text, db)
+                found = oasis.ask("musicbrainz", call="find", args=[kind, text])
             except OSError as e:
                 found, error = [], f"MusicBrainz didn't answer: {e}"
             here = f"/music?q={quote(text)}&kind={kind}"
@@ -1315,7 +1314,7 @@ def routes(oasis) -> list[Route]:
         try:
             if not MBID.fullmatch(mbid):
                 raise LookupError(mbid)
-            info, groups = musicbrainz.artist(mbid, db), musicbrainz.release_groups(mbid, db)
+            info, groups = oasis.ask("musicbrainz", call="artist", args=[mbid]), oasis.ask("musicbrainz", call="release_groups", args=[mbid])
         except LookupError:
             return back("/music", error="MusicBrainz has no such artist.")
         except OSError as e:
@@ -1650,7 +1649,11 @@ def routes(oasis) -> list[Route]:
     def similar_songs(db, user, r, here: str) -> str:
         """Songs like this one from the user's default radio source, those nothing plays too."""
         as_user(db, user["name"])  # similar_line reads the user's stars
-        ids = oasis.recommender.similar(db, r, 25, user, source=user["radio_source"], wait=8, unplayable=True)
+        try:
+            ids = oasis.ask("similar", seed=r["id"], count=25, user=user["name"], source=user["radio_source"], wait=8, unplayable=True)
+        except Exception as e:
+            log.info("similar songs failed: %s", e)
+            ids = []
         found = [t for id in ids if (t := db.execute("select * from track where id = ?", (id,)).fetchone())]
         lines = "".join(similar_line(db, t, here) for t in found)
         return f'<ul class="rows">{lines}</ul>' if lines else '<p class="muted">The radio source found nothing like it.</p>'
@@ -1717,7 +1720,7 @@ def routes(oasis) -> list[Route]:
         if action not in ("search", "block", "give-up") or row is None and not (action == "give-up" and acquire.wanted_by(db, "album", rg, user["name"])):
             return back(here, error="That album isn't wanted any more.")
         name = f'{row["artist"]} – {row["title"]}' if row else "it"
-        if action == "block" and not (oasis.downloads and oasis.downloads.block(db, rg)):
+        if action == "block" and not (oasis.downloads and oasis.ask("block download", rg=rg)):
             return back(here, error=f"Nothing is downloading for {name} that can still be stopped.")
         if action in ("search", "block"):
             oasis.acquire.search_soon(db, rg)
@@ -1764,7 +1767,7 @@ def routes(oasis) -> list[Route]:
     def musicbrainz_album(db, request, user, rg: str):
         """The album page of a release group that isn't here yet: MusicBrainz's smallest edition's songs, and its wanted log."""
         try:
-            found = musicbrainz.editions(rg, db) if MBID.fullmatch(rg) else []
+            found = oasis.ask("musicbrainz", call="editions", args=[rg]) if MBID.fullmatch(rg) else []
         except OSError as e:
             return back("/music/wanted", error=f"MusicBrainz didn't answer: {e}")
         if not found:
@@ -1794,6 +1797,10 @@ def routes(oasis) -> list[Route]:
                 + f'<section><table class="grid tracks"><thead><tr><th class="num">#</th><th>Title</th><th class="num">Length</th></tr></thead><tbody>{rows}</tbody></table></section>'
                 + wanted_log(db, user, rg, f"/music/library/album/{MB_IDS['album']}{rg}"))
         return page(title, body, request.query_params.get("message", ""), request.query_params.get("error", ""), wide=True, tab="wanted", heading=False)
+
+    def ask_prowlarr(call: str, *args):
+        """One of Prowlarr's calls for the indexers page, made by a worker."""
+        return oasis.ask("prowlarr", call=call, args=list(args))
 
     def origin(client, found: list[dict]):
         """guess(guid) for download.by_indexer: the indexer of the release's site, for a download from before oasis noted its indexer."""
@@ -1867,10 +1874,10 @@ def routes(oasis) -> list[Route]:
             return page("Indexers", "", error="Acquisition is off: it needs [torbox] with downloads and [prowlarr] in oasis.toml.", tab="wanted")
         client = oasis.downloads.prowlarr
         try:
-            view = client.overview()
+            view = ask_prowlarr("overview")
         except OSError as e:
             return page("Indexers", f'<section><p class="error">Prowlarr didn\'t answer: {escape(str(e))}</p></section>', tab="wanted")
-        found, status, stats, tags = view["indexers"], view["status"], view["stats"], view["tags"]
+        found, (status, stats, tags) = view["indexers"], ({int(k): v for k, v in view[part].items()} for part in ("status", "stats", "tags"))
         guess = origin(client, found)
         mine, blocks = download.by_indexer(db, guess), download.blocks_by_indexer(db, guess)
         hits = download.searches(db, 30)
@@ -1942,7 +1949,7 @@ def routes(oasis) -> list[Route]:
         id, what = request.path_params["id"], request.path_params["action"]
         client = oasis.downloads.prowlarr
         try:
-            i = client.indexer(id)
+            i = ask_prowlarr("indexer", id)
         except OSError as e:
             return back("/music/indexers", error=f"Prowlarr didn't answer: {e}")
         name, here = i["name"], lambda **kw: back("/music/indexers", anchor=f"indexer-{id}", **kw)
@@ -1951,7 +1958,7 @@ def routes(oasis) -> list[Route]:
         number = lambda key, cast=float: None if (form.get(key) or "").strip() == "" else cast(form[key])
         try:
             if what == "test":
-                client.test(i)
+                ask_prowlarr("test", i)
                 return here(message=f"{name}: Prowlarr's test passed.")
             if what == "seeding":
                 rule = {"mode": form.get("mode"), "ratio": number("ratio"), "days": number("days"), "min_hours": number("min_hours") or 0, "min_ratio": number("min_ratio")}
@@ -1965,7 +1972,7 @@ def routes(oasis) -> list[Route]:
                 oasis.downloads.save_rule(db, name, None)
                 return here(message=f"{name} seeds by its {oasis.downloads.rule_source(name)} rule again.")
             if what == "unblock":
-                gone = download.blocks_by_indexer(db, origin(client, client.every())).get(id, [])
+                gone = download.blocks_by_indexer(db, origin(client, ask_prowlarr("every"))).get(id, [])
                 download.unblock(db, gone)
                 return here(message=f"Cleared {plural(len(gone), 'block')} from {name}.")
             if what == "enable":
@@ -1996,7 +2003,7 @@ def routes(oasis) -> list[Route]:
                 done = f"{', '.join(f.get('label') or f['name'] for f in changed)} saved"
             else:
                 return here(error="No such change.")
-            client.save(i, force=form.get("force") == "1")
+            ask_prowlarr("save", i, form.get("force") == "1")
         except ValueError:
             return here(error="That isn't a number.")
         except OSError as e:
