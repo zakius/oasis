@@ -32,4 +32,5 @@ Wherever the server returns a `Child` song (`getSong`, `getAlbum`, `getPlaylist`
 
 `shareUrl` is the song's YouTube Music link, `https://music.youtube.com/watch?v=<id>`: for YouTube Music songs, and
 for library songs once oasis has matched them to a YouTube Music video (`getSong` looks for a match the first time
-it is asked). Songs with no match have no `shareUrl`.
+it is asked). Songs of another streaming service without such a match link to that service's page of the song
+(Bandcamp, SoundCloud, Qobuz, Tidal). Songs with no match have no `shareUrl`.

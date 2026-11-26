@@ -79,8 +79,11 @@ they are played. Both take their songs from a **source**:
 | `listenbrainz` | ListenBrainz's LB Radio for the song's artist and artists ListenBrainz finds similar | the user linked a ListenBrainz token |
 
 Last.fm's and ListenBrainz's picks become library songs where the library has them, else YouTube Music streaming
-songs (`yt-…`). A source that finds nothing, or fails, gives nothing: no other source stands in, so an empty list
-means that source had nothing for this song.
+songs (`yt-…`), else songs of the other streaming services an admin turned on (Qobuz `qb-…`, Tidal `td-…`, Bandcamp
+`bc-…`, SoundCloud `sc-…`). A pick that none of them has is left out, unless the client asks for unplayable songs
+(the extension `unavailableSongs`, [unavailable-songs-extension.md](unavailable-songs-extension.md)). A source that
+finds nothing, or fails, gives nothing: no other source stands in, so an empty list means that source had nothing for
+this song.
 
 Each user has a **default source**, set on the dashboard (Radio, on the home page) and `all` until set. It serves every
 request that names no source, from any client, and radios started without one.

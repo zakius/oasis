@@ -1,6 +1,6 @@
 """Playlists' entries and kinds. A plain playlist holds what its owner or a YouTube Music mix put in it; a radio grows
 by itself as it is played (see recommend.py), from its own tracks or from everything its owner plays. Streaming tracks
-are in the library while starred or in a plain playlist that is not one of YouTube Music's own mixes, so writing
+(of any service) are in the library while starred or in a plain playlist that is not one of YouTube Music's own mixes, so writing
 entries keeps that up."""
 import time
 
@@ -68,7 +68,7 @@ def touch(db, ids, fetch=None):
     otherwise: YouTube Music's own mixes change daily and stay playlists; library playlists count while shown, Liked
     Music always. fetch(video id) is given the ones the user chose, to download."""
     for id in ids:
-        r = db.execute("select ref from track where id = ? and source = 'ytm'", (id,)).fetchone()
+        r = db.execute("select ref, source from track where id = ? and source not in ('local', 'missing')", (id,)).fetchone()
         if r is None:
             continue
         starred = db.execute("select 1 from stat where id = ? and starred is not null", (id,)).fetchone()  # by anyone
@@ -77,13 +77,13 @@ def touch(db, ids, fetch=None):
         db.execute("update track set library = ? where id = ?", (int(bool(starred or any(map(counts, playlists)))), id))
         # Mixes put their tracks in the library but change daily, so only the user's own choices download.
         wanted = starred or any(row["mix"] is None for row in playlists)
-        if wanted and fetch:
+        if wanted and fetch and r["source"] == "ytm":  # other services' tracks are cached when first played (sources.py)
             fetch(r["ref"])
 
 
 def demix(db):
     """Streaming tracks in the library only through mixes or hidden playlists leave it (counts)."""
-    db.execute("update track set library = 0 where source = 'ytm' and library = 1 and not exists (select 1 from stat s where s.id = track.id "
+    db.execute("update track set library = 0 where source not in ('local', 'missing') and library = 1 and not exists (select 1 from stat s where s.id = track.id "
                "and s.starred is not null) and not exists (select 1 from playlist_entry e join playlist p on p.id = e.playlist_id "
                f"where e.track_id = track.id and p.radio = {PLAIN} and coalesce(p.mix, '') not like '{MIX_PREFIX}%' "
                f"and (p.hidden = 0 or p.mix = '{LIKED}'))")

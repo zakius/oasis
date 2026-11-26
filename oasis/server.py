@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 from starlette.applications import Starlette
 
-from . import accounts, acquire, api, artists, download, forward, lastfm, mixes, playlists, translate, web, worker, youtube
+from . import accounts, acquire, api, artists, download, forward, lastfm, missing, mixes, playlists, translate, web, worker, youtube
 from .acquire import Acquire
 from .config import Config
 from .enrich import Enrichment
@@ -21,12 +21,15 @@ from .library import Scanner
 from .mixes import Mixes
 from .prowlarr import Prowlarr
 from .recommend import Recommender
+from .sources import Sources
 from .torbox import from_rdtclient
 from .upload import Uploads
 from .youtube import YouTubeCatalogue
 from .ytm import YouTubeMusic
 
 log = logging.getLogger(__name__)
+
+MISSING_IDLE = 300  # seconds between looks for songs nothing can play whose album isn't known yet
 
 
 class Oasis:
@@ -36,6 +39,7 @@ class Oasis:
         self.config, self.background = config, background
         self.ytm = ytm or (YouTubeMusic(config.ytm_cache) if config.ytm_cache else None)
         self.youtube = YouTubeCatalogue(self.ytm)
+        self.sources = Sources(config.database.parent / "streams")  # other streaming services' audio, cached when played
         self.throttle = accounts.Throttle()  # the API's and the dashboard's sign-ins
         self.translations = translate.Translations(translate.Google())
         db = self.connect()
@@ -48,7 +52,7 @@ class Oasis:
         services_for = (lambda db, user: services) if services is not None else \
             (lambda db, user: forward.user_services(self.lastfm, self.ytm, accounts.get(db, user)))
         self.forwarder = Forwarder(self.connect, services_for, self.ytm)
-        self.recommender = Recommender(self.connect, self.ytm, lambda: self.lastfm)
+        self.recommender = Recommender(self.connect, self.ytm, lambda: self.lastfm, self.sources)
         self.uploads = Uploads(self.connect, config.library[0], config.database.parent / "uploads")
         self.mixes = Mixes(self.connect, self.ytm, self.youtube.fetch_soon)
         self.enrichment = Enrichment(self.connect)
@@ -78,6 +82,8 @@ class Oasis:
             self.mixes.start()
             worker.start("album fill", self.complete_next_album, youtube.ALBUM_IDLE)
         self.recommender.start()
+        worker.start("missing songs", self.fill_missing, MISSING_IDLE)
+        worker.start("stream cache", self.prune_streams, 86400)
         self.uploads.start()
         self.enrichment.start()
 
@@ -86,6 +92,24 @@ class Oasis:
         db = self.connect()
         try:
             return youtube.ALBUM_GAP if self.youtube.complete_next_album(db) else None
+        finally:
+            db.close()
+
+    def fill_missing(self) -> float | None:
+        """Finds the albums of songs nothing can play, one MusicBrainz search at a time, till none is left (missing.py)."""
+        db = self.connect()
+        try:
+            while missing.fill_next(db, lambda db, user, ids, value: self.want(db, user, "album", ids, value)):
+                pass
+        finally:
+            db.close()
+        return None
+
+    def prune_streams(self):
+        """Deletes the cached audio of other services' songs that no track plays any more (Sources.prune), daily."""
+        db = self.connect()
+        try:
+            self.sources.prune(db)
         finally:
             db.close()
 

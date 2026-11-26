@@ -6,8 +6,8 @@ from .tracks import artist_id
 SCHEMA = """
 create table if not exists track(
     id text primary key,
-    source text not null,           -- 'local' or 'ytm'
-    ref text not null unique,       -- file path, or the videoId for 'ytm'
+    source text not null,           -- 'local', 'ytm', another streaming service (sources.py), or 'missing'
+    ref text not null unique,       -- file path, the videoId for 'ytm', '<source>:<its id>' for other services; the id for 'missing'
     root text,
     title text, artist text, album_artist text, album text,
     album_by text,                  -- streaming tracks: the album's artist as its YouTube Music album page names it
@@ -23,7 +23,9 @@ create table if not exists track(
     mb_release_group text,
     isrc text, label text, release_types text, original_date text, -- several values joined with '; '
     genres text,                    -- JSON list
-    credits_at real                 -- when MusicBrainz credits were filled; -1 when it has none, null while pending
+    credits_at real,                -- when MusicBrainz credits were filled; -1 when it has none, null while pending
+    looked_up real,                 -- missing songs (missing.py): when MusicBrainz was asked for their album
+    preview text                    -- missing songs: their clip, '<preview service>:<its id>' (sources.PREVIEWS)
 );
 create index if not exists track_album on track(album_id);
 create index if not exists track_artist on track(artist_id);
@@ -86,7 +88,8 @@ create table if not exists user(
     listenbrainz_token text,
     ytm_new_shown int not null default 0, -- YouTube Music library playlists that appear later: 1 shown till unticked, 0 hidden till ticked
     radio_source text not null default 'all', -- the default source of similar songs and radios (recommend.SOURCES)
-    translate_lang text             -- the language lyrics are translated to when an app asks with oasisTranslate=1
+    translate_lang text,            -- the language lyrics are translated to when an app asks with oasisTranslate=1
+    missing_songs int not null default 1 -- 1: apps that ask (extension unavailableSongs) get songs nothing can play (missing.py)
 );
 create table if not exists wanted(user text not null, kind text not null, ref text not null, primary key(user, kind, ref));
 create table if not exists want_item(  -- stars and follows (see acquire.py)
@@ -311,6 +314,9 @@ def record_play(db: sqlite3.Connection, user: str, track_id: str, played: float)
     db.execute("insert into play values (?, ?, ?)", (user, track_id, played))
 
 
+NOT_FROM_FILES = {"looked_up", "preview"}  # track columns of songs nothing can play (missing.py): no file to read again
+
+
 def migrate(db: sqlite3.Connection):
     """Adds the columns a database from an older oasis lacks, as SCHEMA defines them."""
     current = sqlite3.connect(":memory:")
@@ -322,7 +328,7 @@ def migrate(db: sqlite3.Connection):
                 # SQLite adds a NOT NULL column only with a default.
                 constraint = (f" not null default {default}" if not_null else f" default {default}") if default is not None else ""
                 db.execute(f"alter table {table} add column {name} {kind}{constraint}")
-                if table == "track":
+                if table == "track" and name not in NOT_FROM_FILES:
                     db.execute("update track set mtime = null where source = 'local'")  # the next scan reads files for it
     current.close()
 
@@ -333,6 +339,7 @@ def create(db: sqlite3.Connection):
     migrate(db)
     db.execute("create index if not exists track_release on track(mb_release)")
     db.execute("create index if not exists track_group on track(mb_release_group)")
+    db.execute("create index if not exists track_recording on track(mb_recording)")  # songs nothing can play, by their recording
     # The library's albums and artists, listed without reading the streaming tracks beside them (api.py's ALBUMS and ARTISTS)
     db.execute("create index if not exists track_library_album on track(library, album_id)")
     db.execute("create index if not exists track_library_artist on track(library, artist_id)")

@@ -13,14 +13,15 @@ from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse, Response
+from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from . import accounts, acquire, audiorecords, cover, download, formats, mixes, musicbrainz, prowlarr, tracks, wants, ytm
+from . import accounts, acquire, audiorecords, cover, download, formats, missing, mixes, musicbrainz, prowlarr, sources, tracks, wants, ytm
 from .musicbrainz import MBID
 from .tracks import IDS, MB_IDS
 from .artists import linked, load_settings, save_settings
 from .credits import credits_of
+from .db import as_user
 from .forward import ListenBrainz
 from .lastfm import signs_in
 from .recommend import SOURCES
@@ -85,7 +86,7 @@ button:hover, .button:hover { border-color: var(--muted); text-decoration: none;
 button.danger { background: none; color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, transparent); }
 button.danger:hover { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, transparent); }
 .row { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; } .row > .right { margin-left: auto; } .row > p { margin: 0; }
-section > .row + .row { margin-top: 1rem; } form.inline { display: inline; }
+section > .row + .row { margin-top: 1rem; } form.inline { display: inline; } audio.preview { height: 2rem; max-width: 100%; vertical-align: middle; }
 .pill { display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .78rem; font-weight: 600; line-height: 1.45; white-space: nowrap;
         vertical-align: .08em; color: var(--muted); background: color-mix(in srgb, currentColor 14%, transparent); }
 .muted { color: var(--muted); font-size: .875rem; } .good, .ok { color: var(--good); } .busy { color: var(--busy); } .bad, .error { color: var(--bad); }
@@ -210,6 +211,8 @@ a.card:hover b { text-decoration: underline; } .card .muted { font-size: .8rem; 
 
 confirm = lambda question: f' onsubmit="return confirm({escape(json.dumps(question, ensure_ascii=False))})"'  # for buttons that drop things
 HIDE_BROKEN = 'onerror="this.removeAttribute(\'src\')"'  # a cover that fails shows the empty frame, not a broken image
+KINDS = sources.KINDS | sources.PREVIEWS  # what the services page turns on and off
+SOURCE_NAMES = {"local": "library", "ytm": "YouTube Music", "missing": "nothing", **{k: v.title for k, v in sources.KINDS.items()}}
 TABS = [("home", "/", "Dashboard", "M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"),
         ("library", "/music/library", "Library", "M5 4v16M9.5 4v16M14 4.5l5.5 15"),
         ("wanted", "/music/wanted", "Wanted", "M12 3v12m-5-5 5 5 5-5M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"),
@@ -467,7 +470,8 @@ def routes(oasis) -> list[Route]:
                         '<form method="post" action="/account/listenbrainz"><label>User token from '
                         '<a href="https://listenbrainz.org/settings/" target="_blank">listenbrainz.org/settings</a>'
                         '<input type="text" name="token"></label><button class="primary">Link</button></form>')
-        admin = '<a class="button" href="/admin">Users</a><a class="button" href="/admin/artists">Artist settings</a>' if user["admin"] else ""
+        admin = ('<a class="button" href="/admin">Users</a><a class="button" href="/admin/artists">Artist settings</a>'
+                 '<a class="button" href="/admin/services">Streaming services</a>') if user["admin"] else ""
         body = (f'<div class="split"><div>{status(db)}</div><div><section><h2>Account</h2><div class="row"><p>Signed in as <b>{escape(user["name"])}</b>.</p>'
                 f'<form class="right" method="post" action="/logout"><button>Sign out</button></form></div>{f"<div class=row>{admin}</div>" if admin else ""}</section>'
                 f'<section><h2>YouTube Music</h2>{youtube}</section>'
@@ -475,6 +479,7 @@ def routes(oasis) -> list[Route]:
                 f'or plays count twice.</p>{lastfm}</section>'
                 f'<section><h2>ListenBrainz</h2>{listenbrainz}</section>'
                 f'<section><h2>Radio</h2>{radio_source(user)}</section>'
+                f'<section><h2>Songs nothing can play</h2>{missing_songs(user)}</section>'
                 f'<section><h2>Lyrics translation</h2>{translation_language(user)}</section>'
                 f'<section><h2>Password</h2>' + (
                     '<p class="muted">Set in oasis.toml.</p>' if user["name"] in oasis.config.users else
@@ -499,6 +504,21 @@ def routes(oasis) -> list[Route]:
                 'started with. A source that finds nothing gives nothing: no other stands in.</p>'
                 f'<form method="post" action="/account/radio">{options}<button class="primary">Save</button></form>'
                 + (f'<p class="muted">Not available: {", ".join(missing)} (link it above, or the server lacks it).</p>' if missing else ""))
+
+    def missing_songs(user) -> str:
+        """Whether apps that can show songs nothing plays (the extension unavailableSongs) get them."""
+        options = "".join(f'<label class="check"><input type="radio" name="show" value="{v}"{" checked" if int(user["missing_songs"]) == on else ""}> {text}</label>'
+                          for v, on, text in (("show", 1, "Show them in apps that can"), ("hide", 0, "Never show them")))
+        return ('<p class="muted">Recommendations sometimes name songs that neither your library nor any streaming service here has. '
+                'Apps that can (OpenSubsonic extension <code>unavailableSongs</code>) show them dimmed, with their album and artist; '
+                'starring one wants its album. Other apps never get them.</p>'
+                f'<form method="post" action="/account/missing">{options}<button class="primary">Save</button></form>')
+
+    def missing_songs_save(db, request, user, form):
+        if form.get("show") not in ("show", "hide"):
+            return back("/", error="Choose to show or hide them.")
+        accounts.set_field(db, user["name"], missing_songs=int(form["show"] == "show"))
+        return back("/", message="Songs nothing can play: " + ("shown in apps that can." if form["show"] == "show" else "never shown."))
 
     def translation_language(user) -> str:
         options = "".join(f'<option value="{k}"{" selected" if k == user["translate_lang"] else ""}>{escape(v)}</option>'
@@ -704,6 +724,89 @@ def routes(oasis) -> list[Route]:
             return back("/admin", error=f"{e}.")
         accounts.delete(db, name)
         return back("/admin", message=f"Deleted {name}.")
+
+    tidal_login: dict = {}  # a Tidal device sign-in under way: its page, code and when it expires
+
+    def services(db, request, user, form):
+        """The streaming services asked for songs YouTube Music lacks: turned on, or linked with an account."""
+        q, on = request.query_params, oasis.sources.settings(db)
+        linked = {name: json.loads(on[name]) for name in sources.ACCOUNTS if on.get(name)}
+
+        def toggle(name: str, text: str) -> str:
+            state = '<p class="ok">On.</p>' if on.get(name) else '<p class="muted">Off.</p>'
+            action = "off" if on.get(name) else "on"
+            return (f'<section><h2>{KINDS[name].title}</h2><p class="muted">{text}</p>{state}<form method="post" action="/admin/services/{name}/{action}">'
+                    f'<button{" class=primary" if action == "on" else ""}>{"Turn off" if on.get(name) else "Turn on"}</button></form></section>')
+
+        def unlink(name: str) -> str:
+            return (f'<p class="ok">Linked as <b>{escape(linked[name].get("name") or "")}</b>.</p><form method="post" action="/admin/services/{name}/off"'
+                    f'{confirm(f"Unlink {sources.KINDS[name].title}? Its songs stop playing until it is linked again.")}><button class="danger">Unlink</button></form>')
+        qobuz = unlink("qobuz") if "qobuz" in linked else (
+            '<form method="post" action="/admin/services/qobuz"><label>Email<input type="text" name="email" autocomplete="off"></label>'
+            '<label>Password<input type="password" name="password" autocomplete="off"></label><button class="primary">Link</button></form>'
+            '<p class="muted">oasis keeps the sign-in Qobuz gives back, not the password.</p>')
+        pending = tidal_login.get("code") and tidal_login["until"] > time.time()
+        tidal = unlink("tidal") if "tidal" in linked else (
+            f'<p>Open <a href="{escape(tidal_login["url"])}" target="_blank">{escape(tidal_login["url"])}</a> and allow oasis; the code is '
+            f'<b>{escape(tidal_login["code"])}</b>. This page shows when it is linked.</p>' if pending else
+            (f'<p class="error">{escape(tidal_login["error"])}</p>' if tidal_login.get("error") else "")
+            + '<form method="post" action="/admin/services/tidal"><button class="primary">Link</button></form>')
+        body = ('<p class="muted">Songs that Last.fm and ListenBrainz suggest, and that neither the library nor YouTube Music has, are looked '
+                'for here in this order; a song none has can still show in apps as one nothing plays. Their audio is kept in '
+                '<code>streams</code> beside the database after it is first played. These services are used through their apps\' '
+                'own interfaces, not public ones, and may stop working or close an account that streams this way.</p>'
+                '<section><h2>Qobuz</h2><p class="muted">FLAC, with a subscription that streams.</p>' + qobuz + '</section>'
+                '<section><h2>Tidal</h2><p class="muted">FLAC, with a subscription that streams lossless.</p>' + tidal + '</section>'
+                + toggle("bandcamp", "Full songs as 128 kbit/s MP3, where the artist allows it. Only the artist's own page counts.")
+                + toggle("soundcloud", "Full songs as AAC from the artist's own account; songs only SoundCloud Go+ plays in full are left out.")
+                + f'<section><h2>Previews</h2><p class="muted">A song none of the above has can still play a {sources.PREVIEW_SECONDS}-second clip from '
+                'these public catalogues, in this order. Only apps that show songs nothing can play get clips, and so does this dashboard.</p></section>'
+                + toggle("deezer", "MP3 clips from Deezer's public catalogue.")
+                + toggle("apple", "AAC clips from the iTunes Search API."))
+        return page("Streaming services", body, q.get("message", ""), q.get("error", ""), live=bool(pending), tab="home")
+
+    def service_switch(db, request, user, form):
+        name, action = request.path_params["name"], request.path_params["action"]
+        if name not in KINDS or action not in ("on", "off") or action == "on" and name in sources.ACCOUNTS:
+            return back("/admin/services", error="No such service.")
+        oasis.sources.set(db, name, "1" if action == "on" else None)
+        title = KINDS[name].title
+        return back("/admin/services", message=f"{title} is on." if action == "on" else f"{title} is off.")
+
+    def qobuz_link(db, request, user, form):
+        try:
+            account = sources.Qobuz.link(form.get("email", "").strip(), form.get("password", ""))
+        except ValueError as e:
+            return back("/admin/services", error=str(e))
+        except (OSError, LookupError, KeyError) as e:
+            return back("/admin/services", error=f"Qobuz didn't answer as expected: {e}")
+        oasis.sources.set(db, "qobuz", json.dumps(account))
+        return back("/admin/services", message=f"Qobuz linked as {account['name']}.")
+
+    def tidal_link(db, request, user, form):
+        attempt = object()  # this click's sign-in: one started later replaces what the page shows
+
+        def done(account):
+            latest = tidal_login.get("attempt") is attempt
+            if account is None:
+                if latest:
+                    tidal_login.clear()
+                    tidal_login["error"] = "Tidal's sign-in expired before it was allowed. Link again."
+                return
+            own = oasis.connect()
+            try:
+                oasis.sources.set(own, "tidal", json.dumps(account))
+            finally:
+                own.close()
+            if latest:
+                tidal_login.clear()
+        try:
+            started = sources.Tidal.link_start(done)
+        except Exception as e:
+            return back("/admin/services", error=f"Tidal didn't answer: {e}")
+        tidal_login.clear()
+        tidal_login.update(started, attempt=attempt)
+        return back("/admin/services", message="Open the link and allow oasis.")
 
     def catalogue(handler):
         """A music page, for any signed-in user: it needs oasis's own catalogue (acquire.py)."""
@@ -1053,11 +1156,67 @@ def routes(oasis) -> list[Route]:
         body += "".join(wanted_log(db, user, rg, f"/music/library/album/{quote(album_id)}") for rg in {r["mb_release_group"] for r in tracks if r["mb_release_group"]})
         return page(t["album"], body, request.query_params.get("message", ""), request.query_params.get("error", ""), wide=True, tab="library", heading=False)
 
+    def song_star(id: str, starred: bool, here: str) -> str:
+        """Star or unstar of a song nothing can play, which wants its album or lets it go."""
+        label, ask = ("Unstar", confirm("Unstar it? Its album is no longer wanted unless you starred it otherwise.")) if starred else ("Star and want its album", "")
+        return (f'<form class="inline" method="post" action="/music/song/star"{ask}><input type="hidden" name="id" value="{escape(id)}">'
+                f'<input type="hidden" name="on" value="{"" if starred else "1"}"><input type="hidden" name="next" value="{escape(here)}">'
+                f'<button{"" if starred else " class=primary"}>{label}</button></form>')
+
+    def preview(t) -> str:
+        """A player of the clip of a song nothing can play, when it has one."""
+        if not t["preview"]:
+            return ""
+        return f'<audio class="preview" controls preload="none" src="/music/preview/{quote(t["id"])}"></audio>'
+
+    def song_preview(db, request, user, form):
+        r = db.execute("select preview from track where id = ? and source = 'missing'", (request.path_params["id"],)).fetchone()
+        try:
+            clip, content_type = oasis.sources.clip(db, r["preview"]) if r and r["preview"] else (None, None)
+        except Exception as e:
+            log.warning("preview %s failed: %s", r["preview"], e)
+            clip = None
+        return FileResponse(clip, media_type=content_type) if clip else Response(status_code=404)
+
+    def similar_line(db, t, here: str) -> str:
+        where = SOURCE_NAMES.get(t["source"], t["source"])
+        starred = db.execute("select 1 from stat where id = ? and user = me() and starred is not null", (t["id"],)).fetchone()
+        album = missing.album_of(t) if t["source"] == "missing" else None
+        sub = details(t["artist"], t["album"])
+        if t["source"] == "missing":
+            state = preview(t) + " " + pill("only a preview plays" if t["preview"] else "nothing plays it", "bad") + " " + song_star(t["id"], bool(starred), here)
+        else:
+            state = pill(where)
+        return (f'<li>{picture(album or t["album_id"], "small")}<div class="grow"><a href="/music/library/song/{quote(t["id"])}">{escape(t["title"] or "")}</a>'
+                f'<div>{sub}</div></div>{state}</li>')
+
+    def similar_songs(db, user, r, here: str) -> str:
+        """Songs like this one from the user's default radio source, those nothing plays too."""
+        as_user(db, user["name"])  # similar_line reads the user's stars
+        ids = oasis.recommender.similar(db, r, 25, source=user["radio_source"], token=user["listenbrainz_token"], wait=8, unplayable=True)
+        found = [t for id in ids if (t := db.execute("select * from track where id = ?", (id,)).fetchone())]
+        lines = "".join(similar_line(db, t, here) for t in found)
+        return f'<ul class="rows">{lines}</ul>' if lines else '<p class="muted">The radio source found nothing like it.</p>'
+
+    def song_star_save(db, request, user, form):
+        id, here = form.get("id", ""), form.get("next", "")
+        here = here if here.startswith("/music/library/song/") else "/music/library"
+        value = time.time() if form.get("on") else None
+        if not missing.star(db, user["name"], id, value, lambda db, name, ids, value: oasis.want(db, name, "album", ids, value)):
+            return back(here, error="That song isn't one nothing can play.")
+        album = db.execute("select mb_release_group from track where id = ?", (id,)).fetchone()
+        if value:
+            return back(here, message="Starred: its album is wanted." if album and album[0] else
+                        "Starred. MusicBrainz doesn't know its album yet; it is wanted once it does.")
+        return back(here, message="Unstarred.")
+
     def library_song(db, request, user, form):
         r = db.execute("select t.*, s.play_count plays, s.played, s.starred, s.rating from track t left join stat s on s.id = t.id and s.user = ? where t.id = ?",
                        (user["name"], request.path_params["id"])).fetchone()
         if r is None:
             return back("/music/library", error="That song isn't here.")
+        q, here = request.query_params, f"/music/library/song/{quote(r['id'])}"
+        album_id = missing.album_of(r) if r["source"] == "missing" else r["album_id"]
         mine = credits_of(db, [r["id"]]).get(r["id"], [])
         roles: dict[str, list] = {}
         for c in mine:
@@ -1072,16 +1231,27 @@ def routes(oasis) -> list[Route]:
         facts = [*credit_facts, ("Genres", escape(", ".join(json.loads(r["genres"]) if r["genres"] else [r["genre"] or ""]))),
                  ("ISRC", escape(r["isrc"] or "")),
                  ("MusicBrainz", f'<a href="https://musicbrainz.org/recording/{escape(r["mb_recording"])}">recording</a>' if r["mb_recording"] else None),
-                 ("Format", escape(f'{(r["suffix"] or "").upper()} · {r["bitrate"]} kbps · {size(r["size"])}') + quality_pills(db, [r["ref"]])),
+                 ("Format", escape(f'{(r["suffix"] or "").upper()} · {r["bitrate"]} kbps · {size(r["size"])}') + quality_pills(db, [r["ref"]])
+                  if r["source"] != "missing" else None),
+                 ("Plays from", SOURCE_NAMES.get(r["source"], r["source"]) if r["source"] not in ("local", "missing") else None),
                  ("Plays", f'{r["plays"] or 0}' + (f' · last {ago(r["played"])}' if r["played"] else "")),
                  ("Lyrics", ("found" if lyrics[0] else "none found") if lyrics else None),
                  ("Shares audio with", f'<code>{escape(shared)}</code>' if shared else None),
                  ("File", f'<code>{escape(r["ref"])}</code>' if r["source"] == "local" else None)]
-        line = [f'from <a href="/music/library/album/{quote(r["album_id"])}">{escape(r["album"])}</a>', f'disc {r["disc_no"]}' if (r["disc_no"] or 1) > 1 else "",
-                f'track {r["track_no"]}' if r["track_no"] else "", length(r["duration"])]
-        body = hero(picture(r["album_id"]), "Song" + (' · <span class="star">★ starred</span>' if r["starred"] else ""), r["title"],
+        line = [f'by {escape(r["artist"] or "")}' if r["source"] == "missing" else "",
+                f'from <a href="/music/library/album/{quote(album_id)}">{escape(r["album"] or "")}</a>' if album_id else "",
+                f'disc {r["disc_no"]}' if (r["disc_no"] or 1) > 1 else "", f'track {r["track_no"]}' if r["track_no"] else "", length(r["duration"])]
+        body = hero(picture(album_id), "Song" + (' · <span class="star">★ starred</span>' if r["starred"] else ""), r["title"],
                     " · ".join(filter(None, line)), f'<dl class="meta">{dl(facts)}</dl>')
-        return page(r["title"], body, wide=True, tab="library", heading=False)
+        if r["source"] == "missing":
+            clip = f'<p>{preview(r)} <span class="muted">A {sources.PREVIEW_SECONDS}-second preview.</span></p>' if r["preview"] else ""
+            body += (f'<section><h2>Nothing can play it</h2><p class="muted">Neither the library nor any streaming service here has this song. '
+                     f'Starring it wants its album{"" if album_id else ", once MusicBrainz names it"}; once the album is here, the star moves to the song.</p>'
+                     f'{clip}{song_star(r["id"], bool(r["starred"]), here)}</section>')
+        body += ('<section><h2>Similar songs</h2>' + (similar_songs(db, user, r, here) if q.get("similar") else
+                 f'<form method="get" action="{here}"><input type="hidden" name="similar" value="1"><button>Find similar songs</button></form>'
+                 '<p class="muted">From your radio source; this takes a few seconds.</p>') + '</section>')
+        return page(r["title"], body, q.get("message", ""), q.get("error", ""), wide=True, tab="library", heading=False)
 
     def wanted_action(db, request, user, form):
         rg, action = request.path_params["rg"], request.path_params["action"]
@@ -1394,6 +1564,13 @@ def routes(oasis) -> list[Route]:
         Route("/account/youtube/unlink", signed_in(unlink_youtube), methods=["POST"]),
         Route("/account/youtube/playlists", signed_in(youtube_playlists_save), methods=["POST"]),
         Route("/account/radio", signed_in(radio_source_save), methods=["POST"]),
+        Route("/account/missing", signed_in(missing_songs_save), methods=["POST"]),
+        Route("/admin/services", signed_in(services, admin=True)),
+        Route("/admin/services/qobuz", signed_in(qobuz_link, admin=True), methods=["POST"]),
+        Route("/admin/services/tidal", signed_in(tidal_link, admin=True), methods=["POST"]),
+        Route("/admin/services/{name}/{action}", signed_in(service_switch, admin=True), methods=["POST"]),
+        Route("/music/song/star", catalogue(song_star_save), methods=["POST"]),
+        Route("/music/preview/{id}", signed_in(song_preview)),
         Route("/account/translation", signed_in(translation_language_save), methods=["POST"]),
         Route("/account/lastfm", signed_in(lastfm_start)),
         Route("/account/lastfm/callback", signed_in(lastfm_callback), name="lastfm_callback"),

@@ -17,7 +17,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import accounts, acquire, artists, cover, forward, lastfm, latin, lyrics, mixes, musicbrainz, playlists, romanize, tracks, transcode, translate, upload, youtube, ytm
+from . import accounts, acquire, artists, cover, forward, lastfm, latin, lyrics, missing, mixes, musicbrainz, playlists, romanize, sources, tracks, transcode, translate, upload, youtube, ytm
 from .credits import credits_of, people
 from .db import as_user, set_stat
 from .playlists import RADIO, is_radio, set_entries, touch
@@ -77,6 +77,9 @@ class Params:
         self.multi = [*request.query_params.multi_items(), *parse_qsl(body.decode())]
         self.range = request.headers.get("range")
         self.oasis = self.get("oasis") == "1"  # the oasis extension (docs/oasis-extension.md)
+        # The unavailableSongs extension (docs/unavailable-songs-extension.md): songs nothing can play are sent when the
+        # client asks and its user wants them (set once signed in, as the user's choice decides).
+        self.missing = False
         self.address = accounts.client_address(request)
 
     def get(self, key: str, default=None):
@@ -143,18 +146,57 @@ def song_row(db, id):
 
 
 def song(r) -> dict:
+    """A track as Subsonic gives a song. A song nothing can play (missing.py) has playable false and goes by its
+    MusicBrainz-only album (al-mb-), which can be starred to want it."""
     root = Path(r["root"] or "/")
+    unplayable = r["source"] == "missing"
+    album_id = missing.album_of(r) if unplayable else r["album_id"]
     return clean({
-        "id": r["id"], "parent": r["album_id"], "isDir": False, "title": r["title"], "album": r["album"],
+        "id": r["id"], "parent": album_id, "isDir": False, "title": r["title"], "album": r["album"],
         "artist": r["artist"], "track": r["track_no"], "discNumber": r["disc_no"], "year": r["year"],
-        "genre": r["genre"], "coverArt": r["album_id"] if r["cover"] else None, "size": r["size"],
+        "genre": r["genre"], "coverArt": album_id if r["cover"] else None, "size": r["size"],
         "contentType": r["content_type"], "suffix": r["suffix"], "duration": r["duration"],
         "bitRate": r["bitrate"], "path": str(Path(r["ref"]).relative_to(root)) if r["source"] == "local" else None,
-        "albumId": r["album_id"], "artistId": r["artist_id"], "type": "music", "mediaType": "song",
+        "albumId": album_id, "artistId": r["artist_id"], "type": "music", "mediaType": "song",
         "created": iso(r["created"]), "starred": iso(r["starred"]), "userRating": r["rating"],
         "playCount": r["play_count"] or 0, "played": iso(r["played"]), "youtubeId": r["ytm_id"] or None,
-        "shareUrl": f"https://music.youtube.com/watch?v={r['ytm_id']}" if r["ytm_id"] else None,  # the shareUrl extension
+        # the shareUrl extension
+        "shareUrl": f"https://music.youtube.com/watch?v={r['ytm_id']}" if r["ytm_id"] else sources.share_url(r["source"], r["ref"]),
+        "playable": False if unplayable else None,
+        "preview": sources.PREVIEW_SECONDS if unplayable and r["preview"] else None,  # stream plays this many seconds of it
     })
+
+
+def playable_only(value):
+    """value without the songs nothing can play, for clients that didn't ask for them (Params.missing)."""
+    if isinstance(value, dict):
+        return {k: playable_only(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [playable_only(v) for v in value if not (isinstance(v, dict) and v.get("playable") is False)]
+    return value
+
+
+def with_hidden(old: list[tuple[str, bool]], new: list[str]) -> list[str]:
+    """A playlist's new entries from a client, with the entries it doesn't see (entries_of) kept: each after the song
+    it followed, if still there, else at the end. old: the entries as (track id, hidden)."""
+    after, before = {}, None
+    for id, hidden in old:
+        if hidden:
+            after.setdefault(before, []).append(id)
+        else:
+            before = id
+    kept = after.pop(None, [])
+    for id in new:
+        kept += [id, *after.pop(id, [])]
+    return kept + [id for ids in after.values() for id in ids]
+
+
+def entries_of(db, playlist_id: str, missing: bool) -> list[tuple[str, bool]]:
+    """A playlist's entries in order as (track id, hidden): a song nothing can play, for a client that doesn't take
+    those (missing is Params.missing)."""
+    rows = db.execute("select e.track_id, t.source from playlist_entry e left join track t on t.id = e.track_id "
+                      "where e.playlist_id = ? order by e.pos", (playlist_id,))
+    return [(id, source == "missing" and not missing) for id, source in rows]
 
 
 def wanted(state: str | None, error: str | None) -> dict:
@@ -471,7 +513,8 @@ class Api:
 
     def getOpenSubsonicExtensions(self, db, p, user):
         return {"openSubsonicExtensions": [{"name": name, "versions": versions} for name, versions in (
-            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]), ("shareUrl", [1]), ("oasis", [1, 2, 3]))]}
+            ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]), ("shareUrl", [1]),
+            ("unavailableSongs", [1]), ("oasis", [1, 2, 3]))]}
 
     def _user(self, row) -> dict:
         roles = ("scrobbling", "settings", "download", "playlist", "coverArt", "comment", "stream", "share")
@@ -579,7 +622,7 @@ class Api:
 
     def _artist_albums(self, db, artist_id):
         # Albums seen only in streaming search results stay hidden unless the artist has nothing in the library.
-        sql = ALBUMS + " where t.artist_id = ? and t.library >= ? group by t.album_id order by year, name"
+        sql = ALBUMS + " where t.artist_id = ? and t.library >= ? and t.source != 'missing' group by t.album_id order by year, name"
         return [album(r) for r in db.execute(sql, (artist_id, 1))] or [album(r) for r in db.execute(sql, (artist_id, 0))]
 
     def _album_songs(self, db, album_id):
@@ -628,8 +671,10 @@ class Api:
 
     def getAlbum(self, db, p, user):
         if tracks.mbid_of(id := p.need("id")):
-            return {"album": {**self._mb_album(db, self._musicbrainz(musicbrainz.release_group, tracks.mbid_of(id), db)),
-                              "song": []}}  # nothing to play until it arrives
+            found = self._mb_album(db, self._musicbrainz(musicbrainz.release_group, tracks.mbid_of(id), db))
+            # Nothing to play until it arrives; clients that take songs nothing plays get its songs to see and star.
+            ids = self._musicbrainz(missing.album_songs, db, tracks.mbid_of(id)) if p.missing else []
+            return {"album": {**found, "song": [song(required(song_row(db, i))) for i in ids]}}
         self.oasis.youtube.complete_album(db, id)
         songs = self._album_songs(db, id)
         if found := self._library_album(db, id, songs):
@@ -646,6 +691,8 @@ class Api:
 
     def getSong(self, db, p, user):
         r = required(song_row(db, p.need("id")))
+        if r["source"] == "missing" and not p.missing:  # unknown to a client that doesn't take songs nothing can play
+            required(None)
         if r["ytm_id"] is None and self.oasis.ytm:  # for share links
             try:
                 youtube.video_of(db, r, self.oasis.ytm)
@@ -846,7 +893,7 @@ class Api:
             return db.execute("select id from stat where user = me() and starred is not null and id like ? order by starred desc", (prefix + "%",)).fetchall()
         return {
             "artist": [a for r in ids(IDS["artist"]) for a in ([artist(required(artist_row(db, r["id"])))]
-                                                      if db.execute("select 1 from track where artist_id = ?", (r["id"],)).fetchone()
+                                                      if db.execute("select 1 from track where artist_id = ? and source != 'missing'", (r["id"],)).fetchone()
                                                       else self._starred_mb(db, "artist", r["id"]) if p.oasis else [])],
             "album": [a for r in ids(IDS["album"]) for a in ([album(required(album_row(db, r["id"])))]
                                                      if db.execute("select 1 from track where album_id = ?", (r["id"],)).fetchone()
@@ -874,8 +921,10 @@ class Api:
         return {"starred": self._starred(db, p)}
 
     def _set_starred(self, db, p, value, user):
+        want_albums = lambda db, user, ids, value: self.oasis.want(db, user, "album", ids, value)
         for id in p.all("id"):
-            set_stat(db, user, id, "starred", value)
+            if not missing.star(db, user, id, value, want_albums):  # a song nothing plays wants its album
+                set_stat(db, user, id, "starred", value)
         touch(db, p.all("id"), self.oasis.youtube.fetch_soon)
         self.oasis.want(db, user, "album", p.all("albumId"), value)
         self.oasis.want(db, user, "artist", p.all("artistId"), value)
@@ -988,9 +1037,17 @@ class Api:
         except Exception as e:
             log.info("Last.fm artist info failed: %s", e)
             return {**youtube, **clean({"similarArtist": linked or None})}
-        names = lastfm.similar_artists(info)[:p.int("count", 20)]
-        similar = [artist(a) for name in names for a in db.execute(
-            ARTISTS + " where t.library = 1 and t.album_artist = ? collate nocase group by t.artist_id", (name,))]
+        # Subsonic's includeNotPresent: the similar artists the library lacks too, those Last.fm knows the MusicBrainz id of,
+        # as artists only MusicBrainz has (ar-mb-), which can be opened and followed.
+        absent = p.get("includeNotPresent") == "true"
+        similar = []
+        for name, mbid in lastfm.similar_artists(info)[:p.int("count", 20)]:
+            present = [artist(a) for a in db.execute(ARTISTS + " where t.library = 1 and t.album_artist = ? collate nocase group by t.artist_id", (name,))]
+            if not present and absent and mbid:
+                own = tracks.current_id(db, MB_IDS["artist"] + mbid)
+                present = [artist(required(artist_row(db, own)))] if not own.startswith(MB_IDS["artist"]) else \
+                    [clean({"id": own, "name": name, "albumCount": 0, "musicBrainzId": mbid, **self._wanted(db, "artist", own)})]
+            similar += present
         similar = linked + [a for a in similar if a["id"] not in {x["id"] for x in linked}]
         return {**youtube, **clean({"biography": lastfm.bio(info), "lastFmUrl": info.get("url"),
                                     "musicBrainzId": info.get("mbid") or None, "similarArtist": similar or None})}
@@ -1031,7 +1088,7 @@ class Api:
         source = self._source(p, account)
         # A player waits for this answer with nothing to play next, so a slow source is left out rather than waited for.
         ids = self.oasis.recommender.similar(db, seed, min(p.int("count", 50), 200), source=source, token=account["listenbrainz_token"],
-                                             wait=SIMILAR_WAIT)
+                                             wait=SIMILAR_WAIT, unplayable=p.missing)
         self.oasis.youtube.warm(db, ids[:WARM])
         return {"song": [song(required(song_row(db, i))) for i in ids], "oasisSource": source}
 
@@ -1074,14 +1131,16 @@ class Api:
     def getPlayQueue(self, db, p, user):
         return {}
 
-    def _playlist(self, db, r, entries: bool) -> dict:
+    def _playlist(self, db, r, entries: bool, unplayable: bool) -> dict:
+        """unplayable: songs nothing can play count and come too (Params.missing)."""
         if entries:
             songs = [song(s) for s in db.execute(
-                SONGS + " join playlist_entry e on e.track_id = t.id where e.playlist_id = ? order by e.pos", (r["id"],))]
+                SONGS + " join playlist_entry e on e.track_id = t.id where e.playlist_id = ? and (? or t.source != 'missing') order by e.pos",
+                (r["id"], unplayable))]
             count, duration = len(songs), sum(s.get("duration", 0) for s in songs)
         else:
             count, duration = db.execute("select count(*), coalesce(sum(t.duration), 0) from playlist_entry e join track t on t.id = e.track_id "
-                                         "where e.playlist_id = ?", (r["id"],)).fetchone()
+                                         "where e.playlist_id = ? and (? or t.source != 'missing')", (r["id"], unplayable)).fetchone()
         result = clean({
             "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": mixes.OWNER if r["mix"] else r["owner"], "public": False,
             "coverArt": IDS["playlist"] + str(r["id"]) if r["cover"] else None,
@@ -1096,7 +1155,7 @@ class Api:
 
     def getPlaylists(self, db, p, user):
         rows = sorted(db.execute("select * from playlist where owner = ? and hidden = 0", (user,)), key=mixes.playlist_order)
-        return {"playlists": {"playlist": [self._playlist(db, r, False) for r in rows]}}
+        return {"playlists": {"playlist": [self._playlist(db, r, False, p.missing) for r in rows]}}
 
     def _own_playlist(self, db, id, user):
         r = self._one(db, "select * from playlist where id = ? and owner = ? and hidden = 0", id, user)
@@ -1109,7 +1168,7 @@ class Api:
         if r["radio"]:
             self.oasis.youtube.warm(db, [e[0] for e in db.execute("select track_id from playlist_entry where playlist_id = ? and pos > ? "
                                                                   "order by pos limit ?", (r["id"], r["played_pos"], WARM))])
-        return {"playlist": self._playlist(db, r, True)}
+        return {"playlist": self._playlist(db, r, True, p.missing)}
 
     def createPlaylist(self, db, p, user):
         """With the oasis extension's oasisSource or oasisStation, a radio whatever its name, filled before the answer."""
@@ -1129,14 +1188,17 @@ class Api:
             radio = RADIO if source or station else is_radio(name)
             playlist_id = playlists.create(db, user, name, radio, source=(source or account["radio_source"]) if radio else None,
                                            station=station, period=period)
-        set_entries(db, playlist_id, p.all("songId"), self.oasis.youtube.fetch_soon)
+        songs = p.all("songId")
+        if p.get("playlistId"):  # a client that rewrites a playlist keeps what it doesn't see
+            songs = with_hidden(entries_of(db, playlist_id, p.missing), songs)
+        set_entries(db, playlist_id, songs, self.oasis.youtube.fetch_soon)
         if source or station:
             try:
                 recommender.top_up(db, self._one(db, "select * from playlist where id = ?", playlist_id))
             except Exception:
                 log.exception("radio fill failed")
         recommender.wake()
-        return {"playlist": self._playlist(db, self._own_playlist(db, playlist_id, user), True)}
+        return {"playlist": self._playlist(db, self._own_playlist(db, playlist_id, user), True, p.missing)}
 
     def updatePlaylist(self, db, p, user):
         r = self._own_playlist(db, p.need("playlistId"), user)
@@ -1144,11 +1206,13 @@ class Api:
             playlists.rename(db, r["id"], name)
         if (comment := p.get("comment")) is not None:
             db.execute("update playlist set comment = ?, changed = ? where id = ?", (comment, time.time(), r["id"]))
-        entries = [e["track_id"] for e in db.execute("select track_id from playlist_entry where playlist_id = ? order by pos", (r["id"],))]
+        old = entries_of(db, r["id"], p.missing)
+        shown = [t for t, hidden in old if not hidden]  # what the client's indexes count
         removed = {int(i) for i in p.all("songIndexToRemove")}
         added = p.all("songIdToAdd")
         if removed or added:
-            set_entries(db, r["id"], [t for i, t in enumerate(entries) if i not in removed] + added, self.oasis.youtube.fetch_soon)
+            songs = [t for i, t in enumerate(shown) if i not in removed] + added
+            set_entries(db, r["id"], with_hidden(old, songs), self.oasis.youtube.fetch_soon)
         self.oasis.recommender.wake()
         return {}
 
@@ -1221,9 +1285,28 @@ class Api:
         return Response(image[0], media_type=image[1], headers={"Cache-Control": "public, max-age=86400"})
 
     def stream(self, db, p, user):
-        r = self._one(db, "select source, ref, content_type, suffix, bitrate from track where id = ?", p.need("id"))
+        r = self._one(db, "select source, ref, content_type, suffix, bitrate, preview from track where id = ?", p.need("id"))
+        if r["source"] == "missing" and not r["preview"]:
+            raise Fail(NOT_FOUND, missing.NOT_PLAYABLE)
+        if r["source"] == "missing":  # only its preview plays
+            try:
+                clip, content_type = self.oasis.sources.clip(db, r["preview"])
+            except Exception as e:
+                log.warning("preview %s failed: %s", r["preview"], e)
+                raise Fail(NOT_FOUND, missing.NOT_PLAYABLE)
+            return FileResponse(clip, media_type=content_type)
         target = transcode.target(p.get("format"), p.int("maxBitRate", 0), r["suffix"], r["bitrate"])
         source = r["ref"]
+        if r["source"] in sources.KINDS:  # another streaming service's song: its audio is cached when first played
+            try:
+                source = self.oasis.sources.audio(db, r["source"], r["ref"])
+            except Exception as e:
+                log.warning("%s audio of %s failed: %s", r["source"], r["ref"], e)
+                raise Fail(NOT_FOUND, "Stream unavailable")
+            target = transcode.target(p.get("format"), p.int("maxBitRate", 0), source.suffix[1:], r["bitrate"])  # the format that came
+            if target:
+                return transcode.stream(str(source), *target, p.int("timeOffset", 0))
+            return FileResponse(source, media_type=sources.content_type(source))
         if r["source"] == "ytm":
             if not self.oasis.ytm:
                 raise Fail(NOT_FOUND, "YouTube Music is not enabled")
@@ -1307,10 +1390,12 @@ def routes(oasis) -> list[Route]:
             try:
                 user = api._authenticate(db, p)
                 as_user(db, user)
+                p.missing = p.get("unavailableSongs") == "1" and bool(accounts.get(db, user)["missing_songs"])
                 p.follow_moves(db)
                 result = handler(api, db, p, user)
                 if isinstance(result, Response):
                     return result
+                result = result if p.missing else playable_only(result)
                 return respond(fmt, romanized(describe(db, result if p.oasis else plain(result)), p.get("romanization"),
                                                      latin.curated(db) if p.get("romanization") in ("both", "latin") else None))
             except Fail as e:
