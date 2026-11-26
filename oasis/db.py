@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from itertools import combinations
 from pathlib import Path
 
@@ -293,6 +294,20 @@ def connect(path: Path) -> sqlite3.Connection:
             step(db)
         migrated.add(path)
     return db
+
+
+@contextmanager
+def transaction(db: sqlite3.Connection):
+    """The statements in the block as one transaction, on a connection that otherwise commits each statement. It takes
+    the write lock at once: a transaction that read first can't write after another connection has ("database is
+    locked")."""
+    db.execute("begin immediate")
+    try:
+        yield
+    except BaseException:
+        db.execute("rollback")
+        raise
+    db.execute("commit")
 
 
 def as_user(db: sqlite3.Connection, user: str | None):

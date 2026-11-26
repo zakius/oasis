@@ -8,12 +8,15 @@ import mutagen
 
 from . import pcm
 from .credits import store
+from .db import transaction
 from .tracks import adopt_local_copies, album_id, artist_id, name_id, track_id
 from .formats import AUDIO, PCM, is_cover, suffix
 from .relocate import repoint
 from .tags import first, labels, number, pictures, tag_credits, values
 
 log = logging.getLogger(__name__)
+
+WRITE_EVERY = 0.5  # seconds of reading files between the scan's writes
 
 
 def folder_cover(directory: Path) -> str | None:
@@ -57,10 +60,30 @@ def read(path: Path, root: Path, covers: dict[Path, str | None]) -> dict | None:
     }
 
 
+def write(db: sqlite3.Connection, rows: list[tuple[dict, dict | None]]):
+    """Writes tracks read (row, and the track known at its path before), with their credits, in one transaction."""
+    with transaction(db):
+        for row, had in rows:
+            row["id"] = had["id"] if had else row["id"]
+            credits, mbids = row.pop("_credits"), row.pop("_albumartist_mbids") or []
+            row["artist_id"] = artist_id(db, row["album_artist"], mbids[0] if len(mbids) == 1 else None)
+            columns = ", ".join(row)
+            updates = ", ".join(f"{k} = excluded.{k}" for k in row if k not in ("id", "created"))
+            # MusicBrainz credits stay while the file is still the same release track.
+            db.execute(f"insert into track({columns}) values ({', '.join('?' * len(row))}) "
+                       f"on conflict(id) do update set {updates}, credits_at = case when track.mb_track is excluded.mb_track "
+                       "and track.mb_release is excluded.mb_release then track.credits_at end", list(row.values()))
+            store(db, row["id"], credits, "tags")
+
+
 def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
     # A file keeps the id it was first scanned with when relocate.py renames it: stars, plays and playlists hang on it.
     known = {r["ref"]: r for r in db.execute("select ref, id, mtime from track where source = 'local'")}
     seen, covers, changed = set(), {}, 0
+    # Tracks are written a few folders at a time, whole folders only: a scan stopped midway leaves no album half
+    # written, and the next one reads what it didn't write. Files are read outside the transaction, which keeps the
+    # write lock short for the requests and workers writing meanwhile.
+    read_rows, last_write = [], time.monotonic()
     for root in roots:
         for directory, folders, files in os.walk(root):
             for name in files:
@@ -68,11 +91,11 @@ def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
                 if suffix(path) not in AUDIO:
                     continue
                 if suffix(path) in PCM and (new := pcm.convert(path)):  # a WAV slipped in: FLAC, keeping its id
-                    repoint(db, str(path), str(new))
+                    with transaction(db):
+                        repoint(db, str(path), str(new))
                     if old := known.pop(str(path), None):
                         known[str(new)] = old
                     path = new
-                    db.commit()
                 seen.add(str(path))
                 if (had := known.get(str(path))) and had["mtime"] == path.stat().st_mtime:
                     continue
@@ -82,21 +105,17 @@ def scan(db: sqlite3.Connection, roots: list[Path]) -> int:
                     log.warning("skipping %s: %s", path, e)
                     continue
                 if row:
-                    row["id"] = had["id"] if had else row["id"]
-                    credits, mbids = row.pop("_credits"), row.pop("_albumartist_mbids") or []
-                    row["artist_id"] = artist_id(db, row["album_artist"], mbids[0] if len(mbids) == 1 else None)
-                    columns = ", ".join(row)
-                    updates = ", ".join(f"{k} = excluded.{k}" for k in row if k not in ("id", "created"))
-                    # MusicBrainz credits stay while the file is still the same release track.
-                    db.execute(f"insert into track({columns}) values ({', '.join('?' * len(row))}) "
-                               f"on conflict(id) do update set {updates}, credits_at = case when track.mb_track is excluded.mb_track "
-                               "and track.mb_release is excluded.mb_release then track.credits_at end", list(row.values()))
-                    store(db, row["id"], credits, "tags")
+                    read_rows.append((row, had))
                     changed += 1
+            if read_rows and time.monotonic() - last_write >= WRITE_EVERY:
+                write(db, read_rows)
+                read_rows, last_write = [], time.monotonic()
+    write(db, read_rows)
     gone = [ref for ref in known if ref not in seen]
-    # Only the tracks go. What is known of their files (dedupe's and quality's records, lyrics, credits) waits for them:
-    # a library folder that is unmounted for a scan comes back whole.
-    db.executemany("delete from track where ref = ?", [(ref,) for ref in gone])
-    adopted = adopt_local_copies(db) if changed else 0
+    with transaction(db):
+        # Only the tracks go. What is known of their files (dedupe's and quality's records, lyrics, credits) waits for
+        # them: a library folder that is unmounted for a scan comes back whole.
+        db.executemany("delete from track where ref = ?", [(ref,) for ref in gone])
+        adopted = adopt_local_copies(db) if changed else 0
     log.info("scan: %d updated, %d removed, %d streams now local", changed, len(gone), adopted)
     return changed + len(gone)
