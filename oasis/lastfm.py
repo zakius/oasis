@@ -16,9 +16,14 @@ OPEN_KEY, OPEN_SECRET = hashlib.md5(b"oasis").hexdigest(), "oasis"
 
 
 def answer(status: int, body: bytes) -> dict:
-    result = json.loads(body or b"{}")
+    try:
+        result = json.loads(body or b"{}")
+    except ValueError:
+        check(status, body, "Last.fm")  # a server without the method may answer with a page: a refusal
+        raise OSError(f"Last.fm: HTTP {status} without JSON") from None
     if "error" in result:
-        # 11 and 16 are temporary outages, 29 is the rate limit; everything else is a real refusal.
+        # 11 and 16 are temporary outages, 29 is the rate limit; everything else is a real refusal, 3 (no such method)
+        # too, from a server that doesn't love tracks.
         if result["error"] in (11, 16, 29):
             raise OSError(f"Last.fm: {result.get('message')}")
         raise Rejected(f"Last.fm: {result.get('message')}")
@@ -27,6 +32,8 @@ def answer(status: int, body: bytes) -> dict:
 
 
 class LastFm:
+    likes = ("song",)  # a starred song is loved (forward.py)
+
     def __init__(self, api_key: str, secret: str, session: str | None, api: str = LASTFM, auth: str = LASTFM_AUTH):
         """api and auth: the server's API and the page where its users allow oasis, Last.fm's unless another's."""
         self.api_key, self.secret, self.session, self.api, self.auth = api_key, secret, session, api, auth
@@ -81,6 +88,14 @@ class LastFm:
 
     def now_playing(self, listen):
         self.call({"method": "track.updateNowPlaying", "sk": self.session, **self.track_params(listen)})
+
+    def find_liked(self, db, item) -> str:
+        """Last.fm loves a song by its artist and title, which it needn't know yet."""
+        return json.dumps([item.artist, item.title])
+
+    def like(self, kind: str, song: str, on: bool):
+        artist, title = json.loads(song)
+        self.call({"method": "track.love" if on else "track.unlove", "sk": self.session, "artist": artist, "track": title})
 
 
 def similar_artists(info: dict) -> list[tuple[str, str | None]]:

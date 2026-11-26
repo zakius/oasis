@@ -253,6 +253,8 @@ These use standard fields only, so they are not part of the parameter:
   `getAlbum` opens it.
 - `star`/`unstar` with `albumId` or `artistId` asks the server to acquire the album or the artist's albums, or takes
   that back. Stars, ratings and play counts are each user's.
+- `star` likes the song, album or artist on the user's services that keep such likes, and `unstar` takes back those
+  likes, in the background, as the README describes. `scrobble` sends plays the same way.
 - Playlists named `Radio …` add similar songs as they are played.
 - Ids a client keeps (a stream that became a library file, an `ar-mb-`/`al-mb-` id that arrived, another name of an
   artist) keep working.

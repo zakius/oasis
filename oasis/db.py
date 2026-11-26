@@ -87,9 +87,17 @@ create table if not exists playlist(
     radio_source text,              -- a radio's source (recommend.SOURCES); null: its owner's default
     station text, period text       -- a station's kind (recommend.STATIONS) and Last.fm period: seeds from the owner's Last.fm
 );
-create table if not exists outbox(
-    id integer primary key, user text not null, service text not null, track_id text not null, played real not null,
-    attempts int not null default 0, next_try real not null
+create table if not exists outbox(  -- what each user did, waiting for each of their services to take it (forward.py)
+    id integer primary key, user text not null, service text not null,
+    track_id text not null,         -- the track played, or the track, album or artist liked or unliked
+    played real not null,           -- when it was played or liked
+    attempts int not null default 0, next_try real not null,
+    action text not null default 'play'  -- play, like or unlike
+);
+create table if not exists liked(  -- what oasis liked on each user's services, for an unstar to take back (forward.py)
+    user text not null, service text not null, id text not null,  -- id: the track, album or artist starred
+    key text not null,              -- the service's own id of it
+    primary key(user, service, id)
 );
 create table if not exists user(
     name text primary key, password text not null, admin int not null default 0, created real not null,  -- password: the dashboard's, hashed (accounts.py)

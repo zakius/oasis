@@ -1,5 +1,10 @@
-"""Forwards plays to Last.fm, ListenBrainz and YouTube Music history, and to the other servers each user added
-(servers.py), retrying until each service takes them, each on its own."""
+"""Forwards each user's plays and likes (Subsonic stars) to the services they use, through the outbox, retrying until
+each service takes them, each on its own. Plays go to Last.fm, ListenBrainz, YouTube Music's history, SoundCloud's
+listening history and the other servers each user added (servers.py). A starred song is loved on Last.fm and the
+servers that speak its API, loved on ListenBrainz and the servers like it when MusicBrainz knows the recording, liked on
+YouTube Music and SoundCloud, and made a favourite on Tidal and Qobuz; a starred album is saved on YouTube Music, Tidal
+and Qobuz, and a starred artist on Tidal and Qobuz. A service that doesn't have it gets nothing. An unstar takes back
+what the star did, on the same service's song, album or artist (the liked table)."""
 import json
 import logging
 import threading
@@ -9,10 +14,11 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from . import worker
+from . import musicbrainz, worker
 from .lastfm import LastFm, elsewhere, signs_in
 from .remote import Rejected, check, post, send
-from .tracks import outside_names
+from .sources import KINDS
+from .tracks import IDS, album_name_of, artist_name_of, mbid_of, outside_names
 from .youtube import video_of
 from .ytm import WATCH
 
@@ -33,6 +39,44 @@ class Listen:
     duration: int | None
     played: float
     ytm_id: str | None
+
+
+@dataclass
+class Item:
+    """A song, album or artist a user starred, as services find it."""
+    kind: str             # song, album or artist
+    id: str               # oasis's
+    artist: str
+    title: str | None     # the song's or album's
+    mbid: str | None      # a song's MusicBrainz recording
+    track: object = None  # a song's track row
+
+
+def kind_of(id: str) -> str:
+    """What a starred id is: an album, an artist, else a song."""
+    if id.startswith(IDS["album"]):
+        return "album"
+    return "artist" if id.startswith(IDS["artist"]) else "song"
+
+
+def item_of(db, id: str) -> Item | None:
+    """The starred song, album or artist, by the names the library or MusicBrainz gives it; None when neither knows it."""
+    kind, mbid = kind_of(id), mbid_of(id)
+    if kind == "song":
+        r = db.execute("select * from track where id = ?", (id,)).fetchone()
+        if r is None:
+            return None
+        return Item("song", id, outside_names(r)[0], r["title"], r["mb_recording"], r)
+    if kind == "album":
+        if found := album_name_of(db, id):
+            return Item("album", id, found["name"], found["title"], None)
+        if mbid:
+            group = musicbrainz.release_group(mbid, db)
+            credit = group.get("artist-credit") or []
+            return Item("album", id, credit[0]["name"] if credit else "", group["title"], None)
+        return None
+    name = artist_name_of(db, id) or (musicbrainz.artist(mbid, db)["name"] if mbid else None)
+    return Item("artist", id, name, None, None) if name else None
 
 
 class ListenBrainz:
@@ -57,8 +101,19 @@ class ListenBrainz:
         body = json.dumps({"listen_type": kind, "payload": [entry]}).encode()
         check(*post(self.api + "submit-listens", body, self.headers() | {"Content-Type": "application/json"}), "ListenBrainz")
 
+    likes = ("song",)
+
     def scrobble(self, listen: Listen):
         self.submit("single", listen)
+
+    def find_liked(self, db, item: Item) -> str | None:
+        """Feedback is given to a MusicBrainz recording."""
+        return item.mbid
+
+    def like(self, kind: str, recording: str, on: bool):
+        """Loves the recording, or takes the love back (score 0)."""
+        body = json.dumps({"recording_mbid": recording, "score": 1 if on else 0}).encode()
+        check(*post(self.api + "feedback/recording-feedback", body, self.headers() | {"Content-Type": "application/json"}), "ListenBrainz")
 
     def read(self, path: str, **query) -> dict:
         url = self.api + path + ("?" + urllib.parse.urlencode(query) if query else "")
@@ -119,8 +174,10 @@ def expired(when: str) -> bool:
     return (moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)) < datetime.now(timezone.utc)
 
 
-class YouTubeMusicHistory:
-    """Adds plays to YouTube Music's history, which feeds its recommendations, also for plays of local copies."""
+class YouTubeMusicAccount:
+    """The user's YouTube Music account: plays go to its history, which feeds its recommendations, also for plays of
+    local copies; a starred song gets its like, and a starred album joins its library."""
+    likes = ("song", "album")
 
     def __init__(self, ytm, client):
         self.ytm, self.client = ytm, client
@@ -133,9 +190,66 @@ class YouTubeMusicHistory:
     def now_playing(self, listen: Listen):
         pass
 
+    def find_liked(self, db, item: Item) -> str | None:
+        """A song's video, or the playlist of an album's songs, which is what YouTube Music saves to the library."""
+        if item.kind == "song":
+            return video_of(db, item.track, self.ytm)
+        page = db.execute("select ytm_album from track where album_id = ? and ytm_album is not null union all "
+                          "select browse_id from ytm_release where album_id = ? limit 1", (item.id, item.id)).fetchone()
+        return self.ytm.album_playlist(item.artist, item.title, page and page[0])
+
+    def like(self, kind: str, target: str, on: bool):
+        self.ytm.rate(self.client, kind, target, on)
+
+
+class Favourites:
+    """The user's favourites on one of their streaming services (sources.Sources.liking): Tidal's and Qobuz's songs,
+    albums and artists, SoundCloud's liked tracks. A song is found by its id there when it is one of that service's
+    tracks or the service's answer to a search is kept (kept: recommend.Recommender.kept), else by a search."""
+
+    def __init__(self, kind, start, kept=lambda question: None):
+        """kind: the service's client class (sources.KINDS); start() gives the user's client of it, None when it fails."""
+        self.likes, self.start, self.kept = kind.likes, start, kept
+
+    def client(self):
+        client = self.start()
+        if client is None:
+            raise OSError("the service didn't start")
+        return client
+
+    def find_liked(self, db, item: Item) -> str | None:
+        client = self.client()
+        if item.kind == "album":
+            return client.find_album(item.artist, item.title)
+        if item.kind == "artist":
+            return client.find_artist(item.artist)
+        if item.id.startswith(client.prefix):  # one of this service's songs
+            return item.id.removeprefix(client.prefix)
+        if kept := self.kept(("find", client.name, getattr(client, "variant", ""), item.artist, item.title)):
+            answer, _ = kept[0]  # (client, song), or None when it hasn't the song
+            return answer[1]["id"] if answer else None
+        found = client.find(item.artist, item.title)
+        return found["id"] if found else None
+
+    def like(self, kind: str, id: str, on: bool):
+        self.client().favourite(kind, id, on)
+
+
+class SoundCloudAccount(Favourites):
+    """The user's SoundCloud account: also its listening history, for each play of a song SoundCloud has."""
+
+    def scrobble(self, listen: Listen):
+        found = self.find_liked(None, Item("song", listen.track_id, listen.artist, listen.title, None))
+        if found is None:
+            raise Rejected(f"SoundCloud has no {listen.artist} - {listen.title}")
+        self.client().add_history(found)
+
+    def now_playing(self, listen: Listen):
+        pass
+
 
 class Forwarder:
-    """Keeps plays in the database outbox until every service the user linked has taken them."""
+    """Keeps plays and likes in the database outbox until every service the user linked has taken them."""
 
     def __init__(self, connect, services_for, ytm=None):
         """services_for(db, user) returns the user's services by name. ytm finds the YouTube Music video of a play
@@ -145,11 +259,23 @@ class Forwarder:
 
     def enqueue(self, db, user: str, track_id: str, played: float):
         db.executemany("insert into outbox(user, service, track_id, played, next_try) values (?, ?, ?, ?, 0)",
-                       [(user, name, track_id, played) for name in self.services_for(db, user)])
+                       [(user, name, track_id, played) for name, service in self.services_for(db, user).items()
+                        if hasattr(service, "scrobble")])
+        self.wake.set()
+
+    def like(self, db, user: str, ids: list[str], on: bool):
+        """Sends the user's star (on) or unstar of songs, albums and artists to each of their services that keeps such
+        likes. A like or unlike still waiting is replaced: only the newest says what the user wants."""
+        services, now = self.services_for(db, user), time.time()
+        for id in ids:
+            db.execute("delete from outbox where user = ? and track_id = ? and action != 'play'", (user, id))
+            db.executemany("insert into outbox(user, service, track_id, action, played, next_try) values (?, ?, ?, ?, ?, 0)",
+                           [(user, name, id, "like" if on else "unlike", now) for name, service in services.items()
+                            if kind_of(id) in getattr(service, "likes", ())])
         self.wake.set()
 
     def now_playing(self, db, user: str, listen: Listen):
-        services = self.services_for(db, user)
+        services = {name: s for name, s in self.services_for(db, user).items() if hasattr(s, "now_playing")}
 
         def send():
             for name, service in services.items():
@@ -173,23 +299,47 @@ class Forwarder:
 
     def send(self, db, entry):
         service = self.services_for(db, entry["user"]).get(entry["service"])
-        listen = self.listen(db, entry)
         try:
             if service is None:
                 raise Rejected(f"{entry['user']} unlinked {entry['service']}")
-            if listen is None:
-                raise Rejected(f"track {entry['track_id']} is gone")
-            service.scrobble(listen)
+            if entry["action"] == "play":
+                listen = self.listen(db, entry)
+                if listen is None:
+                    raise Rejected(f"track {entry['track_id']} is gone")
+                service.scrobble(listen)
+            else:
+                self.send_like(db, entry, service)
         except Rejected as e:
-            log.warning("dropping play: %s", e)
+            log.warning("dropping %s: %s", entry["action"], e)
         except Exception as e:
             if entry["attempts"] + 1 < MAX_ATTEMPTS:
                 delay = min(3600, 30 * 2 ** entry["attempts"])
                 db.execute("update outbox set attempts = attempts + 1, next_try = ? where id = ?", (time.time() + delay, entry["id"]))
                 log.info("%s will retry in %d s: %s", entry["service"], delay, e)
                 return
-            log.warning("giving up on play after %d attempts: %s", MAX_ATTEMPTS, e)
+            log.warning("giving up on %s after %d attempts: %s", entry["action"], MAX_ATTEMPTS, e)
         db.execute("delete from outbox where id = ?", (entry["id"],))
+
+    def send_like(self, db, entry, service):
+        """Likes what the user starred on the service, remembering the service's own id of it; an unlike takes back
+        that like. A service that doesn't have it gets nothing, and neither does an unlike of what oasis never liked."""
+        key = (entry["user"], entry["service"], entry["track_id"])
+        kind = kind_of(entry["track_id"])
+        if entry["action"] == "unlike":
+            row = db.execute("select key from liked where user = ? and service = ? and id = ?", key).fetchone()
+            if row:
+                service.like(kind, row["key"], False)
+                db.execute("delete from liked where user = ? and service = ? and id = ?", key)
+            return
+        item = item_of(db, entry["track_id"])
+        if item is None:
+            raise Rejected(f"{entry['track_id']} is gone")
+        found = service.find_liked(db, item)
+        if found is None:
+            log.info("%s has no %s %s - %s", entry["service"], kind, item.artist, item.title)
+            return
+        service.like(kind, found, True)
+        db.execute("insert or replace into liked values (?, ?, ?, ?)", (*key, found))
 
     def listen(self, db, entry) -> Listen | None:
         r = db.execute("select * from track where id = ?", (entry["track_id"],)).fetchone()
@@ -204,9 +354,10 @@ def listen_for(r, played: float, ytm_id: str | None = None) -> Listen:
     return Listen(r["id"], artist, r["title"], album, r["duration"], played, ytm_id or r["ytm_id"])
 
 
-def user_services(lastfm: LastFm | None, ytm, user, usable, servers: list) -> dict:
-    """The services a user linked and can use (usable: sources.Sources.usable), by name, and the other servers they send
-    plays to (servers.sending), each by 'server:<its id>'. lastfm: oasis's Last.fm app, which a user's session needs."""
+def user_services(lastfm: LastFm | None, ytm, user, usable, servers: list, liking: dict, kept) -> dict:
+    """The services a user linked and can use (usable: sources.Sources.usable), by name, the other servers they send
+    plays to (servers.sending), each by 'server:<its id>', and the streaming services their likes go to (liking:
+    sources.Sources.liking; kept: what Favourites takes). lastfm: oasis's Last.fm app, which a user's session needs."""
     found = {}
     if user is None:
         return found
@@ -215,11 +366,13 @@ def user_services(lastfm: LastFm | None, ytm, user, usable, servers: list) -> di
     if user["listenbrainz_token"] and "listenbrainz" in usable:
         found["listenbrainz"] = ListenBrainz(user["listenbrainz_token"])
     if ytm and user["ytm_auth"] and "account" in usable.get("ytm", ()):
-        found["ytmusic"] = YouTubeMusicHistory(ytm, ytm.client(user["ytm_auth"]))
+        found["ytmusic"] = YouTubeMusicAccount(ytm, ytm.client(user["ytm_auth"]))
     for r in servers:
         account = json.loads(r["account"])
         if r["protocol"] == "lastfm":
             found[f"server:{r['id']}"] = elsewhere(r["url"], account["auth"], account["session"])
         else:
             found[f"server:{r['id']}"] = ListenBrainz(account["token"], r["url"])
+    for name, start in liking.items():
+        found[name] = (SoundCloudAccount if name == "soundcloud" else Favourites)(KINDS[name], start, kept)
     return found

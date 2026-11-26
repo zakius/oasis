@@ -105,3 +105,10 @@ def test_services_set_up_for_everyone_go_and_every_user_keeps_youtube_music_last
     assert db.execute("select ytm_auth from user where name = 'ann'").fetchone()[0] == "{}"  # the linked account stays
     db.execute("delete from user_service where user = 'bob' and service = 'ytm'")  # bob turns it off
     assert ("bob", "ytm") not in on(reopened(db, path))  # once only
+
+
+def test_waiting_plays_stay_plays(tmp_path):
+    path = older(tmp_path / "old.db", "8e15d09",
+                 "insert into outbox(user, service, track_id, played, next_try) values ('admin', 'lastfm', 'tr-1', 5, 0)")
+    db = database.connect(path)
+    assert tuple(db.execute("select service, track_id, played, action from outbox").fetchone()) == ("lastfm", "tr-1", 5, "play")

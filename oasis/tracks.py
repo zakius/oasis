@@ -11,10 +11,11 @@ MB_IDS = {"artist": "ar-mb-", "album": "al-mb-"}  # ids of artists and release g
 
 # The tables that refer to each kind of id, as (table, column), besides stat, which holds all three kinds.
 REFERENCES = {
-    "track": [("playlist_entry", "track_id"), ("play", "track_id"), ("outbox", "track_id"), ("album_track", "track_id")],
-    "album": [("track", "album_id"), ("album_track", "album_id"), ("wanted", "ref"), ("want_item", "ref")],
+    "track": [("playlist_entry", "track_id"), ("play", "track_id"), ("outbox", "track_id"), ("liked", "id"), ("album_track", "track_id")],
+    "album": [("track", "album_id"), ("album_track", "album_id"), ("wanted", "ref"), ("want_item", "ref"), ("outbox", "track_id"),
+              ("liked", "id")],
     "artist": [("track", "artist_id"), ("ytm_release", "artist_id"), ("wanted", "ref"), ("want_item", "ref"),
-               ("artist_link", "artist_id"), ("artist_link", "other_id")],
+               ("artist_link", "artist_id"), ("artist_link", "other_id"), ("outbox", "track_id"), ("liked", "id")],
 }
 # Rows about one id alone, dropped when it moves (the new id has its own) or its track is gone.
 OWN_ROWS = {

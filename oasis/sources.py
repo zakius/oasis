@@ -171,6 +171,7 @@ class SoundCloud:
     audio is a single file (progressive) or HLS; only the single file plays through oasis while it downloads.
     yt-dlp isn't used: it keeps a sign-in for every later download in the process, whoever's it is."""
     name, title, prefix, suffix, content_type, bitrate = "soundcloud", "SoundCloud", "sc-", "m4a", "audio/mp4", 160
+    likes = ("song",)  # what the user's likes can be here (forward.Favourites)
     API = "https://api-v2.soundcloud.com/"
     HQ = 256  # kbit/s of Go+'s AAC
     PAGES = 50  # pages of 200 read of a user's likes or playlists at most
@@ -191,21 +192,27 @@ class SoundCloud:
                 return found[1]
         raise LookupError("SoundCloud's player has no client id where it used to")
 
-    def api(self, path: str, **fields) -> dict | list:
-        """The answer at path (or a whole URL, as next_href gives one). The client id is read again once when refused:
-        SoundCloud changes it now and then."""
+    def call(self, method: str, path: str, body: dict | None = None, **fields) -> urllib3.BaseHTTPResponse:
+        """SoundCloud's response to a request for path (or a whole URL, as next_href gives one), with body as JSON. The
+        client id is read again once when refused: SoundCloud changes it now and then."""
         url = path if path.startswith("http") else self.API + path
         headers = {"Authorization": "OAuth " + self.token} if self.token else {}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
         for again in (False, True):
             if again or not SoundCloud.client_id:
                 SoundCloud.client_id = self.read_client_id()
             query = urllib.parse.urlencode({**{k: v for k, v in fields.items() if v is not None}, "client_id": SoundCloud.client_id})
-            response = request("GET", url + ("&" if "?" in url else "?") + query, headers=headers)
+            response = request(method, url + ("&" if "?" in url else "?") + query, headers=headers,
+                               body=None if body is None else json.dumps(body))
             if response.status not in (401, 403):
                 break
-        if response.status != 200:
+        if response.status // 100 != 2:
             raise OSError(f"HTTP {response.status} from SoundCloud's {url.split('?')[0].removeprefix(self.API)}")
-        return response.json()
+        return response
+
+    def api(self, path: str, **fields) -> dict | list:
+        return self.call("GET", path, **fields).json()
 
     def pages(self, path: str) -> list[dict]:
         found, url = [], path
@@ -302,9 +309,17 @@ class SoundCloud:
                 pairs.append((by, t["title"].removeprefix(by + " - ")))
         return pairs
 
-    def likes(self) -> list[dict]:
+    def liked(self) -> list[dict]:
         """The account's liked tracks, newest first."""
         return [e["track"] for e in self.pages(f"users/{self.account['id']}/track_likes") if e.get("track")]
+
+    def favourite(self, kind: str, id: str, on: bool):
+        """Likes the track, or takes the like back, as SoundCloud's web player does."""
+        self.call("PUT" if on else "DELETE", f"users/{self.account['id']}/track_likes/{id}")
+
+    def add_history(self, id: str):
+        """Adds a play of the track to the account's listening history, as SoundCloud's web player does."""
+        self.call("POST", "me/play-history", {"track_urn": f"soundcloud:tracks:{id}"})
 
     def playlists(self) -> list[dict]:
         """The account's own playlists and albums, then those it liked."""
@@ -327,6 +342,7 @@ class Qobuz:
     player's own script when the account is linked, as no published app has them. Qobuz answers nothing, not even a
     search, without a signed-in account; one without a subscription that streams gets samples only (previews_only)."""
     name, title, prefix, suffix, content_type, bitrate = "qobuz", "Qobuz", "qb-", "flac", "audio/flac", 1411
+    likes = ("song", "album", "artist")
     API = "https://www.qobuz.com/api.json/0.2/"
     PLAYER = "https://play.qobuz.com"
     FORMAT = 6  # FLAC 16-bit 44.1 kHz; 27 would be the highest resolution there is
@@ -363,9 +379,15 @@ class Qobuz:
     def signature(track_id: str, format_id: int, at: int, secret: str) -> str:
         return hashlib.md5(f"trackgetFileUrlformat_id{format_id}intentstreamtrack_id{track_id}{at}{secret}".encode()).hexdigest()
 
-    def call(self, method: str, **params) -> dict:
+    def call(self, method: str, http: str = "GET", **params) -> dict:
         headers = {"X-App-Id": self.account["app_id"], "X-User-Auth-Token": self.account.get("token", "")}
-        return get_json(self.API + method, fields={**params, "app_id": self.account["app_id"]}, headers=headers)
+        fields = {**params, "app_id": self.account["app_id"]}
+        if http == "GET":
+            return get_json(self.API + method, fields=fields, headers=headers)
+        response = request(http, self.API + method, fields=fields, headers=headers, encode_multipart=False)
+        if response.status != 200:
+            raise OSError(f"HTTP {response.status} from Qobuz's {method}: {response.data[:200]!r}")
+        return response.json()
 
     def file_url(self, track_id: str, secret: str | None = None, format_id: int = FORMAT) -> dict:
         """The track's audio URL; sample true when the account gets only its 30 s sample."""
@@ -420,6 +442,21 @@ class Qobuz:
                         "track_no": t.get("track_number"), "disc_no": t.get("media_number"), "cover": (album.get("image") or {}).get("large")}
         return None
 
+    def find_album(self, artist: str, title: str) -> str | None:
+        """The id of the artist's album of that title."""
+        for a in self.call("album/search", query=f"{artist} {title}", limit=10)["albums"]["items"]:
+            if fold(a.get("title") or "") == fold(title) and fold((a.get("artist") or {}).get("name") or "") == fold(artist):
+                return str(a["id"])
+        return None
+
+    def find_artist(self, name: str) -> str | None:
+        return next((str(a["id"]) for a in self.call("artist/search", query=name, limit=5)["artists"]["items"]
+                     if fold(a.get("name") or "") == fold(name)), None)
+
+    def favourite(self, kind: str, id: str, on: bool):
+        """Adds the track, album or artist to the account's favourites, or takes it out."""
+        self.call("favorite/create" if on else "favorite/delete", "POST", **{FAVOURITE_IDS[kind]: id})
+
     def full_url(self, key: str) -> str:
         found = self.file_url(key)
         if found.get("sample") or not found.get("url"):
@@ -436,10 +473,14 @@ class Qobuz:
         return target
 
 
+FAVOURITE_IDS = {"song": "track_ids", "album": "album_ids", "artist": "artist_ids"}  # Qobuz's favorite/create's and favorite/delete's
+
+
 class Tidal:
     """Tidal with a subscriber's account, through tidalapi: FLAC at CD quality. The account is linked like a TV's, by
     a code entered on Tidal's site (link_start)."""
     name, title, prefix, suffix, content_type, bitrate = "tidal", "Tidal", "td-", "flac", "audio/flac", 1411
+    likes = ("song", "album", "artist")
 
     def __init__(self, account: dict):
         """account: the OAuth tokens saved() gives."""
@@ -508,11 +549,35 @@ class Tidal:
         found = self.search(artist, title)
         return [pair(t) for t in found[0].get_track_radio(RELATED)] if found else []
 
+    def artist(self, name: str):
+        """The tidalapi artist of that name, or None."""
+        import tidalapi
+        return next((a for a in self.session.search(name, models=[tidalapi.Artist], limit=5).get("artists") or [] if fold(a.name or "") == fold(name)), None)
+
     def artist_radio(self, artist: str) -> list[tuple[str, str]]:
         """Tidal's radio of the artist, as (artist, title)."""
+        found = self.artist(artist)
+        return [pair(t) for t in found.get_radio(RELATED)] if found else []
+
+    def find_album(self, artist: str, title: str) -> str | None:
+        """The id of the artist's album of that title."""
         import tidalapi
-        found = [a for a in self.session.search(artist, models=[tidalapi.Artist], limit=5).get("artists") or [] if fold(a.name or "") == fold(artist)]
-        return [pair(t) for t in found[0].get_radio(RELATED)] if found else []
+        for a in self.session.search(f"{artist} {title}", models=[tidalapi.Album], limit=10).get("albums") or []:
+            if fold(a.name or "") == fold(title) and fold(artist) in {fold(x.name or "") for x in a.artists or []}:
+                return str(a.id)
+        return None
+
+    def find_artist(self, name: str) -> str | None:
+        found = self.artist(name)
+        return str(found.id) if found else None
+
+    def favourite(self, kind: str, id: str, on: bool):
+        """Adds the track, album or artist to the account's favourites, or takes it out."""
+        favorites = self.session.user.favorites
+        calls = {"song": (favorites.add_track, favorites.remove_track), "album": (favorites.add_album, favorites.remove_album),
+                 "artist": (favorites.add_artist, favorites.remove_artist)}
+        if not calls[kind][0 if on else 1](id):
+            raise OSError(f"Tidal didn't change the {kind}'s favourite")
 
     def mixes(self) -> list[dict]:
         """The account's mixes (My Mix 1..., My Daily Discovery, My New Arrivals) with their songs as (artist, title):
@@ -732,8 +797,9 @@ PREVIEWS = {kind.name: kind for kind in (DeezerPreview, ApplePreview, SoundCloud
 # Every service a user can turn on, with the capabilities of it an admin can allow or not: songs, full songs to find,
 # search and stream; signed-in, SoundCloud's Go+ songs with the user's sign-in; previews, clips of songs nothing can
 # play; radio, the service as a source of radios and similar songs (recommend.py), and Deezer's related artists;
-# account, what a linked account adds: YouTube Music's mixes and history, SoundCloud's likes and playlists, Bandcamp's
-# purchases and wishlist (bandcamp.py), the playlists ListenBrainz makes for the user and Tidal's mixes (mixes.py).
+# account, what a linked account adds: YouTube Music's mixes, history and likes, SoundCloud's likes, playlists and
+# history, Bandcamp's purchases and wishlist (bandcamp.py), the playlists ListenBrainz makes for the user and Tidal's
+# mixes (mixes.py).
 # The lists of other servers that take plays (servers.py) are offered or not as a whole, and turned on by no one.
 CAPABILITIES = {"ytm": ("songs", "account"), "qobuz": ("songs", "previews"), "tidal": ("songs", "previews", "radio", "account"),
                 "bandcamp": ("songs", "account"), "soundcloud": ("songs", "signed-in", "account", "previews", "radio"), "lastfm": (),
@@ -846,6 +912,19 @@ class Sources:
         usable, accounts = self.usable(db, user), self.turned_on(db, user)
         found = [self.started(db, user, name, accounts.get(name), usable[name]) for name in KINDS if "songs" in usable.get(name, ())]
         return [c for c in found if c and not (getattr(c, "account", None) or {}).get("previews_only")]
+
+    def liking(self, db, user: str) -> dict:
+        """The streaming services the user's likes go to, each as a function that starts the user's client of it (None
+        when it fails to start): Tidal once linked, Qobuz once linked while its songs or previews are offered, SoundCloud
+        with its sign-in while its account features are."""
+        usable, found = self.usable(db, user), {}
+        if "tidal" in usable:
+            found["tidal"] = lambda: self.client(db, user, "tidal")
+        if usable.get("qobuz"):
+            found["qobuz"] = lambda: self.client(db, user, "qobuz")
+        if account := self.account(db, user, "soundcloud"):
+            found["soundcloud"] = lambda: SoundCloud(account)
+        return found
 
     def started(self, db, user: str, name: str, value: str | None, capabilities: set):
         """The user's client of the service, made once for its account (JSON) and capabilities; None when it fails to

@@ -161,7 +161,7 @@ class SoundCloudPlaylists:
                 return
             reader = SoundCloud(account)
             player = reader if self.services.uses(db, user, "soundcloud", "signed-in") else SoundCloud()
-            found = [("likes", "SoundCloud likes", None, reader.likes())]
+            found = [("likes", "SoundCloud likes", None, reader.liked())]
             found += [(str(p["id"]), p.get("title") or str(p["id"]), p.get("artwork_url"), reader.playlist_tracks(p["id"])) for p in reader.playlists()]
             for key, title, cover, tracks in found:
                 ids = list(dict.fromkeys(self.services.remember(db, player, player.song(t)) for t in tracks if player.full(t)))
