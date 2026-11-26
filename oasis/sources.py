@@ -853,6 +853,15 @@ class Sources:
         """Keeps a service's song as a streaming track and returns its id (see tracks.remember)."""
         return remember(db, self.track_row(client, song))
 
+    def plays(self, usable: dict[str, set[str]], ytm, source: str, ref: str) -> bool:
+        """Whether a streaming track plays for a user with these usable services: its service's full songs are on for
+        them, or its audio is cached. ytm: YouTube Music's client, None when oasis has none."""
+        if source == "ytm":
+            return bool(ytm) and ("songs" in usable.get("ytm", ()) or bool(ytm.cached(ref)))
+        if source in KINDS:
+            return "songs" in usable.get(source, ()) or bool(self.cached(stream_stem(source, ref.removeprefix(source + ":"))))
+        return False
+
     def cached(self, stem: str) -> Path | None:
         return next((f for f in self.cache.glob(stem + ".*") if f.is_file()), None)
 

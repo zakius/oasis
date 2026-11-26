@@ -1,16 +1,17 @@
 """Playlists' entries and kinds. A plain playlist holds what its owner or a mirrored service put in it; a radio grows
 by itself as it is played (see recommend.py), from its own tracks or from everything its owner plays. Streaming tracks
 (of any service) are in the library while starred or in a plain playlist that is not one a service makes for the user
-(YouTube Music's mixes, ListenBrainz's playlists, Tidal's mixes), so writing entries keeps that up."""
+(YouTube Music's mixes, ListenBrainz's playlists, Tidal's mixes, oasis's ready-made playlists), so writing entries
+keeps that up."""
 import time
 
 from . import accounts
 from .ytm import LIKED, MIX_PREFIX, is_mix
 
 PLAIN, RADIO, LISTENING_RADIO = 0, 1, 2  # playlist.radio: a radio grows from its own tracks, a listening radio from everything played
-# The start of playlist.mix for the playlists another service makes for a user (mixes.py), which change as YouTube
-# Music's mixes do: then the kind of playlist, or its id there.
-MADE_FOR = ("listenbrainz:", "tidal:")
+# The start of playlist.mix for the playlists another service (mixes.py) or oasis itself (ready.py) makes for a user,
+# which change as YouTube Music's mixes do: then the kind of playlist, or its id there.
+MADE_FOR = ("listenbrainz:", "tidal:", "oasis:")
 
 
 def made_for(mix: str | None) -> bool:

@@ -169,6 +169,9 @@ How radios grow, for every radio:
 - Radios are `readonly: true`. A radio whose name doesn't start with `Radio` (made with the params above) stays a
   radio when renamed. One named `Radio …` becomes a plain playlist when renamed to something else, as before.
 
+Users who can have the stations also get both as ready-made playlists, owned by `oasis`, unless they untick them on
+the dashboard ([oasis behaviour every client gets](#oasis-behaviour-every-client-gets)).
+
 Playlist fields (only with `oasis=1`, only on radios):
 
 - `oasisSource`: the source the radio grows from.
@@ -237,6 +240,15 @@ These use standard fields only, so they are not part of the parameter:
   `YouTube Music`.
 - Playlists mirrored from a user's SoundCloud, ListenBrainz and Tidal are read-only too, owned by `SoundCloud`,
   `ListenBrainz` and `Tidal`.
+- oasis's ready-made playlists are read-only and owned by `oasis`: "Your top tracks" (the user's 50 most played songs
+  of the last three months) and "Forgotten favourites" (up to 50 songs played at least 5 times, but not in the last
+  three months), made again daily from the user's plays with the songs that play for them, and absent while empty;
+  and, for a user with Last.fm, the "Last.fm top tracks" (default period) and "Last.fm loved tracks" stations, which
+  grow as any station does. Each user shows or hides each on the dashboard; a hidden one is deleted. A ready-made
+  station is a radio like those started with `oasisStation` (it carries `oasisStation` and `oasisSource` with
+  `oasis=1`), but clients can't rename or delete it. Stations a client starts itself are unaffected.
+- `getAlbumList`/`getAlbumList2` with `type=frequent` and `type=recent` list the library's albums by the requesting
+  user's plays: most played, or most recently played, first.
 - `getArtist` lists the artist's YouTube Music albums after the library's; such an album has `songCount: 0` until
   `getAlbum` opens it.
 - `star`/`unstar` with `albumId` or `artistId` asks the server to acquire the album or the artist's albums, or takes

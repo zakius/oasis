@@ -19,9 +19,10 @@ log = logging.getLogger(__name__)
 
 OWNER = "YouTube Music"
 SOUNDCLOUD = "soundcloud:"  # the start of playlist.mix for a playlist mirrored from SoundCloud: then its id there, or likes
-LISTENBRAINZ, TIDAL = MADE_FOR
-# Who the playlists mirrored from other services than YouTube Music show as owned by, by the start of their mix.
-OWNERS = {SOUNDCLOUD: "SoundCloud", LISTENBRAINZ: "ListenBrainz", TIDAL: "Tidal"}
+LISTENBRAINZ, TIDAL, OASIS = MADE_FOR
+# Who the playlists mirrored from other services than YouTube Music, and oasis's ready-made ones (ready.py), show as
+# owned by, by the start of their mix.
+OWNERS = {SOUNDCLOUD: "SoundCloud", LISTENBRAINZ: "ListenBrainz", TIDAL: "Tidal", OASIS: "oasis"}
 OTHERS = "".join(f" and mix not like '{prefix}%'" for prefix in OWNERS)  # SQL: a mirrored playlist is YouTube Music's
 REFRESH = 6 * 3600
 # YouTube Music's fixed personal mix ids in its own order (the names are localized), as in roma's Mixes.kt.

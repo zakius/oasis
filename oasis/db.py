@@ -81,7 +81,7 @@ create table if not exists playlist(
     created real not null, changed real not null,
     radio int not null default 0,   -- 1: grows from its own tracks, 2: grows from everything played
     played_pos int not null default -1,
-    mix text,                       -- YouTube Music playlist id (mix or library playlist); such playlists are read-only
+    mix text,                       -- YouTube Music playlist id (mix or library playlist), or another service's or oasis's own (mixes.OWNERS); such playlists are read-only
     cover text,                     -- image URL
     hidden int not null default 0,  -- 1: a YouTube Music library playlist its owner chose not to show (mixes.py): no client sees it
     radio_source text,              -- a radio's source (recommend.SOURCES); null: its owner's default
@@ -101,6 +101,9 @@ create table if not exists user(
     radio_source text not null default 'all', -- the default source of similar songs and radios (recommend.SOURCES)
     translate_lang text,            -- the language lyrics are translated to when an app asks with oasisTranslate=1
     missing_songs int not null default 1 -- 1: apps that ask (extension unavailableSongs) get songs nothing can play (missing.py)
+);
+create table if not exists ready_hidden(  -- the ready-made playlists (ready.py) each user chose not to show
+    user text not null, kind text not null, primary key(user, kind)
 );
 create table if not exists user_service(  -- the services each user turned on (sources.SERVICES)
     user text not null, service text not null,
