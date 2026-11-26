@@ -1,3 +1,4 @@
+from collections import deque
 import base64
 import hashlib
 import json
@@ -248,6 +249,34 @@ def test_deezer_and_apple_find_a_clip_of_the_artists_song(monkeypatch):
                "https://itunes.apple.com/search": {"results": [
                    {"trackId": 3, "trackName": "Dancing Creek", "artistName": "Hiroshi Yoshimura", "trackTimeMillis": 449027, "previewUrl": "z"}]}}
     monkeypatch.setattr(sources, "get_json", lambda url, **k: answers[url])
+    monkeypatch.setattr(sources, "request", lambda method, url, **k: AppleAnswer(200, answers[url]))
+    monkeypatch.setattr(sources.ApplePreview, "asked", deque())
     assert sources.DeezerPreview().find("Hiroshi Yoshimura", "dancing creek") == "2"
     assert sources.DeezerPreview().find("Someone Else Again", "Dancing Creek") is None
     assert sources.ApplePreview().find("Hiroshi Yoshimura", "Dancing Creek") == "3"
+
+
+class AppleAnswer:
+    def __init__(self, status, body):
+        self.status, self.body = status, body
+
+    def json(self):
+        return self.body
+
+
+def test_apple_is_searched_at_most_twenty_times_a_minute_and_pauses_when_it_refuses(monkeypatch):
+    statuses = []
+    monkeypatch.setattr(sources, "request", lambda method, url, **k: AppleAnswer(statuses.pop(0) if statuses else 200, {"results": []}))
+    monkeypatch.setattr(sources.ApplePreview, "asked", deque())
+    apple = sources.ApplePreview()
+    for _ in range(20):
+        assert apple.find("A", "B") is None
+    with pytest.raises(OSError, match="skipped"):
+        apple.find("A", "B")  # the 21st within a minute isn't sent
+
+    monkeypatch.setattr(sources.ApplePreview, "asked", deque())
+    statuses.append(429)
+    with pytest.raises(OSError, match="429"):
+        apple.find("A", "B")
+    with pytest.raises(OSError, match="skipped"):
+        apple.find("A", "B")  # paused for a minute after a refusal
