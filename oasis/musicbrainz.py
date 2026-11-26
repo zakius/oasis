@@ -1,17 +1,17 @@
 """The one way oasis asks MusicBrainz anything: callers ask for an artist, a release, a release group's editions...
 by name, and only this module knows the URLs and how long each answer is kept in mb_cache. MusicBrainz allows one
-request a second per client, so every request of the process (credits, imports) waits its turn on one lock; when it
-answers 503 (busy) or another 5xx, everyone backs off. A lookup given no db asks afresh and keeps nothing. The
+request a second per client, so every request of every oasis process (credits, imports, searches) waits its turn
+(pace.py); when it answers 503 (busy) or another 5xx, everyone backs off. A lookup given no db asks afresh and keeps nothing. The
 vocabulary of its answers that oasis reads in several places is here too: ids, release group types, medium formats,
 aliases, artist credits."""
 import json
 import re
-import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import pace
 from .text import fold
 
 USER_AGENT = "oasis/0.1 ( https://github.com/zakius/oasis )"
@@ -43,23 +43,17 @@ MBID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}
 TYPES = ("Album", "EP", "Single")  # the primary types oasis wants and shows
 VIDEO_MEDIA = re.compile(r"video|^dvd$|blu-ray|hd-dvd|vhs|^s?vcd$|laserdisc|umd", re.I)  # medium formats; DVD-Audio is audio
 
-lock = threading.Lock()
-next_at = 0.0
-
 
 def get(url: str, db=None, keep: float = 0) -> dict:
     """The JSON at url. LookupError when MusicBrainz doesn't have it, OSError when it stays unreachable or busy.
     db and keep: an answer cached up to keep seconds ago is used, and a fresh one stored."""
-    global next_at
     if db is not None and keep:
         row = db.execute("select body from mb_cache where url = ? and fetched > ?", (url, time.time() - keep)).fetchone()
         if row:
             return json.loads(row[0])
     for backoff in (*BACKOFF, None):
         # Requests start GAP apart, but run side by side: one slow answer doesn't hold up a search someone waits on.
-        with lock:
-            time.sleep(max(0.0, next_at - time.time()))
-            next_at = time.time() + GAP
+        pace.wait_turn("musicbrainz", GAP)
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}),
                                         timeout=60) as response:
@@ -70,8 +64,7 @@ def get(url: str, db=None, keep: float = 0) -> dict:
                 raise LookupError(url) from e
             if e.code < 500 or backoff is None:
                 raise OSError(f"{url}: {e.code}") from e
-            with lock:  # MusicBrainz is busy: every request waits
-                next_at = max(next_at, time.time() + backoff)
+            pace.hold("musicbrainz", backoff)  # MusicBrainz is busy: every request waits
     if db is not None and keep:
         db.execute("insert or replace into mb_cache values (?, ?, ?)", (url, body.decode(), time.time()))
     return json.loads(body)

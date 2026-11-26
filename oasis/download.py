@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
-from . import releases, wants
+from . import pace, releases, wants
 from .files import need_room
 from .formats import ARCHIVES, AUDIO, IMAGES, suffix
 from .musicbrainz import editions
@@ -46,6 +46,7 @@ KEEP = (*AUDIO, *ARCHIVES, "cue", *IMAGES)  # music (perhaps packed), cue sheets
 PACE = 3                 # seconds between file download requests: bursts of them get TorBox's 429
 PARALLEL = 2             # files fetched at once
 PAUSE = 300              # seconds without file downloads after a 429
+LINKS = "TorBox's file links"  # their rate limit (pace.py)
 FETCH_TRIES = 5          # polls in a row a file may fail to download before the release counts as broken
 GONE_AFTER = 3           # polls in a row TorBox may leave a download out of its list before it counts as gone: the list comes back empty or short now and then
 KEEP_FAILED = 2 * 86400  # seconds a failed download's files stay for inspection
@@ -100,6 +101,11 @@ def source(release: dict) -> dict:
             if not hash_of(release):
                 raise OSError(f"{url.split('?')[0]}: unreachable") from None
     return {"magnet": magnet(hash_of(release))}
+
+
+def indexer_errors(db) -> dict[int, tuple[float, str]]:
+    """Each Prowlarr indexer's last failed search: when, and what Prowlarr said."""
+    return {r[0]: (r[1], r[2]) for r in db.execute("select * from indexer_error")}
 
 
 def under_way(db) -> list:
@@ -221,7 +227,6 @@ class Downloads:
         self.failures = {}   # hash -> polls in a row its files failed to download
         self.missing = {}    # hash -> polls in a row TorBox's list left it out
         self.crowded = False  # TorBox's slots are all taken and albums wait: see step
-        self.pace, self.last_request, self.paused_until = threading.Lock(), 0.0, 0.0
         self.kept = {}       # (kind, key) -> (when, value): see recall
 
     def torbox(self):
@@ -291,9 +296,10 @@ class Downloads:
         row = db.execute("select progress from download where hash = ?", (hash,)).fetchone()
         return row and row[0]
 
-    def paused(self) -> bool:
+    @staticmethod
+    def paused() -> bool:
         """Whether file downloads wait out TorBox's rate limit."""
-        return time.time() < self.paused_until
+        return pace.held(LINKS)
 
     def recall(self, kind: str, key: str, make):
         """make(), kept FRESH: an artist's bundle searches run a pass apart while they send one bundle each."""
@@ -328,6 +334,7 @@ class Downloads:
             picks = releases.find(self.prowlarr, want, blocked, self.torbox().cached, self.unreliable(db), self.slow(db), low_ids, tally)
         finally:
             count_searches(db, tally)
+            self.keep_errors(db)
         sent = self.send(db, picks, blocked, group, label)
         return Outcome.REFUSED if sent is Outcome.NOTHING_SENT and kept is Outcome.REFUSED else sent
 
@@ -345,8 +352,11 @@ class Downloads:
         blocked = self.blocked(db) | {r["hash"] for r in under_way(db)} | \
             {r[0] for r in db.execute("select hash from download where state != 'failed' and hash in (select hash from download_target)")}
         prowlarr = SimpleNamespace(search=lambda query: self.recall("search", query, lambda: self.prowlarr.search(query)))
-        picks = releases.bundles(prowlarr, want, groups, wanted, blocked, self.torbox().cached_files, lambda rg: editions(rg, db),
-                                 not self.crowded, self.slow(db), self.torrent)
+        try:
+            picks = releases.bundles(prowlarr, want, groups, wanted, blocked, self.torbox().cached_files, lambda rg: editions(rg, db),
+                                     not self.crowded, self.slow(db), self.torrent)
+        finally:
+            self.keep_errors(db)
         search = {"want": want, "wanted": sorted(wanted), "groups": [{k: g[k] for k in ("id", "title", "other_titles", "first-release-date", "primary-type")
                                                                        if k in g} for g in groups]}
         for release, targets, holds in picks[:GRAB_TRIES]:
@@ -357,6 +367,10 @@ class Downloads:
             if sent is Outcome.REFUSED:
                 outcome = Outcome.REFUSED
         return outcome
+
+    def keep_errors(self, db):
+        """Each indexer's last failed search, for the indexers page (indexer_errors)."""
+        db.executemany("insert or replace into indexer_error values (?, ?, ?)", [(i, *e) for i, e in getattr(self.prowlarr, "errors", {}).items()])
 
     def remembered(self, db, wanted: set[str], label: str) -> Outcome:
         """Sends the remembered bundle (bundle_kept) that holds the most of these albums, when TorBox still has it
@@ -693,12 +707,10 @@ class Downloads:
 
     def fetch_file(self, torrent_id: int, file: dict, path: Path) -> Exception | None:
         try:
-            with self.pace:
-                if time.time() < self.paused_until:
-                    raise RateLimited("TorBox rate limit: paused")
-                time.sleep(max(0.0, self.last_request + PACE - time.time()))
-                self.last_request = time.time()
-                url = self.torbox().link(torrent_id, file["id"])
+            if pace.held(LINKS):
+                raise RateLimited("TorBox rate limit: paused")
+            pace.wait_turn(LINKS, PACE)
+            url = self.torbox().link(torrent_id, file["id"])
             path.parent.mkdir(parents=True, exist_ok=True)
             part = path.with_name(path.name + ".part")
             try:
@@ -713,7 +725,7 @@ class Downloads:
             part.rename(path)
             return None
         except RateLimited as e:
-            self.paused_until = time.time() + PAUSE
+            pace.hold(LINKS, PAUSE)
             return e
         except OSError as e:
             return e

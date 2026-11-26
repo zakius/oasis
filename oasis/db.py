@@ -299,6 +299,12 @@ create table if not exists task(  -- the workers' queue (see tasks.py): periodic
 create unique index if not exists task_key on task(key) where state in ('queued', 'running');
 create index if not exists task_due on task(state, due);
 create table if not exists worker(id text primary key, seen real not null);  -- each worker process's last heartbeat
+create table if not exists sign_in(  -- each user's sign-ins under way: Tidal's on a device, a Last.fm-like server's on its page
+    user text not null, service text not null, state text not null, primary key(user, service)  -- state: JSON
+);
+create table if not exists answer(question text primary key, answer text not null, expires real not null);  -- see recommend.py's answer
+create table if not exists indexer_error(indexer int primary key, at real not null, error text not null);  -- each Prowlarr indexer's last failed search
+create table if not exists pace(service text primary key, next real not null, held real not null);  -- rate limits (see pace.py)
 """
 
 

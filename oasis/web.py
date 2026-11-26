@@ -687,8 +687,6 @@ def routes(oasis) -> list[Route]:
         oasis.refresh_soon(db, "listenbrainz", user["name"])
         return back("/services", message="ListenBrainz linked.", anchor="service-listenbrainz")
 
-    server_logins: dict[str, tuple[str, str, str]] = {}  # each user's sign-in to a Last.fm-like server under way: its name, API and sign-in page
-
     def server_list(db, user, protocol: str) -> str:
         """The user's servers of a protocol, each with its switch and Remove, and the form that adds one."""
         rows = ""
@@ -720,7 +718,7 @@ def routes(oasis) -> list[Route]:
         except ValueError as e:
             return back("/services", error=str(e), anchor=anchor)
         if protocol == "lastfm":
-            server_logins[user["name"]] = (name, api, auth)
+            accounts.set_signing_in(db, user["name"], "lastfm-servers", {"name": name, "api": api, "auth": auth})
             callback = str(request.url_for("server_signed_in", state=sign_in_state(request, "lastfm-servers")))
             return RedirectResponse(elsewhere(api, auth).auth_url(callback), status_code=303)
         token = form.get("token", "").strip()
@@ -737,10 +735,11 @@ def routes(oasis) -> list[Route]:
 
     def server_signed_in(db, request, user, form):
         """The state is in the path, not the query: a server may add its token to the address as ?token=."""
-        pending = server_logins.pop(user["name"], None)
-        if pending is None or not accounts.same(request.path_params["state"], sign_in_state(request, "lastfm-servers")):
+        pending = accounts.signing_in(db, user["name"], "lastfm-servers")
+        accounts.set_signing_in(db, user["name"], "lastfm-servers", None)
+        if not pending or not accounts.same(request.path_params["state"], sign_in_state(request, "lastfm-servers")):
             return back("/services", error="That sign-in didn't start here. Add the server again.")
-        name, api, auth = pending
+        name, api, auth = pending["name"], pending["api"], pending["auth"]
         try:
             session, signed = oasis.ask("server sign-in", api=api, auth=auth, token=request.query_params.get("token", ""))
         except Exception as e:
@@ -1030,7 +1029,6 @@ def routes(oasis) -> list[Route]:
         accounts.delete(db, name)
         return back("/admin", message=f"Deleted {name}.")
 
-    tidal_logins: dict[str, dict] = {}  # each user's Tidal device sign-in under way: its page, code and when it expires
 
     def withheld(capability: str) -> str:
         return f'<p class="muted">{CAPABILITY_TITLES[capability]} aren\'t offered on this server now.</p>'
@@ -1066,7 +1064,7 @@ def routes(oasis) -> list[Route]:
                 return (not_yet + '<form method="post" action="/services/qobuz/link"><label>Email<input type="text" name="email" autocomplete="off"></label>'
                         '<label>Password<input type="password" name="password" autocomplete="off"></label><button class="primary">Link</button></form>'
                         '<p class="muted">oasis keeps the sign-in Qobuz gives back, not the password.</p>')
-            login = tidal_logins.get(user["name"], {})
+            login = accounts.signing_in(db, user["name"], "tidal")
             if login.get("code") and login["until"] > time.time():
                 return (f'<p>Open <a href="{escape(login["url"])}" target="_blank">{escape(login["url"])}</a> and allow oasis; the code is '
                         f'<b>{escape(login["code"])}</b>. This page shows when it is linked.</p>')
@@ -1140,7 +1138,7 @@ def routes(oasis) -> list[Route]:
         body = body or '<p class="muted">This server offers no services.</p>'
         if user["admin"]:
             body += offering(offered)
-        login = tidal_logins.get(name, {})
+        login = accounts.signing_in(db, name, "tidal")
         pending = bool(login.get("code")) and login["until"] > time.time()
         return page("Services", body, q.get("message", ""), q.get("error", ""), live=pending, tab="home")
 
@@ -1158,7 +1156,7 @@ def routes(oasis) -> list[Route]:
             later = " Sign in below for what your account adds." if key in ("soundcloud", "bandcamp") else later
             return back("/services", message=f"{title} is on.{later}", anchor=f"service-{key}")
         if key == "tidal":
-            tidal_logins.pop(name, None)
+            accounts.set_signing_in(db, name, "tidal", None)
         oasis.turn_off(db, name, key)
         return back("/services", message=f"{title} is off.", anchor=f"service-{key}")
 
@@ -1202,27 +1200,10 @@ def routes(oasis) -> list[Route]:
     def tidal_link(db, request, user, form):
         if not (oasis.sources.allowed(db, "tidal", "songs") or oasis.sources.allowed(db, "tidal", "previews")):
             return back("/services", error="Tidal isn't offered on this server.")
-        name, attempt = user["name"], object()  # this click's sign-in: one started later replaces what the page shows
-
-        def done(account):
-            latest = tidal_logins.get(name, {}).get("attempt") is attempt
-            if account is None:
-                if latest:
-                    tidal_logins[name] = {"error": "Tidal's sign-in expired before it was allowed. Link again."}
-                return
-            own = oasis.connect()
-            try:
-                oasis.sources.link(own, name, "tidal", account)
-                oasis.refresh_soon(own, "tidal", name)
-            finally:
-                own.close()
-            if latest:
-                tidal_logins.pop(name, None)
         try:
-            started = sources.Tidal.link_start(done)
+            oasis.ask("tidal sign-in", user=user["name"])
         except Exception as e:
             return back("/services", error=f"Tidal didn't answer: {e}", anchor="service-tidal")
-        tidal_logins[name] = {**started, "attempt": attempt}
         return back("/services", message="Open the link and allow oasis.", anchor="service-tidal")
 
     def catalogue(handler):
@@ -1882,7 +1863,7 @@ def routes(oasis) -> list[Route]:
         mine, blocks = download.by_indexer(db, guess), download.blocks_by_indexer(db, guess)
         hits = download.searches(db, 30)
         totals = {r["tracker"]: (r["down"], r["up"]) for r in download.trackers(db)}
-        errors = client.errors
+        errors = download.indexer_errors(db)
         cell = lambda *parts: '<br>'.join(p for p in parts if p)
         body, unused = "", ""
         for i in sorted(found, key=lambda i: (not i["enable"], i["name"].casefold())):

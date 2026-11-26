@@ -198,7 +198,7 @@ def test_a_slow_musicbrainz_answer_holds_up_no_other_request(monkeypatch):
         return io.BytesIO(json.dumps({"id": "x", "releases": [], "release-count": 0}).encode())
 
     monkeypatch.setattr(musicbrainz.urllib.request, "urlopen", urlopen)
-    monkeypatch.setattr(musicbrainz, "next_at", 0.0)
+
     slow = threading.Thread(target=musicbrainz.release_credits, args=("slow",))
     slow.start()
     time.sleep(0.1)

@@ -347,7 +347,7 @@ def test_listenbrainz_radio_resolves_like_lastfm_and_its_failures_give_nothing(a
         raise OSError("HTTP 500")
     monkeypatch.setattr(recommend, "lb_radio", broken)
     assert titles(similar(client, "listenbrainz")["similarSongs2"]["song"]) == ["Song B", "Tune"]  # the answer is kept a while
-    api.recommender.answers.clear()
+    api.connect().execute("delete from answer")
     assert similar(client, "listenbrainz")["similarSongs2"]["song"] == []
     assert "one-yt song 0" in titles(similar(client)["similarSongs2"]["song"])  # the mix goes on without it
 

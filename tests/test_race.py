@@ -5,6 +5,7 @@ import time
 import pytest
 
 from oasis import recommend
+from oasis.db import connect
 from oasis.recommend import Recommender, rank
 
 SLACK = 0.2  # seconds a timing may be late by on a busy machine
@@ -37,8 +38,9 @@ class Clips(Service):
 
 
 @pytest.fixture
-def finder():
-    return Recommender(None, None, lambda: None, None)
+def finder(tmp_path):
+    connect(tmp_path / "oasis.db").close()  # made, as a server's is before it asks
+    return Recommender(lambda: connect(tmp_path / "oasis.db"), None, lambda: None, None)
 
 
 def timed(finder, *services, ytm=None, previews=(), deadline=None):
@@ -122,3 +124,10 @@ def test_every_service_failing_is_an_error_and_the_deadline_with_no_answer_a_tim
     with pytest.raises(TimeoutError):
         timed(finder, Service("slow", 2), deadline=0.2)
     assert timed(finder, Service("down2", 0.05, fails=True), Service("up", 0.1))[1] == "up"
+
+
+def test_an_answer_one_worker_kept_serves_another(finder, tmp_path):
+    other = Recommender(lambda: connect(tmp_path / "oasis.db"), None, lambda: None, None)  # another process's
+    timed(finder, Service("quick", 0.3))
+    found, by, took = timed(other, Service("quick", 0.3))
+    assert by == "quick" and took < 0.1

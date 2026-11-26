@@ -6,11 +6,12 @@ signs users in with, recording plays."""
 import json
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager, contextmanager
 
 from starlette.applications import Starlette
 
-from . import accounts, acquire, api, artists, download, doctor, enrich, forward, lastfm, latin, library, lyrics, missing, mixes, musicbrainz, playlists, \
+from . import accounts, acquire, api, artists, download, doctor, enrich, forward, lastfm, latin, library, lyrics, missing, mixes, musicbrainz, pace, playlists, \
     recommend, ready, remove, servers, sources, tasks, translate, upload, web, youtube
 from .acquire import Acquire
 from .bandcamp import Bandcamp, Fan
@@ -50,6 +51,7 @@ class Oasis:
         """services: every user's play-forwarding services, by name, in place of what they linked (tests). background:
         queues tasks as users act (loading a user's mixes); tests run those themselves."""
         self.config, self.background = config, background
+        pace.path = config.database  # rate limits are kept with every other process's
         # YouTube Music's client exists whatever an admin allows: the switch on the dashboard works while oasis runs.
         self.ytm = ytm or (YouTubeMusic(config.ytm_cache) if config.ytm_cache else None)
         # Each user's services and other streaming services' audio, cached when played
@@ -153,7 +155,7 @@ class Oasis:
                 "similar": self.similar, "radio": self.fill_radio, "artist info": self.artist_info, "link": self.link,
                 "listenbrainz token": self.listenbrainz_token, "lastfm sign-in": self.lastfm_sign_in, "server sign-in": self.server_sign_in,
                 "lastfm app": self.connect_lastfm_app, "qobuz sign-in": self.qobuz_sign_in, "prowlarr": self.prowlarr,
-                "block download": self.block_download, "scan": self.scan}
+                "block download": self.block_download, "scan": self.scan, "tidal sign-in": self.tidal_sign_in}
 
     def asking(self, kind: str, key: str | None = None, /, **args) -> Answer:
         """An interactive task (kinds), its result to come; key: see tasks.add."""
@@ -245,6 +247,26 @@ class Oasis:
     def connect_lastfm_app(self, key: str, secret: str):
         with self.opened() as db:
             self.set_lastfm_app(db, key, secret)
+
+    def tidal_sign_in(self, user: str):
+        """Starts the user's Tidal sign-in on a device: its page and code wait in sign_in for the dashboard, and a thread
+        of this process links the account once the user allowed it there. One started later replaces it."""
+        attempt = uuid.uuid4().hex
+
+        def done(account):
+            with self.opened() as db:
+                latest = accounts.signing_in(db, user, "tidal").get("attempt") == attempt
+                if account is None:
+                    if latest:
+                        accounts.set_signing_in(db, user, "tidal", {"error": "Tidal's sign-in expired before it was allowed. Link again."})
+                    return
+                self.sources.link(db, user, "tidal", account)
+                self.refresh_soon(db, "tidal", user)
+                if latest:
+                    accounts.set_signing_in(db, user, "tidal", None)
+        started = sources.Tidal.link_start(done)
+        with self.opened() as db:
+            accounts.set_signing_in(db, user, "tidal", {**started, "attempt": attempt})
 
     @staticmethod
     def qobuz_sign_in(email: str, password: str, samples: bool) -> dict:
