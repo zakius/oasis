@@ -2,8 +2,10 @@
 part (the scan, dedupe's merges, search's romanized names, quality's checks, acquisition's wants)."""
 import threading
 
-from . import acquire, dedupe, latin, quality, scan
+from . import acquire, dedupe, latin, quality, scan, tasks
 from .tracks import move_track, track_id
+
+JOB = "scan"
 
 
 def update(db, roots, merge_copies: bool):
@@ -28,47 +30,43 @@ def merge(db, roots):
 
 
 class Scanner:
-    """The server's scans, one at a time. scanned() is called after each, for the work that follows the files."""
+    """The server's scans: the periodic job JOB, run when woken, one at a time across the workers. scanned() is called
+    after each, for the work that follows the files."""
 
     def __init__(self, connect, roots, merge_copies: bool, scanned=None):
         self.connect, self.roots, self.merge_copies, self.scanned = connect, roots, merge_copies, scanned
-        self.scanning = self.again = False
         self.lock = threading.Lock()
+
+    def step(self):
+        db = self.connect()
+        try:
+            with self.lock:
+                self.scan_once(db)
+        finally:
+            db.close()
 
     def scan_once(self, db):
         update(db, self.roots, self.merge_copies)
         if self.scanned:
-            self.scanned()
+            self.scanned(db)
 
     def start(self):
         """A scan in the background. One asked for while one runs follows it: files an import placed meanwhile may be
         past it."""
-        if not self.lock.acquire(blocking=False):
-            self.again = True
-            return
-        self.scanning = True
+        db = self.connect()
+        try:
+            tasks.wake(db, JOB)
+        finally:
+            db.close()
 
-        def run():
-            db = self.connect()
-            try:
-                while True:
-                    self.again = False
-                    self.scan_once(db)
-                    if not self.again:
-                        break
-            finally:
-                db.close()
-                self.scanning = False
-                self.lock.release()
-        threading.Thread(target=run, daemon=True).start()
+    @staticmethod
+    def scanning(db) -> bool:
+        return tasks.running(db, JOB)
 
     def now(self, db):
-        """A scan that is done on return, after the one running if any; one asked for meanwhile follows it."""
+        """A scan that is done on return, after the one running here if any."""
         with self.lock:
-            self.again = False
             self.scan_once(db)
-        if self.again:
-            self.start()
 
 
 def check_quality(db, roots, jobs: int = quality.JOBS, delete_lossy: bool = False) -> dict:

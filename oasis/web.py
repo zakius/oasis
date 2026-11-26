@@ -684,7 +684,7 @@ def routes(oasis) -> list[Route]:
             return back("/services", error="ListenBrainz says that token isn't valid.", anchor="service-listenbrainz")
         accounts.set_field(db, user["name"], listenbrainz_token=token)
         oasis.sources.turn_on(db, user["name"], "listenbrainz")
-        oasis.refresh_soon(oasis.listenbrainz_playlists, user["name"])
+        oasis.refresh_soon(db, "listenbrainz", user["name"])
         return back("/services", message="ListenBrainz linked.", anchor="service-listenbrainz")
 
     server_logins: dict[str, tuple[str, str, str]] = {}  # each user's sign-in to a Last.fm-like server under way: its name, API and sign-in page
@@ -801,13 +801,13 @@ def routes(oasis) -> list[Route]:
         accounts.revoke_app_password(db, user["name"], request.path_params["id"])
         return back("/account/apps", message="Revoked. Apps using it are signed out.")
 
-    def progress(hash: str, state: str, since: float) -> str:
+    def progress(db, hash: str, state: str, since: float) -> str:
         """Where a download is: queued on TorBox, TorBox downloading it (its share done), copying it here from TorBox
         (the share here), importing it. The step, share and age on one line, the bar under them."""
         d = oasis.downloads
         if d and state == "fetching" and d.paused():
             return f'<div class="progress"><span class="busy">copying here: paused by TorBox\'s rate limit</span><span class="muted">{ago(since)}</span></div>'
-        share = (d.progress(hash) if state == "downloading" else d.copied(hash) if state == "fetching" else None) if d else None
+        share = (d.progress(db, hash) if state == "downloading" else d.copied(db, hash) if state == "fetching" else None) if d else None
         label = download.STEPS.get(state, state)
         return (f'<div class="progress"><span class="busy">{label}{f" {share:.0%}" if share is not None else ""}</span>'
                 f'<span class="muted">{ago(since)}</span>'
@@ -825,7 +825,7 @@ def routes(oasis) -> list[Route]:
         active = download.under_way(db)
         html += (f'<section><h2>Downloading <span class="count">{len(active)}</span></h2><ul class="rows">' + "".join(
             f'<li><div class="grow">{escape(r["title"])}{" <span class=\"muted\">from a remembered bundle</span>" if r["kept"] else ""}'
-            f'{progress(r["hash"], r["state"], r["created"])}</div></li>'
+            f'{progress(db, r["hash"], r["state"], r["created"])}</div></li>'
             for r in active) + '</ul></section>' if active else '<section><h2>Downloading</h2><p class="muted">Nothing downloading.</p></section>')
         trackers = download.trackers(db)
         if trackers:
@@ -1214,9 +1214,9 @@ def routes(oasis) -> list[Route]:
             own = oasis.connect()
             try:
                 oasis.sources.link(own, name, "tidal", account)
+                oasis.refresh_soon(own, "tidal", name)
             finally:
                 own.close()
-            oasis.refresh_soon(oasis.tidal_mixes, name)
             if latest:
                 tidal_logins.pop(name, None)
         try:
@@ -1360,10 +1360,10 @@ def routes(oasis) -> list[Route]:
         def place(r) -> tuple[str, str]:
             """The group a wanted album goes in, and what to say about it."""
             if d := active.get(r["rg"]):
-                return "downloading", progress(d["hash"], d["state"], d["created"])
+                return "downloading", progress(db, d["hash"], d["state"], d["created"])
             if r["state"] == "downloading":
                 return "downloading", pill("downloading", "busy")
-            if acq.searching_soon(r["rg"]):
+            if acq.searching_soon(db, r["rg"]):
                 return "next", pill("in a minute or two", "accent")
             if (r["error"] or "").startswith((wants.DOWNLOAD_FAILED, wants.SEARCH_FAILED)):
                 return "attention", f'<span class="error">{escape(r["error"])}</span> <span class="muted">· tries again {again(r)}</span>'
@@ -1720,7 +1720,7 @@ def routes(oasis) -> list[Route]:
         if action == "block" and not (oasis.downloads and oasis.downloads.block(db, rg)):
             return back(here, error=f"Nothing is downloading for {name} that can still be stopped.")
         if action in ("search", "block"):
-            oasis.acquire.search_soon(rg)
+            oasis.acquire.search_soon(db, rg)
             return back(here, message=f"{name} is searched next, in a minute or two." if action == "search" else
                         f"Blocked that release of {name}; the next search picks another.", anchor=f"rg-{rg}")
         oasis.give_up(db, user["name"], rg)
@@ -1740,7 +1740,7 @@ def routes(oasis) -> list[Route]:
         if not (row or downloads or wanted):
             return ""
         active = next((d for d in downloads if d["state"] not in ("done", "failed")), None)
-        state = progress(active["hash"], active["state"], active["created"]) if active else pill("arrived", "good") if row and row["state"] == "have" else \
+        state = progress(db, active["hash"], active["state"], active["created"]) if active else pill("arrived", "good") if row and row["state"] == "have" else \
             pill("wanted", "accent") if row else '<span class="muted">not wanted</span>'
         searched = row and row["searched"] and f'{ago(row["searched"])}, {row["tries"]} time{"s" if row["tries"] != 1 else ""} in all' + (
             f'; next try {until(row["next_search"])}' if row["state"] == "missing" and (row["next_search"] or 0) > time.time() else "")

@@ -3,7 +3,7 @@ import time
 import pytest
 
 from conftest import call, make_client, sign_in
-from oasis import accounts, ready, worker
+from oasis import accounts, ready
 from oasis.db import record_play
 from oasis.recommend import PERIOD
 from test_accounts import add_user
@@ -94,12 +94,10 @@ def test_a_user_with_no_plays_gets_no_empty_playlists(api, client):
     assert shown(client) == {}
 
 
-def test_the_playlists_from_plays_are_made_again_daily(api, client, monkeypatch):
-    started = []
-    monkeypatch.setattr(worker, "start", lambda name, step, every, wake=None: started.append((step, every)))
-    api.ready.start()
-    [(step, every)] = started
-    assert every == DAY
+def test_the_playlists_from_plays_are_made_again_daily(api, client):
+    [job] = [j for j in api.jobs() if j.name == "ready-made playlists"]
+    step = job.step
+    assert job.every == DAY
     db = api.connect()
     play(db, "One", 1, 1)
     step()

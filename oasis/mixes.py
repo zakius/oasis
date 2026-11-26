@@ -7,7 +7,7 @@ import html
 import logging
 import re
 
-from . import accounts, playlists, worker
+from . import accounts, playlists
 from .forward import ListenBrainz
 from .playlists import MADE_FOR, set_entries
 from .recommend import recording_of
@@ -85,9 +85,6 @@ class Mixes:
         id): for set_entries, the streaming tracks to download."""
         self.connect, self.ytm, self.services, self.fetch = connect, ytm, services, fetch
 
-    def start(self):
-        worker.start("mix refresh", self.refresh_all, REFRESH)
-
     def refresh_all(self):
         db = self.connect()
         users = [r["name"] for r in db.execute("select name from user where ytm_auth is not null")]
@@ -142,9 +139,6 @@ class SoundCloudPlaylists:
         """services: each user's services (sources.Sources)."""
         self.connect, self.services = connect, services
 
-    def start(self):
-        worker.start("soundcloud playlists", self.refresh_all, REFRESH)
-
     def refresh_all(self):
         db = self.connect()
         users = [r[0] for r in db.execute("select user from user_service where service = 'soundcloud' and account is not null")]
@@ -188,9 +182,6 @@ class MadeFor:
     def __init__(self, connect, services, recommender):
         """services: each user's services (sources.Sources)."""
         self.connect, self.services, self.recommender = connect, services, recommender
-
-    def start(self):
-        worker.start(f"{self.name} playlists", self.refresh_all, REFRESH)
 
     def refresh_all(self):
         db = self.connect()

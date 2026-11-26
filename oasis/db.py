@@ -171,7 +171,9 @@ create table if not exists download(  -- releases oasis downloads through TorBox
     uploaded int, downloaded int,           -- TorBox's last totals for it, kept after it is deleted: the tracker's running ratio
     seeding int not null default 0,         -- 1: imported and still seeding on TorBox (see download.py)
     mode text,                              -- seeding as sent to TorBox: torbox (its account's setting), seed (oasis stops it), off; null: seed if tracker, else off
-    indexer int                             -- the Prowlarr indexer it came from; null before oasis noted it (by_indexer goes by the guid's site then)
+    indexer int,                            -- the Prowlarr indexer it came from; null before oasis noted it (by_indexer goes by the guid's site then)
+    progress real, progressed real,         -- TorBox's share of it at the last poll, and since when it is at that share
+    fetching text                           -- the files being fetched here (JSON: [path, size]), for the dashboard (copied)
 );
 create table if not exists search_stat(  -- each indexer's answers to album searches, a day at a time: results, the album, usable
     day text not null, indexer int not null, results int not null, album int not null, usable int not null, primary key(day, indexer)
@@ -227,7 +229,8 @@ create table if not exists want_album(  -- albums oasis looks for: starred ones 
     reason text not null,                   -- starred, followed
     state text not null,                    -- missing, downloading, have
     searched real, next_search real, tries int not null default 0,
-    error text                              -- what its last search found
+    error text,                             -- what its last search found
+    soon real                               -- when the dashboard asked for it to be searched before any other
 );
 create index if not exists want_album_artist on want_album(artist_mbid);
 create table if not exists given_up(rg text primary key, at real not null);  -- albums users gave up on: followed artists' catalogues leave them out
@@ -278,6 +281,24 @@ create table if not exists playlist_entry(
     playlist_id int not null references playlist(id) on delete cascade,
     pos int not null, track_id text not null
 );
+create table if not exists task(  -- the workers' queue (see tasks.py): periodic jobs, one row each, and one-off tasks
+    id integer primary key,
+    kind text not null,                -- a periodic job's name, or the kind of a one-off task (worker.py)
+    args text not null default '{}',   -- JSON
+    key text,                          -- a periodic job's name; a one-off task's, when another with it would do the same
+    lane text,                         -- periodic jobs of one lane run in one worker process while it lives
+    priority int not null default 0,   -- interactive tasks, someone waiting for them, come first
+    state text not null default 'queued',  -- queued, running, done or failed
+    due real,                          -- claimed from then; a periodic job without a schedule waits for a wake (null)
+    woken int not null default 0,      -- a periodic job woken while it ran: due again once it ends
+    worker text, lease real,           -- who claimed it last, and till when the claim holds unless renewed
+    attempts int not null default 0,
+    result text, error text,           -- JSON
+    created real not null, finished real
+);
+create unique index if not exists task_key on task(key) where state in ('queued', 'running');
+create index if not exists task_due on task(state, due);
+create table if not exists worker(id text primary key, seen real not null);  -- each worker process's last heartbeat
 """
 
 

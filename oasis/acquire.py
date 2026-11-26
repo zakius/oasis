@@ -12,11 +12,10 @@ import itertools
 import json
 import logging
 import re
-import threading
 import time
 from collections import Counter
 
-from . import artists, musicbrainz, releases, worker
+from . import artists, musicbrainz, releases, tasks
 from .wants import Outcome
 from .formats import LOSSLESS
 from .musicbrainz import lucene, search_artist
@@ -52,6 +51,7 @@ GIVEN_UP = "given up"  # why a catalogue leaves out an album a user gave up on
 RETRY_NO_MATCH = 1800     # seconds before looking an unmatched name up again
 RETRY_ERROR = 300         # seconds before retrying after MusicBrainz or Prowlarr errors
 SEARCH_GAP = 60           # seconds between searches, so a burst of stars doesn't trip TorBox's rate limit
+JOB = "acquire pass"
 MISS_GAP = 15             # seconds after a search that asked TorBox to add nothing: only Prowlarr had work
 RETRY_FULL = 600          # seconds before an album TorBox had no free slot for is searched again
 UPGRADE_AGAIN = 7 * 86400  # seconds between searches for a lossless copy of an album here lossy
@@ -186,30 +186,27 @@ class Acquire:
     def __init__(self, connect, downloads, settings):
         """downloads: download.py's. settings: config.Acquisition."""
         self.connect, self.downloads, self.allowed, self.bundles = connect, downloads, set(settings.secondary_types), settings.bundles
-        self.woken = threading.Event()
         self.last_search, self.gap = 0.0, SEARCH_GAP
-        self.soon: set[str] = set()  # release groups to search before any other (the dashboard's "search now")
         self.idle = False  # nothing was due at the last pass: searching early
-
-    def start(self):
-        worker.start("acquire pass", self.step, 60, self.woken)
 
     def step(self) -> float:
         """A pass, then a wait until the next search is due, at most a minute."""
         self.reconcile()
         return self.gap if time.time() - self.last_search < self.gap else 60
 
-    def wake(self):
+    @staticmethod
+    def wake(db):
         """A pass now: what users want changed."""
-        self.woken.set()
+        tasks.wake(db, JOB)
 
-    def search_soon(self, rg: str):
-        """The album is searched before any other, at a pass now."""
-        self.soon.add(rg)
-        self.woken.set()
+    def search_soon(self, db, rg: str):
+        """The album is searched before any other (the dashboard's "search now"), at a pass now."""
+        db.execute("update want_album set soon = ? where rg = ?", (time.time(), rg))
+        self.wake(db)
 
-    def searching_soon(self, rg: str) -> bool:
-        return rg in self.soon
+    @staticmethod
+    def searching_soon(db, rg: str) -> bool:
+        return db.execute("select 1 from want_album where rg = ? and soon is not null", (rg,)).fetchone() is not None
 
     def to_find(self, db) -> list[dict]:
         """The albums still to find, albums and EPs, then singles: of each (single), how many (count), how many were
@@ -448,8 +445,10 @@ class Acquire:
         first; BUNDLE_FIRST ones once their artist's bundles are. Then albums here only lossy, for a lossless copy weekly."""
         if time.time() - self.last_search < self.gap:
             return
-        if self.soon and (row := db.execute("select * from want_album where rg = ? and state = 'missing'", (self.soon.pop(),)).fetchone()):
-            return self.search(db, row)
+        if row := db.execute("select * from want_album where soon is not null order by soon limit 1").fetchone():
+            db.execute("update want_album set soon = null where rg = ?", (row["rg"],))
+            if row["state"] == "missing":
+                return self.search(db, row)
         if self.bundles and self.bundle_next(db):
             return
         now, queued = time.time(), self.downloads.groups(db)

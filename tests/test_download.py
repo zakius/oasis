@@ -244,10 +244,10 @@ def test_how_much_of_a_download_is_copied_here_counts_partly_fetched_files(downl
     (folder / names[0]).write_bytes((tmp_path / "cdn" / "0").read_bytes())  # fetched before a restart
     (folder / "Album/02.flac.part").write_bytes(b"x" * (sizes[1] // 2))  # cut short
     seen, link = [], torbox.link
-    torbox.link = lambda torrent_id, file_id: seen.append(downloads.copied("abcd")) or link(torrent_id, file_id)
+    torbox.link = lambda torrent_id, file_id: seen.append(downloads.copied(downloads.connect(), "abcd")) or link(torrent_id, file_id)
     downloads.cycle()
     assert seen[0] == (sizes[0] + sizes[1] // 2) / sum(sizes)
-    assert downloads.copied("other") is None
+    assert downloads.copied(db, "other") is None
 
 
 def test_a_trickling_torrent_makes_way_when_slots_are_full_and_albums_wait_and_is_tried_last_again(downloads, torbox, db, monkeypatch):

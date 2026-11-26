@@ -250,7 +250,7 @@ def test_a_search_knows_the_albums_other_titles_from_its_aliases_and_pseudo_rele
     acq, now = client.app.state.oasis.acquire, [time.time()]
     monkeypatch.setattr(time, "time", lambda: now[0])
     for rg in ("g-second", "g-ost"):
-        acq.search_soon(rg)
+        acq.search_soon(client.app.state.oasis.connect(), rg)
         now[0] += acquire.SEARCH_GAP
         sync(client)
     assert acq.downloads.found[-2:] == ["g-second", "g-ost"]

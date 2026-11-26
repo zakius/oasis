@@ -3,7 +3,6 @@ account's queued items, active torrents nobody tracks, and dead ones. Each rule 
 import logging
 from datetime import datetime, timedelta, timezone
 
-from . import worker
 from .torbox import TorBox, from_rdtclient, read_copy
 
 log = logging.getLogger(__name__)
@@ -21,9 +20,6 @@ class Doctor:
         self.connect, self.rdt_db, self.ours, self.torbox_for, self.clock = connect, settings.rdt_db, ours, torbox, clock
         self.stall, self.dry = timedelta(hours=settings.stall_hours), settings.dry_run
         self.progress_seen = {}  # TorBox hash -> (progress, when it was first seen at that progress)
-
-    def start(self):
-        worker.start("doctor cycle", self.cycle, INTERVAL)  # TorBox restarts: next cycle
 
     def say(self, *parts):
         log.info("%s%s", "[dry] " if self.dry else "", " ".join(str(p) for p in parts))

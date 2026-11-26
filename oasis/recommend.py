@@ -15,7 +15,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait as wait_for
 from itertools import chain, zip_longest
 
-from . import accounts, lastfm, missing, playlists, worker
+from . import accounts, lastfm, missing, playlists, tasks
 from .forward import LISTENBRAINZ
 from .artists import linked
 from .formats import LOSSLESS
@@ -43,6 +43,8 @@ KEPT = 3600     # seconds a source's answer is kept (Recommender.answer)
 GRACE, GRACE_MOST = 0.3, 3.0
 LASTFM_SIMILAR = 15  # similar tracks asked of Last.fm, the most a method uses
 RADIOS = ("deezer", "tidal", "soundcloud")  # the services a user's radio capability (sources.CAPABILITIES) makes sources
+JOB = "radio"
+EVERY = 600  # seconds between top-ups of every radio when nothing woke them
 
 
 class Recommender:
@@ -50,7 +52,6 @@ class Recommender:
         """lastfm(): oasis's Last.fm app as it is now, or None. services: each user's services and the other streaming
         services (sources.Sources): a user gets songs only from the services they have on."""
         self.connect, self.ytm, self.lastfm, self.services = connect, ytm, lastfm, services
-        self.woken = threading.Event()
         self.answers: dict[tuple, tuple[float, object]] = {}  # (expiry, answer) by question (answer, find)
         self.answers_lock = threading.Lock()
         self.asking = ThreadPoolExecutor(ASKS)
@@ -320,12 +321,10 @@ class Recommender:
             raise TimeoutError("no service answered by the deadline")
         return None
 
-    def start(self):
-        worker.start("radio", self.top_up_pass, 600, self.woken)
-
-    def wake(self):
+    @staticmethod
+    def wake(db):
         """Tops radios up now: a playlist was made or changed."""
-        self.woken.set()
+        tasks.wake(db, JOB)
 
     def top_up_pass(self):
         db = self.connect()
@@ -349,7 +348,7 @@ class Recommender:
             db.execute("update playlist set played_pos = max(played_pos, (select max(pos) from playlist_entry e "
                        "where e.playlist_id = playlist.id and e.track_id = ?)) where radio != ? and owner = ? and exists "
                        "(select 1 from playlist_entry e where e.playlist_id = playlist.id and e.track_id = ?)", (id, PLAIN, owner, id))
-        self.woken.set()
+        tasks.wake(db, JOB)
 
     def top_up(self, db, playlist):
         """Adds songs to a radio until it has AHEAD playable ones after the last played. Songs nothing plays come too

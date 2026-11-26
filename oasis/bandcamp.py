@@ -11,7 +11,7 @@ import time
 from html import unescape
 from pathlib import Path
 
-from . import musicbrainz, worker
+from . import musicbrainz
 from .acquire import LOSSLESS_TRACK
 from .musicbrainz import lucene
 from .sources import request, save
@@ -111,9 +111,6 @@ class Bandcamp:
         is in the library."""
         self.connect, self.services, self.importer, self.staging = connect, services, importer, staging
         self.want, self.imported = want, imported
-
-    def start(self):
-        worker.start("bandcamp", self.refresh_all, REFRESH)
 
     def refresh_all(self):
         db = self.connect()

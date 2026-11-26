@@ -579,7 +579,7 @@ class Api:
         return {"musicFolders": {"musicFolder": [{"id": 1, "name": "Music"}]}}
 
     def getScanStatus(self, db, p, user):
-        return {"scanStatus": {"scanning": self.oasis.scanner.scanning, "count": db.execute("select count(*) from track").fetchone()[0]}}
+        return {"scanStatus": {"scanning": self.oasis.scanner.scanning(db), "count": db.execute("select count(*) from track").fetchone()[0]}}
 
     def startScan(self, db, p, user):
         self.oasis.scanner.start()
@@ -1186,7 +1186,7 @@ class Api:
                 recommender.top_up(db, self._one(db, "select * from playlist where id = ?", playlist_id))
             except Exception:
                 log.exception("radio fill failed")
-        recommender.wake()
+        recommender.wake(db)
         return {"playlist": self._playlist(db, self._own_playlist(db, playlist_id, user), True, p.missing)}
 
     def updatePlaylist(self, db, p, user):
@@ -1202,7 +1202,7 @@ class Api:
         if removed or added:
             songs = [t for i, t in enumerate(shown) if i not in removed] + added
             set_entries(db, r["id"], with_hidden(old, songs), self.oasis.youtube.fetch_soon)
-        self.oasis.recommender.wake()
+        self.oasis.recommender.wake(db)
         return {}
 
     def deletePlaylist(self, db, p, user):

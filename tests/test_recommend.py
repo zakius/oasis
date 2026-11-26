@@ -6,10 +6,11 @@ import time
 import pytest
 
 from conftest import call, make_client, make_track
-from oasis import accounts, playlists
+from oasis import accounts, playlists, recommend
 from oasis.db import connect
 from oasis.playlists import LISTENING_RADIO
 from oasis.recommend import Recommender
+from oasis.worker import Job, Worker
 from oasis.scan import scan
 from oasis.youtube import remember_song
 from oasis.ytm import song
@@ -282,9 +283,18 @@ def test_a_failing_radio_pass_leaves_the_radio_worker_running(api):
         done.set()
         return api.connect()
     recommender = Recommender(connect, None, None, api.sources)
-    recommender.start()
-    recommender.wake()
-    assert done.wait(10)
+    worker = Worker(api.connect, [Job(recommend.JOB, recommender.top_up_pass, recommend.EVERY)], {})
+    worker.start()
+    try:
+        while not passes:
+            time.sleep(0.01)
+        db = api.connect()
+        while db.execute("select state from task where key = ?", (recommend.JOB,)).fetchone()[0] != "queued":
+            time.sleep(0.01)
+        recommender.wake(db)
+        assert done.wait(10)
+    finally:
+        worker.stop()
 
 
 class LastFmUser(FakeLastFm):
