@@ -1,11 +1,16 @@
 """Each user's YouTube Music mixes and library playlists, mirrored as read-only playlists shown as owned by "YouTube
 Music" and read again every REFRESH. Mixes always show; each library playlist shows or stays hidden as its owner chose
 on the dashboard (playlist.hidden), and one that appears later as user.ytm_new_shown says. Each user's SoundCloud
-likes and playlists are mirrored the same way (SoundCloudPlaylists), all shown."""
+likes and playlists are mirrored the same way (SoundCloudPlaylists), all shown, and so are the playlists ListenBrainz
+makes for the user and the user's Tidal mixes (MadeFor), whose songs are found as radios find theirs."""
+import html
 import logging
+import re
 
 from . import accounts, playlists, worker
-from .playlists import set_entries
+from .forward import ListenBrainz
+from .playlists import MADE_FOR, set_entries
+from .recommend import recording_of
 from .sources import SoundCloud
 from .youtube import remember_song
 from .ytm import LIKED, MIX_PREFIX, is_mix
@@ -14,6 +19,10 @@ log = logging.getLogger(__name__)
 
 OWNER = "YouTube Music"
 SOUNDCLOUD = "soundcloud:"  # the start of playlist.mix for a playlist mirrored from SoundCloud: then its id there, or likes
+LISTENBRAINZ, TIDAL = MADE_FOR
+# Who the playlists mirrored from other services than YouTube Music show as owned by, by the start of their mix.
+OWNERS = {SOUNDCLOUD: "SoundCloud", LISTENBRAINZ: "ListenBrainz", TIDAL: "Tidal"}
+OTHERS = "".join(f" and mix not like '{prefix}%'" for prefix in OWNERS)  # SQL: a mirrored playlist is YouTube Music's
 REFRESH = 6 * 3600
 # YouTube Music's fixed personal mix ids in its own order (the names are localized), as in roma's Mixes.kt.
 ORDER = [
@@ -33,7 +42,31 @@ ORDER = [
 
 def owner(mix: str) -> str:
     """Who a mirrored playlist shows as owned by."""
-    return "SoundCloud" if mix.startswith(SOUNDCLOUD) else OWNER
+    return next((name for prefix, name in OWNERS.items() if mix.startswith(prefix)), OWNER)
+
+
+def from_youtube(mix: str | None) -> bool:
+    """Whether a playlist is mirrored from YouTube Music."""
+    return bool(mix) and not mix.startswith(tuple(OWNERS))
+
+
+def mirror(db, user: str, mix: str, title: str, cover: str | None, ids: list[str], comment: str | None = None):
+    """Keeps a service's playlist as the user's read-only playlist of that mix, with those songs."""
+    row = db.execute("select id from playlist where owner = ? and mix = ?", (user, mix)).fetchone()
+    if row:
+        playlists.rename(db, row["id"], title)
+        db.execute("update playlist set cover = ?, comment = ? where id = ?", (cover, comment, row["id"]))
+        playlist_id = row["id"]
+    else:
+        playlist_id = playlists.create(db, user, title, comment=comment, mix=mix, cover=cover)
+    set_entries(db, playlist_id, ids)
+
+
+def drop(db, user: str, prefix: str, keep=()):
+    """Deletes the user's playlists mirrored from the service whose mixes start with prefix, but those in keep."""
+    for gone in db.execute(f"select id from playlist where owner = ? and mix like '{prefix}%' and mix not in ({','.join('?' * len(keep))})",
+                           (user, *keep)).fetchall():
+        playlists.delete(db, gone["id"])
 
 
 def playlist_order(r) -> tuple:
@@ -94,7 +127,7 @@ class Mixes:
 
     def drop(self, db, user, keep=()):
         """Deletes the user's mirrored YouTube Music playlists but those in keep."""
-        for gone in db.execute(f"select id from playlist where owner = ? and mix is not null and mix not like '{SOUNDCLOUD}%' "
+        for gone in db.execute(f"select id from playlist where owner = ? and mix is not null{OTHERS} "
                                f"and mix not in ({','.join('?' * len(keep))})", (user, *keep)).fetchall():
             playlists.delete(db, gone["id"], self.fetch)
 
@@ -131,15 +164,7 @@ class SoundCloudPlaylists:
             found += [(str(p["id"]), p.get("title") or str(p["id"]), p.get("artwork_url"), reader.playlist_tracks(p["id"])) for p in reader.playlists()]
             for key, title, cover, tracks in found:
                 ids = list(dict.fromkeys(self.services.remember(db, player, player.song(t)) for t in tracks if player.full(t)))
-                mix = SOUNDCLOUD + key
-                row = db.execute("select id from playlist where owner = ? and mix = ?", (user, mix)).fetchone()
-                if row:
-                    playlists.rename(db, row["id"], title)
-                    db.execute("update playlist set cover = ? where id = ?", (cover, row["id"]))
-                    playlist_id = row["id"]
-                else:
-                    playlist_id = playlists.create(db, user, title, mix=mix, cover=cover)
-                set_entries(db, playlist_id, ids)
+                mirror(db, user, SOUNDCLOUD + key, title, cover, ids)
             self.drop(db, user, keep=[SOUNDCLOUD + key for key, *_ in found])
             log.info("soundcloud playlists for %s: %d refreshed", user, len(found))
         except Exception as e:
@@ -149,15 +174,86 @@ class SoundCloudPlaylists:
 
     def drop(self, db, user: str, keep=()):
         """Deletes the user's mirrored SoundCloud playlists but those in keep."""
-        for gone in db.execute(f"select id from playlist where owner = ? and mix like '{SOUNDCLOUD}%' and mix not in ({','.join('?' * len(keep))})",
-                               (user, *keep)).fetchall():
-            playlists.delete(db, gone["id"])
+        drop(db, user, SOUNDCLOUD, keep)
+
+
+class MadeFor:
+    """The playlists a service makes for each user, mirrored while the user can use that service's account features:
+    ListenBrainz's (Weekly Jams, Weekly Exploration, Daily Jams...) and Tidal's mixes. Their songs are found as radios
+    find theirs (Recommender.resolve): from the library, else the user's streaming services; a song none has comes as
+    one nothing plays for a user who sees those (user.missing_songs)."""
+    name = prefix = ""  # the service, and the start of its playlists' mix
+
+    def __init__(self, connect, services, recommender):
+        """services: each user's services (sources.Sources)."""
+        self.connect, self.services, self.recommender = connect, services, recommender
+
+    def start(self):
+        worker.start(f"{self.name} playlists", self.refresh_all, REFRESH)
+
+    def refresh_all(self):
+        db = self.connect()
+        users = [r[0] for r in db.execute("select user from user_service where service = ?", (self.name,))]
+        db.close()
+        for user in users:
+            self.refresh(user)
+
+    def lists(self, db, user: str) -> list[dict]:
+        """The service's playlists for the user: key (the kind of playlist, or its id), title, comment, cover and songs,
+        as (artist, title) or (artist, title, MusicBrainz recording id)."""
+        raise NotImplementedError
+
+    def refresh(self, user: str):
+        """Mirrors the user's playlists; a failure is logged and leaves them as they were."""
+        db = self.connect()
+        try:
+            if not self.services.uses(db, user, self.name, "account"):
+                return
+            found = self.lists(db, user)
+            unplayable = bool(accounts.get(db, user)["missing_songs"])
+            for p in found:
+                ids = list(dict.fromkeys(self.recommender.resolve(db, p["songs"], user, unplayable=unplayable)))
+                mirror(db, user, self.prefix + p["key"], p["title"], p["cover"], ids, p["comment"])
+            drop(db, user, self.prefix, keep=[self.prefix + p["key"] for p in found])
+            log.info("%s playlists for %s: %d refreshed", self.name, user, len(found))
+        except Exception as e:
+            log.warning("%s playlists for %s failed: %s", self.name, user, e)
+        finally:
+            db.close()
+
+    def drop(self, db, user: str):
+        drop(db, user, self.prefix)
+
+
+class ListenBrainzPlaylists(MadeFor):
+    name, prefix = "listenbrainz", LISTENBRAINZ
+
+    def lists(self, db, user: str) -> list[dict]:
+        found = []
+        for p in ListenBrainz(accounts.get(db, user)["listenbrainz_token"]).made_for():
+            songs = [(t["creator"], t["title"], recording_of(t)) for t in p.get("track") or [] if t.get("creator") and t.get("title")]
+            found.append({"key": p["kind"], "title": p["title"], "comment": plain(p.get("annotation") or "") or None, "cover": None, "songs": songs})
+        return found
+
+
+def plain(annotation: str) -> str:
+    """A ListenBrainz playlist's annotation, which may be HTML, as text."""
+    return html.unescape(re.sub(r"<[^>]+>", " ", annotation)).strip()
+
+
+class TidalMixes(MadeFor):
+    name, prefix = "tidal", TIDAL
+
+    def lists(self, db, user: str) -> list[dict]:
+        client = self.services.client(db, user, "tidal")
+        if client is None:
+            raise LookupError("Tidal doesn't start for this user")
+        return [{"key": m["id"], **m} for m in client.mixes()]
 
 
 def library_playlists(db, user: str) -> list:
     """The user's mirrored YouTube Music library playlists (mixes aside), Liked Music first: id, name, mix, hidden."""
-    return db.execute(f"select id, name, mix, hidden from playlist where owner = ? and mix is not null and mix not like '{MIX_PREFIX}%' "
-                      f"and mix not like '{SOUNDCLOUD}%' "
+    return db.execute(f"select id, name, mix, hidden from playlist where owner = ? and mix is not null and mix not like '{MIX_PREFIX}%'{OTHERS} "
                       "order by mix != ?, name collate nocase", (user, LIKED)).fetchall()
 
 

@@ -221,6 +221,14 @@ def album(r) -> dict:
     })
 
 
+def unique(artists: list[dict]) -> list[dict]:
+    """Each artist once, where it first comes."""
+    found = {}
+    for a in artists:
+        found.setdefault(a["id"], a)
+    return list(found.values())
+
+
 def artist(r) -> dict:
     return clean({
         "id": r["id"], "name": r["name"], "albumCount": r["album_count"],
@@ -985,7 +993,7 @@ class Api:
     def getNowPlaying(self, db, p, user):
         return {"nowPlaying": {}}
 
-    def _artist_info(self, db, p):
+    def _artist_info(self, db, p, user):
         r = artist_row(db, p.need("id"))
         if r is None:  # only credited on others' songs
             self._one(db, "select 1 from credit where artist_id = ? limit 1", p.need("id"))
@@ -994,28 +1002,41 @@ class Api:
         page = db.execute("select description, image from ytm_artist where artist_id = ?", (r["id"],)).fetchone()
         youtube = clean({"biography": page["description"], "smallImageUrl": page["image"], "mediumImageUrl": page["image"],
                          "largeImageUrl": page["image"]}) if page else {}
-        linked = self._linked_artists(db, r["id"])
+        linked = self._linked_artists(db, r["id"]) + self._deezer_related(db, user, r["name"])
         if not self.oasis.lastfm:
-            return {**youtube, **clean({"similarArtist": linked or None})}
+            return {**youtube, **clean({"similarArtist": unique(linked) or None})}
         try:
             info = self.oasis.lastfm.artist_info(r["name"])
         except Exception as e:
             log.info("Last.fm artist info failed: %s", e)
-            return {**youtube, **clean({"similarArtist": linked or None})}
+            return {**youtube, **clean({"similarArtist": unique(linked) or None})}
         # Subsonic's includeNotPresent: the similar artists the library lacks too, those Last.fm knows the MusicBrainz id of,
         # as artists only MusicBrainz has (ar-mb-), which can be opened and followed.
         absent = p.get("includeNotPresent") == "true"
         similar = []
         for name, mbid in lastfm.similar_artists(info)[:p.int("count", 20)]:
-            present = [artist(a) for a in db.execute(ARTISTS + " where t.library = 1 and t.album_artist = ? collate nocase group by t.artist_id", (name,))]
+            present = self._library_artists(db, name)
             if not present and absent and mbid:
                 own = tracks.current_id(db, MB_IDS["artist"] + mbid)
                 present = [artist(required(artist_row(db, own)))] if not own.startswith(MB_IDS["artist"]) else \
                     [clean({"id": own, "name": name, "albumCount": 0, "musicBrainzId": mbid, **self._wanted(db, "artist", own)})]
             similar += present
-        similar = linked + [a for a in similar if a["id"] not in {x["id"] for x in linked}]
         return {**youtube, **clean({"biography": lastfm.bio(info), "lastFmUrl": info.get("url"),
-                                    "musicBrainzId": info.get("mbid") or None, "similarArtist": similar or None})}
+                                    "musicBrainzId": info.get("mbid") or None, "similarArtist": unique(linked + similar) or None})}
+
+    def _library_artists(self, db, name: str) -> list[dict]:
+        return [artist(a) for a in db.execute(ARTISTS + " where t.library = 1 and t.album_artist = ? collate nocase group by t.artist_id", (name,))]
+
+    def _deezer_related(self, db, user: str, name: str) -> list[dict]:
+        """The library's artists among those Deezer calls related, for a user who has Deezer's radio capability."""
+        if not self.oasis.sources.uses(db, user, "deezer", "radio"):
+            return []
+        try:
+            names = self.oasis.recommender.answer(("deezer artists", name), lambda: sources.Deezer().related(name))
+        except Exception as e:
+            log.info("Deezer related artists failed: %s", e)
+            return []
+        return [a for related in names for a in self._library_artists(db, related)]
 
     def _linked_artists(self, db, artist_id):
         """Personas, the user's related artists and band members that have songs here, closest first; oasisLink says how."""
@@ -1028,10 +1049,10 @@ class Api:
         return found
 
     def getArtistInfo2(self, db, p, user):
-        return {"artistInfo2": self._artist_info(db, p)}
+        return {"artistInfo2": self._artist_info(db, p, user)}
 
     def getArtistInfo(self, db, p, user):
-        return {"artistInfo": self._artist_info(db, p)}
+        return {"artistInfo": self._artist_info(db, p, user)}
 
     def getAlbumInfo2(self, db, p, user):
         return {"albumInfo": {}}
@@ -1110,7 +1131,7 @@ class Api:
             "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": mixes.owner(r["mix"]) if r["mix"] else r["owner"], "public": False,
             "coverArt": IDS["playlist"] + str(r["id"]) if r["cover"] else None,
             "readonly": True if r["mix"] or r["radio"] else None,  # OpenSubsonic: clients offer no edits; oasis keeps mixes and radios
-            "oasisMix": True if ytm.is_mix(r["mix"]) else None, "youtubeId": None if (r["mix"] or "").startswith(mixes.SOUNDCLOUD) else r["mix"],
+            "oasisMix": True if ytm.is_mix(r["mix"]) else None, "youtubeId": r["mix"] if mixes.from_youtube(r["mix"]) else None,
             "oasisSource": (r["radio_source"] or accounts.get(db, r["owner"])["radio_source"]) if r["radio"] else None,
             "oasisStation": r["station"], "oasisPeriod": r["period"],
             "songCount": count, "duration": duration,

@@ -1,13 +1,21 @@
-"""Playlists' entries and kinds. A plain playlist holds what its owner or a YouTube Music mix put in it; a radio grows
+"""Playlists' entries and kinds. A plain playlist holds what its owner or a mirrored service put in it; a radio grows
 by itself as it is played (see recommend.py), from its own tracks or from everything its owner plays. Streaming tracks
-(of any service) are in the library while starred or in a plain playlist that is not one of YouTube Music's own mixes, so writing
-entries keeps that up."""
+(of any service) are in the library while starred or in a plain playlist that is not one a service makes for the user
+(YouTube Music's mixes, ListenBrainz's playlists, Tidal's mixes), so writing entries keeps that up."""
 import time
 
 from . import accounts
 from .ytm import LIKED, MIX_PREFIX, is_mix
 
 PLAIN, RADIO, LISTENING_RADIO = 0, 1, 2  # playlist.radio: a radio grows from its own tracks, a listening radio from everything played
+# The start of playlist.mix for the playlists another service makes for a user (mixes.py), which change as YouTube
+# Music's mixes do: then the kind of playlist, or its id there.
+MADE_FOR = ("listenbrainz:", "tidal:")
+
+
+def made_for(mix: str | None) -> bool:
+    """Whether a mirrored playlist is one a service makes for the user and changes by itself: YouTube Music's mixes too."""
+    return is_mix(mix) or (mix or "").startswith(MADE_FOR)
 
 
 def is_radio(playlist_name: str) -> int:
@@ -60,7 +68,7 @@ def set_entries(db, playlist_id, track_ids, fetch=None):
 
 def counts(row) -> bool:
     """Whether a playlist's songs are library songs: not a radio or a mix, and shown (Liked Music's whatever)."""
-    return row["radio"] == PLAIN and not is_mix(row["mix"]) and (not row["hidden"] or row["mix"] == LIKED)
+    return row["radio"] == PLAIN and not made_for(row["mix"]) and (not row["hidden"] or row["mix"] == LIKED)
 
 
 def touch(db, ids, fetch=None):
@@ -86,4 +94,4 @@ def demix(db):
     db.execute("update track set library = 0 where source not in ('local', 'missing') and library = 1 and not exists (select 1 from stat s where s.id = track.id "
                "and s.starred is not null) and not exists (select 1 from playlist_entry e join playlist p on p.id = e.playlist_id "
                f"where e.track_id = track.id and p.radio = {PLAIN} and coalesce(p.mix, '') not like '{MIX_PREFIX}%' "
-               f"and (p.hidden = 0 or p.mix = '{LIKED}'))")
+               + "".join(f"and coalesce(p.mix, '') not like '{prefix}%' " for prefix in MADE_FOR) + f"and (p.hidden = 0 or p.mix = '{LIKED}'))")

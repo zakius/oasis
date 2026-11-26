@@ -16,7 +16,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from . import accounts, acquire, audiorecords, cover, download, formats, missing, mixes, musicbrainz, prowlarr, remove, sources, tracks, wants, ytm
+from . import accounts, acquire, audiorecords, cover, download, formats, missing, mixes, musicbrainz, prowlarr, remove, servers, sources, tracks, wants, ytm
 from .musicbrainz import MBID
 from .tracks import IDS, MB_IDS
 from .artists import (ALIAS_TYPES, LINKS, add_name, add_related, configure, known_artists, linked, load_settings, names_of,
@@ -25,7 +25,8 @@ from .credits import credits_of
 from .text import fold
 from .db import as_user
 from .forward import ListenBrainz
-from .lastfm import signs_in
+from .lastfm import LIBREFM, LIBREFM_AUTH, elsewhere, gnufm_auth, signs_in
+from .remote import api_root, web_address
 from .recommend import SOURCES
 from .translate import LANGUAGES
 
@@ -229,25 +230,58 @@ SERVICES = [
     ("Streaming", STREAMING, [
         ("ytm", "YouTube Music", "Search results, radios and full songs, without an account. Yours adds your mixes and history."),
         ("qobuz", "Qobuz", "FLAC, with a subscription that streams; 30-second samples with any account."),
-        ("tidal", "Tidal", "FLAC, with a subscription that streams lossless; 30-second previews."),
+        ("tidal", "Tidal", "FLAC, with a subscription that streams lossless; 30-second previews. Radios from Tidal's track and artist "
+                           "radios, and your mixes as playlists."),
         ("bandcamp", "Bandcamp", "Full songs as 128 kbit/s MP3, where the artist allows it. Only the artist's own page counts. "
                                  "Signed in, your purchases come into the library and your wishlist is wanted."),
         ("soundcloud", "SoundCloud", "Full songs as AAC from the artist's own account. Songs only SoundCloud Go+ plays in full give "
-                                     "30-second previews, or play in full with your Go+ sign-in, which also brings your likes and playlists.")]),
+                                     "30-second previews, or play in full with your Go+ sign-in, which also brings your likes and playlists. "
+                                     "Radios from a song's related tracks.")]),
     ("Plays and recommendations", "", [
         ("lastfm", "Last.fm", "Similar songs and radios from Last.fm. Signed in, your plays are scrobbled there."),
-        ("listenbrainz", "ListenBrainz", "Your plays go to ListenBrainz, and radios can take songs from its LB Radio.")]),
+        ("listenbrainz", "ListenBrainz", "Your plays go to ListenBrainz, radios can take songs from its LB Radio, and the playlists "
+                                         "it makes for you show up in your apps."),
+        ("lastfm-servers", "Other Last.fm-compatible servers", "Your plays are scrobbled to each of these you switch on too: "
+                                                               "Libre.fm, or any server that speaks Last.fm's API, such as one running GNU FM."),
+        ("listenbrainz-servers", "Other ListenBrainz-compatible servers", "Your plays go to each of these you switch on too: any "
+                                                                          "server that takes ListenBrainz's submissions, such as Maloja or Koito.")]),
     ("Previews", f"A song none of your streaming services has can still play a {sources.PREVIEW_SECONDS}-second clip from these public "
                  "catalogues, in this order. Only apps that show songs nothing can play get clips, and so does this dashboard.", [
-        ("deezer", "Deezer", "MP3 clips from Deezer's public catalogue."),
+        ("deezer", "Deezer", "MP3 clips from Deezer's public catalogue. Radios from its artist radios, and its related artists "
+                             "among similar artists."),
         ("apple", "Apple Music", "AAC clips from the iTunes Search API.")]),
 ]
 SERVICE_TITLES = {key: title for _, _, members in SERVICES for key, title, _ in members}
-CAPABILITY_TITLES = {"songs": "Full songs", "signed-in": "Signed-in songs", "previews": "Previews", "account": "Account features"}  # sources.CAPABILITIES
-# What a sign-in to SoundCloud or Bandcamp adds, by capability.
+CAPABILITY_TITLES = {"songs": "Full songs", "signed-in": "Signed-in songs", "previews": "Previews", "radio": "Radios",
+                     "account": "Account features"}  # sources.CAPABILITIES
+# What a sign-in to a service adds, by capability.
 SIGNED_IN = {("soundcloud", "signed-in"): "Songs only SoundCloud Go+ plays in full play in full, as 256 kbit/s AAC, while your account has Go+.",
              ("soundcloud", "account"): "Your likes and playlists show up as playlists, with the songs SoundCloud plays you in full.",
-             ("bandcamp", "account"): "Your purchases come into the library as FLAC, and the albums on your wishlist are wanted for you."}
+             ("bandcamp", "account"): "Your purchases come into the library as FLAC, and the albums on your wishlist are wanted for you.",
+             ("tidal", "radio"): "Radios can take songs from Tidal's radio of a song and of its artist: choose Tidal as a radio source.",
+             ("tidal", "account"): "Your mixes (My Mix, My Daily Discovery, My New Arrivals) show up as playlists, read again every 6 hours.",
+             ("listenbrainz", "account"): "The playlists ListenBrainz makes for you (Weekly Jams, Weekly Exploration, Daily Jams...) show "
+                                          "up as playlists, read again every 6 hours."}
+SERVER_LISTS = {list_key: protocol for protocol, list_key in servers.PROTOCOLS.items()}  # the services that are lists of servers
+# How a user adds a server of each protocol: Libre.fm fills in its own address.
+ADD_SERVER = {
+    "lastfm": ('<form method="post" action="/services/servers/lastfm/add"><input type="hidden" name="preset" value="librefm">'
+               '<button class="primary">Sign in with Libre.fm</button></form>'
+               '<p class="muted">Or another server: oasis signs in through its own page, as with Last.fm.</p>'
+               '<form method="post" action="/services/servers/lastfm/add"><label>Name <span class="muted">(optional)</span>'
+               '<input type="text" name="name"></label><label>API address<input type="text" name="api" placeholder="https://example.org/2.0/"></label>'
+               '<label>Sign-in page, if not the API address\'s <code>../api/auth/</code> (GNU FM\'s)'
+               '<input type="text" name="auth" placeholder="https://example.org/api/auth/"></label><button>Sign in</button></form>'),
+    "listenbrainz": ('<form method="post" action="/services/servers/listenbrainz/add"><label>Name <span class="muted">(optional)</span>'
+                     '<input type="text" name="name"></label><label>API address<input type="text" name="api" '
+                     'placeholder="https://example.org/apis/listenbrainz/1/"></label><label>Token<input type="text" name="token" autocomplete="off">'
+                     '</label><button class="primary">Add</button></form><p class="muted">Maloja\'s and Koito\'s ListenBrainz API is at '
+                     '<code>/apis/listenbrainz/1/</code> on their address. oasis checks the token with the server\'s '
+                     '<code>validate-token</code>, else by sending it a song playing now.</p>'),
+}
+# Said of the user's own servers, which oasis calls from where it runs.
+REACHED = ('<p class="muted">oasis calls the server from its own host, so the address must be one that host reaches, not only '
+           'your own computer.</p>')
 SOURCE_NAMES = {"local": "library", "ytm": "YouTube Music", "missing": "nothing", **{k: v.title for k, v in sources.KINDS.items()}}
 TABS = [("home", "/", "Dashboard", "M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"),
         ("library", "/music/library", "Library", "M5 4v16M9.5 4v16M14 4.5l5.5 15"),
@@ -588,15 +622,16 @@ def routes(oasis) -> list[Route]:
         oasis.unlink_youtube(db, user["name"])
         return back("/services", message="YouTube Music unlinked. Its songs still play.", anchor="service-ytm")
 
-    def lastfm_state(request) -> str:
-        """Ties a Last.fm sign-in to the dashboard session that started it, so no other page can link its own account."""
-        return hmac.new(request.cookies.get(COOKIE, "").encode(), b"lastfm", "sha256").hexdigest()
+    def sign_in_state(request, service: str) -> str:
+        """Ties a sign-in through a service's page to the dashboard session that started it, so no other page can link
+        its own account."""
+        return hmac.new(request.cookies.get(COOKIE, "").encode(), service.encode(), "sha256").hexdigest()
 
     def lastfm_start(db, request, user, form):
-        return RedirectResponse(oasis.lastfm.auth_url(f'{request.url_for("lastfm_callback")}?state={lastfm_state(request)}'), status_code=303)
+        return RedirectResponse(oasis.lastfm.auth_url(f'{request.url_for("lastfm_callback")}?state={sign_in_state(request, "lastfm")}'), status_code=303)
 
     def lastfm_callback(db, request, user, form):
-        if not accounts.same(request.query_params.get("state", ""), lastfm_state(request)):
+        if not accounts.same(request.query_params.get("state", ""), sign_in_state(request, "lastfm")):
             return back("/services", error="That Last.fm sign-in didn't start here. Sign in with Last.fm again.")
         try:
             key, name = oasis.lastfm.sign_in(request.query_params.get("token", ""))
@@ -630,7 +665,81 @@ def routes(oasis) -> list[Route]:
             return back("/services", error="ListenBrainz says that token isn't valid.", anchor="service-listenbrainz")
         accounts.set_field(db, user["name"], listenbrainz_token=token)
         oasis.sources.turn_on(db, user["name"], "listenbrainz")
+        oasis.refresh_soon(oasis.listenbrainz_playlists, user["name"])
         return back("/services", message="ListenBrainz linked.", anchor="service-listenbrainz")
+
+    server_logins: dict[str, tuple[str, str, str]] = {}  # each user's sign-in to a Last.fm-like server under way: its name, API and sign-in page
+
+    def server_list(db, user, protocol: str) -> str:
+        """The user's servers of a protocol, each with its switch and Remove, and the form that adds one."""
+        rows = ""
+        for r in servers.entries(db, user["name"], protocol):
+            id, name = r["id"], r["name"]
+            signed = json.loads(r["account"]).get("user")
+            rows += (f'<li id="server-{id}"><span class="grow"><b>{escape(name)}</b> <code>{escape(r["url"])}</code>'
+                     + (f' <span class="muted">as {escape(signed)}</span>' if signed else "") + '</span>'
+                     + switch(f"/services/servers/{id}", r["enabled"], f"Send plays to {name}")
+                     + f'<form class="inline" method="post" action="/services/servers/{id}/remove"{confirm(f"Remove {name}?")}>'
+                     '<button class="danger">Remove</button></form></li>')
+        listed = f'<ul class="rows">{rows}</ul>' if rows else '<p class="muted">None yet.</p>'
+        return listed + f'<details><summary>Add a server</summary>{ADD_SERVER[protocol]}{REACHED}</details>'
+
+    def server_add(db, request, user, form):
+        """Adds a ListenBrainz-like server once its token is checked; for a Last.fm-like one, sends the user to its
+        sign-in page first, which comes back to server_signed_in with a token."""
+        protocol = request.path_params["protocol"]
+        if protocol not in servers.PROTOCOLS or not oasis.sources.allowed(db, servers.PROTOCOLS[protocol]):
+            return back("/services", error="That list isn't offered on this server.")
+        anchor = f"service-{servers.PROTOCOLS[protocol]}"
+        name = form.get("name", "").strip()
+        try:
+            if protocol == "lastfm" and form.get("preset") == "librefm":
+                api, auth, name = LIBREFM, LIBREFM_AUTH, name or "Libre.fm"
+            else:
+                api = api_root(form.get("api", ""))
+                auth = web_address(form["auth"]) if form.get("auth", "").strip() else gnufm_auth(api)
+        except ValueError as e:
+            return back("/services", error=str(e), anchor=anchor)
+        if protocol == "lastfm":
+            server_logins[user["name"]] = (name, api, auth)
+            callback = str(request.url_for("server_signed_in", state=sign_in_state(request, "lastfm-servers")))
+            return RedirectResponse(elsewhere(api, auth).auth_url(callback), status_code=303)
+        token = form.get("token", "").strip()
+        if not token:
+            return back("/services", error="Paste your token from that server.", anchor=anchor)
+        try:
+            valid = ListenBrainz(token, api).valid()
+        except Exception as e:
+            return back("/services", error=f"{api} didn't answer: {e}", anchor=anchor)
+        if not valid:
+            return back("/services", error=f"{api} refused that token: it said it isn't valid, or refused a test of what oasis sends.", anchor=anchor)
+        servers.add(db, user["name"], protocol, name, api, {"token": token})
+        return back("/services", message=f"Added {api}: your plays go there too.", anchor=anchor)
+
+    def server_signed_in(db, request, user, form):
+        """The state is in the path, not the query: a server may add its token to the address as ?token=."""
+        pending = server_logins.pop(user["name"], None)
+        if pending is None or not accounts.same(request.path_params["state"], sign_in_state(request, "lastfm-servers")):
+            return back("/services", error="That sign-in didn't start here. Add the server again.")
+        name, api, auth = pending
+        try:
+            session, signed = elsewhere(api, auth).sign_in(request.query_params.get("token", ""))
+        except Exception as e:
+            return back("/services", error=f"Signing in at {api} failed: {e}", anchor="service-lastfm-servers")
+        servers.add(db, user["name"], "lastfm", name, api, {"session": session, "user": signed, "auth": auth})
+        return back("/services", message=f"Added {name or api}, signed in as {signed}: your plays are scrobbled there too.",
+                    anchor="service-lastfm-servers")
+
+    def server_switch(db, request, user, form):
+        id, state = request.path_params["id"], request.path_params["state"]
+        if state not in ("on", "off") or not servers.switch(db, user["name"], id, state == "on"):
+            return back("/services", error="No such server.")
+        return back("/services", message=f"Plays {'go' if state == 'on' else 'no longer go'} to that server.", anchor=f"server-{id}")
+
+    def server_remove(db, request, user, form):
+        if not servers.remove(db, user["name"], request.path_params["id"]):
+            return back("/services", error="No such server.")
+        return back("/services", message="Server removed.")
 
     def change_password(db, request, user, form):
         try:
@@ -927,6 +1036,7 @@ def routes(oasis) -> list[Route]:
             return html + '<h3>Your account</h3><p class="muted">Link it for your mixes and playlists, and to send your plays to its history.</p>' + YOUTUBE_STEPS
         if key in ("qobuz", "tidal"):
             missing = "".join(withheld(c) for c in sources.CAPABILITIES[key] if c not in allowed)
+            missing += "".join(f'<p class="muted">{text}</p>' for (service, c), text in SIGNED_IN.items() if service == key and c in allowed)
             if account:
                 samples = '<p class="muted">Without a subscription that streams, it gives samples only.</p>' if account.get("previews_only") else ""
                 return linked_as(account.get("name") or "") + samples + missing
@@ -961,7 +1071,7 @@ def routes(oasis) -> list[Route]:
             return html + (f'<h3>Your account</h3>{adds}' + ACCOUNT_STEPS[key] if adds else "")
         if key == "listenbrainz":
             if user["listenbrainz_token"]:
-                return '<p class="ok">Linked.</p>'
+                return '<p class="ok">Linked.</p>' + (f'<p class="muted">{SIGNED_IN[key, "account"]}</p>' if "account" in allowed else withheld("account"))
             return ('<p class="muted">Not used till it is linked.</p><form method="post" action="/services/listenbrainz/link"><label>User token from '
                     '<a href="https://listenbrainz.org/settings/" target="_blank">listenbrainz.org/settings</a><input type="text" name="token"></label>'
                     '<button class="primary">Link</button></form>')
@@ -997,6 +1107,10 @@ def routes(oasis) -> list[Route]:
             for key, title, text in members:
                 if key not in offered or key == "ytm" and not oasis.ytm:
                     continue
+                if key in SERVER_LISTS:
+                    rows += (f'<section id="service-{key}"><b>{title}</b><div class="muted">{text}</div>'
+                             f'<div class="panel">{server_list(db, user, SERVER_LISTS[key])}</div></section>')
+                    continue
                 account = json.loads(on[key]) if on.get(key) else None
                 ask = f"Turn off {title}? oasis forgets your sign-in." if has_sign_in(user, key, on.get(key)) else ""
                 panel = service_panel(db, user, key, offered[key], account) if key in on else ""
@@ -1015,7 +1129,7 @@ def routes(oasis) -> list[Route]:
         """The user turns a service on or off; off forgets its sign-in."""
         key, state, name = request.path_params["name"], request.path_params["state"], user["name"]
         title = SERVICE_TITLES.get(key)
-        if title is None or state not in ("on", "off"):
+        if title is None or key in SERVER_LISTS or state not in ("on", "off"):
             return back("/services", error="No such service.")
         if state == "on":
             if not oasis.sources.allowed(db, key):
@@ -1024,17 +1138,9 @@ def routes(oasis) -> list[Route]:
             later = " Link your account below: it isn't used till then." if key in ("qobuz", "tidal", "listenbrainz") else ""
             later = " Sign in below for what your account adds." if key in ("soundcloud", "bandcamp") else later
             return back("/services", message=f"{title} is on.{later}", anchor=f"service-{key}")
-        if key == "ytm":
-            oasis.unlink_youtube(db, name)
-        elif key == "lastfm":
-            accounts.set_field(db, name, lastfm_session=None, lastfm_name=None)
-        elif key == "listenbrainz":
-            accounts.set_field(db, name, listenbrainz_token=None)
-        elif key == "tidal":
+        if key == "tidal":
             tidal_logins.pop(name, None)
-        elif key == "soundcloud":
-            oasis.soundcloud.drop(db, name)
-        oasis.sources.turn_off(db, name, key)
+        oasis.turn_off(db, name, key)
         return back("/services", message=f"{title} is off.", anchor=f"service-{key}")
 
     def service_offer(db, request, user, form):
@@ -1091,6 +1197,7 @@ def routes(oasis) -> list[Route]:
                 oasis.sources.link(own, name, "tidal", account)
             finally:
                 own.close()
+            oasis.refresh_soon(oasis.tidal_mixes, name)
             if latest:
                 tidal_logins.pop(name, None)
         try:
@@ -1916,6 +2023,10 @@ def routes(oasis) -> list[Route]:
         Route("/services/lastfm/app", signed_in(lastfm_app, admin=True), methods=["POST"]),
         Route("/services/lastfm/unlink", signed_in(unlink_lastfm), methods=["POST"]),
         Route("/services/listenbrainz/link", signed_in(link_listenbrainz), methods=["POST"]),
+        Route("/services/servers/{protocol}/add", signed_in(server_add), methods=["POST"]),
+        Route("/services/servers/signed-in/{state}", signed_in(server_signed_in), name="server_signed_in"),
+        Route("/services/servers/{id:int}/remove", signed_in(server_remove), methods=["POST"]),
+        Route("/services/servers/{id:int}/{state}", signed_in(server_switch), methods=["POST"]),
         Route("/services/{name}/{state}", signed_in(service_switch), methods=["POST"]),
         Route("/services/{name}/offered/{state}", signed_in(service_offer, admin=True), methods=["POST"]),
         Route("/services/{name}/offered/{capability}/{state}", signed_in(service_offer, admin=True), methods=["POST"]),

@@ -1,7 +1,7 @@
 """The running oasis: the loaded config, the database, YouTube Music and every background worker, wired once and shared
 by both front ends, the Subsonic API (api.py) and the dashboard (web.py). What both front ends do alike lives here too:
-wanting music, linking YouTube Music, SoundCloud and Bandcamp, connecting the Last.fm app oasis signs users in with,
-recording plays."""
+wanting music, linking YouTube Music, SoundCloud and Bandcamp, turning services off, connecting the Last.fm app oasis
+signs users in with, recording plays."""
 import json
 import logging
 import threading
@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 
 from starlette.applications import Starlette
 
-from . import accounts, acquire, api, artists, download, forward, lastfm, missing, mixes, playlists, remove, translate, web, worker, youtube
+from . import accounts, acquire, api, artists, download, forward, lastfm, missing, mixes, playlists, remove, servers, translate, web, worker, youtube
 from .acquire import Acquire
 from .bandcamp import Bandcamp, Fan
 from .config import Config
@@ -56,13 +56,14 @@ class Oasis:
         playlists.demix(db)
         artists.unify(db)
         db.close()
-        services_for = (lambda db, user: services) if services is not None else \
-            (lambda db, user: forward.user_services(self.lastfm, self.ytm, accounts.get(db, user), self.sources.usable(db, user)))
+        services_for = (lambda db, user: services) if services is not None else self.user_services
         self.forwarder = Forwarder(self.connect, services_for, self.ytm)
         self.recommender = Recommender(self.connect, self.ytm, lambda: self.lastfm, self.sources)
         self.uploads = Uploads(self.connect, config.library[0], config.database.parent / "uploads")
         self.mixes = Mixes(self.connect, self.ytm, self.sources, self.youtube.fetch_soon)
         self.soundcloud = mixes.SoundCloudPlaylists(self.connect, self.sources)
+        self.listenbrainz_playlists = mixes.ListenBrainzPlaylists(self.connect, self.sources, self.recommender)
+        self.tidal_mixes = mixes.TidalMixes(self.connect, self.sources, self.recommender)
         self.enrichment = Enrichment(self.connect)
         self.scanner = Scanner(self.connect, config.library, config.dedupe, self.enrichment.wake.set)
         self.bandcamp = Bandcamp(self.connect, self.sources, Importer(self.connect, config.library[0]), config.database.parent / "bandcamp",
@@ -78,6 +79,11 @@ class Oasis:
 
     def connect(self):
         return connect(self.config.database)
+
+    def user_services(self, db, user: str) -> dict:
+        """The services the user's plays go to, by name (forward.user_services)."""
+        return forward.user_services(self.lastfm, self.ytm, accounts.get(db, user), self.sources.usable(db, user),
+                                     servers.sending(db, user, self.sources.offered(db)))
 
     def youtube_music(self, db, user: str | None = None):
         """YouTube Music's client while an admin offers it; with user, for its full songs, while they are allowed and
@@ -100,6 +106,8 @@ class Oasis:
             self.mixes.start()
             worker.start("album fill", self.complete_next_album, youtube.ALBUM_IDLE)
         self.soundcloud.start()
+        self.listenbrainz_playlists.start()
+        self.tidal_mixes.start()
         self.bandcamp.start()
         self.recommender.start()
         worker.start("missing songs", self.fill_missing, MISSING_IDLE)
@@ -214,10 +222,30 @@ class Oasis:
         return name
 
     def unlink(self, db, user: str, name: str):
-        """Forgets the user's sign-in to SoundCloud or Bandcamp, which stay on; SoundCloud's mirrored playlists go."""
+        """Forgets the user's sign-in to a service, which stays on; SoundCloud's mirrored playlists go."""
         self.sources.unlink(db, user, name)
         if name == "soundcloud":
             self.soundcloud.drop(db, user)
+
+    def turn_off(self, db, user: str, name: str):
+        """Turns the service off for the user, forgetting their sign-in to it; the playlists mirrored from it go."""
+        if name == "ytm":
+            self.unlink_youtube(db, user)
+        elif name == "lastfm":
+            accounts.set_field(db, user, lastfm_session=None, lastfm_name=None)
+        elif name == "listenbrainz":
+            accounts.set_field(db, user, listenbrainz_token=None)
+            self.listenbrainz_playlists.drop(db, user)
+        elif name == "soundcloud":
+            self.soundcloud.drop(db, user)
+        elif name == "tidal":
+            self.tidal_mixes.drop(db, user)
+        self.sources.turn_off(db, user, name)
+
+    def refresh_soon(self, worker, user: str):
+        """Mirrors the user's playlists of a service in the background (one of mixes.py's), as they were just linked."""
+        if self.background:
+            threading.Thread(target=worker.refresh, args=(user,), daemon=True).start()
 
     def set_lastfm_app(self, db, key: str, secret: str):
         """Checks a Last.fm API key and secret, then keeps and uses them."""

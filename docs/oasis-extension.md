@@ -77,8 +77,11 @@ they are played. Both take their songs from a **source**:
 | `ytm` | YouTube Music's radio for the song | the user has YouTube Music on, and the server offers its full songs |
 | `library` | The library alone: the artist's linked artists, the same artist, songs played around it, the same genre | always |
 | `listenbrainz` | ListenBrainz's LB Radio for the song's artist and artists ListenBrainz finds similar | the user has ListenBrainz on, with a token |
+| `deezer` | Deezer's radio of the song's artist | the user has Deezer on, and the server offers its radios |
+| `tidal` | Tidal's radio of the song and of its artist | the user has Tidal on and linked, and the server offers its radios |
+| `soundcloud` | SoundCloud's related tracks of the song | the user has SoundCloud on, and the server offers its radios |
 
-Last.fm's and ListenBrainz's picks become library songs where the library has them, else the best of what the
+The picks of Last.fm, ListenBrainz, Deezer, Tidal and SoundCloud become library songs where the library has them, else the best of what the
 streaming services the user has on answer, all asked at once: YouTube Music (`yt-…`), Qobuz (`qb-…`), Tidal (`td-…`),
 Bandcamp (`bc-…`), SoundCloud (`sc-…`). A full lossless song beats a lossy one, and a lossy one a higher bitrate (see the
 README). A pick that none of them has is left out, unless the client asks for unplayable songs
@@ -122,7 +125,7 @@ In XML, `source` and `station` are repeated elements with attributes, and each `
 
 - `similarSongs`/`similarSongs2` has `oasisSource`: the source the songs came from (the one asked for, else the
   default).
-- An unknown id is error 0, `oasisSource must be one of all, lastfm, ytm, library, listenbrainz`.
+- An unknown id is error 0, `oasisSource must be one of all, lastfm, ytm, library, listenbrainz, deezer, tidal, soundcloud`.
 - A known but unavailable source gives an empty `song` list.
 
 ### Starting a radio playlist
@@ -232,6 +235,8 @@ These use standard fields only, so they are not part of the parameter:
   they stream like library songs.
 - YouTube Music mixes and library playlists of a linked account are read-only playlists (`readonly: true`) owned by
   `YouTube Music`.
+- Playlists mirrored from a user's SoundCloud, ListenBrainz and Tidal are read-only too, owned by `SoundCloud`,
+  `ListenBrainz` and `Tidal`.
 - `getArtist` lists the artist's YouTube Music albums after the library's; such an album has `songCount: 0` until
   `getAlbum` opens it.
 - `star`/`unstar` with `albumId` or `artistId` asks the server to acquire the album or the artist's albums, or takes
