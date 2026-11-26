@@ -37,9 +37,11 @@ def playlist_order(r) -> tuple:
 
 
 class Mixes:
-    def __init__(self, connect, ytm, fetch=None):
-        """fetch(video id): for set_entries, the streaming tracks to download."""
-        self.connect, self.ytm, self.fetch = connect, ytm, fetch
+    def __init__(self, connect, ytm, services, fetch=None):
+        """services: each user's services (sources.Sources): only users with YouTube Music's account features have mixes
+        read. fetch(video
+        id): for set_entries, the streaming tracks to download."""
+        self.connect, self.ytm, self.services, self.fetch = connect, ytm, services, fetch
 
     def start(self):
         worker.start("mix refresh", self.refresh_all, REFRESH)
@@ -52,13 +54,13 @@ class Mixes:
             self.refresh(user)
 
     def refresh(self, user: str):
-        """Mirrors the user's mixes and library playlists; a failure is logged and leaves them as they were. A library
-        playlist seen first is shown or hidden as the user's ytm_new_shown says (Liked Music is shown); a hidden one's
-        songs aren't read till it is shown."""
+        """Mirrors the user's mixes and library playlists, while the user has YouTube Music's account features; a
+        failure is logged and leaves them as they were. A library playlist seen first is shown or hidden as the user's
+        ytm_new_shown says (Liked Music is shown); a hidden one's songs aren't read till it is shown."""
         db = self.connect()
         try:
             account = accounts.get(db, user)
-            if not (self.ytm and account and account["ytm_auth"]):
+            if not (self.ytm and account and account["ytm_auth"] and self.services.uses(db, user, "ytm", "account")):
                 return
             client = self.ytm.client(account["ytm_auth"])
             mixes = self.ytm.playlists(client)

@@ -48,13 +48,15 @@ def test_web_sign_in_and_link_services(client):
     assert "Wrong user" in client.post("/login", data={"name": "admin", "password": "x"}).text
     sign_in(client)
     page = client.get("/").text
-    assert "Signed in as <b>admin</b>" in page and "Copy as cURL" in page
-    linked = client.post("/account/youtube", data={"headers": "SID=a; __Secure-3PAPISID=b"}).text
+    assert "Signed in as <b>admin</b>" in page and 'href="/services"' in page and "Copy as cURL" not in page
+    assert "Copy as cURL" in client.get("/services").text
+    linked = client.post("/services/ytm/link", data={"headers": "SID=a; __Secure-3PAPISID=b"}).text
     assert "YouTube Music linked as Tester" in linked
-    assert "Wrong" not in client.post("/account/youtube", data={"headers": "nothing"}).text
-    assert "no YouTube sign-in cookie" in client.post("/account/youtube", data={"headers": "nothing"}).text
-    assert "unlinked" in client.post("/account/youtube/unlink").text
-    assert "last.fm/api/account/create" in client.get("/").text
+    assert "Wrong" not in client.post("/services/ytm/link", data={"headers": "nothing"}).text
+    assert "no YouTube sign-in cookie" in client.post("/services/ytm/link", data={"headers": "nothing"}).text
+    assert "unlinked" in client.post("/services/ytm/unlink").text
+    assert "last.fm/api/account/create" not in client.get("/services").text  # Last.fm is off
+    assert "last.fm/api/account/create" in client.post("/services/lastfm/on").text
 
 
 @pytest.fixture
@@ -69,23 +71,24 @@ def lastfm(monkeypatch):
 
 def link_lastfm(client) -> str:
     """Signs the dashboard's user in with Last.fm; returns the page it lands on."""
-    location = client.get("/account/lastfm", follow_redirects=False).headers["location"]
+    location = client.get("/services/lastfm/link", follow_redirects=False).headers["location"]
     callback = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)["cb"][0]
     return client.get(callback + "&token=t").text  # Last.fm adds its token to the callback
 
 
 def test_an_admin_connects_oasis_to_lastfm_on_the_dashboard(client, lastfm, library, tmp_path):
     sign_in(client)
-    assert "Invalid method signature" in client.post("/account/lastfm/app", data={"key": "k", "secret": "wrong"}).text
-    assert "Sign in with Last.fm" in client.post("/account/lastfm/app", data={"key": "k", "secret": "right"}).text
-    location = client.get("/account/lastfm", follow_redirects=False).headers["location"]
+    client.post("/services/lastfm/on")
+    assert "Invalid method signature" in client.post("/services/lastfm/app", data={"key": "k", "secret": "wrong"}).text
+    assert "Sign in with Last.fm" in client.post("/services/lastfm/app", data={"key": "k", "secret": "right"}).text
+    location = client.get("/services/lastfm/link", follow_redirects=False).headers["location"]
     assert urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)["api_key"] == ["k"]
-    assert "start here" in client.get("/account/lastfm/callback", params={"token": "t"}).text  # another page's link
-    assert "start here" in client.get("/account/lastfm/callback", params={"token": "t", "state": "forged"}).text
+    assert "start here" in client.get("/services/lastfm/callback", params={"token": "t"}).text  # another page's link
+    assert "start here" in client.get("/services/lastfm/callback", params={"token": "t", "state": "forged"}).text
     assert "Linked as <b>zak</b>" in link_lastfm(client)
     with make_client(library, tmp_path / "oasis.db") as restarted:  # the key and secret are kept
         sign_in(restarted)
-        restarted.post("/account/lastfm/unlink")
+        restarted.post("/services/lastfm/unlink")
         assert "Linked as <b>zak</b>" in link_lastfm(restarted)
 
 
@@ -183,10 +186,13 @@ def test_status_shows_oasis_downloads_and_what_arrived_lately(client):
 def test_get_user_reports_lastfm_forwarding(client, lastfm):
     assert call(client, "getUser")["user"]["scrobblingEnabled"] is False
     sign_in(client)
-    client.post("/account/lastfm/app", data={"key": "k", "secret": "right"})
+    client.post("/services/lastfm/on")
+    client.post("/services/lastfm/app", data={"key": "k", "secret": "right"})
     assert call(client, "getUser")["user"]["scrobblingEnabled"] is False
     link_lastfm(client)
     assert call(client, "getUser")["user"]["scrobblingEnabled"] is True
+    client.post("/services/lastfm/off")
+    assert call(client, "getUser")["user"]["scrobblingEnabled"] is False
 
 
 def test_stars_ratings_and_plays_are_each_users(client):

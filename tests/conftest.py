@@ -90,11 +90,18 @@ def offline_lyrics(monkeypatch):
     monkeypatch.setattr(lyrics, "PROVIDERS", {})
 
 
-def make_client(library, database, ytm=None, services=None, **settings):
-    """settings: more of the Config."""
-    config = Config(library=[library], users={"admin": "secret"}, database=database, **settings)
+def make_client(library, database, ytm=None, services=None, turned_on=None, **settings):
+    """turned_on: the services the admin has on, YouTube Music by default when there is one, which the server then
+    offers too. settings: more of the Config."""
+    config = Config(library=[library], users={"admin": "secret"}, database=database, **{"ytm_allowed": ytm is not None, **settings})
     scan(connect(config.database), config.library)
-    return TestClient(app_for(config, ytm=ytm, services=services or {}))
+    app = app_for(config, ytm=ytm, services=services or {})
+    oasis = app.state.oasis
+    db = oasis.connect()
+    for name in turned_on if turned_on is not None else ["ytm"] if ytm else []:
+        oasis.sources.turn_on(db, "admin", name)
+    db.close()
+    return TestClient(app)
 
 
 def app_for(config, **options):

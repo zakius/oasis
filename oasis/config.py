@@ -42,6 +42,7 @@ class Config:
     host: str = "0.0.0.0"
     port: int = 4533
     ytm_cache: Path | None = None
+    ytm_allowed: bool = False   # [ytmusic] enabled: whether users may turn YouTube Music on, till an admin decides on the dashboard
     lastfm_key: str | None = None
     lastfm_secret: str | None = None
     torbox: TorBox | None = None
@@ -64,7 +65,8 @@ def load(path: Path) -> Config:
     found = Config(
         library=[(base / Path(p).expanduser()).resolve() for p in data.get("library", {}).get("paths", [])],
         users={u["name"]: u["password"] for u in data.get("users", [])},
-        ytm_cache=base / Path(ytm.get("cache", "cache")).expanduser() if ytm.get("enabled") else None,
+        ytm_cache=base / Path(ytm.get("cache", "cache")).expanduser(),
+        ytm_allowed=bool(ytm.get("enabled")),
         lastfm_key=lastfm.get("api_key") or None,
         lastfm_secret=lastfm.get("secret") or None,
         artists=data.get("artists", {}),

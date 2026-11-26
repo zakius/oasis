@@ -37,9 +37,11 @@ class Oasis:
         """services: every user's play-forwarding services, by name, in place of what they linked (tests). background:
         starts threads as users act (loading a user's mixes); tests run those themselves."""
         self.config, self.background = config, background
+        # YouTube Music's client exists whatever an admin allows: the switch on the dashboard works while oasis runs.
         self.ytm = ytm or (YouTubeMusic(config.ytm_cache) if config.ytm_cache else None)
-        self.youtube = YouTubeCatalogue(self.ytm)
-        self.sources = Sources(config.database.parent / "streams")  # other streaming services' audio, cached when played
+        # Each user's services and other streaming services' audio, cached when played
+        self.sources = Sources(config.database.parent / "streams", config.ytm_allowed)
+        self.youtube = YouTubeCatalogue(self.ytm, lambda db: self.sources.allowed(db, "ytm"))
         self.throttle = accounts.Throttle()  # the API's and the dashboard's sign-ins
         self.translations = translate.Translations(translate.Google())
         db = self.connect()
@@ -52,11 +54,11 @@ class Oasis:
         artists.unify(db)
         db.close()
         services_for = (lambda db, user: services) if services is not None else \
-            (lambda db, user: forward.user_services(self.lastfm, self.ytm, accounts.get(db, user)))
+            (lambda db, user: forward.user_services(self.lastfm, self.ytm, accounts.get(db, user), self.sources.usable(db, user)))
         self.forwarder = Forwarder(self.connect, services_for, self.ytm)
         self.recommender = Recommender(self.connect, self.ytm, lambda: self.lastfm, self.sources)
         self.uploads = Uploads(self.connect, config.library[0], config.database.parent / "uploads")
-        self.mixes = Mixes(self.connect, self.ytm, self.youtube.fetch_soon)
+        self.mixes = Mixes(self.connect, self.ytm, self.sources, self.youtube.fetch_soon)
         self.enrichment = Enrichment(self.connect)
         self.scanner = Scanner(self.connect, config.library, config.dedupe, self.enrichment.wake.set)
         torbox, prowlarr = config.torbox, config.prowlarr
@@ -70,6 +72,14 @@ class Oasis:
 
     def connect(self):
         return connect(self.config.database)
+
+    def youtube_music(self, db, user: str | None = None):
+        """YouTube Music's client while an admin offers it; with user, for its full songs, while they are allowed and
+        that user has it on too. Else None."""
+        if not self.ytm:
+            return None
+        on = self.sources.uses(db, user, "ytm", "songs") if user else self.sources.allowed(db, "ytm")
+        return self.ytm if on else None
 
     def start(self):
         self.scanner.start()
@@ -139,10 +149,10 @@ class Oasis:
         return remove.delete(db, rg, self.config.library)
 
     def link_youtube(self, db, user: str, headers: dict) -> str:
-        """Checks the sign-in by reading the account name, saves it, and loads the user's mixes; ValueError saying why
-        when it can't."""
-        if not self.ytm:
-            raise ValueError("YouTube Music is not enabled on this server")
+        """Checks the sign-in by reading the account name, saves it with YouTube Music turned on, and loads the user's
+        mixes; ValueError saying why when it can't."""
+        if not (self.ytm and self.sources.allowed(db, "ytm", "account")):
+            raise ValueError("YouTube Music accounts aren't offered on this server")
         auth = json.dumps(headers)
         try:
             name = self.ytm.account_name(self.ytm.client(auth))
@@ -151,6 +161,7 @@ class Oasis:
             log.warning("YouTube Music sign-in for %s rejected: %s", user, e)
             raise ValueError("YouTube Music didn't accept that sign-in. Sign in again and retry.")
         accounts.set_field(db, user, ytm_auth=auth, ytm_name=name)
+        self.sources.turn_on(db, user, "ytm")
         if self.background:
             threading.Thread(target=self.mixes.refresh, args=(user,), daemon=True).start()
         return name

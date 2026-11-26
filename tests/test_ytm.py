@@ -224,5 +224,5 @@ def test_warm_readies_only_the_first_song_that_streams_from_youtube():
         def warm(self, video_id):
             asked.append(video_id)
             warmed.set()
-    YouTubeCatalogue(Ytm()).warm(db, ["tr-1", "yt-3", "yt-2"])
+    YouTubeCatalogue(Ytm(), lambda db: True).warm(db, ["tr-1", "yt-3", "yt-2"])
     assert warmed.wait(5) and asked == ["v3"]

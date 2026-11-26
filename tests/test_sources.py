@@ -56,9 +56,10 @@ class FakePreview:
 def client(library, tmp_path, monkeypatch):
     monkeypatch.setattr(sources, "KINDS", {"fake": FakeService, **sources.KINDS})
     monkeypatch.setattr(sources, "PREVIEWS", {"clips": FakePreview})
+    monkeypatch.setattr(sources, "CAPABILITIES", {**sources.CAPABILITIES, "fake": ("songs",), "clips": ("previews",)})
     monkeypatch.setattr(sources, "save", lambda url, path: path.write_bytes(b"ID3 clip from " + url.encode()))
     FakeService.asked, FakeService.formats, FakeService.broken = [], ["mp3"], False
-    with make_client(library, tmp_path / "oasis.db", FakeYtm()) as c:
+    with make_client(library, tmp_path / "oasis.db", FakeYtm(), turned_on=["ytm", "lastfm"]) as c:
         c.app.state.oasis.lastfm = LastFmWithGaps()
         yield c
 
@@ -71,7 +72,7 @@ def similar(client, **params):
 def test_a_song_youtube_music_lacks_plays_from_another_service_once_turned_on(client):
     assert "Lost Song" not in [s["title"] for s in similar(client)]
     db = client.app.state.oasis.connect()
-    client.app.state.oasis.sources.set(db, "fake", "1")
+    client.app.state.oasis.sources.turn_on(db, "admin", "fake")
     found = next(s for s in similar(client, unavailableSongs="1") if s["title"] == "Lost Song")
     assert found["id"] == "fk-42" and "playable" not in found
     assert db.execute("select source, ref, library from track where id = 'fk-42'").fetchone()[:] == ("fake", "fake:42", 0)
@@ -83,24 +84,27 @@ def test_a_song_youtube_music_lacks_plays_from_another_service_once_turned_on(cl
 def test_a_service_turned_off_stops_its_streams_and_its_songs_in_recommendations(client):
     db = client.app.state.oasis.connect()
     oasis = client.app.state.oasis
-    oasis.sources.set(db, "fake", "1")
+    oasis.sources.turn_on(db, "admin", "fake")
     assert "fk-42" in [s["id"] for s in similar(client)]
-    oasis.sources.set(db, "fake", None)
+    oasis.sources.turn_off(db, "admin", "fake")
     assert call(client, "stream", id="fk-42")["error"]["code"] == 70
     assert "fk-42" not in [s["id"] for s in similar(client)]
 
 
-def test_the_admin_turns_services_on_and_off_on_the_dashboard(client):
+def test_a_user_turns_services_on_and_off_on_the_services_page(client):
     sign_in(client)
-    page = client.get("/admin/services").text
+    assert client.get("/admin/services", follow_redirects=False).headers["location"] == "/services"
+    page = client.get("/services").text
     assert "Bandcamp" in page and "SoundCloud" in page and "Qobuz" in page and "Tidal" in page
-    client.post("/admin/services/bandcamp/on")
+    client.post("/services/bandcamp/on")
     db = client.app.state.oasis.connect()
-    assert [c.name for c in client.app.state.oasis.sources.active(db)] == ["bandcamp"]
-    assert "Turn off" in client.get("/admin/services").text
-    client.post("/admin/services/bandcamp/off")
-    assert client.app.state.oasis.sources.active(db) == []
-    assert "No such service" in client.post("/admin/services/qobuz/on").text  # Qobuz needs its account
+    assert [c.name for c in client.app.state.oasis.sources.active(db, "admin")] == ["bandcamp"]
+    assert 'action="/services/bandcamp/off"' in client.get("/services").text
+    client.post("/services/bandcamp/off")
+    assert client.app.state.oasis.sources.active(db, "admin") == []
+    assert "No such service" in client.post("/services/nothing/on").text
+    assert "isn&#x27;t used till then" in client.post("/services/qobuz/on").text  # Qobuz needs its account
+    assert client.app.state.oasis.sources.active(db, "admin") == []
 
 
 class Answer:
@@ -125,10 +129,10 @@ def test_linking_qobuz_keeps_its_sign_in_and_the_secret_that_works_not_the_passw
     monkeypatch.setattr(Qobuz, "fetch_player_keys", classmethod(lambda cls: ("123", ["first", "second"])))
     monkeypatch.setattr(sources, "request", qobuz)
     sign_in(client)
-    assert "Qobuz linked as Listener" in client.post("/admin/services/qobuz", data={"email": "a@b", "password": "pw"}).text
-    assert "Linked as <b>Listener</b>" in client.get("/admin/services").text
-    settings = client.app.state.oasis.sources.settings(client.app.state.oasis.connect())
-    assert json.loads(settings["qobuz"]) == {"app_id": "123", "token": "tok", "name": "Listener", "secret": "second"}
+    assert "Qobuz linked as Listener" in client.post("/services/qobuz/link", data={"email": "a@b", "password": "pw"}).text
+    assert "Linked as <b>Listener</b>" in client.get("/services").text
+    on = client.app.state.oasis.sources.turned_on(client.app.state.oasis.connect(), "admin")
+    assert json.loads(on["qobuz"]) == {"app_id": "123", "token": "tok", "name": "Listener", "secret": "second"}
 
 
 def test_qobuz_out_of_reach_says_so_without_the_password(client, monkeypatch):
@@ -138,14 +142,14 @@ def test_qobuz_out_of_reach_says_so_without_the_password(client, monkeypatch):
     monkeypatch.setattr(Qobuz, "fetch_player_keys", classmethod(lambda cls: ("123", ["s"])))
     monkeypatch.setattr(sources.HTTP, "request", away)
     sign_in(client)
-    answer = client.post("/admin/services/qobuz", data={"email": "a@b", "password": "pw"})
+    answer = client.post("/services/qobuz/link", data={"email": "a@b", "password": "pw"})
     assert answer.status_code == 200 and "couldn&#x27;t be reached" in answer.text
     assert hashlib.md5(b"pw").hexdigest() not in answer.text
 
 
 def test_a_broken_download_is_never_played_as_the_song_and_the_format_that_came_is_kept(client):
     db = client.app.state.oasis.connect()
-    client.app.state.oasis.sources.set(db, "fake", "1")
+    client.app.state.oasis.sources.turn_on(db, "admin", "fake")
     similar(client)
     FakeService.broken = True
     assert call(client, "stream", id="fk-42")["error"]["code"] == 70
@@ -159,7 +163,7 @@ def test_a_broken_download_is_never_played_as_the_song_and_the_format_that_came_
 def test_cached_audio_no_track_plays_is_deleted(client):
     db = client.app.state.oasis.connect()
     oasis = client.app.state.oasis
-    oasis.sources.set(db, "fake", "1")
+    oasis.sources.turn_on(db, "admin", "fake")
     similar(client)
     client.get("/rest/stream.view", params={"u": "admin", "p": "secret", "id": "fk-42"})
     orphan = oasis.sources.cache / (sources.stream_stem("fake", "gone") + ".mp3")
@@ -212,25 +216,29 @@ def lost(client, **params):
 def test_a_song_nothing_has_plays_a_preview_only_in_apps_that_take_unplayable_songs(client):
     db = client.app.state.oasis.connect()
     assert "preview" not in lost(client, unavailableSongs="1")
-    client.app.state.oasis.sources.set(db, "clips", "1")
+    client.app.state.oasis.sources.turn_on(db, "admin", "clips")
     song = lost(client, unavailableSongs="1")
     assert song["playable"] is False and song["preview"] == 30
     assert lost(client) is None  # plain Subsonic apps get neither the song nor its clip
     assert client.get("/rest/stream.view", params={"u": "admin", "p": "secret", "id": song["id"]}).content == b"ID3 clip from https://clips.example/7"
-    client.app.state.oasis.sources.set(db, "clips", None)
+    client.app.state.oasis.sources.turn_off(db, "admin", "clips")
+    stream = {"u": "admin", "p": "secret", "id": song["id"]}
+    assert client.get("/rest/stream.view", params=stream).content.startswith(b"ID3 clip")  # kept: it plays for everyone
+    for f in client.app.state.oasis.sources.cache.glob("*.*"):
+        f.unlink()
     assert call(client, "stream", id=song["id"])["error"]["code"] == 70
 
 
 def test_the_dashboard_plays_a_preview_and_turns_preview_services_on(client):
     db = client.app.state.oasis.connect()
-    client.app.state.oasis.sources.set(db, "clips", "1")
+    client.app.state.oasis.sources.turn_on(db, "admin", "clips")
     song = lost(client, unavailableSongs="1")
     sign_in(client)
     client.app.state.oasis.acquire = Acquiring()
     assert f'src="/music/preview/{song["id"]}"' in client.get(f"/music/library/song/{song['id']}").text
     assert client.get(f"/music/preview/{song['id']}").content.startswith(b"ID3 clip")
-    client.post("/admin/services/deezer/on")
-    assert client.app.state.oasis.sources.settings(db)["deezer"] == "1"
+    client.post("/services/deezer/on")
+    assert "deezer" in client.app.state.oasis.sources.usable(db, "admin")
 
 
 def test_deezer_and_apple_find_a_clip_of_the_artists_song(monkeypatch):

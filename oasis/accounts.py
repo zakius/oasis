@@ -88,6 +88,7 @@ def delete(db, name: str):
     db.execute("delete from user where name = ?", (name,))
     db.execute("delete from session where user = ?", (name,))
     db.execute("delete from app_password where user = ?", (name,))
+    db.execute("delete from user_service where user = ?", (name,))
 
 
 def new_app_password(db, user: str, name: str) -> str:

@@ -89,14 +89,17 @@ def audio(ytm, video_id: str) -> Path | Stream:
 
 
 class YouTubeCatalogue:
-    """The catalogue's pages and albums as the front ends ask for them, for one YouTube Music client (None when it is
-    off: then nothing is fetched)."""
+    """The catalogue's pages and albums as the front ends ask for them, for one YouTube Music client (None when oasis
+    has none). Nothing is fetched while there is none or an admin doesn't allow YouTube Music (allowed(db))."""
 
-    def __init__(self, ytm):
-        self.ytm = ytm
+    def __init__(self, ytm, allowed):
+        self.ytm, self.allowed = ytm, allowed
         self.completed: set[str] = set()  # albums complete_album fetched in full
         self.album_tried: set[str] = set()  # albums complete_next_album asked YouTube Music for, read or not
         self.warmed: dict[str, float] = {}  # when each video was last readied (warm), worked or not
+
+    def on(self, db) -> bool:
+        return self.ytm is not None and self.allowed(db)
 
     def fetch_soon(self, video_id: str):
         if self.ytm:
@@ -105,7 +108,7 @@ class YouTubeCatalogue:
     def warm(self, db, track_ids: list[str]):
         """Readies the stream of the first of these songs that plays from YouTube, in the background: a client is about to
         play it. One only, as YouTube refuses players that ask too often; a client fetches the next song during this one."""
-        if not self.ytm or not track_ids:
+        if not track_ids or not self.on(db):
             return
         refs = dict(db.execute(f"select id, ref from track where source = 'ytm' and id in ({','.join('?' * len(track_ids))})", track_ids).fetchall())
         video_id = next((refs[id] for id in track_ids if id in refs), None)
@@ -116,7 +119,7 @@ class YouTubeCatalogue:
 
     def search(self, db, query: str, limit: int) -> list[str]:
         """The ids of YouTube Music's songs for a query, kept as streaming tracks; none when it fails."""
-        if not self.ytm:
+        if not self.on(db):
             return []
         try:
             return [remember_song(db, song) for song in self.ytm.search(query, limit)]
@@ -127,7 +130,7 @@ class YouTubeCatalogue:
     def artist_page(self, db, artist_id: str, name: str):
         """Fetches the artist's YouTube Music page into ytm_artist and ytm_release, at most once per ARTIST_PAGE_KEPT."""
         page = db.execute("select fetched from ytm_artist where artist_id = ?", (artist_id,)).fetchone()
-        if not self.ytm or (page and page["fetched"] > time.time() - ARTIST_PAGE_KEPT):
+        if not self.on(db) or (page and page["fetched"] > time.time() - ARTIST_PAGE_KEPT):
             return
         try:
             found = self.ytm.artist(name)
@@ -144,7 +147,7 @@ class YouTubeCatalogue:
     def top_songs(self, db, name: str, count: int) -> list[str]:
         """The ids of the artist's top songs on YouTube Music, kept as streaming tracks: its page's list, or a search
         when the page has none. None of them when it fails."""
-        if not self.ytm:
+        if not self.on(db):
             return []
         try:
             owner = db.execute("select artist_id from track where album_artist = ? collate nocase limit 1", (name,)).fetchone()
@@ -161,7 +164,7 @@ class YouTubeCatalogue:
     def complete_album(self, db, album_id: str):
         """Fetches the rest of an album that is only known from streaming tracks seen in search or radio, or only
         from an artist's YouTube Music page."""
-        if not self.ytm or album_id in self.completed:
+        if album_id in self.completed or not self.on(db):
             return
         sources = db.execute("select source, ytm_album from track where album_id = ?", (album_id,)).fetchall()
         release = db.execute("select * from ytm_release where album_id = ?", (album_id,)).fetchone()
@@ -184,6 +187,8 @@ class YouTubeCatalogue:
     def complete_next_album(self, db) -> bool:
         """Reads the YouTube Music album page of one library streaming song's album not read yet, for its album
         artist, year and numbers (complete_album); False when there is none."""
+        if not self.on(db):
+            return False
         row = db.execute("select album_id from track where source = 'ytm' and library = 1 and ytm_album is not null "
                          "and id not in (select track_id from album_track) and album_id not in (select value from json_each(?)) limit 1",
                          (json.dumps([*self.completed, *self.album_tried]),)).fetchone()

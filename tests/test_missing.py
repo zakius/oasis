@@ -29,7 +29,7 @@ def recording(id="rec-lost", groups=(("rg-live", "Album", ["Live"], "2001"), ("r
 @pytest.fixture
 def client(library, tmp_path, monkeypatch):
     monkeypatch.setattr(musicbrainz, "search", lambda kind, query, db=None: [recording()] if kind == "recording" else [])
-    with make_client(library, tmp_path / "oasis.db", FakeYtm()) as c:
+    with make_client(library, tmp_path / "oasis.db", FakeYtm(), turned_on=["ytm", "lastfm"]) as c:
         c.app.state.oasis.lastfm = LastFmWithGaps()
         yield c
 

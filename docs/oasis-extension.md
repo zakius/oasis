@@ -73,13 +73,13 @@ they are played. Both take their songs from a **source**:
 | Source id | Songs from | Available when |
 |---|---|---|
 | `all` | Every source below that is available, taking turns (oasis's behaviour before version 2) | always |
-| `lastfm` | Last.fm's similar tracks, and library songs by Last.fm's similar artists | the server has a Last.fm API key |
-| `ytm` | YouTube Music's radio for the song | the server has YouTube Music on |
+| `lastfm` | Last.fm's similar tracks, and library songs by Last.fm's similar artists | the user has Last.fm on, and the server a Last.fm API key |
+| `ytm` | YouTube Music's radio for the song | the user has YouTube Music on, and the server offers its full songs |
 | `library` | The library alone: the artist's linked artists, the same artist, songs played around it, the same genre | always |
-| `listenbrainz` | ListenBrainz's LB Radio for the song's artist and artists ListenBrainz finds similar | the user linked a ListenBrainz token |
+| `listenbrainz` | ListenBrainz's LB Radio for the song's artist and artists ListenBrainz finds similar | the user has ListenBrainz on, with a token |
 
 Last.fm's and ListenBrainz's picks become library songs where the library has them, else YouTube Music streaming
-songs (`yt-…`), else songs of the other streaming services an admin turned on (Qobuz `qb-…`, Tidal `td-…`, Bandcamp
+songs (`yt-…`), else songs of the other streaming services the user has on (Qobuz `qb-…`, Tidal `td-…`, Bandcamp
 `bc-…`, SoundCloud `sc-…`). A pick that none of them has is left out, unless the client asks for unplayable songs
 (the extension `unavailableSongs`, [unavailable-songs-extension.md](unavailable-songs-extension.md)). A source that
 finds nothing, or fails, gives nothing: no other source stands in, so an empty list means that source had nothing for
@@ -90,7 +90,8 @@ request that names no source, from any client, and radios started without one.
 
 ### `oasisRadio` (answers with or without `oasis=1`)
 
-No params. What this user can choose from now; ask again after the user links or unlinks an account.
+No params. What this user can choose from now; ask again after the user turns a service on or off, or links or
+unlinks an account.
 
 ```json
 "oasisRadio": {
@@ -105,7 +106,8 @@ No params. What this user can choose from now; ask again after the user links or
 ```
 
 - `source` lists only the available sources, in this order; `name` is for display.
-- `station` lists only the available stations: both need the server's Last.fm API key and the user's linked Last.fm.
+- `station` lists only the available stations: both need the server's Last.fm API key and the user's Last.fm, on and
+  linked.
   It is an empty list otherwise. Only `lastfm-top` has periods.
 - `defaultSource` can name a source that is no longer available (the user unlinked it); requests that rely on it then
   get nothing until the user picks another.

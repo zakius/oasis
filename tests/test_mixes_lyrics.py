@@ -156,7 +156,7 @@ def save(client, *shown, new="hide"):
     db = client.app.state.oasis.connect()
     ids |= {r["name"]: str(r["id"]) for r in db.execute("select id, name from playlist where mix is not null")}
     client.post("/login", data={"name": "admin", "password": "secret"})
-    return client.post("/account/youtube/playlists", data={"new": new, **{f"show-{ids[n]}": "on" for n in shown}}).text
+    return client.post("/services/ytm/playlists", data={"new": new, **{f"show-{ids[n]}": "on" for n in shown}}).text
 
 
 def test_library_playlists_show_as_ticked_and_their_songs_follow(client, ytm):
@@ -164,7 +164,7 @@ def test_library_playlists_show_as_ticked_and_their_songs_follow(client, ytm):
     oasis = client.app.state.oasis
     oasis.mixes.refresh("admin")
     client.post("/login", data={"name": "admin", "password": "secret"})
-    page = client.get("/").text
+    page = client.get("/services").text
     assert "Road trip" in page and "Liked Music" in page and "My Supermix" not in page.split("Playlists shown in your apps")[1].split("</form>")[0]
     assert "Playlists saved. Newly shown ones are loading." in save(client, "Liked Music", "Road trip")
     oasis.mixes.refresh("admin")  # as the thread the save starts does

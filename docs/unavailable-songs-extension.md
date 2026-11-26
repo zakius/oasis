@@ -60,8 +60,12 @@ An unplayable song carries the usual fields where the server knows them: `title`
 ## In oasis
 
 - Unplayable songs are the picks of Last.fm and ListenBrainz (similar songs, radios) that neither the library, YouTube
-  Music nor another streaming service the admin turned on has, and the tracks of albums only MusicBrainz has
+  Music nor another streaming service the user has on has, and the tracks of albums only MusicBrainz has
   (`getAlbum` on an `al-mb-` id). Their ids start with `ms-`.
+- A streaming song (YouTube Music, Qobuz, Tidal, Bandcamp, SoundCloud) is unplayable for a user who doesn't have its
+  service on, until its audio is kept on the server (someone who has the service played it). For that user it keeps
+  its id, has `playable: false` and isn't in library lists. Apps that don't ask for unplayable songs still get it as
+  usual, and its `stream` fails with a message.
 - Each user chooses on the dashboard (Songs nothing can play) whether apps that ask get them. The default is yes.
 - Their `albumId` is the MusicBrainz release group's `al-mb-` id: the earliest official studio album that has the
   song, else an EP, else a single, else any official release. oasis looks it up on MusicBrainz in the background, so a
@@ -73,5 +77,5 @@ An unplayable song carries the usual fields where the server knows them: `title`
 - When the song arrives (its album is downloaded, or a streaming service has it), its stars and playlist entries move
   to the playable song, and the `ms-` id keeps working.
 - A radio counts only playable songs toward the 30 it keeps queued.
-- With previews on (dashboard, Streaming services), a song that Deezer's public API or Apple's iTunes Search API has
+- With previews on (the user's, on the dashboard's Services), a song that Deezer's public API or Apple's iTunes Search API has
   gets `preview: 30`. oasis asks for the clip's link when it is first played, and keeps the clip.
