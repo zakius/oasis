@@ -847,8 +847,8 @@ def routes(oasis) -> list[Route]:
                 f'</div></div></li>' for r in recent) + '</ul></section>'
         filled = count("select count(*) from track where source = 'local' and credits_at is not null")
         known = count("select count(*) from track where source = 'local' and mb_release is not null")
-        artists_done = count("select count(*) from mb_artist where fetched is not null and mbid in (select mbid from credit)")
-        artists_all = count("select count(*) from mb_artist where mbid in (select mbid from credit)")
+        artists_done = count("select count(*) from mb_artist m where fetched is not null and exists (select 1 from credit c where c.mbid = m.mbid)")
+        artists_all = count("select count(*) from mb_artist m where exists (select 1 from credit c where c.mbid = m.mbid)")
         html += ('<p class="muted"><a href="/music/indexers">Indexers</a>: each one\'s health, searches, downloads and seeding.</p>' if oasis.acquire else "")
         html += (f'<section><h2>Background</h2><p class="muted">MusicBrainz: credits for {filled} of {known} songs, names and links for '
                  f'{artists_done} of {artists_all} artists.</p>')
