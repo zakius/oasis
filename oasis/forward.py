@@ -328,7 +328,10 @@ class Forwarder:
         if entry["action"] == "unlike":
             row = db.execute("select key from liked where user = ? and service = ? and id = ?", key).fetchone()
             if row:
-                service.like(kind, row["key"], False)
+                try:
+                    service.like(kind, row["key"], False)
+                except Rejected as e:  # taken back on the service already: nothing left to undo
+                    log.info("%s unlike of %s needs nothing: %s", entry["service"], entry["track_id"], e)
                 db.execute("delete from liked where user = ? and service = ? and id = ?", key)
             return
         item = item_of(db, entry["track_id"])

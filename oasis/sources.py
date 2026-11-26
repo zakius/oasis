@@ -22,6 +22,7 @@ from pathlib import Path
 
 import urllib3
 
+from .remote import Rejected
 from .text import fold
 from .tracks import album_id, make_id, name_id, remember
 from .ytm import Stream
@@ -35,6 +36,19 @@ PREVIEW = 31  # seconds: a "song" this short is a service's preview clip, not th
 ALLOW = "allow."  # the setting table's keys for what an admin offers users: allow.<service> and allow.<service>.<capability>, "1" or "0"
 YDL = {"quiet": True, "no_warnings": True, "noprogress": True}  # yt-dlp's options for every service it reads
 STREAM_KEPT = 600  # seconds a service's audio URL is played from before it is asked for again: they expire
+
+
+class Refused(OSError):
+    """A service's HTTP refusal, with its status."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+def lasting(status: int) -> bool:
+    """Whether a refusal stays the same however often it is asked again: a 4xx but for sign-in, timeouts and rate limits."""
+    return 400 <= status < 500 and status not in (401, 403, 408, 429)
 
 
 def full_length(seconds: float | None) -> bool:
@@ -208,7 +222,7 @@ class SoundCloud:
             if response.status not in (401, 403):
                 break
         if response.status // 100 != 2:
-            raise OSError(f"HTTP {response.status} from SoundCloud's {url.split('?')[0].removeprefix(self.API)}")
+            raise Refused(response.status, f"HTTP {response.status} from SoundCloud's {url.split('?')[0].removeprefix(self.API)}")
         return response
 
     def api(self, path: str, **fields) -> dict | list:
@@ -314,8 +328,14 @@ class SoundCloud:
         return [e["track"] for e in self.pages(f"users/{self.account['id']}/track_likes") if e.get("track")]
 
     def favourite(self, kind: str, id: str, on: bool):
-        """Likes the track, or takes the like back, as SoundCloud's web player does."""
-        self.call("PUT" if on else "DELETE", f"users/{self.account['id']}/track_likes/{id}")
+        """Likes the track, or takes the like back, as SoundCloud's web player does. Rejected when SoundCloud refuses for
+        good: a like taken back already, say."""
+        try:
+            self.call("PUT" if on else "DELETE", f"users/{self.account['id']}/track_likes/{id}")
+        except Refused as e:
+            if lasting(e.status):
+                raise Rejected(str(e)) from e
+            raise
 
     def add_history(self, id: str):
         """Adds a play of the track to the account's listening history, as SoundCloud's web player does."""
@@ -386,7 +406,7 @@ class Qobuz:
             return get_json(self.API + method, fields=fields, headers=headers)
         response = request(http, self.API + method, fields=fields, headers=headers, encode_multipart=False)
         if response.status != 200:
-            raise OSError(f"HTTP {response.status} from Qobuz's {method}: {response.data[:200]!r}")
+            raise Refused(response.status, f"HTTP {response.status} from Qobuz's {method}: {response.data[:200]!r}")
         return response.json()
 
     def file_url(self, track_id: str, secret: str | None = None, format_id: int = FORMAT) -> dict:
@@ -454,8 +474,14 @@ class Qobuz:
                      if fold(a.get("name") or "") == fold(name)), None)
 
     def favourite(self, kind: str, id: str, on: bool):
-        """Adds the track, album or artist to the account's favourites, or takes it out."""
-        self.call("favorite/create" if on else "favorite/delete", "POST", **{FAVOURITE_IDS[kind]: id})
+        """Adds the track, album or artist to the account's favourites, or takes it out. Rejected when Qobuz refuses for
+        good: one taken out already, say."""
+        try:
+            self.call("favorite/create" if on else "favorite/delete", "POST", **{FAVOURITE_IDS[kind]: id})
+        except Refused as e:
+            if lasting(e.status):
+                raise Rejected(str(e)) from e
+            raise
 
     def full_url(self, key: str) -> str:
         found = self.file_url(key)
@@ -572,11 +598,20 @@ class Tidal:
         return str(found.id) if found else None
 
     def favourite(self, kind: str, id: str, on: bool):
-        """Adds the track, album or artist to the account's favourites, or takes it out."""
+        """Adds the track, album or artist to the account's favourites, or takes it out. Rejected when Tidal refuses for
+        good: one taken out already, say."""
+        import requests
         favorites = self.session.user.favorites
         calls = {"song": (favorites.add_track, favorites.remove_track), "album": (favorites.add_album, favorites.remove_album),
                  "artist": (favorites.add_artist, favorites.remove_artist)}
-        if not calls[kind][0 if on else 1](id):
+        try:
+            changed = calls[kind][0 if on else 1](id)
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            if lasting(status):
+                raise Rejected(f"Tidal refused the {kind}'s favourite: {status}") from e
+            raise
+        if not changed:
             raise OSError(f"Tidal didn't change the {kind}'s favourite")
 
     def mixes(self) -> list[dict]:
