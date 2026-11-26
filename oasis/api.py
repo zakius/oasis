@@ -619,7 +619,7 @@ class Api:
             return self._credited_artist(db, p.need("id"))
         albums = self._artist_albums(db, r["id"])
         known = {a["id"] for a in albums}
-        self._artist_page(db, r)
+        self._artist_page(db, r, known=bool(albums))
         # The rest of the artist's discography on YouTube Music, newest first; opening one fetches its tracks.
         listed = {a: (n, d) for a, n, d in db.execute("select at.album_id, count(*), sum(t.duration) from album_track at join track t "
                                                        "on t.id = at.track_id join ytm_release x on x.album_id = at.album_id "
@@ -629,16 +629,22 @@ class Api:
                    if x["album_id"] not in known]
         return {"artist": {**artist(r), "albumCount": len(albums), "album": albums}}
 
-    def _artist_page(self, db, r):
-        """The artist's YouTube Music page when it is due (youtube.artist_page), fetched by a worker."""
-        if self.oasis.youtube.page_due(db, r["id"]):
-            self._wait(self.oasis.asking("youtube", f"artist page {r['id']}", call="artist_page", args=[r["id"], r["name"]]), "YouTube Music artist page")
+    def _artist_page(self, db, r, known: bool):
+        """The artist's YouTube Music page when it is due (youtube.artist_page), fetched by a worker. When the artist
+        already has albums to show (known), the answer doesn't wait for it: the next one has what it found."""
+        if not self.oasis.youtube.page_due(db, r["id"]):
+            return
+        answer = self.oasis.asking("youtube", f"artist page {r['id']}", call="artist_page", args=[r["id"], r["name"]])
+        if not (known or db.execute("select 1 from ytm_release where artist_id = ?", (r["id"],)).fetchone()):
+            self._wait(answer, "YouTube Music artist page")
 
-    def _complete_album(self, db, album_id):
+    def _complete_album(self, db, album_id, known: bool):
         """The rest of an album known only from streaming songs or an artist's page (youtube.complete_album), fetched
-        by a worker."""
-        if self.oasis.youtube.browse_id(db, album_id) and \
-                self._wait(self.oasis.asking("youtube", f"complete album {album_id}", call="complete_album", args=[album_id]), "YouTube Music album"):
+        by a worker. When some of its songs are known, the answer doesn't wait for it: the next one has the rest."""
+        if not self.oasis.youtube.browse_id(db, album_id):
+            return
+        answer = self.oasis.asking("youtube", f"complete album {album_id}", call="complete_album", args=[album_id])
+        if not known and self._wait(answer, "YouTube Music album"):
             self.oasis.youtube.completed.add(album_id)
 
     @staticmethod
@@ -671,8 +677,10 @@ class Api:
             # Nothing to play until it arrives; clients that take songs nothing plays get its songs to see and star.
             ids = self._lookup(missing.album_songs, db, tracks.mbid_of(id)) if p.missing else []
             return {"album": {**found, "song": [song(required(song_row(db, i))) for i in ids]}}
-        self._complete_album(db, id)
         songs = self._album_songs(db, id)
+        self._complete_album(db, id, known=bool(songs))
+        if not songs:
+            songs = self._album_songs(db, id)
         if found := self._library_album(db, id, songs):
             return found
         release = db.execute("select * from ytm_release where album_id = ?", (id,)).fetchone()

@@ -162,12 +162,24 @@ def test_first_play_creates_a_radio_that_follows_listening(api, client):
     assert queued[0] == "Two" and {"Song B", "one-yt song 0"} <= set(queued) and "One" not in queued
 
 
+def fetched(client, sql: str, *args):
+    """Waits until a fetch the answer didn't wait for is saved: sql finds a row."""
+    db = client.app.state.oasis.connect()
+    end = time.monotonic() + 5
+    while not db.execute(sql, args).fetchone():
+        assert time.monotonic() < end, "never fetched"
+        time.sleep(0.01)
+
+
 def test_other_uploads_of_a_song_merge_and_albums_place_them(api, client, ytm):
     db = api.connect()
     single = song(item("upload-a", "Track 2", album="Track 2", album_id=None))
     first = remember_song(db, single)
     assert remember_song(db, song(item("upload-b", "Track 2", album="Some Live Set"))) == first
     remote = call(client, "search3", query="gamma")["searchResult3"]["song"][0]
+    # The first answer has the songs known so far; it doesn't wait for the rest of the album.
+    assert titles(call(client, "getAlbum", id=remote["albumId"])["album"]["song"]) == ["Gamma Hit"]
+    fetched(client, "select 1 from album_track where album_id = ?", remote["albumId"])
     album = call(client, "getAlbum", id=remote["albumId"])["album"]
     assert titles(album["song"]) == ["Track 1", "Track 2", "Track 3", "Gamma Hit"]
     assert next(s for s in album["song"] if s["title"] == "Track 2")["id"] == first
@@ -211,6 +223,9 @@ def test_artist_page_lists_the_whole_youtube_discography(client, ytm, monkeypatc
             {"browse_id": "MPREb_single", "title": "A Single", "year": 2021, "type": "single", "cover": None}]}
     monkeypatch.setattr(ytm, "artist", artist, raising=False)
     monkeypatch.setattr(ytm, "playlist_rows", lambda playlist_id, limit: [song(item("top1", "Hit", artist="Beta"))], raising=False)
+    # Beta has an album to show, so the first answer doesn't wait for the page.
+    assert [a["name"] for a in call(client, "getArtist", id=beta["id"])["artist"]["album"]] == ["First"]
+    fetched(client, "select 1 from ytm_artist where artist_id = ?", beta["id"])
     albums = call(client, "getArtist", id=beta["id"])["artist"]["album"]
     assert [a["name"] for a in albums] == ["First", "A Single", "Newer Album"]  # the local album once, then newest first
     assert albums[1]["releaseTypes"] == ["Single"] and albums[2]["year"] == 2020
@@ -233,6 +248,8 @@ def test_a_song_on_an_album_and_its_single_stays_on_both(client, ytm, monkeypatc
     monkeypatch.setattr(ytm, "album", lambda browse_id: [
         song(item(v, t, artist="Beta", album="Newer Album" if browse_id == "MPREb_new" else "Track 2", album_id=browse_id)) | {"track_no": n}
         for v, t, n in listings[browse_id]])
+    call(client, "getArtist", id=beta["id"])
+    fetched(client, "select 1 from ytm_artist where artist_id = ?", beta["id"])
     albums = {a["name"]: a for a in call(client, "getArtist", id=beta["id"])["artist"]["album"]}
     first = call(client, "getAlbum", id=albums["Newer Album"]["id"])["album"]
     single = call(client, "getAlbum", id=albums["Track 2"]["id"])["album"]
@@ -247,6 +264,8 @@ def test_a_song_on_an_album_and_its_single_stays_on_both(client, ytm, monkeypatc
 def test_search_lists_youtube_artists_and_albums_after_the_librarys(client):
     found = call(client, "search3", query="gamma")["searchResult3"]
     assert [a["name"] for a in found["artist"]] == ["Gamma"] and [a["name"] for a in found["album"]] == ["Far Away"]
+    call(client, "getAlbum", id=found["album"][0]["id"])
+    fetched(client, "select 1 from album_track where album_id = ?", found["album"][0]["id"])
     album = call(client, "getAlbum", id=found["album"][0]["id"])["album"]
     assert titles(album["song"]) == ["Track 1", "Track 2", "Track 3", "Gamma Hit"]  # opening it fetches the rest
     assert call(client, "getArtist", id=found["artist"][0]["id"])["artist"]["album"][0]["name"] == "Far Away"
@@ -443,6 +462,8 @@ def test_a_worker_asks_the_other_services_and_the_api_answers_the_same(library, 
                 worker.start()
             try:
                 found = call(client, "search3", query="gamma")["searchResult3"]
+                call(client, "getAlbum", id=found["album"][0]["id"])
+                fetched(client, "select 1 from album_track where album_id = ?", found["album"][0]["id"])
                 album = call(client, "getAlbum", id=found["album"][0]["id"])["album"]
                 artist = call(client, "getArtist", id=found["artist"][0]["id"])["artist"]
                 beta = call(client, "search3", query="beta")["searchResult3"]["artist"][0]
