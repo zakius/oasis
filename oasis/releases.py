@@ -231,7 +231,7 @@ def reject_title(release: dict, want: dict) -> str | None:
         return "various artists"
     compact, names = squashed(title), {squashed(n) for n in want["names"]}
     for other in want["others"]:  # 'Korn III: Remember Who You Are' holds 'Korn', and is another album
-        if len(o := words(other)) > len(words(title)) and spans(o, words(title)) and apart(spans(tokens, o)):
+        if len(o := words(other)) > len(words(title)) and spans(o, words(title)) and (inside and spans(tokens, o) or apart(spans(tokens, o))):
             return f"another album: {other}"
     if not inside and not placed(name, tokens, artists, titles, variants):
         return "the artist's name isn't on its own"
