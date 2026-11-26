@@ -112,3 +112,26 @@ def test_waiting_plays_stay_plays(tmp_path):
                  "insert into outbox(user, service, track_id, played, next_try) values ('admin', 'lastfm', 'tr-1', 5, 0)")
     db = database.connect(path)
     assert tuple(db.execute("select service, track_id, played, action from outbox").fetchone()) == ("lastfm", "tr-1", 5, "play")
+
+
+def test_processes_starting_at_once_add_new_columns_once(tmp_path):
+    import threading
+    import time
+    path = tmp_path / "old.db"
+    other, failed = sqlite3.connect(path, isolation_level=None), []
+    database.create(other)
+    other.execute("alter table want_album drop column soon")  # a database from before that column
+    other.execute("begin immediate")  # another process migrating: it adds the column this one lacks too
+
+    def start():
+        try:
+            database.create(sqlite3.connect(path, timeout=30, isolation_level=None))
+        except sqlite3.Error as e:
+            failed.append(e)
+    starting = threading.Thread(target=start)
+    starting.start()
+    time.sleep(0.5)
+    other.execute("alter table want_album add column soon real")
+    other.execute("commit")
+    starting.join()
+    assert failed == []

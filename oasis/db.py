@@ -444,18 +444,20 @@ NOT_FROM_FILES = {"looked_up", "preview"}  # track columns of songs nothing can 
 
 
 def migrate(db: sqlite3.Connection):
-    """Adds the columns a database from an older oasis lacks, as SCHEMA defines them."""
+    """Adds the columns a database from an older oasis lacks, as SCHEMA defines them. In one transaction: the API and
+    the workers may start at once, and only the first adds them."""
     current = sqlite3.connect(":memory:")
     current.executescript(SCHEMA)
-    for (table,) in current.execute("select name from sqlite_master where type = 'table'"):
-        have = {row[1] for row in db.execute(f"pragma table_info({table})")}
-        for _, name, kind, not_null, default, _ in current.execute(f"pragma table_info({table})"):
-            if name not in have:
-                # SQLite adds a NOT NULL column only with a default.
-                constraint = (f" not null default {default}" if not_null else f" default {default}") if default is not None else ""
-                db.execute(f"alter table {table} add column {name} {kind}{constraint}")
-                if table == "track" and name not in NOT_FROM_FILES:
-                    db.execute("update track set mtime = null where source = 'local'")  # the next scan reads files for it
+    with transaction(db):
+        for (table,) in current.execute("select name from sqlite_master where type = 'table'"):
+            have = {row[1] for row in db.execute(f"pragma table_info({table})")}
+            for _, name, kind, not_null, default, _ in current.execute(f"pragma table_info({table})"):
+                if name not in have:
+                    # SQLite adds a NOT NULL column only with a default.
+                    constraint = (f" not null default {default}" if not_null else f" default {default}") if default is not None else ""
+                    db.execute(f"alter table {table} add column {name} {kind}{constraint}")
+                    if table == "track" and name not in NOT_FROM_FILES:
+                        db.execute("update track set mtime = null where source = 'local'")  # the next scan reads files for it
     current.close()
 
 
