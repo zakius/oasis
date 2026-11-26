@@ -107,8 +107,10 @@ class Params:
 
 
 SONG_COLUMNS = """t.*, s.starred, s.rating, s.play_count, s.played"""
-# Stars, ratings and plays are the requesting user's: me() names them for each request (db.as_user).
-SONGS = f"select {SONG_COLUMNS} from track t left join stat s on s.id = t.id and s.user = me()"
+# Stars, ratings and plays are the requesting user's: me() names them for each request (db.as_user). In a left join's
+# on clause SQLite calls a function for every row, and each call into Python waits for the GIL behind every other
+# request; (select me()) is called once per query.
+SONGS = f"select {SONG_COLUMNS} from track t left join stat s on s.id = t.id and s.user = (select me())"
 ALBUMS = """
 select t.album_id as id, t.album as name, coalesce(max(t.album_by), t.album_artist) as artist, t.artist_id,
        count(*) as song_count, sum(t.duration) as duration, min(t.created) as created,
@@ -116,13 +118,13 @@ select t.album_id as id, t.album as name, coalesce(max(t.album_by), t.album_arti
        max(t.genre) as genre, max(t.cover is not null) as has_cover,
        s.starred as album_starred, s.rating as album_rating,
        coalesce(sum(ps.play_count), 0) as plays, max(ps.played) as last_played, wi.state as want_state, wi.error as want_error
-from track t left join stat s on s.id = t.album_id and s.user = me() left join stat ps on ps.id = t.id and ps.user = me()
+from track t left join stat s on s.id = t.album_id and s.user = (select me()) left join stat ps on ps.id = t.id and ps.user = (select me())
 left join want_item wi on wi.kind = 'album' and wi.ref = t.album_id
 """
 ARTISTS = """
 select t.artist_id as id, t.album_artist as name, count(distinct t.album_id) as album_count,
        max(t.cover is not null) as has_cover, s.starred, s.rating, wi.state as want_state, wi.error as want_error
-from track t left join stat s on s.id = t.artist_id and s.user = me() left join want_item wi on wi.kind = 'artist' and wi.ref = t.artist_id
+from track t left join stat s on s.id = t.artist_id and s.user = (select me()) left join want_item wi on wi.kind = 'artist' and wi.ref = t.artist_id
 """
 
 
@@ -602,7 +604,7 @@ class Api:
         """The album's own songs, and the songs its YouTube Music listing shares with another album, in its order."""
         return [clean(song(r) | {"track": r["no"], "discNumber": r["disc"]}) for r in db.execute(
             f"select {SONG_COLUMNS}, coalesce(at.disc_no, t.disc_no) as disc, coalesce(at.track_no, t.track_no) as no "
-            "from track t left join stat s on s.id = t.id and s.user = me() left join album_track at on at.track_id = t.id and at.album_id = ? "
+            "from track t left join stat s on s.id = t.id and s.user = (select me()) left join album_track at on at.track_id = t.id and at.album_id = ? "
             "where t.id in (select id from track where album_id = ? union select track_id from album_track where album_id = ?) "
             "order by disc, no is null, no, title", (album_id, album_id, album_id))]
 
@@ -1097,7 +1099,7 @@ class Api:
 
     def getTopSongs(self, db, p, user):
         name, count = p.need("artist"), min(p.int("count", 50), 200)
-        ids = [r[0] for r in db.execute("select t.id from track t left join stat s on s.id = t.id and s.user = me() where t.library = 1 and "
+        ids = [r[0] for r in db.execute("select t.id from track t left join stat s on s.id = t.id and s.user = (select me()) where t.library = 1 and "
                                         "t.album_artist = ? collate nocase order by coalesce(s.play_count, 0) desc limit ?", (name, count))]
         if len(ids) < count and self.oasis.youtube_music(db, user):
             ids += self.oasis.youtube.top_songs(db, name, count)
