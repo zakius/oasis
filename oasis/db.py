@@ -42,6 +42,7 @@ create table if not exists credit(  -- who made each track, as credited
 );
 create index if not exists credit_track on credit(track_id);
 create index if not exists credit_artist on credit(artist_id);
+create index if not exists credit_mbid on credit(mbid);
 create table if not exists mb_artist(  -- MusicBrainz artists and the oasis artist each one is
     mbid text primary key, artist_id text not null, name text not null, type text,
     fetched real                    -- when its other names and links were read; -1 when MusicBrainz lacks it

@@ -23,7 +23,7 @@ NOT_FOUND = -1  # mb_artist.fetched for artists MusicBrainz doesn't have
 def step(db) -> bool:
     """Learns one credited artist MusicBrainz wasn't asked about yet; whether there was one. OSError: MusicBrainz is
     away."""
-    row = db.execute("select mbid from mb_artist where fetched is null and mbid in (select mbid from credit) limit 1").fetchone()
+    row = db.execute("select mbid from mb_artist m where fetched is null and exists (select 1 from credit c where c.mbid = m.mbid) limit 1").fetchone()
     if row is None:
         return False
     mbid = row["mbid"]
