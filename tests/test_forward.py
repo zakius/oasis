@@ -229,6 +229,29 @@ def test_an_unstar_replaces_a_like_still_waiting(likers):
     assert services["all"].liked == [("song", "s2", True), ("song", "s2", False)]
 
 
+def test_an_unlike_of_a_like_already_taken_back_is_done_at_once(likers):
+    client, services, db = likers
+    song = ids_of(db, "One")["id"]
+    call(client, "star", id=song)
+    client.app.state.oasis.forwarder.flush()
+    services["songs"].fail = Rejected("HTTP 404: not a favourite")  # the user took it back on the service
+    call(client, "unstar", id=song)
+    client.app.state.oasis.forwarder.flush()
+    assert queued(db) == [] and db.execute("select count(*) from liked").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("status, error", [(404, Rejected), (400, Rejected), (429, OSError), (500, OSError)])
+def test_qobuz_and_soundcloud_refusing_for_good_isnt_retried(monkeypatch, status, error):
+    class Response:
+        def __init__(self):
+            self.status, self.data = status, b"{}"
+    monkeypatch.setattr(sources, "request", lambda method, url, **kwargs: Response())
+    monkeypatch.setattr(SoundCloud, "client_id", "cid")
+    for service in (Qobuz({"app_id": "1", "token": "t"}), SoundCloud({"token": "t", "id": 77})):
+        with pytest.raises(error):
+            service.favourite("song", "123", False)
+
+
 def test_a_star_goes_to_the_services_the_user_can_use(client):
     oasis = client.app.state.oasis
     db = oasis.connect()
