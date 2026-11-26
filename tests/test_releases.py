@@ -56,6 +56,16 @@ def test_a_bracketed_self_titled_album_needs_its_title_apart_from_the_artist(nam
     assert reject(result(name), RAMMSTEIN) == why
 
 
+@pytest.mark.parametrize("name, why", [
+    ("[Some-Group] [EAC] H△G × Mili vol.2 [2CD Limited Edition] (FLAC+CUE+LOG)", None),  # the title alone names the artist
+    ("Mili - H△G×Mili vol.2 [FLAC]", None),
+    ("H△G vol.2 [FLAC]", "no artist"),
+    ("Mili - H△G×Mili [FLAC]", "no title"),
+])
+def test_a_title_holding_the_artists_name_needs_no_other_artist(name, why):
+    assert reject(result(name), want("H△G×Mili vol.2", "Mili", year="2015", others=["H△G×Mili"])) == why
+
+
 ON_ITS_OWN = "the artist's name isn't on its own"
 
 
@@ -196,6 +206,12 @@ def test_a_seedless_release_only_counts_when_torbox_has_it_cached(downloads, tor
     assert downloads.find(db, WANT, "mb-album") is Outcome.SENT
     assert torbox.added == [("Artist - Album [MP3]", "magnet:?xt=urn:btih:ef01", None)]  # the seedless FLAC nobody cached is no use
     assert db.execute("select hash, album_mbid, state from download").fetchone()[:] == ("ef01", "mb-album", "added")
+
+
+def test_a_base32_info_hash_is_the_same_torrent_as_its_hex_one():
+    hex, base32 = "e2aaf9a466e72e9b7e804d38848edb350b05bfcf", "4KVPTJDG44XJW7UAJU4IJDW3GUFQLP6P"
+    assert releases.hash_of(result("x", base32)) == hex == releases.hash_of(result("x", hex.upper()))
+    assert info_hash({"magnet": f"magnet:?xt=urn:btih:{base32}&dn=x"}) == hex
 
 
 def test_a_release_listed_without_its_hash_is_skipped_when_it_failed_before(downloads, torbox, db, monkeypatch):

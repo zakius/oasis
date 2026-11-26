@@ -198,6 +198,14 @@ def test_missing_albums_are_searched_in_order_and_again_ever_further_apart(clien
     assert want["artist"] == "Beta" and want["names"] == ["Beta"] and "Greatest Hits" in want["others"] and want["upgrade"] is False
 
 
+def test_a_release_out_less_than_four_weeks_is_searched_again_daily_even_a_single(client, mb, monkeypatch):
+    follow_beta(client, mb)
+    acq, db = client.app.state.oasis.acquire, client.app.state.oasis.connect()
+    db.execute("update want_album set first_date = ?, next_search = 0, tries = 3 where rg = 'g-new'", (time.strftime("%Y-%m-%d"),))
+    acq.search(db, db.execute("select * from want_album where rg = 'g-new'").fetchone())
+    assert db.execute("select next_search - searched from want_album where rg = 'g-new'").fetchone()[0] == 86400
+
+
 def test_a_search_prowlarr_couldnt_answer_is_due_again_soon_without_counting_as_a_try(client, mb, monkeypatch):
     follow_beta(client, mb)
     acq, db = client.app.state.oasis.acquire, client.app.state.oasis.connect()
