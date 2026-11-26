@@ -43,7 +43,10 @@ def remember_song(db, song: dict) -> str:
 
 
 def video_of(db, r, ytm) -> str | None:
-    """The track's video on YouTube Music, searched for once: a miss is kept as '' and not searched for again."""
+    """The track's video on YouTube Music, searched for once: a miss is kept as '' and not searched for again. A song
+    nothing can play (missing.py) has none: it would become a stream that way, not by a match."""
+    if r["source"] == "missing":
+        return None
     if r["ytm_id"] is not None:
         return r["ytm_id"] or None
     video_id = ytm.match(r)

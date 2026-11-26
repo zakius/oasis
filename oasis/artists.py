@@ -112,12 +112,13 @@ def unify(db):
     has (artist_key) unless MusicBrainz's takes over; the others' ids resolve to it. Two MusicBrainz artists of one
     name stay two, and names the user's merges or separations mention stay as the user has them."""
     spellings, ids, mb = defaultdict(Counter), defaultdict(set), defaultdict(dict)
-    for sql in ("select album_artist, artist_id, count(*) from track where album_artist is not null group by 1, 2",
+    # Songs nothing can play (missing.py) stay out: their artist is the library's, or one only MusicBrainz has, or none yet.
+    for sql in ("select album_artist, artist_id, count(*) from track where album_artist is not null and source != 'missing' group by 1, 2",
                 "select artist_name, artist_id, count(distinct track_id) from credit where mbid is null and artist_name is not null group by 1, 2"):
         for name, id, n in db.execute(sql):
             spellings[key := fold(name)][name] += n
             ids[key] |= {id, name_id(name)}
-    for (name,) in db.execute("select distinct artist from track where artist is not null"):  # respelled in songs, not counted
+    for (name,) in db.execute("select distinct artist from track where artist is not null and source != 'missing'"):  # respelled in songs, not counted
         if (key := fold(name)) in spellings:
             spellings[key][name] += 0
     for name, id in db.execute("select name, artist_id from mb_artist"):

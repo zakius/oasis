@@ -45,10 +45,11 @@ class LastFm:
         query = urllib.parse.urlencode({**params, "api_key": self.api_key, "format": "json"})
         return answer(*get(f"{LASTFM}?{query}"))
 
-    def similar(self, artist: str, title: str, limit: int) -> list[tuple[str, str]]:
+    def similar(self, artist: str, title: str, limit: int) -> list[tuple[str, str, str | None]]:
+        """Similar tracks as (artist, title, MusicBrainz recording id when Last.fm knows it)."""
         tracks = self.read({"method": "track.getSimilar", "artist": artist, "track": title, "limit": limit,
                             "autocorrect": 1})["similartracks"]["track"]
-        return [(t["artist"]["name"], t["name"]) for t in tracks]
+        return [(t["artist"]["name"], t["name"], t.get("mbid") or None) for t in tracks]
 
     def user_tracks(self, user: str, loved: bool, period: str) -> list[tuple[str, str]]:
         """A Last.fm user's loved tracks, or top tracks over period, as (artist, title)."""
@@ -76,9 +77,10 @@ class LastFm:
         self.call({"method": "track.updateNowPlaying", "sk": self.session, **self.track_params(listen)})
 
 
-def similar_artists(info: dict) -> list[str]:
-    """The names of the artists Last.fm calls similar, from artist_info, most similar first."""
-    return [a["name"] for a in info.get("similar", {}).get("artist", [])]
+def similar_artists(info: dict) -> list[tuple[str, str | None]]:
+    """The artists Last.fm calls similar, from artist_info, as (name, MusicBrainz id when Last.fm knows it), most
+    similar first."""
+    return [(a["name"], a.get("mbid") or None) for a in info.get("similar", {}).get("artist", [])]
 
 
 def bio(info: dict) -> str | None:

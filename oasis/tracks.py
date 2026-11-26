@@ -5,7 +5,8 @@ import hashlib
 from .text import fold
 
 SAME_SONG_SECONDS = 5  # two copies of one song differ in length by at most this
-IDS = {"artist": "ar-", "album": "al-", "track": "tr-", "stream": "yt-", "playlist": "pl-"}  # each kind's id prefix
+IDS = {"artist": "ar-", "album": "al-", "track": "tr-", "stream": "yt-", "playlist": "pl-", "missing": "ms-"}  # each kind's id prefix
+# Other streaming services' tracks have their own prefixes (sources.py).
 MB_IDS = {"artist": "ar-mb-", "album": "al-mb-"}  # ids of artists and release groups only MusicBrainz has (see acquire.adopt)
 
 # The tables that refer to each kind of id, as (table, column), besides stat, which holds all three kinds.
@@ -100,11 +101,12 @@ def remember(db, row: dict) -> str:
     YouTube upload, keeps its id; a local copy wins."""
     row["artist_id"] = artist_id(db, row["album_artist"]) if row["artist_id"] == name_id(row["album_artist"]) else resolve(db, row["artist_id"])
     known = db.execute(f"select t.id, t.source from track t, (select ? artist_id, ? title, ? duration) new "
-                       f"where {same_song('t', 'new')} and t.id != ? order by t.source != 'local' limit 1",
+                       f"where {same_song('t', 'new')} and t.id != ? and t.source != 'missing' order by t.source != 'local' limit 1",
                        (row["artist_id"], row["title"], row["duration"], row["id"])).fetchone()
     if known and not db.execute("select 1 from track where id = ?", (row["id"],)).fetchone():
-        if known["source"] == "local":
+        if known["source"] == "local" and row.get("ytm_id"):
             db.execute("update track set ytm_id = ? where id = ?", (row["ytm_id"], known["id"]))
+        take_missing(db, known["id"], row)
         return known["id"]
     # The album a song was first seen on stays its own: other albums that list it hold it in album_track.
     kept = ("album", "album_id", "ytm_album", "track_no", "disc_no", "year")  # a playlist's sighting carries no year
@@ -112,18 +114,46 @@ def remember(db, row: dict) -> str:
                         for k in row if k not in ("id", "library", "created"))
     db.execute(f"insert into track({', '.join(row)}) values ({', '.join('?' * len(row))}) "
                f"on conflict(id) do update set {updates}", list(row.values()))
+    take_missing(db, row["id"], row)
     return row["id"]
+
+
+def take_missing(db, id: str, row: dict):
+    """A song recommended while nothing could play it (missing.py) is track id now: its stars and playlist entries come
+    here, and a stream they make wanted joins the library (playlists.touch)."""
+    gone = [g for (g,) in db.execute("select id from track where source = 'missing' and (artist_id = ? or album_artist = ? collate nocase) "
+                                     "and title = ? collate nocase", (row["artist_id"], row["album_artist"], row["title"]))]
+    for g in gone:
+        move_track(db, g, id)
+    if gone:
+        from .playlists import touch  # here, as playlists imports tracks (through ytm)
+        touch(db, [id])
 
 
 def adopt_local_copies(db):
     """Points streams that now have a local copy at the local file: playlist entries, stars and plays move over and the
-    stream entry goes, so nothing keeps streaming what's on disk."""
-    pairs = db.execute(f"select y.id stream, y.ref video, l.id local from track y join track l on l.source = 'local' "
-                       f"and {same_song('l', 'y')} where y.source = 'ytm'").fetchall()
-    for stream, video, local in pairs:
-        db.execute("update track set ytm_id = ? where id = ? and coalesce(ytm_id, '') = ''", (video, local))
+    stream entry goes, so nothing keeps streaming what's on disk. Songs nothing could play (missing.py) move too: by
+    their MusicBrainz recording, else by artist and title."""
+    pairs = db.execute(f"select y.id stream, y.source, y.ref video, l.id local from track y join track l on l.source = 'local' "
+                       f"and {same_song('l', 'y')} where y.source not in ('local', 'missing')").fetchall()
+    for stream, source, video, local in pairs:
+        if source == "ytm":
+            db.execute("update track set ytm_id = ? where id = ? and coalesce(ytm_id, '') = ''", (video, local))
         move_track(db, stream, local)
-    return len(pairs)
+    moved = 0
+    keys = dict(db.execute("select key, artist_id from artist_key").fetchall())  # the library's artist of each name
+    for m in db.execute("select id, mb_recording, artist_id, album_artist, title from track where source = 'missing'").fetchall():
+        local = None
+        if m["mb_recording"]:
+            local = db.execute("select id from track where mb_recording = ? and source = 'local' limit 1", (m["mb_recording"],)).fetchone()
+        if local is None:
+            artists = (m["artist_id"], keys.get(fold(m["album_artist"] or "")))
+            local = db.execute("select id from track where artist_id in (?, ?) and source = 'local' and title = ? collate nocase limit 1",
+                               (*artists, m["title"])).fetchone()
+        if local:
+            move_track(db, m["id"], local[0])
+            moved += 1
+    return len(pairs) + moved
 
 
 def move_track(db, old: str, new: str):

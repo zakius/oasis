@@ -1,5 +1,7 @@
 """Song recommendations from YouTube Music, Last.fm, ListenBrainz and the library itself, and radio playlists that grow
-as they are played: from their own songs, from everything played, or as stations from the user's Last.fm."""
+as they are played: from their own songs, from everything played, or as stations from the user's Last.fm. A song Last.fm
+or ListenBrainz suggests is played from the library, else YouTube Music, else another streaming service (sources.py);
+when none has it, it can be kept as a song nothing plays (missing.py), for the users who want to see those."""
 import json
 import logging
 import random
@@ -10,12 +12,13 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait as wait_for
 from itertools import chain, zip_longest
 
-from . import accounts, lastfm, playlists, worker
+from . import accounts, lastfm, missing, playlists, worker
 from .forward import LISTENBRAINZ
 from .artists import linked
 from .playlists import LISTENING_RADIO, PLAIN, set_entries
-from .tracks import BY_ARTIST_NAME, outside_names
+from .tracks import BY_ARTIST_NAME, IDS, outside_names
 from .youtube import remember_song, video_of
+
 
 log = logging.getLogger(__name__)
 
@@ -33,9 +36,9 @@ LASTFM_SIMILAR = 15  # similar tracks asked of Last.fm, the most a method uses
 
 
 class Recommender:
-    def __init__(self, connect, ytm, lastfm):
-        """lastfm(): oasis's Last.fm app as it is now, or None."""
-        self.connect, self.ytm, self.lastfm = connect, ytm, lastfm
+    def __init__(self, connect, ytm, lastfm, services=None):
+        """lastfm(): oasis's Last.fm app as it is now, or None. services: the other streaming services (sources.Sources)."""
+        self.connect, self.ytm, self.lastfm, self.services = connect, ytm, lastfm, services
         self.woken = threading.Event()
         self.answers: dict[tuple, tuple[float, object]] = {}  # (expiry, answer) by question (answer)
         self.answers_lock = threading.Lock()
@@ -51,19 +54,20 @@ class Recommender:
         return list(STATIONS) if self.lastfm() and user["lastfm_session"] and user["lastfm_name"] else []
 
     def similar(self, db, seed, count: int, deep: bool = False, source: str = "all", token: str | None = None,
-                wait: float | None = None) -> list[str]:
+                wait: float | None = None, unplayable: bool = False) -> list[str]:
         """Track ids like the seed track from one source, or from every one at hand ("all"), taking turns so local songs
         come throughout. YouTube Music, Last.fm and ListenBrainz (with the user's token) need the network; the library
         methods always give something. A source that gives nothing gives an empty list: no other stands in.
         The methods run at once, each on its own connection (sqlite connections stay in their thread), so the answer
         takes as long as the slowest. With wait, a method that hasn't answered within that many seconds is left out; those
-        that look songs up on YouTube Music one by one give what they found by then."""
+        that look songs up on YouTube Music one by one give what they found by then. unplayable: songs no service has come
+        too, as missing songs (missing.py)."""
         deadline = time.monotonic() + wait - 0.5 if wait else None  # half a second to keep what they found
         methods = {
             "ytm": [("YouTube Music radio", lambda db: self.from_youtube(db, seed, count))],
-            "lastfm": [("Last.fm similar tracks", lambda db: self.from_lastfm(db, seed, min(count, 15 if deep else 10), deadline) if self.lastfm() else []),
+            "lastfm": [("Last.fm similar tracks", lambda db: self.from_lastfm(db, seed, min(count, 15 if deep else 10), deadline, unplayable) if self.lastfm() else []),
                        ("Last.fm similar artists", lambda db: self.from_similar_artists(db, seed, count) if self.lastfm() else [])],
-            "listenbrainz": [("ListenBrainz radio", lambda db: self.from_listenbrainz(db, seed, count, token, deadline))],
+            "listenbrainz": [("ListenBrainz radio", lambda db: self.from_listenbrainz(db, seed, count, token, deadline, unplayable))],
             "library": [("linked artists", lambda db: self.from_linked(db, seed, count)),
                         ("same artist", lambda db: self.from_artist(db, seed, count)),
                         ("played together", lambda db: self.from_plays(db, seed, count)),
@@ -117,7 +121,8 @@ class Recommender:
     def from_similar_artists(self, db, seed, count: int) -> list[str]:
         """Library songs by the artists Last.fm calls similar, a few from each in turn."""
         artist, _ = outside_names(seed)
-        names = self.answer(("lastfm artists", artist), lambda: lastfm.similar_artists(self.lastfm().artist_info(artist)))
+        found = self.answer(("lastfm artists", artist), lambda: lastfm.similar_artists(self.lastfm().artist_info(artist)))
+        names = [name for name, _ in found]
         per_artist = [[r[0] for r in db.execute(
             f"select id from track where library = 1 and {BY_ARTIST_NAME} order by random() limit 3", (name, name))] for name in names]
         return [id for id in chain.from_iterable(zip_longest(*per_artist)) if id][:count]
@@ -151,16 +156,16 @@ class Recommender:
             "select id from track where library = 1 and genre = ? collate nocase and artist_id != ? "
             "order by abs(coalesce(year, 0) - ?), random() limit ?", (seed["genre"], seed["artist_id"], seed["year"] or 0, count))]
 
-    def from_lastfm(self, db, seed, count: int, deadline: float | None = None) -> list[str]:
+    def from_lastfm(self, db, seed, count: int, deadline: float | None = None, unplayable: bool = False) -> list[str]:
         artist, _ = outside_names(seed)
         try:
             pairs = self.answer(("lastfm", artist, seed["title"]), lambda: self.lastfm().similar(artist, seed["title"], LASTFM_SIMILAR))[:count]
         except Exception as e:
             log.info("Last.fm similar failed: %s", e)
             return []
-        return self.resolve(db, pairs, deadline)
+        return self.resolve(db, pairs, deadline, unplayable)
 
-    def from_listenbrainz(self, db, seed, count: int, token: str | None, deadline: float | None = None) -> list[str]:
+    def from_listenbrainz(self, db, seed, count: int, token: str | None, deadline: float | None = None, unplayable: bool = False) -> list[str]:
         """LB Radio's songs for the seed's artist and those ListenBrainz finds similar. Its API is experimental and needs
         a user token: any failure is logged and gives nothing."""
         if not token:
@@ -171,30 +176,81 @@ class Recommender:
         except Exception as e:
             log.info("ListenBrainz radio failed: %s", e)
             return []
-        return self.resolve(db, pairs[:count], deadline)
+        return self.resolve(db, pairs[:count], deadline, unplayable)
 
-    def resolve(self, db, pairs: list[tuple[str, str]], deadline: float | None = None) -> list[str]:
-        """(artist, title) pairs as track ids, in their order: a library song, else the song on YouTube Music, a known
-        one before a search, whose answer is kept too. Searches not done by deadline (time.monotonic) are left out."""
-        ids, missing = {}, []
-        for i, (a, t) in enumerate(pairs):
-            known = db.execute(f"select id, library from track where title = ? collate nocase and {BY_ARTIST_NAME} "
-                               "and (library = 1 or source = 'ytm') order by library desc limit 1", (t, a, a)).fetchone()
-            if known and (known["library"] or self.ytm):
+    def resolve(self, db, pairs: list[tuple], deadline: float | None = None, unplayable: bool = False) -> list[str]:
+        """(artist, title) pairs, or (artist, title, MusicBrainz recording id), as track ids in their order: a library
+        song, else a known streaming one, else the song searched for on YouTube Music, then the other streaming services
+        in turn, whose answer is kept too. Searches not done by deadline (time.monotonic) are left out. unplayable: a song
+        every service was asked for and none has comes as a missing song (missing.py); otherwise it is left out."""
+        ids, unknown = {}, []
+        clients = self.services.active(db) if self.services else []
+        playing = {"local", *(c.name for c in clients), *(["ytm"] if self.ytm else [])}  # the sources that play now
+        for i, pair in enumerate(pairs):
+            a, t = pair[0], pair[1]
+            rows = db.execute(f"select id, source from track where title = ? collate nocase and {BY_ARTIST_NAME} "
+                              "and (library = 1 or source not in ('local', 'missing')) order by library desc", (t, a, a)).fetchall()
+            known = next((r for r in rows if r["source"] in playing), None)
+            if known:
                 ids[i] = known["id"]
-            elif self.ytm:
-                missing.append(i)
-        if missing:
+            else:
+                unknown.append(i)
+        previews = self.services.previews(db) if self.services and unplayable else []
+        searched = {}  # index: what the search found, None for nothing
+        if unknown and (self.ytm or clients or previews):
             pool = ThreadPoolExecutor(FINDS)
-            searches = {i: pool.submit(self.answer, ("find", *pairs[i]), lambda pair=pairs[i]: self.ytm.find(*pair)) for i in missing}
+            asked = tuple(c.name for c in clients + previews)  # an answer from before a service was turned on doesn't count for it
+            searches = {i: pool.submit(self.answer, ("find", *pairs[i][:2], asked),
+                                       lambda pair=pairs[i]: self.find(clients, pair[0], pair[1], previews)) for i in unknown}
             done, _ = wait_for(searches.values(), timeout=deadline - time.monotonic() if deadline else None)
             pool.shutdown(wait=False, cancel_futures=True)
             for i, search in searches.items():
                 if search in done and search.exception():
-                    log.info("YouTube Music search for %s failed: %s", pairs[i], search.exception())
-                elif search in done and search.result():
-                    ids[i] = remember_song(db, search.result())
+                    log.info("search for %s failed: %s", pairs[i][:2], search.exception())
+                elif search in done:
+                    searched[i] = search.result()
+        elif unknown:
+            searched = dict.fromkeys(unknown)
+        for i, found in searched.items():
+            pair = pairs[i]
+            if found and found[0] == "ytm":
+                ids[i] = remember_song(db, found[1])
+            elif found and found[0] == "preview":
+                ids[i] = missing.remember(db, pair[0], pair[1], pair[2] if len(pair) > 2 else None, preview=found[1])
+            elif found:
+                ids[i] = self.services.remember(db, *found)
+            elif unplayable:
+                ids[i] = missing.remember(db, pair[0], pair[1], pair[2] if len(pair) > 2 else None)
         return [ids[i] for i in sorted(ids)]
+
+    def find(self, clients: list, artist: str, title: str, previews: list = ()):
+        """The song on YouTube Music, as ("ytm", song), else on the first other service that has it, as (client, song),
+        else a clip of it from the first preview service that has one, as ("preview", "<service>:<its id>"); None when
+        none has it. OSError when every service asked for the whole song failed."""
+        failed = 0
+        if self.ytm:
+            try:
+                if found := self.ytm.find(artist, title):
+                    return "ytm", found
+            except Exception as e:
+                log.info("YouTube Music search for %s - %s failed: %s", artist, title, e)
+                failed += 1
+        for client in clients:
+            try:
+                if found := client.find(artist, title):
+                    return client, found
+            except Exception as e:
+                log.info("%s search for %s - %s failed: %s", client.title, artist, title, e)
+                failed += 1
+        if failed and failed == bool(self.ytm) + len(clients):
+            raise OSError("every service failed")
+        for service in previews:
+            try:
+                if key := service.find(artist, title):
+                    return "preview", f"{service.name}:{key}"
+            except Exception as e:
+                log.info("%s preview search for %s - %s failed: %s", service.title, artist, title, e)
+        return None
 
     def start(self):
         worker.start("radio", self.top_up_pass, 600, self.woken)
@@ -228,14 +284,20 @@ class Recommender:
         self.woken.set()
 
     def top_up(self, db, playlist):
-        entries = [r[0] for r in db.execute("select track_id from playlist_entry where playlist_id = ? order by pos", (playlist["id"],))]
+        """Adds songs to a radio until it has AHEAD playable ones after the last played. Songs nothing plays come too
+        when its owner sees those (user.missing_songs), but don't count."""
+        rows = db.execute("select e.track_id, t.source from playlist_entry e left join track t on t.id = e.track_id "
+                          "where e.playlist_id = ? order by e.pos", (playlist["id"],)).fetchall()
+        entries = [r[0] for r in rows]
         played_pos = min(playlist["played_pos"], len(entries) - 1)
-        missing = AHEAD - (len(entries) - 1 - played_pos)
-        if missing <= 0:
+        playable = sum(1 for r in rows[played_pos + 1:] if r["source"] != "missing")
+        needed = AHEAD - playable
+        if needed <= 0:
             return
         owner = accounts.get(db, playlist["owner"])
         if not owner:
             return
+        unplayable = bool(owner["missing_songs"])
         source = playlist["radio_source"] or owner["radio_source"]  # the automatic radio follows the user's default
         station = playlist["station"]
         if station:
@@ -244,7 +306,8 @@ class Recommender:
             if playlist["radio"] == LISTENING_RADIO:
                 seed_ids = [r[0] for r in db.execute("select id from stat where user = ? and played is not null order by played desc limit 3", (owner["name"],))]
             else:
-                seed_ids = list(reversed(entries[max(0, played_pos - 2):played_pos + 1])) or entries[:3]
+                heard = [e for e in entries if not e.startswith(IDS["missing"])]  # a song nothing can play was never heard
+                seed_ids = [e for e in reversed(entries[:played_pos + 1]) if e in heard][:3] or heard[:3]
             seeds = [r for id in seed_ids if (r := db.execute("select * from track where id = ?", (id,)).fetchone())]
         skip = set(entries) | {r[0] for r in db.execute("select id from stat where user = ? and played is not null order by played desc limit ?", (owner["name"], RECENT))}
         added = []
@@ -254,19 +317,23 @@ class Recommender:
                 skip.add(id)
                 added.append(id)
 
+        def playable_added() -> int:
+            return sum(1 for id in added if not id.startswith(IDS["missing"]))
+
         for seed in seeds:
             if station:  # the user's own song, then a few like it
                 add(seed["id"])
-                for id in [i for i in self.similar(db, seed, PER_SEED * 3, source=source, token=owner["listenbrainz_token"]) if i not in skip][:PER_SEED]:
+                for id in [i for i in self.similar(db, seed, PER_SEED * 3, source=source, token=owner["listenbrainz_token"], unplayable=unplayable)
+                           if i not in skip][:PER_SEED]:
                     add(id)
             else:
-                for id in self.similar(db, seed, AHEAD + 20, deep=True, source=source, token=owner["listenbrainz_token"]):
+                for id in self.similar(db, seed, AHEAD + 20, deep=True, source=source, token=owner["listenbrainz_token"], unplayable=unplayable):
                     add(id)
-            if len(added) >= missing:
+            if playable_added() >= needed:
                 break
         if not added:
             return
-        added = added[:max(missing, 10)]
+        added = keep_playable(added, max(needed, 10))
         entries += added
         dropped = max(0, len(entries) - KEEP)
         set_entries(db, playlist["id"], entries[dropped:])
@@ -291,10 +358,31 @@ class Recommender:
                     yield row
 
 
-def lb_radio(token: str, artist: str) -> list[tuple[str, str]]:
-    """ListenBrainz's LB Radio for an artist and the artists it finds similar, popular songs first ("easy")."""
+def keep_playable(ids: list[str], count: int) -> list[str]:
+    """ids up to the count-th playable one, with the missing songs among them."""
+    kept, playable = [], 0
+    for id in ids:
+        if playable == count:
+            break
+        kept.append(id)
+        playable += not id.startswith(IDS["missing"])
+    return kept
+
+
+def lb_radio(token: str, artist: str) -> list[tuple[str, str, str | None]]:
+    """ListenBrainz's LB Radio for an artist and the artists it finds similar, popular songs first ("easy"), as (artist,
+    title, MusicBrainz recording id)."""
     query = urllib.parse.urlencode({"prompt": f"artist:({artist.replace('(', ' ').replace(')', ' ').strip()})", "mode": "easy"})
     request = urllib.request.Request(f"{LISTENBRAINZ}explore/lb-radio?{query}", headers={"Authorization": "Token " + token, "User-Agent": "oasis/0.1"})
     with urllib.request.urlopen(request, timeout=30) as response:
         playlist = json.load(response)["payload"]["jspf"].get("playlist") or {}
-    return [(t["creator"], t["title"]) for t in playlist.get("track") or [] if t.get("creator") and t.get("title")]
+    return [(t["creator"], t["title"], recording_of(t)) for t in playlist.get("track") or [] if t.get("creator") and t.get("title")]
+
+
+def recording_of(track: dict) -> str | None:
+    """The MusicBrainz recording id of a JSPF track, from its identifier link."""
+    identifiers = track.get("identifier") or []
+    for link in [identifiers] if isinstance(identifiers, str) else identifiers:
+        if "/recording/" in link:
+            return link.rstrip("/").rsplit("/", 1)[-1]
+    return None
