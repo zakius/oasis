@@ -5,7 +5,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from conftest import call, make_client, sign_in
-from oasis import accounts, config, forward, sources
+from oasis import accounts, config, sources
 from oasis.forward import ListenBrainz
 from oasis.ytm import song
 from test_mixes_lyrics import FakeYtm as MixesYtm, item
@@ -172,12 +172,12 @@ def test_youtube_music_without_full_songs_still_loads_mixes(client):
     assert "My Supermix" in {p["name"] for p in call(client, "getPlaylists")["playlists"]["playlist"]}
     assert "yt-s1" not in searched(client) and call(client, "stream", id="yt-m1")["error"]["code"] == 70
     assert "Full songs aren't offered on this server now" in client.get("/services").text
-    assert "ytmusic" in forward.user_services(None, oasis.ytm, accounts.get(db, "admin"), oasis.sources.usable(db, "admin"))
+    assert "ytmusic" in oasis.user_services(db, "admin")
 
     client.post("/services/ytm/offered/songs/on")
     client.post("/services/ytm/offered/account/off")
     assert "yt-s1" in searched(client)
-    assert "ytmusic" not in forward.user_services(None, oasis.ytm, accounts.get(db, "admin"), oasis.sources.usable(db, "admin"))
+    assert "ytmusic" not in oasis.user_services(db, "admin")
     assert "aren't offered" in call(client, "oasisLinkYouTubeMusic", cookie="SID=1; __Secure-3PAPISID=abc")["error"]["message"]
     assert "Account features aren't offered on this server now" in client.get("/services").text
     assert accounts.get(db, "admin")["ytm_auth"]  # kept for when they are offered again

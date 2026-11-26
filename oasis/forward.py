@@ -1,14 +1,17 @@
-"""Forwards plays to Last.fm, ListenBrainz and YouTube Music history, retrying until each service takes them."""
+"""Forwards plays to Last.fm, ListenBrainz and YouTube Music history, and to the other servers each user added
+(servers.py), retrying until each service takes them, each on its own."""
 import json
 import logging
 import threading
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from . import worker
-from .lastfm import LastFm, signs_in
-from .remote import Rejected, check, post
+from .lastfm import LastFm, elsewhere, signs_in
+from .remote import Rejected, check, post, send
 from .tracks import outside_names
 from .youtube import video_of
 from .ytm import WATCH
@@ -16,6 +19,8 @@ from .ytm import WATCH
 log = logging.getLogger(__name__)
 
 LISTENBRAINZ = "https://api.listenbrainz.org/1/"
+JSPF_PLAYLIST = "https://musicbrainz.org/doc/jspf#playlist"  # the key of ListenBrainz's own fields in a JSPF playlist
+MADE_FOR = 100  # playlists made for a user read at most: about two weeks of daily ones, and the weekly and yearly ones
 MAX_ATTEMPTS = 20
 
 
@@ -31,8 +36,13 @@ class Listen:
 
 
 class ListenBrainz:
-    def __init__(self, token: str):
-        self.token = token
+    """ListenBrainz's API, or the same API of a server of the user's own (Maloja, Koito...) at api, its root."""
+
+    def __init__(self, token: str, api: str = LISTENBRAINZ):
+        self.token, self.api = token, api
+
+    def headers(self) -> dict:
+        return {"Authorization": "Token " + self.token, "User-Agent": "oasis/0.1"}
 
     def submit(self, kind: str, listen: Listen):
         metadata = {"artist_name": listen.artist, "track_name": listen.title,
@@ -45,19 +55,68 @@ class ListenBrainz:
             metadata["additional_info"]["origin_url"] = WATCH + listen.ytm_id
         entry = {"track_metadata": metadata} | ({"listened_at": int(listen.played)} if kind == "single" else {})
         body = json.dumps({"listen_type": kind, "payload": [entry]}).encode()
-        check(*post(LISTENBRAINZ + "submit-listens", body, {"Authorization": "Token " + self.token, "Content-Type": "application/json"}), "ListenBrainz")
+        check(*post(self.api + "submit-listens", body, self.headers() | {"Content-Type": "application/json"}), "ListenBrainz")
 
     def scrobble(self, listen: Listen):
         self.submit("single", listen)
 
+    def read(self, path: str, **query) -> dict:
+        url = self.api + path + ("?" + urllib.parse.urlencode(query) if query else "")
+        status, body = send(urllib.request.Request(url, headers=self.headers()))
+        check(status, body, "ListenBrainz")
+        return json.loads(body)
+
+    def checked(self) -> dict | None:
+        """The server's answer to validate-token: valid, and user_name when it is; None when the server has no such
+        call. An exception when it doesn't answer."""
+        status, body = send(urllib.request.Request(self.api + "validate-token", headers=self.headers()))
+        if status == 429 or status >= 500:
+            check(status, body, "ListenBrainz")
+        try:
+            found = json.loads(body)
+        except ValueError:
+            return None
+        return found if isinstance(found, dict) and "valid" in found else None
+
     def valid(self) -> bool:
-        """Whether ListenBrainz knows the token; an exception when it doesn't answer."""
-        request = urllib.request.Request(LISTENBRAINZ + "validate-token", headers={"Authorization": "Token " + self.token})
-        with urllib.request.urlopen(request, timeout=15) as response:
-            return bool(json.load(response).get("valid"))
+        """Whether the server knows the token: by validate-token, else by a test of what oasis sends (a song playing
+        now, which no server counts as a play). An exception when it doesn't answer."""
+        found = self.checked()
+        if found is not None:
+            return bool(found["valid"])
+        try:
+            self.now_playing(Listen("", "oasis", "Linking oasis", None, None, time.time(), None))
+        except Rejected:
+            return False
+        return True
 
     def now_playing(self, listen: Listen):
         self.submit("playing_now", listen)
+
+    def made_for(self) -> list[dict]:
+        """The newest of each kind of playlist ListenBrainz makes for the user (Weekly Jams, Weekly Exploration, Daily
+        Jams...) that hasn't expired, with their tracks, as JSPF playlists."""
+        name = (self.checked() or {}).get("user_name")
+        if not name:
+            raise Rejected("ListenBrainz doesn't know this token")
+        newest = {}
+        for entry in self.read(f"user/{urllib.parse.quote(name, safe='')}/playlists/createdfor", count=MADE_FOR)["playlists"]:
+            playlist = entry["playlist"]
+            more = (playlist.get("extension") or {}).get(JSPF_PLAYLIST) or {}
+            extra = more.get("additional_metadata") or {}
+            kind = (extra.get("algorithm_metadata") or {}).get("source_patch") or playlist["identifier"]
+            if extra.get("expires_at") and expired(extra["expires_at"]):
+                continue
+            if kind not in newest or playlist.get("date", "") > newest[kind].get("date", ""):
+                newest[kind] = playlist
+        return [self.read("playlist/" + p["identifier"].rstrip("/").rsplit("/", 1)[-1])["playlist"] | {"kind": kind}
+                for kind, p in newest.items()]
+
+
+def expired(when: str) -> bool:
+    """Whether an ISO time ListenBrainz gives has passed; one without a zone is UTC."""
+    moment = datetime.fromisoformat(when)
+    return (moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)) < datetime.now(timezone.utc)
 
 
 class YouTubeMusicHistory:
@@ -145,9 +204,9 @@ def listen_for(r, played: float, ytm_id: str | None = None) -> Listen:
     return Listen(r["id"], artist, r["title"], album, r["duration"], played, ytm_id or r["ytm_id"])
 
 
-def user_services(lastfm: LastFm | None, ytm, user, usable) -> dict:
-    """The services a user linked and can use (usable: sources.Sources.usable), by name. lastfm: oasis's Last.fm app,
-    which a user's session needs."""
+def user_services(lastfm: LastFm | None, ytm, user, usable, servers: list) -> dict:
+    """The services a user linked and can use (usable: sources.Sources.usable), by name, and the other servers they send
+    plays to (servers.sending), each by 'server:<its id>'. lastfm: oasis's Last.fm app, which a user's session needs."""
     found = {}
     if user is None:
         return found
@@ -157,4 +216,10 @@ def user_services(lastfm: LastFm | None, ytm, user, usable) -> dict:
         found["listenbrainz"] = ListenBrainz(user["listenbrainz_token"])
     if ytm and user["ytm_auth"] and "account" in usable.get("ytm", ()):
         found["ytmusic"] = YouTubeMusicHistory(ytm, ytm.client(user["ytm_auth"]))
+    for r in servers:
+        account = json.loads(r["account"])
+        if r["protocol"] == "lastfm":
+            found[f"server:{r['id']}"] = elsewhere(r["url"], account["auth"], account["session"])
+        else:
+            found[f"server:{r['id']}"] = ListenBrainz(account["token"], r["url"])
     return found

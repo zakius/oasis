@@ -1,8 +1,9 @@
-"""Song recommendations from YouTube Music, Last.fm, ListenBrainz and the library itself, and radio playlists that grow
-as they are played: from their own songs, from everything played, or as stations from the user's Last.fm. A song Last.fm
-or ListenBrainz suggests is played from the library, else from the best of what the user's streaming services answer,
-all asked at once (YouTube Music and the others of sources.py); when none has it, it can be kept as a song nothing plays
-(missing.py), with a preview where a preview service has one, for the users who want to see those."""
+"""Song recommendations from YouTube Music, Last.fm, ListenBrainz, Deezer, Tidal, SoundCloud and the library itself, and
+radio playlists that grow as they are played: from their own songs, from everything played, or as stations from the
+user's Last.fm. A song Last.fm, ListenBrainz or another service's radio suggests is played from the library, else from
+the best of what the user's streaming services answer, all asked at once (YouTube Music and the others of sources.py);
+when none has it, it can be kept as a song nothing plays (missing.py), with a preview where a preview service has one,
+for the users who want to see those."""
 import json
 import logging
 import queue
@@ -19,6 +20,7 @@ from .forward import LISTENBRAINZ
 from .artists import linked
 from .formats import LOSSLESS
 from .playlists import LISTENING_RADIO, PLAIN, set_entries
+from .sources import Deezer
 from .tracks import BY_ARTIST_NAME, IDS, outside_names
 from .youtube import BITRATE, remember_song, video_of
 
@@ -29,7 +31,8 @@ AHEAD = 30      # unplayed tracks a radio keeps queued
 KEEP = 300      # older radio entries beyond this are dropped
 RECENT = 100    # recently played tracks a radio won't repeat
 PER_SEED = 4    # similar songs a station adds after each of the user's Last.fm songs
-SOURCES = {"all": "Everything mixed", "lastfm": "Last.fm", "ytm": "YouTube Music", "library": "Your library", "listenbrainz": "ListenBrainz"}
+SOURCES = {"all": "Everything mixed", "lastfm": "Last.fm", "ytm": "YouTube Music", "library": "Your library", "listenbrainz": "ListenBrainz",
+           "deezer": "Deezer", "tidal": "Tidal", "soundcloud": "SoundCloud"}
 STATIONS = {"lastfm-top": "Last.fm top tracks", "lastfm-loved": "Last.fm loved tracks"}
 PERIODS = ("7day", "1month", "3month", "6month", "12month", "overall")  # Last.fm's periods for top tracks
 PERIOD = "3month"
@@ -39,6 +42,7 @@ KEPT = 3600     # seconds a source's answer is kept (Recommender.answer)
 # After the best answer so far came at t seconds, a better one is waited for min(GRACE·t, GRACE_MOST) seconds more.
 GRACE, GRACE_MOST = 0.3, 3.0
 LASTFM_SIMILAR = 15  # similar tracks asked of Last.fm, the most a method uses
+RADIOS = ("deezer", "tidal", "soundcloud")  # the services a user's radio capability (sources.CAPABILITIES) makes sources
 
 
 class Recommender:
@@ -53,10 +57,12 @@ class Recommender:
 
     def sources(self, db, user) -> list[str]:
         """The sources that can give this user anything: YouTube Music, Last.fm and ListenBrainz when the user has them
-        on (sources.Sources.usable); Last.fm needs the server's API key too."""
+        on (sources.Sources.usable), Deezer, Tidal and SoundCloud when their radio capability is usable too; Last.fm
+        needs the server's API key too."""
         usable = self.services.usable(db, user["name"])
         return [s for s, on in (("all", True), ("lastfm", self.lastfm() and "lastfm" in usable), ("ytm", self.ytm and "songs" in usable.get("ytm", ())),
-                                ("library", True), ("listenbrainz", "listenbrainz" in usable)) if on]
+                                ("library", True), ("listenbrainz", "listenbrainz" in usable),
+                                *((name, "radio" in usable.get(name, ())) for name in RADIOS)) if on]
 
     def stations(self, db, user) -> list[str]:
         """Stations from the user's Last.fm need the API key and the user's Last.fm, on and linked."""
@@ -66,9 +72,8 @@ class Recommender:
     def similar(self, db, seed, count: int, user, deep: bool = False, source: str = "all", wait: float | None = None,
                 unplayable: bool = False) -> list[str]:
         """Track ids like the seed track for the user (their row) from one source, or from every one at hand ("all"),
-        taking turns so local songs come throughout. YouTube Music, Last.fm and ListenBrainz need the network and the
-        user to have them on; the library methods always give something. A source that gives nothing gives an empty
-        list: no other stands in.
+        taking turns so local songs come throughout. The services need the network and the user to have them on; the
+        library methods always give something. A source that gives nothing gives an empty list: no other stands in.
         The methods run at once, each on its own connection (sqlite connections stay in their thread), so the answer
         takes as long as the slowest. With wait, a method that hasn't answered within that many seconds is left out; those
         that look songs up on YouTube Music one by one give what they found by then. unplayable: songs no service has come
@@ -79,17 +84,32 @@ class Recommender:
         lastfm = self.lastfm() if "lastfm" in usable else None
         token = user["listenbrainz_token"] if "listenbrainz" in usable else None
         name = user["name"]
+        radios = [s for s in RADIOS if "radio" in usable.get(s, ())]
+        tidal = self.services.client(db, name, "tidal") if "tidal" in radios else None
+        soundcloud = self.services.client(db, name, "soundcloud") if "soundcloud" in radios else None
+        artist, _ = outside_names(seed)
+
+        def asked(question: tuple, ask):
+            """The songs a radio of another service names, found for the user (resolve)."""
+            return lambda db: self.resolve(db, self.answer(question, ask)[:count], name, deadline, unplayable)
         methods = {
             "ytm": [("YouTube Music radio", lambda db: self.from_youtube(db, seed, count, ytm))],
             "lastfm": [("Last.fm similar tracks", lambda db: self.from_lastfm(db, seed, min(count, 15 if deep else 10), name, deadline, unplayable) if lastfm else []),
                        ("Last.fm similar artists", lambda db: self.from_similar_artists(db, seed, count) if lastfm else [])],
             "listenbrainz": [("ListenBrainz radio", lambda db: self.from_listenbrainz(db, seed, count, token, name, deadline, unplayable))],
+            "deezer": [("Deezer artist radio", asked(("deezer", artist), lambda: Deezer().radio(artist)))] if "deezer" in radios else [],
+            "tidal": [("Tidal track radio", asked(("tidal track", artist, seed["title"]), lambda: tidal.track_radio(artist, seed["title"]))),
+                      ("Tidal artist radio", asked(("tidal artist", artist), lambda: tidal.artist_radio(artist)))] if tidal else [],
+            "soundcloud": [("SoundCloud related tracks", asked(("soundcloud", soundcloud.variant, artist, seed["title"]),
+                                                              lambda: soundcloud.related(artist, seed["title"])))] if soundcloud else [],
             "library": [("linked artists", lambda db: self.from_linked(db, seed, count)),
                         ("same artist", lambda db: self.from_artist(db, seed, count)),
                         ("played together", lambda db: self.from_plays(db, seed, count)),
                         ("same genre", lambda db: self.from_tags(db, seed, count))],
         }
         chosen = list(chain.from_iterable(methods.values())) if source == "all" else methods[source]
+        if not chosen:
+            return []
 
         def run(method):
             own = self.connect()

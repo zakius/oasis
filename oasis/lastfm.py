@@ -1,6 +1,7 @@
 """Last.fm's API: signed calls with oasis's API key and secret (an app registered by the admin), signing a user in to
 get their session key, the read-only methods recommendations and artist info use, and scrobbles for forward.py. oasis's own app is
-oasis.toml's, else the one an admin connected on the dashboard, kept in the setting table."""
+oasis.toml's, else the one an admin connected on the dashboard, kept in the setting table. Libre.fm and other servers that
+speak Last.fm's API (GNU FM's) sign users in and take scrobbles the same way, at their own addresses."""
 import hashlib
 import json
 import urllib.parse
@@ -8,6 +9,10 @@ import urllib.parse
 from .remote import Rejected, check, get, post
 
 LASTFM = "https://ws.audioscrobbler.com/2.0/"
+LASTFM_AUTH = "https://www.last.fm/api/auth/"
+LIBREFM, LIBREFM_AUTH = "https://libre.fm/2.0/", "https://libre.fm/api/auth/"
+# Libre.fm takes any API key and secret, and GNU FM servers don't register apps: oasis signs in to them with its own.
+OPEN_KEY, OPEN_SECRET = hashlib.md5(b"oasis").hexdigest(), "oasis"
 
 
 def answer(status: int, body: bytes) -> dict:
@@ -22,18 +27,19 @@ def answer(status: int, body: bytes) -> dict:
 
 
 class LastFm:
-    def __init__(self, api_key: str, secret: str, session: str | None):
-        self.api_key, self.secret, self.session = api_key, secret, session
+    def __init__(self, api_key: str, secret: str, session: str | None, api: str = LASTFM, auth: str = LASTFM_AUTH):
+        """api and auth: the server's API and the page where its users allow oasis, Last.fm's unless another's."""
+        self.api_key, self.secret, self.session, self.api, self.auth = api_key, secret, session, api, auth
 
     def call(self, params: dict) -> dict:
         params = {**params, "api_key": self.api_key}
         signature = "".join(k + str(params[k]) for k in sorted(params)) + self.secret
         params |= {"api_sig": hashlib.md5(signature.encode()).hexdigest(), "format": "json"}
-        return answer(*post(LASTFM, urllib.parse.urlencode(params).encode(), {"Content-Type": "application/x-www-form-urlencoded"}))
+        return answer(*post(self.api, urllib.parse.urlencode(params).encode(), {"Content-Type": "application/x-www-form-urlencoded"}))
 
     def auth_url(self, callback: str) -> str:
-        """Last.fm's page where the user allows oasis; it comes back to callback with a token."""
-        return f"https://www.last.fm/api/auth/?api_key={self.api_key}&cb={urllib.parse.quote(callback, safe='')}"
+        """The server's page where the user allows oasis; it comes back to callback with a token."""
+        return f"{self.auth}?api_key={self.api_key}&cb={urllib.parse.quote(callback, safe='')}"
 
     def sign_in(self, token: str) -> tuple[str, str]:
         """Trades the token from the callback for a session key, which never expires, and the user name."""
@@ -43,7 +49,7 @@ class LastFm:
     def read(self, params: dict) -> dict:
         """Read-only methods need only the API key."""
         query = urllib.parse.urlencode({**params, "api_key": self.api_key, "format": "json"})
-        return answer(*get(f"{LASTFM}?{query}"))
+        return answer(*get(f"{self.api}?{query}"))
 
     def similar(self, artist: str, title: str, limit: int) -> list[tuple[str, str, str | None]]:
         """Similar tracks as (artist, title, MusicBrainz recording id when Last.fm knows it)."""
@@ -108,3 +114,14 @@ def connect_app(db, key: str, secret: str) -> LastFm:
 def signs_in(app: LastFm | None) -> bool:
     """Whether oasis's app can sign users in, which takes its secret: oasis.toml may give only a key, enough to read."""
     return bool(app and app.secret)
+
+
+def elsewhere(api: str, auth: str, session: str | None = None) -> LastFm:
+    """A client of another server that speaks Last.fm's API (Libre.fm's, GNU FM's), with oasis's own key, and the user's
+    session there once signed in."""
+    return LastFm(OPEN_KEY, OPEN_SECRET, session, api, auth)
+
+
+def gnufm_auth(api: str) -> str:
+    """Where a GNU FM server (Libre.fm's software) has its sign-in page, from its API's address (…/2.0/)."""
+    return urllib.parse.urljoin(api.rstrip("/") + "/", "../api/auth/")

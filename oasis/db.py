@@ -107,6 +107,14 @@ create table if not exists user_service(  -- the services each user turned on (s
     account text,                   -- the user's sign-in to Qobuz, Tidal, SoundCloud, Bandcamp (JSON); YouTube Music's, Last.fm's and ListenBrainz's are user's columns
     primary key(user, service)
 );
+create table if not exists play_server(  -- each user's other servers that take their plays (servers.py)
+    id integer primary key, user text not null,
+    protocol text not null,         -- the API it speaks: lastfm or listenbrainz (servers.PROTOCOLS)
+    name text not null,             -- the user's name for it
+    url text not null,              -- its API's address
+    account text not null,          -- the sign-in there (JSON): a Last.fm-like session and the sign-in page, or a ListenBrainz-like token
+    enabled int not null default 1  -- 0: switched off, sent nothing
+);
 create table if not exists bandcamp_item(  -- what oasis did with each user's Bandcamp purchases and wishlist (bandcamp.py)
     user text not null, kind text not null,  -- purchase or wish
     id text not null,               -- a purchase's sale ('p123'), a wish's album or track ('a123', 't123')

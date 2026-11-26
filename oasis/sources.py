@@ -5,7 +5,8 @@ YouTube Music, Last.fm and ListenBrainz. Each finds one song by artist and title
 keeps in a cache and plays from there; those that can (stream) play through oasis while it downloads. Their songs are
 streaming tracks like YouTube Music's: source is the service's name, ref '<service>:<its id>'. Deezer, Apple Music,
 SoundCloud, Qobuz and Tidal give 30 s previews of songs none has (PREVIEWS), which stay songs nothing can play
-(missing.py)."""
+(missing.py). Deezer, Tidal and SoundCloud also name songs for radios (recommend.py), and Tidal has each user's mixes
+(mixes.py)."""
 import base64
 import hashlib
 import json
@@ -278,6 +279,23 @@ class SoundCloud:
             save_hls(url, target, container)
         return target
 
+    def related(self, artist: str, title: str) -> list[tuple[str, str]]:
+        """The tracks SoundCloud plays after the song (its related tracks), as (artist, title): the artist its label
+        names, else the uploader, and the title without the artist's name before it. The song is the artist's own
+        upload, else the first one found whose title holds the song's."""
+        found = self.search(artist, title)
+        if not found:
+            results = self.api("search/tracks", q=f"{artist} {title}", limit=10).get("collection") or []
+            found = [t for t in results if fold(title) in fold(t.get("title") or "")]
+        if not found:
+            return []
+        pairs = []
+        for t in self.api(f"tracks/{found[0]['id']}/related", limit=RELATED).get("collection") or []:
+            by = (t.get("publisher_metadata") or {}).get("artist") or (t.get("user") or {}).get("username")
+            if by and t.get("title"):
+                pairs.append((by, t["title"].removeprefix(by + " - ")))
+        return pairs
+
     def likes(self) -> list[dict]:
         """The account's liked tracks, newest first."""
         return [e["track"] for e in self.pages(f"users/{self.account['id']}/track_likes") if e.get("track")]
@@ -479,6 +497,33 @@ class Tidal:
                         "track_no": t.track_num, "disc_no": t.volume_num, "cover": cover}
         return None
 
+    def track_radio(self, artist: str, title: str) -> list[tuple[str, str]]:
+        """Tidal's radio of the song, as (artist, title)."""
+        found = self.search(artist, title)
+        return [pair(t) for t in found[0].get_track_radio(RELATED)] if found else []
+
+    def artist_radio(self, artist: str) -> list[tuple[str, str]]:
+        """Tidal's radio of the artist, as (artist, title)."""
+        import tidalapi
+        found = [a for a in self.session.search(artist, models=[tidalapi.Artist], limit=5).get("artists") or [] if fold(a.name or "") == fold(artist)]
+        return [pair(t) for t in found[0].get_radio(RELATED)] if found else []
+
+    def mixes(self) -> list[dict]:
+        """The account's mixes (My Mix 1..., My Daily Discovery, My New Arrivals) with their songs as (artist, title):
+        id, title, comment, cover, songs. Video mixes are left out."""
+        from tidalapi.media import Track
+        from tidalapi.mix import Mix
+        found = []
+        for mix in [m for m in self.session.mixes() if isinstance(m, Mix)]:
+            songs = [pair(t) for t in mix.items() if isinstance(t, Track)]
+            if songs:
+                try:
+                    cover = mix.image(640)
+                except Exception:
+                    cover = None
+                found.append({"id": mix.id, "title": mix.title, "comment": mix.sub_title or None, "cover": cover, "songs": songs})
+        return found
+
     def stream(self, key: str) -> Stream:
         """One URL, or a DASH manifest's segments sent one after another, each measured first."""
         manifest = unencrypted(self.session.track(int(key)).get_stream())
@@ -490,6 +535,11 @@ class Tidal:
 
     def download(self, key: str, path: Path) -> Path:
         return save_manifest(unencrypted(self.session.track(int(key)).get_stream()), path)
+
+
+def pair(track) -> tuple[str, str]:
+    """A tidalapi track as (artist, title)."""
+    return (track.artist.name if track.artist else ""), track.name
 
 
 def unencrypted(stream):
@@ -522,6 +572,36 @@ class Preview:
         target = path.with_name(f"{path.name}.{self.suffix}")
         save(link, target)
         return target
+
+
+class Deezer:
+    """Deezer's public API, without an account: an artist's radio and related artists."""
+    API = "https://api.deezer.com/"
+
+    def answer(self, path: str, **fields) -> dict:
+        found = get_json(self.API + path, fields=fields)
+        if "error" in found:
+            raise OSError(f"Deezer: {found['error']}")
+        return found
+
+    def artist(self, name: str) -> int | None:
+        """The id of the artist of that name."""
+        return next((a["id"] for a in self.answer("search/artist", q=name, limit=5).get("data") or [] if fold(a.get("name") or "") == fold(name)), None)
+
+    def radio(self, artist: str) -> list[tuple[str, str]]:
+        """The artist's radio: songs by the artist and those like them, as (artist, title)."""
+        id = self.artist(artist)
+        if not id:
+            return []
+        tracks = self.answer(f"artist/{id}/radio", limit=RELATED).get("data") or []
+        return [(t["artist"]["name"], t.get("title_short") or t["title"]) for t in tracks if (t.get("artist") or {}).get("name")]
+
+    def related(self, artist: str) -> list[str]:
+        """The names of the artists Deezer calls related, closest first."""
+        id = self.artist(artist)
+        if not id:
+            return []
+        return [a["name"] for a in self.answer(f"artist/{id}/related", limit=20).get("data") or [] if a.get("name")]
 
 
 class DeezerPreview(Preview):
@@ -617,11 +697,15 @@ ACCOUNTS = ("qobuz", "tidal")  # the services that need a linked account; the ot
 PREVIEWS = {kind.name: kind for kind in (DeezerPreview, ApplePreview, SoundCloudPreview, QobuzPreview, TidalPreview)}
 # Every service a user can turn on, with the capabilities of it an admin can allow or not: songs, full songs to find,
 # search and stream; signed-in, SoundCloud's Go+ songs with the user's sign-in; previews, clips of songs nothing can
-# play; account, what a linked account adds: YouTube Music's mixes and history, SoundCloud's likes and playlists,
-# Bandcamp's purchases and wishlist (bandcamp.py).
-CAPABILITIES = {"ytm": ("songs", "account"), "qobuz": ("songs", "previews"), "tidal": ("songs", "previews"), "bandcamp": ("songs", "account"),
-                "soundcloud": ("songs", "signed-in", "account", "previews"), "lastfm": (), "listenbrainz": (), "deezer": ("previews",),
+# play; radio, the service as a source of radios and similar songs (recommend.py), and Deezer's related artists;
+# account, what a linked account adds: YouTube Music's mixes and history, SoundCloud's likes and playlists, Bandcamp's
+# purchases and wishlist (bandcamp.py), the playlists ListenBrainz makes for the user and Tidal's mixes (mixes.py).
+# The lists of other servers that take plays (servers.py) are offered or not as a whole, and turned on by no one.
+CAPABILITIES = {"ytm": ("songs", "account"), "qobuz": ("songs", "previews"), "tidal": ("songs", "previews", "radio", "account"),
+                "bandcamp": ("songs", "account"), "soundcloud": ("songs", "signed-in", "account", "previews", "radio"), "lastfm": (),
+                "listenbrainz": ("account",), "lastfm-servers": (), "listenbrainz-servers": (), "deezer": ("previews", "radio"),
                 "apple": ("previews",)}
+RELATED = 50  # songs asked of a service's radio or related tracks
 PREVIEW_SECONDS = 30
 
 
@@ -715,6 +799,12 @@ class Sources:
                    "set account = excluded.account", (user, name, json.dumps(account)))
         self.clients.pop((user, name), None)
         self.failed.pop((user, name), None)
+
+    def client(self, db, user: str, name: str):
+        """The user's client of one of their streaming services (KINDS) they can use, whatever for; None when it fails to
+        start."""
+        usable = self.usable(db, user)
+        return self.started(db, user, name, self.turned_on(db, user).get(name), usable[name]) if name in usable else None
 
     def active(self, db, user: str) -> list:
         """The clients of the user's streaming services whose full songs the user can use, in the order they are asked;
