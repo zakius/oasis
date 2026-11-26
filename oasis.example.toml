@@ -18,12 +18,12 @@ dedupe = false    # store each audio stream once: copies of a song in several ed
                                                       # similar artists and mixed into each other's radios
 
 [ytmusic]
-enabled = false   # search YouTube Music and stream from it
+enabled = false   # offer YouTube Music to users (they turn it on in Services); admins change it there while oasis runs
 cache = "cache"   # downloaded audio; tracks you star or add to a playlist download right away
 
 [lastfm]
-# App credentials from https://www.last.fm/api/account/create, or entered by an admin on the account page. Each user
-# then signs in to Last.fm on the account page; the key also adds Last.fm's similar tracks to radios.
+# App credentials from https://www.last.fm/api/account/create, or entered by an admin on the Services page. Each user
+# who turns Last.fm on gets its similar tracks in radios, and can sign in there to scrobble.
 api_key = ""
 secret = ""
 

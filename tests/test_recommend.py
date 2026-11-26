@@ -6,7 +6,7 @@ import time
 import pytest
 
 from conftest import call, make_client, make_track
-from oasis import playlists
+from oasis import accounts, playlists
 from oasis.db import connect
 from oasis.playlists import LISTENING_RADIO
 from oasis.recommend import Recommender
@@ -70,7 +70,7 @@ def ytm():
 
 @pytest.fixture
 def client(library, tmp_path, ytm):
-    with make_client(library, tmp_path / "oasis.db", ytm) as c:
+    with make_client(library, tmp_path / "oasis.db", ytm, turned_on=["ytm", "lastfm", "listenbrainz"]) as c:
         c.app.state.oasis.lastfm = FakeLastFm()
         yield c
 
@@ -281,7 +281,7 @@ def test_a_failing_radio_pass_leaves_the_radio_worker_running(api):
             raise sqlite3.OperationalError("database is locked")
         done.set()
         return api.connect()
-    recommender = Recommender(connect, None, None)
+    recommender = Recommender(connect, None, None, api.sources)
     recommender.start()
     recommender.wake()
     assert done.wait(10)
@@ -414,7 +414,7 @@ def test_a_slow_source_gives_the_songs_it_found_by_the_deadline(api, client, ytm
     db = api.connect()
     seed = db.execute("select * from track where title = 'Song A'").fetchone()
     started = time.monotonic()
-    ids = api.recommender.similar(db, seed, 10, source="listenbrainz", token="lb-token", wait=1.5)
+    ids = api.recommender.similar(db, seed, 10, accounts.get(db, "admin"), source="listenbrainz", wait=1.5)
     release.set()
     assert time.monotonic() - started < 1.5
     assert [db.execute("select title from track where id = ?", (i,)).fetchone()[0] for i in ids] == ["Tune"]

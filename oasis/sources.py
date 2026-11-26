@@ -1,5 +1,6 @@
 """Streaming services besides YouTube Music, asked for songs YouTube Music doesn't have: Qobuz and Tidal (lossless, with
-an account an admin links on the dashboard), Bandcamp and SoundCloud (no account; an admin turns them on). Each finds
+the user's own account, linked on the dashboard), Bandcamp and SoundCloud (no account). Each user turns on the ones they
+use, among those an admin allows (Sources); the same goes for YouTube Music, Last.fm and ListenBrainz. Each finds
 one song by artist and title, and downloads its audio, which oasis keeps in a cache and plays from there. Their songs
 are streaming tracks like YouTube Music's: source is the service's name, ref '<service>:<its id>'. Deezer and Apple
 Music give 30 s previews of songs none has (PREVIEWS), which stay songs nothing can play (missing.py)."""
@@ -24,7 +25,7 @@ BROWSER = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.
 HTTP = urllib3.PoolManager(maxsize=4, retries=urllib3.Retry(connect=1, read=1, status=0, other=0, redirect=5),
                            timeout=urllib3.Timeout(connect=10, read=30), headers={"User-Agent": BROWSER})
 PREVIEW = 31  # seconds: a "song" this short is a service's preview clip, not the song
-SETTING = "service."  # the setting table's keys: service.<name>, "1" or the account's JSON
+ALLOW = "allow."  # the setting table's keys for what an admin offers users: allow.<service> and allow.<service>.<capability>, "1" or "0"
 YDL = {"quiet": True, "no_warnings": True, "noprogress": True}  # yt-dlp's options for every service it reads
 
 
@@ -353,58 +354,121 @@ class ApplePreview:
 
 KINDS = {kind.name: kind for kind in (Qobuz, Tidal, Bandcamp, SoundCloud)}  # also the order they are asked in
 ACCOUNTS = ("qobuz", "tidal")  # the services that need a linked account; the others are only turned on
-# Where songs nothing can play get a clip from, in the order they are asked; an admin turns each on. Clips reach only
+# Where songs nothing can play get a clip from, in the order they are asked; each user turns each on. Clips reach only
 # apps that take songs nothing can play (extension unavailableSongs), so plain Subsonic apps never play one.
 PREVIEWS = {kind.name: kind for kind in (DeezerPreview, ApplePreview)}
+# Every service a user can turn on, with the capabilities of it an admin can allow or not: songs, full songs to find,
+# search and stream; previews, clips of songs nothing can play; account, what a linked account adds (YouTube Music's
+# mixes and history).
+CAPABILITIES = {"ytm": ("songs", "account"), "qobuz": ("songs",), "tidal": ("songs",), "bandcamp": ("songs",), "soundcloud": ("songs",),
+                "lastfm": (), "listenbrainz": (), "deezer": ("previews",), "apple": ("previews",)}
 PREVIEW_SECONDS = 30
 
 
-class Sources:
-    """The services an admin turned on or linked (the setting table), the songs they find as tracks, and their audio,
-    downloaded into cache when first played."""
+class Off(LookupError):
+    """A song's service is one the user can't use now: not turned on, not linked, or not allowed on this server."""
 
-    def __init__(self, cache: Path):
-        self.cache = cache
-        self.clients: dict[str, tuple[str, object]] = {}  # by service: (its setting, its client)
-        self.failed: dict[str, tuple[str, float]] = {}  # by service: (the setting it failed to start with, when)
+
+def off(title: str) -> Off:
+    return Off(f"This song plays from {title}, which you haven't turned on: see Services on the oasis dashboard.")
+
+
+class Sources:
+    """Each user's services (user_service) as an admin allows them (the setting table), the songs their streaming
+    services find as tracks, and those songs' audio, downloaded into cache when first played. Cached audio plays for
+    everyone; downloading it takes the requesting user's own service."""
+
+    def __init__(self, cache: Path, ytm_allowed: bool = False):
+        """ytm_allowed: whether YouTube Music is allowed till an admin decides (oasis.toml); the others are."""
+        self.cache, self.ytm_allowed = cache, ytm_allowed
+        self.clients: dict[tuple[str, str], tuple[str, object]] = {}  # by (user, service): (its account, its client)
+        self.failed: dict[tuple[str, str], tuple[str, float]] = {}  # by (user, service): (the account it failed to start with, when)
         self.locks = defaultdict(threading.Lock)
 
-    def settings(self, db) -> dict[str, str]:
-        return {k.removeprefix(SETTING): v for k, v in db.execute("select key, value from setting where key like ?", (SETTING + "%",))}
+    def offered(self, db) -> dict[str, set[str]]:
+        """The services an admin offers users, each with the capabilities of it allowed (CAPABILITIES). Until an admin
+        decides, all are, but YouTube Music as oasis.toml says."""
+        settings = dict(db.execute("select key, value from setting where key like ?", (ALLOW + "%",)).fetchall())
 
-    def active(self, db) -> list:
-        """The clients of the services that are on, in the order they are asked; one that fails to start is left out."""
-        settings, found = self.settings(db), []
-        for name, kind in KINDS.items():
-            value = settings.get(name)
-            if not value:
+        def on(key: str, default: bool = True) -> bool:
+            value = settings.get(ALLOW + key)
+            return value == "1" if value is not None else default
+        return {name: {c for c in capabilities if on(f"{name}.{c}")} for name, capabilities in CAPABILITIES.items()
+                if on(name, self.ytm_allowed if name == "ytm" else True)}
+
+    def allowed(self, db, name: str, capability: str | None = None) -> bool:
+        """Whether users may use the service, and that capability of it."""
+        offered = self.offered(db)
+        return name in offered and (capability is None or capability in offered[name])
+
+    def allow(self, db, name: str, on: bool, capability: str | None = None):
+        """Offers the service, or a capability of it, to users or takes it back. Their accounts stay."""
+        key = ALLOW + name + (f".{capability}" if capability else "")
+        db.execute("insert or replace into setting values (?, ?)", (key, "1" if on else "0"))
+
+    def turned_on(self, db, user: str) -> dict[str, str | None]:
+        """The services the user turned on, offered or not, each with its account (JSON) where it keeps one here."""
+        return dict(db.execute("select service, account from user_service where user = ?", (user,)).fetchall())
+
+    def usable(self, db, user: str) -> dict[str, set[str]]:
+        """The services the user turned on that the server offers, each with the capabilities allowed. Those that need
+        an account (ACCOUNTS, and ListenBrainz's token) count once it is linked."""
+        offered, found = self.offered(db), {}
+        for name, account, token in db.execute("select s.service, s.account, u.listenbrainz_token from user_service s "
+                                               "join user u on u.name = s.user where s.user = ?", (user,)):
+            if name in ACCOUNTS and not account or name == "listenbrainz" and not token:
                 continue
-            kept = self.clients.get(name)
+            if name in offered:
+                found[name] = offered[name]
+        return found
+
+    def uses(self, db, user: str, name: str, capability: str | None = None) -> bool:
+        """Whether the user can use the service now, and that capability of it."""
+        usable = self.usable(db, user)
+        return name in usable and (capability is None or capability in usable[name])
+
+    def turn_on(self, db, user: str, name: str):
+        db.execute("insert or ignore into user_service(user, service) values (?, ?)", (user, name))
+
+    def turn_off(self, db, user: str, name: str):
+        """Turns the service off for the user and forgets its account."""
+        db.execute("delete from user_service where user = ? and service = ?", (user, name))
+        self.clients.pop((user, name), None)
+        self.failed.pop((user, name), None)
+
+    def link(self, db, user: str, name: str, account: dict):
+        """Keeps the account of a service that needs one (ACCOUNTS), turning it on."""
+        db.execute("insert into user_service(user, service, account) values (?, ?, ?) on conflict(user, service) do update "
+                   "set account = excluded.account", (user, name, json.dumps(account)))
+        self.clients.pop((user, name), None)
+        self.failed.pop((user, name), None)
+
+    def active(self, db, user: str) -> list:
+        """The clients of the user's streaming services whose full songs the user can use, in the order they are asked;
+        one that fails to start is left out."""
+        usable, accounts, found = self.usable(db, user), self.turned_on(db, user), []
+        for name, kind in KINDS.items():
+            if "songs" not in usable.get(name, ()):
+                continue
+            value, key = accounts.get(name) or "", (user, name)
+            kept = self.clients.get(key)
             if not kept or kept[0] != value:
-                failed = self.failed.get(name)
+                failed = self.failed.get(key)
                 if failed and failed[0] == value and failed[1] > time.time() - RETRY_START:
                     continue
                 try:
                     kept = (value, kind(json.loads(value)) if name in ACCOUNTS else kind())
                 except Exception as e:
-                    log.warning("%s is unavailable: %s", kind.title, e)
-                    self.failed[name] = (value, time.time())
+                    log.warning("%s is unavailable for %s: %s", kind.title, user, e)
+                    self.failed[key] = (value, time.time())
                     continue
-                self.clients[name] = kept
+                self.clients[key] = kept
             if hasattr(kept[1], "current") and (now := json.dumps(kept[1].current())) != kept[0]:
-                self.set(db, name, now)  # a renewed sign-in, kept for the next start
-                self.clients[name] = kept = (now, kept[1])
+                # a renewed sign-in, kept for the next start
+                db.execute("update user_service set account = ? where user = ? and service = ?", (now, user, name))
+                self.clients[key] = kept = (now, kept[1])
             found.append(kept[1])
         return found
-
-    def set(self, db, name: str, value: str | None):
-        """Turns a service on ("1", or its account's JSON) or off (None)."""
-        if value is None:
-            db.execute("delete from setting where key = ?", (SETTING + name,))
-        else:
-            db.execute("insert or replace into setting values (?, ?)", (SETTING + name, value))
-        self.clients.pop(name, None)
-        self.failed.pop(name, None)
 
     @staticmethod
     def track_row(client, song: dict) -> dict:
@@ -435,16 +499,17 @@ class Sources:
         done = download(partial / stem)
         return done.rename(self.cache / done.name)
 
-    def audio(self, db, source: str, ref: str) -> Path:
-        """The track's audio file: the cached one, else downloaded now. LookupError when the service is off or no longer
-        has it. A service may send another format than the one it usually does, so the track takes the file's."""
+    def audio(self, db, user: str, source: str, ref: str) -> Path:
+        """The track's audio file: the cached one, else downloaded now with the user's own service. Off when the user
+        can't use the service, LookupError when it no longer has the song. A service may send another format than the
+        one it usually does, so the track takes the file's."""
         key = ref.removeprefix(source + ":")
         with self.locks[ref]:
             if path := self.cached(stream_stem(source, key)):
                 return path
-            client = next((c for c in self.active(db) if c.name == source), None)
+            client = next((c for c in self.active(db, user) if c.name == source), None)
             if client is None:
-                raise LookupError(f"{KINDS[source].title if source in KINDS else source} is off on this server")
+                raise off(KINDS[source].title if source in KINDS else source)
             path = self.kept(stream_stem(source, key), lambda target: client.download(key, target))
             db.execute("update track set suffix = ?, content_type = ? where ref = ?", (path.suffix[1:], content_type(path), ref))
             return path
@@ -462,18 +527,17 @@ class Sources:
             if f.stat().st_mtime < time.time() - 86400:
                 f.unlink(missing_ok=True)
 
-    def previews(self, db) -> list:
-        """The preview services that are on, in the order they are asked."""
-        settings = self.settings(db)
-        return [kind() for name, kind in PREVIEWS.items() if settings.get(name)]
+    def previews(self, db, user: str) -> list:
+        """The user's usable preview services, in the order they are asked."""
+        usable = self.usable(db, user)
+        return [kind() for name, kind in PREVIEWS.items() if "previews" in usable.get(name, ())]
 
-    def clip(self, db, preview: str) -> tuple[Path, str]:
-        """A song's preview ('<service>:<its id>') as its file and content type: the cached one, else downloaded now.
-        LookupError when the service is off or no longer has it."""
+    def clip(self, db, user: str, preview: str) -> tuple[Path, str]:
+        """A song's preview ('<service>:<its id>') as its file and content type: the cached one, else downloaded now
+        with the user's preview service. Off when the user can't use it, LookupError when it no longer has the clip."""
         name, key = preview.split(":", 1)
         kind = PREVIEWS.get(name)
-        if kind is None or not self.settings(db).get(name):
-            raise LookupError(f"{kind.title if kind else name} previews are off on this server")
+
         def download(path: Path) -> Path:
             link = kind().link(key)
             if not link:
@@ -482,7 +546,10 @@ class Sources:
             save(link, target)
             return target
         with self.locks[preview]:
-            return self.kept(preview_stem(preview), download), kind.content_type
+            if not self.cached(preview_stem(preview)) and not (kind and self.uses(db, user, name, "previews")):
+                raise off(f"{kind.title if kind else name} previews")
+            path = self.kept(preview_stem(preview), download)
+            return path, content_type(path)
 
 
 PARTIAL = "partial"  # the cache's folder for downloads till they are complete

@@ -91,3 +91,17 @@ def test_dashboard_merges_and_related_groups_move_to_their_own_tables(tmp_path):
         ("BB", "Beta", "dashboard"), ("Beta Band", "Beta", "dashboard")]
     assert [tuple(r) for r in db.execute("select artist, other from related_artist order by 1, 2")] == [("A", "B"), ("A", "C"), ("B", "C")]
     assert json.loads(db.execute("select value from setting where key = 'artists'").fetchone()[0]) == {"separate": ["D"]}
+
+
+def test_services_set_up_for_everyone_go_and_every_user_keeps_youtube_music_last_fm_and_their_links(tmp_path):
+    path = older(tmp_path / "old.db", "8e15d09",
+                 "insert into user(name, password, admin, created, ytm_auth, lastfm_session, listenbrainz_token) values "
+                 "('ann', 'pw', 1, 0, '{}', 'sk', null), ('bob', 'pw', 0, 0, null, null, 'tok')",
+                 """insert into setting values ('service.qobuz', '{"token": "t"}'), ('service.bandcamp', '1'), ('artists', '{}')""")
+    db = database.connect(path)
+    on = lambda db: sorted(tuple(r) for r in db.execute("select user, service from user_service"))
+    assert on(db) == [("ann", "lastfm"), ("ann", "ytm"), ("bob", "lastfm"), ("bob", "listenbrainz"), ("bob", "ytm")]
+    assert [r[0] for r in db.execute("select key from setting")] == ["artists"]
+    assert db.execute("select ytm_auth from user where name = 'ann'").fetchone()[0] == "{}"  # the linked account stays
+    db.execute("delete from user_service where user = 'bob' and service = 'ytm'")  # bob turns it off
+    assert ("bob", "ytm") not in on(reopened(db, path))  # once only

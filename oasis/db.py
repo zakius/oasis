@@ -102,6 +102,11 @@ create table if not exists user(
     translate_lang text,            -- the language lyrics are translated to when an app asks with oasisTranslate=1
     missing_songs int not null default 1 -- 1: apps that ask (extension unavailableSongs) get songs nothing can play (missing.py)
 );
+create table if not exists user_service(  -- the services each user turned on (sources.SERVICES)
+    user text not null, service text not null,
+    account text,                   -- Qobuz's and Tidal's sign-in (JSON); YouTube Music's, Last.fm's and ListenBrainz's are user's columns
+    primary key(user, service)
+);
 create table if not exists app_password(  -- what apps sign in with (accounts.py): each user's own password signs in to the dashboard only
     id integer primary key, user text not null, name text not null,
     secret text not null,           -- as given to the app: Subsonic's token login needs it
@@ -282,6 +287,22 @@ def rename(db: sqlite3.Connection):
         db.execute("alter table stat rename to stat_global")
 
 
+def own_services(db: sqlite3.Connection):
+    """Streaming services are each user's own. A database from before (users, no user_service) drops the services an
+    admin set up for everyone; every user keeps YouTube Music and Last.fm, which were on for everyone (Last.fm's
+    similar songs need no account), and the ListenBrainz they linked."""
+    tables = {row[0] for row in db.execute("select name from sqlite_master where type = 'table'")}
+    if "user" not in tables or "user_service" in tables:
+        return
+    db.execute("create table user_service(user text not null, service text not null, account text, primary key(user, service))")
+    db.execute("insert into user_service(user, service) select name, 'ytm' from user")
+    db.execute("insert into user_service(user, service) select name, 'lastfm' from user")
+    if "listenbrainz_token" in {row[1] for row in db.execute("pragma table_info(user)")}:
+        db.execute("insert into user_service(user, service) select name, 'listenbrainz' from user where listenbrainz_token is not null")
+    if "setting" in tables:
+        db.execute("delete from setting where key like 'service.%'")
+
+
 def own_stats(db: sqlite3.Connection):
     """Stars, ratings and plays from when they were global go to every admin, or every user when there is no admin,
     so whoever had them keeps them; with no users yet they wait in stat_global."""
@@ -378,4 +399,4 @@ def create(db: sqlite3.Connection):
 
 # What a database from any older oasis needs, in order, each time a process first connects to it; each step does
 # nothing once done.
-MIGRATIONS = [rename, create, own_stats, lyrics_with_words, one_listening_radio, reidentify, drop_left_out, artist_tables]
+MIGRATIONS = [rename, own_services, create, own_stats, lyrics_with_words, one_listening_radio, reidentify, drop_left_out, artist_tables]

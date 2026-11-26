@@ -145,15 +145,16 @@ def listen_for(r, played: float, ytm_id: str | None = None) -> Listen:
     return Listen(r["id"], artist, r["title"], album, r["duration"], played, ytm_id or r["ytm_id"])
 
 
-def user_services(lastfm: LastFm | None, ytm, user) -> dict:
-    """The services a user linked, by name. lastfm: oasis's Last.fm app, which a user's session needs."""
+def user_services(lastfm: LastFm | None, ytm, user, usable) -> dict:
+    """The services a user linked and can use (usable: sources.Sources.usable), by name. lastfm: oasis's Last.fm app,
+    which a user's session needs."""
     found = {}
     if user is None:
         return found
-    if signs_in(lastfm) and user["lastfm_session"]:
+    if signs_in(lastfm) and user["lastfm_session"] and "lastfm" in usable:
         found["lastfm"] = LastFm(lastfm.api_key, lastfm.secret, user["lastfm_session"])
-    if user["listenbrainz_token"]:
+    if user["listenbrainz_token"] and "listenbrainz" in usable:
         found["listenbrainz"] = ListenBrainz(user["listenbrainz_token"])
-    if ytm and user["ytm_auth"]:
+    if ytm and user["ytm_auth"] and "account" in usable.get("ytm", ()):
         found["ytmusic"] = YouTubeMusicHistory(ytm, ytm.client(user["ytm_auth"]))
     return found

@@ -525,9 +525,9 @@ class Api:
             ("apiKeyAuthentication", [1]), ("formPost", [1]), ("songLyrics", [1, 2]), ("transcodeOffset", [1]), ("romanization", [1]), ("upload", [1]), ("shareUrl", [1]),
             ("unavailableSongs", [1]), ("oasis", [1, 2, 3]))]}
 
-    def _user(self, row) -> dict:
+    def _user(self, db, row) -> dict:
         roles = ("scrobbling", "settings", "download", "playlist", "coverArt", "comment", "stream", "share")
-        scrobbling = lastfm.signs_in(self.oasis.lastfm) and bool(row["lastfm_session"])
+        scrobbling = lastfm.signs_in(self.oasis.lastfm) and bool(row["lastfm_session"]) and self.oasis.sources.uses(db, row["name"], "lastfm")
         return {"username": row["name"], "adminRole": bool(row["admin"]), "scrobblingEnabled": scrobbling, **{f"{r}Role": True for r in roles},
                 "uploadRole": bool(row["admin"]), **{f"{r}Role": False for r in ("podcast", "jukebox")}, "folder": [1]}
 
@@ -539,11 +539,11 @@ class Api:
         name = p.get("username", user)
         if name != user:
             self._admin(db, user)
-        return {"user": self._user(self._one(db, "select * from user where name = ?", name))}
+        return {"user": self._user(db, self._one(db, "select * from user where name = ?", name))}
 
     def getUsers(self, db, p, user):
         self._admin(db, user)
-        return {"users": {"user": [self._user(r) for r in db.execute("select * from user order by name")]}}
+        return {"users": {"user": [self._user(db, r) for r in db.execute("select * from user order by name").fetchall()]}}
 
     def createUser(self, db, p, user):
         """Apps get no say over users and passwords: an app password opens less than the dashboard does."""
@@ -658,9 +658,9 @@ class Api:
         r = required(song_row(db, p.need("id")))
         if r["source"] == "missing" and not p.missing:  # unknown to a client that doesn't take songs nothing can play
             required(None)
-        if r["ytm_id"] is None and self.oasis.ytm:  # for share links
+        if r["ytm_id"] is None and (music := self.oasis.youtube_music(db)):  # for share links
             try:
-                youtube.video_of(db, r, self.oasis.ytm)
+                youtube.video_of(db, r, music)
                 r = required(song_row(db, r["id"]))
             except Exception as e:
                 log.info("YouTube Music match for %s failed: %s", r["id"], e)
@@ -728,7 +728,7 @@ class Api:
         rows = db.execute("select genre, count(*) n, count(distinct album_id) a from track where library = 1 and genre is not null group by genre order by genre")
         return {"genres": {"genre": [{"value": r["genre"], "songCount": r["n"], "albumCount": r["a"]} for r in rows]}}
 
-    def _search(self, db, p):
+    def _search(self, db, p, user):
         terms = [t for t in p.get("query", "").replace('"', "").split() if t]
         text = " ".join(terms)
         # MusicBrainz, last in the answer, for what neither the library nor YouTube Music has: these can be starred like any
@@ -756,7 +756,7 @@ class Api:
         cond, args = match("t.title || ' ' || t.artist || ' ' || t.album", "l.title || ' ' || l.artist || ' ' || l.album")
         songs = [song(r) for r in db.execute(SONGS + joined + f" where {cond} order by t.album_artist, t.album, t.disc_no, t.track_no limit ? offset ?",
                                              (*args, p.int("songCount", 20), p.int("songOffset", 0)))]
-        if self.oasis.ytm and terms and p.int("songOffset", 0) == 0:
+        if terms and p.int("songOffset", 0) == 0 and self.oasis.youtube_music(db, user):
             known = {s["id"] for s in songs}
             # Capped: a client asking for 500 songs would otherwise wait on YouTube Music's paging for many seconds.
             # At least 20, for the artists and albums of a client asking for those alone (songCount=0).
@@ -847,10 +847,10 @@ class Api:
                       **self._wanted(db, "album", id)})
 
     def search3(self, db, p, user):
-        return {"searchResult3": self._search(db, p)}
+        return {"searchResult3": self._search(db, p, user)}
 
     def search2(self, db, p, user):
-        return {"searchResult2": self._search(db, p)}
+        return {"searchResult2": self._search(db, p, user)}
 
     def _starred(self, db, p):
         """The user's stars; MusicBrainz-only artists and albums only for the oasis extension, as search finds them."""
@@ -924,7 +924,7 @@ class Api:
 
     def getLyricsBySongId(self, db, p, user):
         r = self._one(db, "select * from track where id = ?", p.need("id"))
-        found = lyrics.for_track(db, r, self.oasis.ytm)
+        found = lyrics.for_track(db, r, self.oasis.youtube_music(db))
         if not found:
             return {"lyricsList": {}}
         main = {"displayArtist": r["artist"], "displayTitle": r["title"], "lang": "xxx", "offset": 0, "synced": found.synced,
@@ -978,7 +978,7 @@ class Api:
         artist, title = p.get("artist", ""), p.get("title", "")
         r = db.execute(f"select * from track where title = ? collate nocase and (? = '' or {BY_ARTIST_NAME}) "
                        "order by library desc limit 1", (title, artist, artist, artist)).fetchone()
-        found = lyrics.for_track(db, r, self.oasis.ytm) if r else None
+        found = lyrics.for_track(db, r, self.oasis.youtube_music(db)) if r else None
         text = found.text() if found else None
         return {"lyrics": clean({"artist": r["artist"] if r else artist, "title": r["title"] if r else title, "value": text})}
 
@@ -1052,8 +1052,8 @@ class Api:
         account = accounts.get(db, user)
         source = self._source(p, account)
         # A player waits for this answer with nothing to play next, so a slow source is left out rather than waited for.
-        ids = self.oasis.recommender.similar(db, seed, min(p.int("count", 50), 200), source=source, token=account["listenbrainz_token"],
-                                             wait=SIMILAR_WAIT, unplayable=p.missing)
+        ids = self.oasis.recommender.similar(db, seed, min(p.int("count", 50), 200), account, source=source, wait=SIMILAR_WAIT,
+                                             unplayable=p.missing)
         self.oasis.youtube.warm(db, ids[:WARM])
         return {"song": [song(required(song_row(db, i))) for i in ids], "oasisSource": source}
 
@@ -1069,15 +1069,15 @@ class Api:
         recommender = self.oasis.recommender
         return {"oasisRadio": {
             "defaultSource": account["radio_source"],
-            "source": [{"id": s, "name": SOURCES[s]} for s in recommender.sources(account)],
+            "source": [{"id": s, "name": SOURCES[s]} for s in recommender.sources(db, account)],
             "station": [clean({"id": s, "name": STATIONS[s], "period": list(PERIODS) if s == "lastfm-top" else None,
-                               "defaultPeriod": PERIOD if s == "lastfm-top" else None}) for s in recommender.stations(account)]}}
+                               "defaultPeriod": PERIOD if s == "lastfm-top" else None}) for s in recommender.stations(db, account)]}}
 
     def getTopSongs(self, db, p, user):
         name, count = p.need("artist"), min(p.int("count", 50), 200)
         ids = [r[0] for r in db.execute("select t.id from track t left join stat s on s.id = t.id and s.user = me() where t.library = 1 and "
                                         "t.album_artist = ? collate nocase order by coalesce(s.play_count, 0) desc limit ?", (name, count))]
-        if len(ids) < count:
+        if len(ids) < count and self.oasis.youtube_music(db, user):
             ids += self.oasis.youtube.top_songs(db, name, count)
         return {"topSongs": {"song": [song(required(song_row(db, i))) for i in dict.fromkeys(ids)][:count]}}
 
@@ -1142,9 +1142,9 @@ class Api:
         if id := p.get("playlistId"):
             playlist_id, source, station = self._own_playlist(db, id, user)["id"], None, None
         else:
-            if source is not None and source not in recommender.sources(account):
+            if source is not None and source not in recommender.sources(db, account):
                 raise Fail(0, f"oasisSource {source} isn't available: oasisRadio lists those that are")
-            if station is not None and station not in recommender.stations(account):
+            if station is not None and station not in recommender.stations(db, account):
                 raise Fail(0, f"oasisStation {station} isn't available: oasisRadio lists those that are")
             period = (p.get("oasisPeriod") or PERIOD) if station == "lastfm-top" else None
             if period is not None and period not in PERIODS:
@@ -1255,7 +1255,9 @@ class Api:
             raise Fail(NOT_FOUND, missing.NOT_PLAYABLE)
         if r["source"] == "missing":  # only its preview plays
             try:
-                clip, content_type = self.oasis.sources.clip(db, r["preview"])
+                clip, content_type = self.oasis.sources.clip(db, user, r["preview"])
+            except sources.Off as e:
+                raise Fail(NOT_FOUND, str(e))
             except Exception as e:
                 log.warning("preview %s failed: %s", r["preview"], e)
                 raise Fail(NOT_FOUND, missing.NOT_PLAYABLE)
@@ -1264,7 +1266,9 @@ class Api:
         source = r["ref"]
         if r["source"] in sources.KINDS:  # another streaming service's song: its audio is cached when first played
             try:
-                source = self.oasis.sources.audio(db, r["source"], r["ref"])
+                source = self.oasis.sources.audio(db, user, r["source"], r["ref"])
+            except sources.Off as e:
+                raise Fail(NOT_FOUND, str(e))
             except Exception as e:
                 log.warning("%s audio of %s failed: %s", r["source"], r["ref"], e)
                 raise Fail(NOT_FOUND, "Stream unavailable")
@@ -1275,6 +1279,8 @@ class Api:
         if r["source"] == "ytm":
             if not self.oasis.ytm:
                 raise Fail(NOT_FOUND, "YouTube Music is not enabled")
+            if not self.oasis.ytm.cached(r["ref"]) and not self.oasis.youtube_music(db, user):  # cached audio plays for everyone
+                raise Fail(NOT_FOUND, str(sources.off("YouTube Music")))
             try:
                 source = youtube.audio(self.oasis.ytm, r["ref"])
             except Exception as e:
@@ -1287,6 +1293,41 @@ class Api:
         if target:
             return transcode.stream(str(source), *target, p.int("timeOffset", 0))
         return FileResponse(source, media_type=r["content_type"])
+
+    def _unplayable(self, db, user, payload: dict) -> dict:
+        """payload with the streaming songs the user can't play marked playable false, as songs nothing can play are:
+        their service isn't on for the user and their audio isn't cached. A song nothing can play loses a clip (preview)
+        the user can't play the same way. Only for clients that take such songs (Params.missing)."""
+        songs = []
+
+        def walk(value):
+            if isinstance(value, dict):
+                if value.get("mediaType") == "song":
+                    songs.append(value)
+                for v in value.values():
+                    walk(v)
+            elif isinstance(value, list):
+                for v in value:
+                    walk(v)
+        walk(payload)
+        if not songs:
+            return payload
+        found = {r["id"]: r for r in db.execute("select id, source, ref, preview from track where id in (select value from json_each(?))",
+                                                (json.dumps([s["id"] for s in songs]),))}
+        usable, music, streams = self.oasis.sources.usable(db, user), self.oasis.ytm, self.oasis.sources
+        for s in songs:
+            r = found.get(s["id"])
+            if r is None:
+                continue
+            if r["source"] == "ytm" and not (music and ("songs" in usable.get("ytm", ()) or music.cached(r["ref"]))):
+                s["playable"] = False
+            elif r["source"] in sources.KINDS and "songs" not in usable.get(r["source"], ()) \
+                    and not streams.cached(sources.stream_stem(r["source"], r["ref"].removeprefix(r["source"] + ":"))):
+                s["playable"] = False
+            elif r["source"] == "missing" and r["preview"] and "previews" not in usable.get(r["preview"].split(":")[0], ()) \
+                    and not streams.cached(sources.preview_stem(r["preview"])):
+                s.pop("preview", None)
+        return payload
 
     def _proxy(self, video_id, stream, range_header):
         start, end = 0, stream.size - 1
@@ -1326,6 +1367,8 @@ def respond(fmt: str, payload: dict, error: Fail | None = None) -> Response:
     return Response(b'<?xml version="1.0" encoding="UTF-8"?>' + tostring(root), media_type="application/xml")
 
 
+# Methods that list the library's songs, which never hold unplayable ones (docs/unavailable-songs-extension.md)
+LIBRARY_LISTS = ("getRandomSongs", "getSongsByGenre", "search2", "search3")
 RAW_BODY = ("uploadTrack", "uploadCover")  # the body is a file, read as it arrives; parameters go in the query
 
 
@@ -1360,7 +1403,10 @@ def routes(oasis) -> list[Route]:
                 result = handler(api, db, p, user)
                 if isinstance(result, Response):
                     return result
-                result = result if p.missing else playable_only(result)
+                if p.missing:
+                    result = api._unplayable(db, user, result)
+                if not p.missing or method in LIBRARY_LISTS:
+                    result = playable_only(result)
                 return respond(fmt, romanized(describe(db, result if p.oasis else plain(result)), p.get("romanization"),
                                                      latin.curated(db) if p.get("romanization") in ("both", "latin") else None))
             except Fail as e:
