@@ -1341,10 +1341,7 @@ class Api:
             r = found.get(s["id"])
             if r is None:
                 continue
-            if r["source"] == "ytm" and not (music and ("songs" in usable.get("ytm", ()) or music.cached(r["ref"]))):
-                s["playable"] = False
-            elif r["source"] in sources.KINDS and "songs" not in usable.get(r["source"], ()) \
-                    and not streams.cached(sources.stream_stem(r["source"], r["ref"].removeprefix(r["source"] + ":"))):
+            if r["source"] in ("ytm", *sources.KINDS) and not streams.plays(usable, music, r["source"], r["ref"]):
                 s["playable"] = False
             elif r["source"] == "missing" and r["preview"] and "previews" not in usable.get(r["preview"].split(":")[0], ()) \
                     and not streams.cached(sources.preview_stem(r["preview"])):

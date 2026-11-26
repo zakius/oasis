@@ -16,7 +16,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from . import accounts, acquire, audiorecords, cover, download, formats, missing, mixes, musicbrainz, prowlarr, remove, servers, sources, tracks, wants, ytm
+from . import accounts, acquire, audiorecords, cover, download, formats, missing, mixes, musicbrainz, prowlarr, ready, remove, servers, sources, tracks, wants, ytm
 from .musicbrainz import MBID
 from .tracks import IDS, MB_IDS
 from .artists import (ALIAS_TYPES, LINKS, add_name, add_related, configure, known_artists, linked, load_settings, names_of,
@@ -27,12 +27,13 @@ from .db import as_user
 from .forward import ListenBrainz
 from .lastfm import LIBREFM, LIBREFM_AUTH, elsewhere, gnufm_auth, signs_in
 from .remote import api_root, web_address
-from .recommend import SOURCES
+from .recommend import SOURCES, STATIONS
 from .translate import LANGUAGES
 
 log = logging.getLogger(__name__)
 
 COOKIE = "oasis_session"
+READY_MADE = {**{kind: title for kind, (title, _) in ready.FROM_PLAYS.items()}, **STATIONS}  # ready.py's playlists, by kind
 
 LASTFM_APP_STEPS = """<p>First connect oasis itself to Last.fm (once, for every user):</p><ol>
 <li>Signed in to Last.fm, open <a href="https://www.last.fm/api/account/create" target="_blank">last.fm/api/account/create</a>.</li>
@@ -536,6 +537,7 @@ def routes(oasis) -> list[Route]:
                 '<section><h2>Services</h2><p class="muted">YouTube Music and the other streaming services, Last.fm, ListenBrainz '
                 'and previews: turn on the ones you use and link your accounts.</p><a class="button" href="/services">Services</a></section>'
                 f'<section><h2>Radio</h2>{radio_source(db, user)}</section>'
+                f'<section><h2>Ready-made playlists</h2>{ready_made(db, user)}</section>'
                 f'<section><h2>Songs nothing can play</h2>{missing_songs(user)}</section>'
                 f'<section><h2>Lyrics translation</h2>{translation_language(user)}</section>'
                 '<section><h2>Apps</h2><p class="muted">Subsonic apps sign in with app passwords, not yours.</p>'
@@ -556,6 +558,20 @@ def routes(oasis) -> list[Route]:
                 'started with. A source that finds nothing gives nothing: no other stands in.</p>'
                 f'<form method="post" action="/account/radio">{options}<button class="primary">Save</button></form>'
                 + (f'<p class="muted">Not available: {", ".join(missing)} (turn it on in <a href="/services">Services</a>).</p>' if missing else ""))
+
+    def ready_made(db, user) -> str:
+        """The ready-made playlists the user can have, each shown in their apps or not (ready.py)."""
+        hidden = ready.hidden(db, user["name"])
+        boxes = "".join(f'<label class="check"><input type="checkbox" name="show-{kind}"{"" if kind in hidden else " checked"}> {READY_MADE[kind]}</label>'
+                        for kind in oasis.ready.offered(db, user["name"]))
+        return ('<p class="muted">Playlists oasis makes for you, shown in every app. Your top tracks and forgotten favourites come from '
+                'what you play here and change daily; one with no songs yet doesn\'t show. The Last.fm stations grow as you play them, '
+                'and come with your Last.fm linked in <a href="/services">Services</a>. An unticked one is nowhere in your apps.</p>'
+                f'<form method="post" action="/account/ready">{boxes}<button class="primary">Save</button></form>')
+
+    def ready_made_save(db, request, user, form):
+        oasis.ready.show(db, user["name"], {key[5:] for key in form if key.startswith("show-")})
+        return back("/", message="Ready-made playlists saved.")
 
     def missing_songs(user) -> str:
         """Whether apps that can show songs nothing plays (the extension unavailableSongs) get them."""
@@ -639,6 +655,7 @@ def routes(oasis) -> list[Route]:
             return back("/services", error=f"Last.fm sign-in failed: {e}")
         accounts.set_field(db, user["name"], lastfm_session=key, lastfm_name=name)
         oasis.sources.turn_on(db, user["name"], "lastfm")
+        oasis.ready.refresh(db, user["name"])
         return back("/services", message=f"Last.fm linked as {name}.", anchor="service-lastfm")
 
     def lastfm_app(db, request, user, form):
@@ -651,6 +668,7 @@ def routes(oasis) -> list[Route]:
 
     def unlink_lastfm(db, request, user, form):
         accounts.set_field(db, user["name"], lastfm_session=None, lastfm_name=None)
+        oasis.ready.refresh(db, user["name"])
         return back("/services", message="Last.fm unlinked. Its similar songs still come.", anchor="service-lastfm")
 
     def link_listenbrainz(db, request, user, form):
@@ -2009,6 +2027,7 @@ def routes(oasis) -> list[Route]:
         Route("/logout", signed_in(logout), methods=["POST"]),
         Route("/account/radio", signed_in(radio_source_save), methods=["POST"]),
         Route("/account/missing", signed_in(missing_songs_save), methods=["POST"]),
+        Route("/account/ready", signed_in(ready_made_save), methods=["POST"]),
         Route("/admin/services", lambda request: RedirectResponse("/services", status_code=301)),
         Route("/services", signed_in(services)),
         Route("/services/ytm/link", signed_in(link_youtube), methods=["POST"]),

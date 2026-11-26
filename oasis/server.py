@@ -23,6 +23,7 @@ from .importer import Importer
 from .library import Scanner
 from .mixes import Mixes
 from .prowlarr import Prowlarr
+from .ready import ReadyMade
 from .recommend import Recommender
 from .sources import SoundCloud, Sources
 from .torbox import from_rdtclient
@@ -64,6 +65,7 @@ class Oasis:
         self.soundcloud = mixes.SoundCloudPlaylists(self.connect, self.sources)
         self.listenbrainz_playlists = mixes.ListenBrainzPlaylists(self.connect, self.sources, self.recommender)
         self.tidal_mixes = mixes.TidalMixes(self.connect, self.sources, self.recommender)
+        self.ready = ReadyMade(self.connect, self.recommender)
         self.enrichment = Enrichment(self.connect)
         self.scanner = Scanner(self.connect, config.library, config.dedupe, self.enrichment.wake.set)
         self.bandcamp = Bandcamp(self.connect, self.sources, Importer(self.connect, config.library[0]), config.database.parent / "bandcamp",
@@ -110,6 +112,7 @@ class Oasis:
         self.tidal_mixes.start()
         self.bandcamp.start()
         self.recommender.start()
+        self.ready.start()
         worker.start("missing songs", self.fill_missing, MISSING_IDLE)
         worker.start("stream cache", self.prune_streams, 86400)
         self.uploads.start()
@@ -233,6 +236,7 @@ class Oasis:
             self.unlink_youtube(db, user)
         elif name == "lastfm":
             accounts.set_field(db, user, lastfm_session=None, lastfm_name=None)
+            self.ready.refresh(db, user)
         elif name == "listenbrainz":
             accounts.set_field(db, user, listenbrainz_token=None)
             self.listenbrainz_playlists.drop(db, user)
