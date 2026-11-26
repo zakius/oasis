@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 import urllib.parse
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -134,8 +134,14 @@ class Bandcamp:
 
     def find(self, artist: str, title: str) -> dict | None:
         """The artist's own full-length track of that title; at most PAGES track pages are read."""
+        import yt_dlp
         for r in [r for r in self.search(f"{artist} {title}") if fold(r.get("name") or "") == fold(title)][:self.PAGES]:
-            info = self.info(r["item_url_path"])
+            try:
+                info = self.info(r["item_url_path"])
+            except yt_dlp.utils.DownloadError as e:
+                if "No video formats found" in str(e):  # a track its artist doesn't let stream: not this service's song
+                    continue
+                raise
             if fold(artist) not in (fold(r.get("band_name") or ""), fold(info.get("artist") or "")):
                 continue
             if not any(f.get("format_id") == self.FORMAT for f in info.get("formats") or []) or not full_length(info.get("duration")):
@@ -625,12 +631,40 @@ class DeezerPreview(Preview):
 
 
 class ApplePreview(Preview):
-    """Apple Music's 30 s AAC previews, from the iTunes Search API. No account."""
+    """Apple Music's 30 s AAC previews, from the iTunes Search API. No account. The API takes about 20 searches a
+    minute from one address and refuses more (429) for a while, so oasis keeps under that itself: a search past it is
+    skipped at once, as an error, which isn't kept as a miss."""
     name, title, suffix, content_type = "apple", "Apple Music", "m4a", "audio/mp4"
     API = "https://itunes.apple.com/"
+    LIMIT = 20  # searches a minute
+    asked: deque = deque()  # when each search of the last minute was made, from every user's lookups
+    lock = threading.Lock()
+
+    @classmethod
+    def take_turn(cls):
+        with cls.lock:
+            now = time.time()
+            while cls.asked and cls.asked[0] < now - 60:
+                cls.asked.popleft()
+            if len(cls.asked) >= cls.LIMIT:
+                raise OSError(f"skipped: Apple Music's search takes {cls.LIMIT} searches a minute")
+            cls.asked.append(now)
+
+    @classmethod
+    def refused(cls):
+        """Apple refused anyway (429): no search for a minute."""
+        with cls.lock:
+            cls.asked.extend([time.time()] * cls.LIMIT)
 
     def find(self, artist: str, title: str) -> str | None:
-        found = get_json(self.API + "search", fields={"term": f"{artist} {title}", "entity": "song", "limit": 10})
+        self.take_turn()
+        response = request("GET", self.API + "search", fields={"term": f"{artist} {title}", "entity": "song", "limit": 10}, retries=False)
+        if response.status == 429:
+            self.refused()
+            raise OSError("Apple Music's search refused (429): paused for a minute")
+        if response.status != 200:
+            raise OSError(f"HTTP {response.status} from Apple Music's search")
+        found = response.json()
         for t in found.get("results") or []:
             if fold(t.get("trackName") or "") == fold(title) and fold(t.get("artistName") or "") == fold(artist) and t.get("previewUrl"):
                 return str(t["trackId"])
