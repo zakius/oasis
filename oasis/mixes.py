@@ -72,12 +72,25 @@ def drop(db, user: str, prefix: str, keep=()):
         playlists.delete(db, gone["id"])
 
 
+# oasis's ready-made playlists in display order, after the automatic listening Radio.
+OASIS_ORDER = [OASIS + "top", OASIS + "forgotten", OASIS + "lastfm-top", OASIS + "lastfm-loved"]
+
+
 def playlist_order(r) -> tuple:
-    """Mixes first in YouTube Music's order, then Liked Music, then everything else by name."""
+    """oasis's own mixes and radios first, then streaming mixes (YouTube Music in its own order, then other services),
+    then Liked Music, then everything else by name."""
     mix = r["mix"] or ""
+    if r["radio"] == playlists.LISTENING_RADIO:
+        return 0, 0, ""
+    if mix.startswith(OASIS):
+        return 0, 1 + (OASIS_ORDER.index(mix) if mix in OASIS_ORDER else len(OASIS_ORDER)), r["name"].casefold()
+    if r["radio"]:
+        return 0, 1 + len(OASIS_ORDER) + 1, r["name"].casefold()
     if is_mix(mix):
-        return 0, ORDER.index(mix) if mix in ORDER else len(ORDER), r["name"].casefold()
-    return (1 if mix == "LM" else 2), 0, r["name"].casefold()
+        return 1, ORDER.index(mix) if mix in ORDER else len(ORDER), r["name"].casefold()
+    if playlists.made_for(mix):
+        return 2, 0, owner(mix).casefold() + "\0" + r["name"].casefold()
+    return (3 if mix == LIKED else 4), 0, r["name"].casefold()
 
 
 class Mixes:

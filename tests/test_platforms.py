@@ -288,6 +288,7 @@ def test_the_playlists_listenbrainz_makes_for_a_user_become_their_read_only_play
     assert set(lists) == {"Daily Jams for someone, 2026-11-26 Thu", "Top Discoveries of 2025 for someone"}  # the newest of each, unexpired
     daily = lists["Daily Jams for someone, 2026-11-26 Thu"]
     assert daily["owner"] == "ListenBrainz" and daily["readonly"] is True and "youtubeId" not in daily and "oasisMix" not in daily
+    assert next(p for p in call(client, "getPlaylists", oasis="1")["playlists"]["playlist"] if p["id"] == daily["id"])["oasisMix"] is True
     assert daily["comment"] == "We made this playlist from your recommended tracks."
     entries = call(client, "getPlaylist", id=daily["id"], unavailableSongs="1")["playlist"]["entry"]
     assert [(s["title"], s["id"][:3], s.get("playable", True)) for s in entries] == [("One", "tr-", True), ("Lost Song", "fk-", True),
@@ -329,6 +330,7 @@ def test_tidal_mixes_become_read_only_playlists_while_its_account_features_are_o
     oasis.tidal_mixes.refresh("admin")
     [mix] = call(client, "getPlaylists")["playlists"]["playlist"]
     assert (mix["name"], mix["owner"], mix["comment"], mix["readonly"]) == ("My Mix 1", "Tidal", "Beta, The Alpha and more", True)
+    assert "oasisMix" not in mix and call(client, "getPlaylists", oasis="1")["playlists"]["playlist"][0]["oasisMix"] is True
     assert [s["title"] for s in call(client, "getPlaylist", id=mix["id"])["playlist"]["entry"]] == ["Two", "Lost Song"]
     sign_in(client)
     assert "Your mixes (My Mix" in client.get("/services").text
