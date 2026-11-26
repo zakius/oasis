@@ -7,7 +7,7 @@ import pytest
 from mutagen.flac import FLAC, Picture
 from starlette.testclient import TestClient
 
-from oasis import download
+from oasis import accounts, download
 from oasis.server import create_app
 from oasis.config import Config, TorBox as TorBoxSettings
 from oasis.db import connect
@@ -94,7 +94,16 @@ def make_client(library, database, ytm=None, services=None, **settings):
     """settings: more of the Config."""
     config = Config(library=[library], users={"admin": "secret"}, database=database, **settings)
     scan(connect(config.database), config.library)
-    return TestClient(create_app(config, background=False, ytm=ytm, services=services or {}))
+    return TestClient(app_for(config, ytm=ytm, services=services or {}))
+
+
+def app_for(config, **options):
+    """create_app, with the app password call() signs in with: "secret", as the admin's own password in config."""
+    app = create_app(config, background=False, **options)
+    db = connect(config.database)
+    if "secret" not in accounts.app_secrets(db, "admin"):
+        accounts.add_app(db, "admin", "tests", "secret")
+    return app
 
 
 @pytest.fixture

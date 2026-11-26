@@ -2,8 +2,7 @@ import mutagen
 import pytest
 from starlette.testclient import TestClient
 
-from conftest import call, make_track
-from oasis.server import create_app
+from conftest import app_for, call, make_track
 from oasis.config import Config
 from oasis import musicbrainz
 from oasis.enrich import Enrichment
@@ -51,7 +50,7 @@ def library(tmp_path):
 def client(library, tmp_path):
     config = Config(library=[library], users={"admin": "secret"}, database=tmp_path / "oasis.db")
     scan(connect(config.database), config.library)
-    with TestClient(create_app(config, background=False, services={})) as c:
+    with TestClient(app_for(config, services={})) as c:
         yield c
 
 

@@ -81,7 +81,7 @@ create table if not exists outbox(
     attempts int not null default 0, next_try real not null
 );
 create table if not exists user(
-    name text primary key, password text not null, admin int not null default 0, created real not null,
+    name text primary key, password text not null, admin int not null default 0, created real not null,  -- password: the dashboard's, hashed (accounts.py)
     ytm_auth text,                  -- browser headers (JSON) for ytmusicapi
     ytm_name text,
     lastfm_session text, lastfm_name text,
@@ -91,6 +91,12 @@ create table if not exists user(
     translate_lang text,            -- the language lyrics are translated to when an app asks with oasisTranslate=1
     missing_songs int not null default 1 -- 1: apps that ask (extension unavailableSongs) get songs nothing can play (missing.py)
 );
+create table if not exists app_password(  -- what apps sign in with (accounts.py): each user's own password signs in to the dashboard only
+    id integer primary key, user text not null, name text not null,
+    secret text not null,           -- as given to the app: Subsonic's token login needs it
+    created real not null
+);
+create index if not exists app_password_secret on app_password(secret);
 create table if not exists wanted(user text not null, kind text not null, ref text not null, primary key(user, kind, ref));
 create table if not exists want_item(  -- stars and follows (see acquire.py)
     kind text not null, ref text not null,  -- 'album' or 'artist', and its oasis id

@@ -1,9 +1,8 @@
 import pytest
 from starlette.testclient import TestClient
 
-from conftest import call, make_track
+from conftest import app_for, call, make_track
 from oasis import artists
-from oasis.server import create_app
 from oasis.config import Config
 from oasis import musicbrainz
 from oasis.enrich import Enrichment
@@ -50,7 +49,7 @@ def client_for(tmp_path, **settings):
     remember(db, {"id": "yt-v1", "source": "ytm", "ref": "v1", "title": "Lemon", "artist": "Kenshi Yonezu", "album_artist": "Kenshi Yonezu",
                   "album": "Lemon", "artist_id": make_id("ar-", "Kenshi Yonezu"), "album_id": make_id("al-", "Kenshi Yonezu", "Lemon"), "duration": 250})
     db.execute("insert into stat(user, id, starred) values ('admin', ?, 1)", (make_id("ar-", "Kenshi Yonezu"),))
-    return TestClient(create_app(config, background=False, services={}))
+    return TestClient(app_for(config, services={}))
 
 
 def fill(client):
@@ -130,7 +129,7 @@ def stream(id, artist, title, guest=""):
 
 def spelled_client(tmp_path, streams):
     config = Config(library=[tmp_path / "music"], users={"admin": "secret"}, database=tmp_path / "oasis.db")
-    client = TestClient(create_app(config, background=False, services={}))
+    client = TestClient(app_for(config, services={}))
     db = connect(config.database)
     for s in streams:
         remember(db, s)

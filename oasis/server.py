@@ -43,6 +43,7 @@ class Oasis:
         self.throttle = accounts.Throttle()  # the API's and the dashboard's sign-ins
         self.translations = translate.Translations(translate.Google())
         db = self.connect()
+        accounts.hash_plain_passwords(db)
         accounts.sync_config_users(db, config.users)
         self.lastfm = lastfm.app(db, config.lastfm_key, config.lastfm_secret)  # oasis's Last.fm app, or None
         artists.configure(db, artists.load_settings(db, config.artists))

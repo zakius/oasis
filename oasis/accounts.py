@@ -1,4 +1,7 @@
-"""Users and their linked services. Subsonic's token auth needs the plain password, so passwords are stored as given."""
+"""Users and their linked services. A user's password signs in to the dashboard, and is stored hashed. Apps sign in
+with app passwords: Subsonic's token login needs the secret itself, so these are stored as given, and each is random, so
+one read from the database opens oasis's API and nothing else."""
+import hashlib
 import hmac
 import re
 import secrets
@@ -6,6 +9,31 @@ import threading
 import time
 
 SESSION_DAYS = 30
+SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1}
+OLD_APPS = "Apps signed in before app passwords"  # a user's password from then, kept for the apps that have it
+APP_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"  # no 0, o, 1 or l: app passwords are typed off a screen
+
+
+def hashed(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    return f"scrypt${salt.hex()}${hashlib.scrypt(password.encode(), salt=salt, **SCRYPT).hex()}"
+
+
+def verifies(stored: str, password: str) -> bool:
+    """password is the one hashed() turned into stored."""
+    _, salt, digest = stored.split("$")
+    return same(hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), **SCRYPT).hex(), digest)
+
+
+UNKNOWN = hashed(secrets.token_urlsafe())  # checked for names no user has, so they take as long as a wrong password
+
+
+def hash_plain_passwords(db):
+    """Users from before app passwords, whose password was stored as given: it goes on signing their apps in, as an app
+    password, and becomes their dashboard password, hashed."""
+    for user in db.execute("select name, password from user where password not like 'scrypt$%'").fetchall():
+        add_app(db, user["name"], OLD_APPS, user["password"])
+        db.execute("update user set password = ? where name = ?", (hashed(user["password"]), user["name"]))
 
 
 def sync_config_users(db, users: dict[str, str]):
@@ -13,10 +41,10 @@ def sync_config_users(db, users: dict[str, str]):
     for name, password in users.items():
         user = get(db, name)
         if user is None:
-            db.execute("insert into user(name, password, admin, created) values (?, ?, 1, ?)", (name, password, time.time()))
+            db.execute("insert into user(name, password, admin, created) values (?, ?, 1, ?)", (name, hashed(password), time.time()))
             continue
-        if user["password"] != password:
-            set_field(db, name, password=password)
+        if not verifies(user["password"], password):
+            set_field(db, name, password=hashed(password))
         set_field(db, name, admin=1)
 
 
@@ -41,11 +69,11 @@ def create(db, name: str, password: str, admin: bool = False):
     if get(db, name):
         raise ValueError(f"User {name} already exists.")
     check_password(password)
-    db.execute("insert into user(name, password, admin, created) values (?, ?, ?, ?)", (name, password, int(admin), time.time()))
+    db.execute("insert into user(name, password, admin, created) values (?, ?, ?, ?)", (name, hashed(password), int(admin), time.time()))
 
 
 def check_password(password: str):
-    """ValueError unless there is a password: Subsonic's token auth would take an empty one."""
+    """ValueError unless there is a password."""
     if not password:
         raise ValueError("A password is needed.")
 
@@ -53,12 +81,39 @@ def check_password(password: str):
 def set_password(db, name: str, password: str):
     """ValueError when the password is empty (check_password). The new one signs the user out of the dashboard everywhere."""
     check_password(password)
-    set_field(db, name, password=password)
+    set_field(db, name, password=hashed(password))
 
 
 def delete(db, name: str):
     db.execute("delete from user where name = ?", (name,))
     db.execute("delete from session where user = ?", (name,))
+    db.execute("delete from app_password where user = ?", (name,))
+
+
+def new_app_password(db, user: str, name: str) -> str:
+    """A random password for the app called name: its secret, which the dashboard shows once. ValueError without a name."""
+    name = name.strip()
+    if not name:
+        raise ValueError("Name the app, so you know which password to revoke later.")
+    secret = "-".join("".join(secrets.choice(APP_ALPHABET) for _ in range(5)) for _ in range(4))
+    add_app(db, user, name, secret)
+    return secret
+
+
+def add_app(db, user: str, name: str, secret: str):
+    db.execute("insert into app_password(user, name, secret, created) values (?, ?, ?, ?)", (user, name, secret, time.time()))
+
+
+def app_passwords(db, user: str):
+    return db.execute("select id, name, created from app_password where user = ? order by created", (user,)).fetchall()
+
+
+def revoke_app_password(db, user: str, id: int):
+    db.execute("delete from app_password where user = ? and id = ?", (user, id))
+
+
+def app_secrets(db, user: str) -> list[str]:
+    return [r["secret"] for r in db.execute("select secret from app_password where user = ?", (user,))]
 
 
 def set_field(db, name: str, **values):
@@ -105,16 +160,26 @@ def client_address(request) -> str:
 
 
 def sign_in(db, throttle: Throttle, address: str, name: str, matches):
-    """The user, when matches(their stored password) is true; else Refused, a failure the throttle counts. Unknown
-    users are compared too (with ""), so the time a sign-in takes doesn't tell which names exist."""
+    """The user, when matches(user) is true; else Refused, a failure the throttle counts. matches gets None for a name
+    no user has, and should take as long as for a user, so the time a sign-in takes doesn't tell which names exist."""
     if throttle.blocked(address):
         raise Refused(throttled=True)
     user = get(db, name)
-    ok = matches(user["password"] if user else "")
-    if user is None or not ok:
+    if not matches(user):
         throttle.fail(address)
         raise Refused(throttled=False)
     return user
+
+
+def password_matches(password: str):
+    """sign_in's matches for the dashboard: the user's own password."""
+    return lambda user: verifies(user["password"] if user else UNKNOWN, password)
+
+
+def sign_in_with_key(db, throttle: Throttle, address: str, key: str):
+    """sign_in with an API key: any app password but a user's old password (OLD_APPS), which needed their name too."""
+    rows = db.execute("select user from app_password where secret = ? and name != ?", (key, OLD_APPS)).fetchall()
+    return sign_in(db, throttle, address, rows[0]["user"] if len(rows) == 1 else "", lambda user: user is not None)
 
 
 def new_session(db, name: str) -> str:
