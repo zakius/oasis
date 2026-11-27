@@ -1,4 +1,4 @@
-# OpenSubsonic extension `oasis`, versions 1 to 3
+# OpenSubsonic extension `oasis`, version 0
 
 Status: written on 2026-11-02 from what oasis already sent every client; this is the canonical copy. caravanserai (caravan)
 link to it.
@@ -8,9 +8,9 @@ clients that know them, and other clients get plain OpenSubsonic.
 
 ## Rules
 
-- The server advertises `{"name": "oasis", "versions": [1, 2, 3]}` in `getOpenSubsonicExtensions`. Version 2 adds
-  radio sources and stations ([Radio](#radio-version-2)), version 3 lyrics translation
-  ([Lyrics translation](#lyrics-translation-version-3)). A client offers each only when the list has its version.
+- The server advertises `{"name": "oasis", "versions": [0]}` in `getOpenSubsonicExtensions`. Version 0 is unstable:
+  it changes with oasis and caravan, without a new version, until it is settled as version 1. A client that knows
+  the extension uses everything here when the server lists it.
 - Clients decide by that list only, never by `subsonic-response.type`.
 - A client opts in per request with the parameter `oasis=1`. Without it (absent, `0`, anything else) the response
   has none of the fields and none of the items below.
@@ -29,6 +29,8 @@ clients that know them, and other clients get plain OpenSubsonic.
   - `oasisWanted`: acquisition state of a starred album or artist: `wanted`, `downloading` or `failed`. Absent for
     albums in the library and for followed artists, which need no badge.
   - `oasisWantedError`: with `oasisWanted`, why it isn't downloading (for `failed`, the last search's result).
+- Album (`AlbumID3`): `oasisSongsPlayed`: how many of its songs this user played at least once, so a client can tell
+  an album not yet played (0) from one begun (less than `songCount`).
 - Song (`Child`): `youtubeId`: the YouTube Music video id of a streaming song, or of the YouTube Music copy of a
   library song once oasis found one. `getSong` looks for one the first time it is asked. The link to share is
   `shareUrl`, from the separate extension `shareUrl` ([share-url-extension.md](share-url-extension.md)), sent to every
@@ -69,15 +71,22 @@ album.
   their mixes. Response `youtubeMusic.account`: the account name. Error 0 with a message when YouTube Music rejects
   the sign-in or is off on the server.
 - `oasisUnlinkYouTubeMusic`: no params. Unlinks it and removes the mirrored playlists.
+- `oasisHome`: no params. What to play, for a client's home screen, as stops from what the user plays now to what they
+  have never played. Response `oasisHome.stop[]`, in order, only those with songs: `id` (`repeat`: most played in the
+  last three months; `while`: played 5 times or more, not in three months; `blend`: the songs of the user's generated
+  playlists, those more of them hold first; `new`: songs in those playlists the user never played), `name`,
+  `description` and `song[]` (at most 40, each playable for the user). Each song has, with `oasis=1`, `oasisWhy`
+  ("12 plays lately", "My Supermix + 2 more") and `oasisFrom[]`, the names of the user's generated playlists (mixes,
+  stations, radios) that hold it. The mixes' songs are shuffled the same way for a whole day.
 
-## Radio (version 2)
+## Radio
 
 oasis suggests songs like a seed song (`getSimilarSongs`, `getSimilarSongs2`) and keeps radio playlists that grow as
 they are played. Both take their songs from a **source**:
 
 | Source id | Songs from | Available when |
 |---|---|---|
-| `all` | Every source below that is available, taking turns (oasis's behaviour before version 2) | always |
+| `all` | Every source below that is available, taking turns (the default) | always |
 | `lastfm` | Last.fm's similar tracks, and library songs by Last.fm's similar artists | the user has Last.fm on, and the server a Last.fm API key |
 | `ytm` | YouTube Music's radio for the song | the user has YouTube Music on, and the server offers its full songs |
 | `library` | The library alone: the artist's linked artists, the same artist, songs played around it, the same genre | always |
@@ -183,7 +192,7 @@ Playlist fields (only with `oasis=1`, only on radios):
 - `oasisStation`: `lastfm-top` or `lastfm-loved`, for a station.
 - `oasisPeriod`: a `lastfm-top` station's period.
 
-## Lyrics translation (version 3)
+## Lyrics translation
 
 Lyrics come as songLyrics v2 entries (`getLyricsBySongId` with `enhanced=true`; see the romanization extension's
 Lyrics section for `kinds` and alignment). `main` holds only the song's own lines. Translations come as
@@ -230,8 +239,7 @@ No params.
 }
 ```
 
-- `available`: whether this server makes machine translations. A client offers translation when the server lists
-  oasis version 3 and `available` is true.
+- `available`: whether this server makes machine translations. A client offers translation when `available` is true.
 - `language`: the user's language from the dashboard, which `oasisTranslate=1` uses. Absent when not set.
 - `languages`: the languages the dashboard offers, for a client's own picker. Requests may name others.
 
