@@ -4,6 +4,7 @@ import pytest
 
 from conftest import call, make_client, sign_in
 from oasis import accounts, ready, tasks
+from oasis.mixes import OASIS, mirror
 from oasis.db import record_play
 from oasis.recommend import PERIOD
 from test_accounts import add_user
@@ -191,3 +192,31 @@ def test_rebuild_now_makes_the_playlist_jobs_due(api, client):
     due = dict(db.execute("select key, due from task"))
     assert due["ready-made playlists"] <= time.time() and due["listenbrainz playlists"] <= time.time()
     assert due["search index"] > time.time()
+
+
+def test_home_deals_songs_from_plays_and_mixes_with_reasons(api, client):
+    db = api.connect()
+    play(db, "One", 3, 10)
+    play(db, "Song B", 9, 100)  # a favourite not played for three months
+    api.ready.refresh(db, "admin")  # Your top tracks: One
+    mirror(db, "admin", OASIS + "test", "Test mix", None, [track(db, "Two"), track(db, "One")], None)
+    db.commit()
+    stops = call(client, "oasisHome", oasis="1")["oasisHome"]["stop"]
+    assert [s["id"] for s in stops] == ["repeat", "while", "blend", "new"]
+    songs = {s["id"]: s["song"] for s in stops}
+    assert songs["repeat"][0]["title"] == "One" and songs["repeat"][0]["oasisWhy"] == "3 plays lately"
+    assert songs["while"][0]["title"] == "Song B" and songs["while"][0]["oasisWhy"].startswith("9 plays, last in ")
+    assert songs["blend"][0]["title"] == "One" and songs["blend"][0]["oasisFrom"] == ["Your top tracks", "Test mix"]
+    assert songs["blend"][0]["oasisWhy"] == "Your top tracks + 1 more"
+    assert [(s["title"], s["oasisFrom"]) for s in songs["new"]] == [("Two", ["Test mix"])]
+    plain = call(client, "oasisHome")["oasisHome"]["stop"]
+    assert not {"oasisWhy", "oasisFrom"} & {k for s in plain for song in s["song"] for k in song}
+
+
+def test_albums_say_how_many_of_their_songs_were_played(api, client):
+    db = api.connect()
+    play(db, "One", 2, 1)
+    album_id = db.execute("select album_id from track where title = 'One'").fetchone()[0]
+    db.commit()
+    assert call(client, "getAlbum", id=album_id, oasis="1")["album"]["oasisSongsPlayed"] == 1
+    assert "oasisSongsPlayed" not in call(client, "getAlbum", id=album_id)["album"]
