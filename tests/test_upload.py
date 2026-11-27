@@ -236,7 +236,10 @@ def test_a_cover_that_cant_be_added_leaves_the_upload_committed(client, root, tm
     made = call(client, "createUpload", tags=json.dumps(tags("One")))["upload"]
     send(client, made["id"], 1, encode(tmp_path / "one.flac"))
     client.post("/rest/uploadCover", params={**AUTH, "uploadId": made["id"]}, content=PNG)
-    (tmp_path / "uploads" / made["id"] / "cover.png").chmod(0)  # unreadable
+    # A folder where the cover was: no one, root included, can read it as a file.
+    stored = tmp_path / "uploads" / made["id"] / "cover.png"
+    stored.unlink()
+    stored.mkdir()
     assert call(client, "commitUpload", uploadId=made["id"])["album"]["songCount"] == 1
     assert [p.name for p in (root / "Beta/2001 - First").iterdir()] == ["01 - One.flac"] and not (tmp_path / "uploads" / made["id"]).exists()
 
