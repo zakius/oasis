@@ -16,7 +16,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from . import accounts, acquire, artists, cover, home, lastfm, latin, lyrics, missing, mixes, musicbrainz, playlists, romanize, sources, tracks, transcode, translate, upload, youtube, ytm
+from . import accounts, acquire, artists, cover, lastfm, latin, lyrics, missing, mixes, musicbrainz, playlists, romanize, sources, tracks, transcode, translate, upload, youtube, ytm
 from .credits import credits_of, people
 from .db import as_user, set_stat
 from .playlists import RADIO, is_radio, set_entries, touch
@@ -242,7 +242,7 @@ def artist(r) -> dict:
 
 
 # The oasis extension's fields (docs/oasis-extension.md): sent only to clients asking with oasis=1.
-OASIS_FIELDS = {"oasisWanted", "oasisWantedError", "oasisMix", "oasisShelf", "oasisSongsPlayed", "oasisWhy", "oasisFrom", "oasisLink", "youtubeId", "oasisSource", "oasisStation", "oasisPeriod",
+OASIS_FIELDS = {"oasisWanted", "oasisWantedError", "oasisMix", "oasisShelf", "oasisSongsPlayed", "oasisLink", "youtubeId", "oasisSource", "oasisStation", "oasisPeriod",
                 "oasisMachineTranslation"}
 
 
@@ -1116,18 +1116,6 @@ class Api:
             "source": [{"id": s, "name": SOURCES[s]} for s in recommender.sources(db, account)],
             "station": [clean({"id": s, "name": STATIONS[s], "period": list(PERIODS) if s == "lastfm-top" else None,
                                "defaultPeriod": PERIOD if s == "lastfm-top" else None}) for s in recommender.stations(db, account)]}}
-
-    def oasisHome(self, db, p, user):
-        """Home's dial for this user (docs/oasis-extension.md): its stops, each with songs and why each is there."""
-        services, music = self.oasis.recommender.services, self.oasis.recommender.ytm
-        usable = services.usable(db, user)
-        stops = home.stops(db, user, lambda r: r["source"] == "local" or services.plays(usable, music, r["source"], r["ref"]))
-        rows = {r["id"]: r for r in db.execute(SONGS + " where t.id in (select value from json_each(?))",
-                                               (json.dumps([id for _, songs in stops for id, _, _ in songs]),))}
-        return {"oasisHome": {"stop": [
-            {"id": kind, "name": home.STOPS[kind][0], "description": home.STOPS[kind][1],
-             "song": [{**song(rows[id]), "oasisWhy": why, "oasisFrom": names} for id, why, names in songs]}
-            for kind, songs in stops]}}
 
     def getTopSongs(self, db, p, user):
         name, count = p.need("artist"), min(p.int("count", 50), 200)

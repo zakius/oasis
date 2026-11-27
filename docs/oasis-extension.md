@@ -71,13 +71,6 @@ album.
   their mixes. Response `youtubeMusic.account`: the account name. Error 0 with a message when YouTube Music rejects
   the sign-in or is off on the server.
 - `oasisUnlinkYouTubeMusic`: no params. Unlinks it and removes the mirrored playlists.
-- `oasisHome`: no params. What to play, for a client's home screen, as stops from what the user plays now to what they
-  have never played. Response `oasisHome.stop[]`, in order, only those with songs: `id` (`repeat`: most played in the
-  last three months; `while`: played 5 times or more, not in three months; `blend`: the songs of the user's generated
-  playlists, those more of them hold first; `new`: songs in those playlists the user never played), `name`,
-  `description` and `song[]` (at most 40, each playable for the user). Each song has, with `oasis=1`, `oasisWhy`
-  ("12 plays lately", "My Supermix + 2 more") and `oasisFrom[]`, the names of the user's generated playlists (mixes,
-  stations, radios) that hold it. The mixes' songs are shuffled the same way for a whole day.
 
 ## Radio
 
