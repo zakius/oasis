@@ -86,7 +86,7 @@ def test_mixes_are_read_only_playlists_in_the_library(client, ytm):
     assert mixes["My Supermix"]["oasisMix"] is True and "oasisMix" not in mixes["Liked Music"]
     assert mixes["My Supermix"]["oasisShelf"] == "YouTube Music mixes" and "oasisShelf" not in mixes["Liked Music"]
     assert mixes["My Supermix"]["youtubeId"] == "RDTMAK_super" and mixes["Liked Music"]["youtubeId"] == "LM"
-    assert not {"oasisMix", "youtubeId"} & {k for p in call(client, "getPlaylists")["playlists"]["playlist"] for k in p}  # plain clients
+    assert not {"oasisMix", "oasisShelf", "youtubeId"} & {k for p in call(client, "getPlaylists")["playlists"]["playlist"] for k in p}  # plain clients
     entries = call(client, "getPlaylist", id=mixes["My Supermix"]["id"])["playlist"]["entry"]
     assert [e["title"] for e in entries] == ["Song m1", "Song m2"]
     titles = library_titles(client)
