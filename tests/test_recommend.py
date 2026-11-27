@@ -158,7 +158,7 @@ def test_first_play_creates_a_radio_that_follows_listening(api, client):
     radio = next(p for p in call(client, "getPlaylists")["playlists"]["playlist"] if p["name"] == "Radio")
     assert radio["readonly"] is True and radio["owner"] == "oasis" and "oasisMix" not in radio
     oasis_radio = next(p for p in call(client, "getPlaylists", oasis="1")["playlists"]["playlist"] if p["name"] == "Radio")
-    assert oasis_radio["oasisMix"] is True and oasis_radio["owner"] == "oasis"
+    assert oasis_radio["oasisMix"] is True and oasis_radio["owner"] == "oasis" and oasis_radio["oasisShelf"] == "Mixes & radios"
     api.recommender.top_up_pass()
     queued = entries(client, radio["id"])
     assert queued[0] == "Two" and {"Song B", "one-yt song 0"} <= set(queued) and "One" not in queued

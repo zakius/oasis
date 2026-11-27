@@ -241,7 +241,7 @@ def artist(r) -> dict:
 
 
 # The oasis extension's fields (docs/oasis-extension.md): sent only to clients asking with oasis=1.
-OASIS_FIELDS = {"oasisWanted", "oasisWantedError", "oasisMix", "oasisLink", "youtubeId", "oasisSource", "oasisStation", "oasisPeriod",
+OASIS_FIELDS = {"oasisWanted", "oasisWantedError", "oasisMix", "oasisShelf", "oasisLink", "youtubeId", "oasisSource", "oasisStation", "oasisPeriod",
                 "oasisMachineTranslation"}
 
 
@@ -1159,12 +1159,15 @@ class Api:
                 (r["id"], unplayable),
             ).fetchone():
                 cover_art = missing.album_of(first) if first["source"] == "missing" else first["album_id"]
+        generated = playlists.made_for(r["mix"]) or r["radio"]
         owner = mixes.owner(r["mix"]) if r["mix"] else ("oasis" if r["radio"] == playlists.LISTENING_RADIO else r["owner"])
         result = clean({
             "id": str(r["id"]), "name": r["name"], "comment": r["comment"], "owner": owner, "public": False,
             "coverArt": cover_art,
             "readonly": True if r["mix"] or r["radio"] else None,  # OpenSubsonic: clients offer no edits; oasis keeps mixes and radios
-            "oasisMix": True if playlists.made_for(r["mix"]) or r["radio"] else None, "youtubeId": r["mix"] if mixes.from_youtube(r["mix"]) else None,
+            "oasisMix": True if generated else None,
+            "oasisShelf": (mixes.SHELF if r["radio"] or owner == "oasis" else f"{owner} mixes") if generated else None,
+            "youtubeId": r["mix"] if mixes.from_youtube(r["mix"]) else None,
             "oasisSource": (r["radio_source"] or accounts.get(db, r["owner"])["radio_source"]) if r["radio"] else None,
             "oasisStation": r["station"], "oasisPeriod": r["period"],
             "songCount": count, "duration": duration,

@@ -26,6 +26,7 @@ LISTENBRAINZ, TIDAL, OASIS = MADE_FOR
 OWNERS = {SOUNDCLOUD: "SoundCloud", LISTENBRAINZ: "ListenBrainz", TIDAL: "Tidal", OASIS: "oasis"}
 OTHERS = "".join(f" and mix not like '{prefix}%'" for prefix in OWNERS)  # SQL: a mirrored playlist is YouTube Music's
 REFRESH = 6 * 3600
+SHELF = "Mixes & radios"  # the shelf apps group oasis's own mixes and the radios on (oasisShelf)
 # YouTube Music's fixed personal mix ids in its own order (the names are localized), as in roma's Mixes.kt.
 ORDER = [
     "RDTMAK5uy_kset8DisdE7LSD4TNjEVvrKRTmG7a56sY",  # My Supermix
