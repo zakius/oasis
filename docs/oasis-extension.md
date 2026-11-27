@@ -38,6 +38,9 @@ clients that know them, and other clients get plain OpenSubsonic.
     the automatic `Radio`), YouTube Music personal mixes (My Supermix, My Mix 1-7, Discover Mix, New Release Mix,
     Replay Mix), Tidal mixes and ListenBrainz made-for playlists. Absent for plain playlists and mirrored library
     playlists (such as Liked Music).
+  - `oasisShelf`: with `oasisMix`, the name of the shelf an app groups it on: `Mixes & radios` for oasis's own
+    playlists and every radio, `<owner> mixes` (such as `YouTube Music mixes`) for a service's. Apps show these names
+    as they are rather than making their own.
   - `youtubeId`: the YouTube Music playlist id of a mix or library playlist mirrored from YouTube Music.
 - Artist in `getArtistInfo`/`getArtistInfo2` `similarArtist`: `oasisLink`: how the artist relates to the one asked
   about: `persona` (one person's other names or projects), `related` (grouped by the server's admin) or `member`

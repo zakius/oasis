@@ -567,11 +567,17 @@ def routes(oasis) -> list[Route]:
         return ('<p class="muted">Playlists oasis makes for you, shown in every app. Your top tracks and forgotten favourites come from '
                 'what you play here and change daily; one with no songs yet doesn\'t show. The Last.fm stations grow as you play them, '
                 'and come with your Last.fm linked in <a href="/services">Services</a>. An unticked one is nowhere in your apps.</p>'
-                f'<form method="post" action="/account/ready">{boxes}<button class="primary">Save</button></form>')
+                f'<form method="post" action="/account/ready">{boxes}<button class="primary">Save</button></form>'
+                '<form method="post" action="/account/rebuild"><button>Rebuild now</button> '
+                '<span class="muted">Makes every generated playlist and mix again now, instead of at its next daily or 6-hourly run.</span></form>')
 
     def ready_made_save(db, request, user, form):
         oasis.ready.show(db, user["name"], {key[5:] for key in form if key.startswith("show-")})
         return back("/", message="Ready-made playlists saved.")
+
+    def rebuild(db, request, user, form):
+        oasis.rebuild_playlists(db)
+        return back("/", message="Rebuilding playlists: they change in your apps within a few minutes.")
 
     def missing_songs(user) -> str:
         """Whether apps that can show songs nothing plays (the extension unavailableSongs) get them."""
@@ -2016,6 +2022,7 @@ def routes(oasis) -> list[Route]:
         Route("/account/radio", signed_in(radio_source_save), methods=["POST"]),
         Route("/account/missing", signed_in(missing_songs_save), methods=["POST"]),
         Route("/account/ready", signed_in(ready_made_save), methods=["POST"]),
+        Route("/account/rebuild", signed_in(rebuild), methods=["POST"]),
         Route("/admin/services", lambda request: RedirectResponse("/services", status_code=301)),
         Route("/services", signed_in(services)),
         Route("/services/ytm/link", signed_in(link_youtube), methods=["POST"]),

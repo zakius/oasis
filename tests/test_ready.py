@@ -3,7 +3,7 @@ import time
 import pytest
 
 from conftest import call, make_client, sign_in
-from oasis import accounts, ready
+from oasis import accounts, ready, tasks
 from oasis.db import record_play
 from oasis.recommend import PERIOD
 from test_accounts import add_user
@@ -70,7 +70,7 @@ def test_top_tracks_are_the_most_played_of_the_last_three_months_that_play(api, 
     playlist = next(p for p in call(client, "getPlaylists")["playlists"]["playlist"] if p["name"] == "Your top tracks")
     assert playlist["readonly"] is True and playlist["comment"].startswith("Your most played") and "oasisMix" not in playlist
     oasis_top = next(p for p in call(client, "getPlaylists", oasis="1")["playlists"]["playlist"] if p["name"] == "Your top tracks")
-    assert oasis_top["oasisMix"] is True and oasis_top["coverArt"].startswith("al-")  # first covered song's cover
+    assert oasis_top["oasisMix"] is True and oasis_top["oasisShelf"] == "Mixes & radios" and oasis_top["coverArt"].startswith("al-")  # first covered song's cover
     assert call(client, "deletePlaylist", id=playlist["id"])["error"]["message"] == "oasis's playlists are read-only"
     assert db.execute("select library from track where id = 'sc-1'").fetchone()[0] == 0  # a playlist made for the user
 
@@ -179,3 +179,15 @@ def test_frequent_and_recent_albums_follow_each_users_plays(client):
     assert albums("frequent", u="bob", p="app") == albums("recent", u="bob", p="app") == ["Loose"]
     old = call(client, "getAlbumList", type="recent", u="bob", p="app")["albumList"]["album"]
     assert [a["title"] for a in old] == ["Loose"]
+
+
+def test_rebuild_now_makes_the_playlist_jobs_due(api, client):
+    db = api.connect()
+    tasks.schedule(db, api.jobs())
+    db.execute("update task set due = ?", (time.time() + ready.DAY,))
+    db.commit()
+    sign_in(client)
+    client.post("/account/rebuild")
+    due = dict(db.execute("select key, due from task"))
+    assert due["ready-made playlists"] <= time.time() and due["listenbrainz playlists"] <= time.time()
+    assert due["search index"] > time.time()

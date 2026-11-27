@@ -128,6 +128,11 @@ class Oasis:
         on = self.sources.uses(db, user, "ytm", "songs") if user else self.sources.allowed(db, "ytm")
         return self.ytm if on else None
 
+    def rebuild_playlists(self, db):
+        """Makes the jobs that make every user's generated playlists run now (the dashboard's Rebuild now)."""
+        for job in ("ready-made playlists", "mix refresh", "soundcloud playlists", "listenbrainz playlists", "tidal playlists"):
+            tasks.wake(db, job)
+
     def jobs(self) -> list[Job]:
         """The periodic jobs. Acquisition's keep what they learn between runs in memory (download.py's failed polls in a row,
         its recent searches), so they share a lane: one worker runs them."""
