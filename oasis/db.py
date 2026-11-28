@@ -393,6 +393,16 @@ def lyrics_with_words(db: sqlite3.Connection):
     db.execute("""delete from lyrics where found like '%"word_level": true%' and found not like '%"words"%'""")
 
 
+def lyrics_placeholders(db: sqlite3.Connection):
+    """Forgets the providers' stand-ins for no lyrics (lyrics.placeholder) cached before oasis dropped them, so the
+    track's lyrics are looked for again."""
+    from .lyrics import Lyrics, placeholder  # lyrics imports youtube, which imports this module
+    enjoy = "%" + json.dumps("欣赏")[1:-1] + "%"  # the lyrics table keeps JSON with non-ASCII escaped
+    for track_id, found in db.execute("select track_id, found from lyrics where found like ?", (enjoy,)).fetchall():
+        if placeholder(Lyrics(**json.loads(found))):
+            db.execute("delete from lyrics where track_id = ?", (track_id,))
+
+
 def one_listening_radio(db: sqlite3.Connection):
     """Makes the database keep one listening radio (playlist.radio 2) per user with the unique index one_radio. A race
     once made two; the later ones stay as radios of their own tracks (1)."""
@@ -475,4 +485,4 @@ def create(db: sqlite3.Connection):
 
 # What a database from any older oasis needs, in order, each time a process first connects to it; each step does
 # nothing once done.
-MIGRATIONS = [rename, own_services, create, own_stats, lyrics_with_words, one_listening_radio, reidentify, drop_left_out, artist_tables]
+MIGRATIONS = [rename, own_services, create, own_stats, lyrics_with_words, lyrics_placeholders, one_listening_radio, reidentify, drop_left_out, artist_tables]
