@@ -188,3 +188,21 @@ def test_translations_interleaved_with_their_own_times_are_taken_out():
 def test_a_song_with_a_few_lines_in_another_language_keeps_them():
     kpop = parse("[00:01.00]너를 보면\n[00:02.00]Baby\n[00:03.00]가슴이 뛰어\n[00:04.00]내 마음\n[00:05.00]Oh my love\n[00:06.00]사랑해\n[00:07.00]너만\n")
     assert lyrics.separate(kpop) == kpop
+
+
+def test_a_providers_stand_in_for_no_lyrics_does_not_hide_real_ones(monkeypatch):
+    stand_in = lyrics.timed("KuGou", [(0, "DJ音乐，请欣赏", [[0, None, "DJ音乐，请欣赏"]])], True)
+    real = Lyrics("LRCLIB", lines(TEXT), True)
+    monkeypatch.setattr(lyrics, "PROVIDERS", {"kugou": lambda query: stand_in, "lrclib": lambda query: real})
+    assert lyrics.find(QUERY).source == "LRCLIB"
+    assert found_by(monkeypatch, Lyrics("NetEase", [(0, "作词 : X"), (1000, "纯音乐，请欣赏")], True)) is None
+
+
+def test_stand_ins_cached_before_are_forgotten(tmp_path):
+    from dataclasses import asdict
+    from oasis.db import connect, lyrics_placeholders
+    db = connect(tmp_path / "oasis.db")
+    for track_id, found in (("a", Lyrics("KuGou", [(0, "纯音乐，请欣赏")], True)), ("b", Lyrics("LRCLIB", [(0, "请欣赏"), (1000, "the rest of it")], True))):
+        db.execute("insert into lyrics values (?, ?, 0)", (track_id, json.dumps(asdict(found))))
+    lyrics_placeholders(db)
+    assert [r[0] for r in db.execute("select track_id from lyrics")] == ["b"]

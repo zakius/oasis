@@ -239,6 +239,15 @@ def cleaned(found: Lyrics, query: "Query") -> Lyrics:
     return found
 
 
+# "纯音乐，请欣赏" (instrumental, please enjoy), "DJ音乐，请欣赏": what KuGou and NetEase answer for a song without lyrics
+PLACEHOLDER = re.compile(r".{0,16}请您?欣赏\W*")
+
+
+def placeholder(found: Lyrics) -> bool:
+    """Lyrics with no line but a provider's stand-in for none (PLACEHOLDER), or no line at all."""
+    return all(not text.strip() or PLACEHOLDER.fullmatch(text.strip()) for _, text in found.lines)
+
+
 def fold_title(s: str) -> str:
     return fold(re.sub(r"[(\[（【].*?[)\]）】]", "", unicodedata.normalize("NFKD", s)))
 
@@ -449,6 +458,7 @@ def find(query: Query, youtube=None) -> Lyrics | None:
             log.info("lyrics from %s failed: %s", name, e)
             return None
     others = [cleaned(found, query) for job, name in jobs.items() if (found := result(job, name))]
+    others = [found for found in others if not placeholder(found)]
     ytm = result(ytm_job, "YouTube Music") if ytm_job else None
     return choose(cleaned(ytm, query) if ytm else None, others)
 
